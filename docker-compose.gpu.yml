@@ -1,0 +1,29 @@
+# For GPU server deployment
+# How to use: docker compose -f docker-compose.gpu.yml up -d
+#
+# 사전 조건:
+#   - NVIDIA Container Toolkit 설치
+#   - .env.gpu 파일에 PC_HOST_IP 설정
+
+services:
+  worker:
+    build: ./worker
+    container_name: 3dgs-worker
+    volumes:
+      - ./core:/app/core:ro
+      - ./utilities:/app/utilities:ro
+    environment:
+      - RABBITMQ_URL=amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@${PC_HOST_IP}:5672//
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@${PC_HOST_IP}:6379/0
+      - MINIO_ENDPOINT=${PC_HOST_IP}:9000
+      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY}
+      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
+      - MINIO_BUCKET=${MINIO_BUCKET}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [ gpu ]
+    restart: unless-stopped

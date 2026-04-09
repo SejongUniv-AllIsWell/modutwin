@@ -1,0 +1,14 @@
+# Local development override — use without SSL certificates
+# Usage: docker compose -f docker-compose.yml -f docker-compose.local.yml up -d
+#
+# Differences from production:
+#   - nginx: HTTP only (no SSL, no HTTPS redirect)
+#   - nginx: uses nginx.local.conf directly
+#   - MinIO presigned URLs go directly to localhost:9000 (not through nginx)
+
+services:
+  nginx:
+    volumes:
+      - ./nginx/nginx.local.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "80:80"

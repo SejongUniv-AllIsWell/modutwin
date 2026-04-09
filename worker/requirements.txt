@@ -1,0 +1,5 @@
+celery
+redis
+minio
+numpy
+plyfile

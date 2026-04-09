@@ -1,0 +1,8 @@
+# 처음 환경 만들 때
+conda env create -f environment.yml
+
+# 환경 활성화
+conda activate alliswell
+
+# 누가 패키지 추가해서 yml이 바뀌었을 때
+conda env update -f environment.yml --prune

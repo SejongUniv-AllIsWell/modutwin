@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+sqlalchemy[asyncio]
+asyncpg
+alembic
+python-jose[cryptography]
+httpx
+celery
+redis
+minio
+python-multipart
+pydantic-settings
+numpy
+plyfile

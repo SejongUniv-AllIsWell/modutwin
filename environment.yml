@@ -1,0 +1,34 @@
+# (= 2.1.2) 정확히 이 버전
+# >=1.0.0 → 이 버전 이상 아무거나 (pip 패키지)
+# pip: 아래에는 pip으로만 설치 가능한 패키지를 넣기
+
+
+name: alliswell
+
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.10
+  - pytorch=2.4.0
+  - torchvision=0.19.0
+  - torchaudio=2.4.0
+  - pytorch-cuda=12.1
+  - numpy
+  - scipy
+  - matplotlib
+  - pip
+  - pip:
+      - gsplat==1.5.3
+      - viser
+      - nerfview
+      - opencv-python
+      - Pillow
+      - tqdm
+      - plyfile
+      - pycolmap
+      - scikit-learn
+      - sam3
