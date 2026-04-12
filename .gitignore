@@ -1,3 +1,14 @@
+# development 
+.claude/
+*.sql
+nginx/nginx.conf
+
+# data
+*.mp4
+*.wav
+*.ply
+*.sog
+
 # Dependencies
 node_modules/
 __pycache__/

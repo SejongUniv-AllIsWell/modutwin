@@ -35,14 +35,14 @@ GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo"
 
 
 def _resolve_frontend_base(request: Request) -> str:
-    """프론트엔드 오리진 결정: Referer 헤더 → PUBLIC_BASE_URL → 상대 경로."""
+    """프론트엔드 오리진 결정: PUBLIC_BASE_URL → Referer 헤더 → 상대 경로."""
+    if settings.PUBLIC_BASE_URL:
+        return settings.PUBLIC_BASE_URL
     referer = request.headers.get("Referer", "")
     if referer:
         parsed = urlparse(referer)
         if parsed.scheme and parsed.netloc:
             return f"{parsed.scheme}://{parsed.netloc}"
-    if settings.PUBLIC_BASE_URL:
-        return settings.PUBLIC_BASE_URL
     return ""
 
 

@@ -67,7 +67,7 @@ services:
     image: postgres:16-alpine
     container_name: 3dgs-postgres
     ports:
-      - "127.0.0.1:5432:5432"  # Local access only(GPU worker does not need direct access)
+      - "127.0.0.1:5433:5432"  # Local access only(GPU worker does not need direct access)
     volumes:
       - pgdata:/var/lib/postgresql/data
     environment:
