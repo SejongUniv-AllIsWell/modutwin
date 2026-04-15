@@ -263,11 +263,18 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
           const keys = new Set<string>();
           const onKD = (e: KeyboardEvent) => { e.preventDefault(); keys.add(e.code); };
           const onKU = (e: KeyboardEvent) => keys.delete(e.code);
+          const clearKeys = () => keys.clear();
           canvas.addEventListener('keydown', onKD);
-          canvas.addEventListener('keyup', onKU);
+          // keyup / blur / 창 숨김은 window에 바인딩해야 캔버스 포커스 상관없이 잡힘
+          // (안 그러면 키 누른 채 모달/버튼 클릭 → 포커스 이탈 시 keyup 놓쳐서 계속 움직이는 버그)
+          window.addEventListener('keyup', onKU);
+          window.addEventListener('blur', clearKeys);
+          document.addEventListener('visibilitychange', clearKeys);
           cleanups.push(() => {
             canvas.removeEventListener('keydown', onKD);
-            canvas.removeEventListener('keyup', onKU);
+            window.removeEventListener('keyup', onKU);
+            window.removeEventListener('blur', clearKeys);
+            document.removeEventListener('visibilitychange', clearKeys);
           });
 
           // ── Update loop ──
@@ -303,7 +310,7 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
 
             // WASD
             if (keys.size) {
-              const speed = moveSpeedRef.current * 3 * dt;
+              const speed = moveSpeedRef.current * 3 * dt * (keys.has('ShiftLeft') || keys.has('ShiftRight') ? 5 : 1);
               const look = getLookDir(azim, elev);
               const right = getRightDir(azim);
               const t = cameraModeRef.current === 'fly' ? camPos : orbitTarget;
@@ -369,6 +376,11 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
             if (destroyed) return;
 
             const splatEntity = new pc.Entity('splat');
+            // SuperSplat과 동일한 PLY 로드 기본 회전 (SPZ는 (0,0,0), PLY/기타는 Z축 180°)
+            const ext = sogUrl.split('?')[0].split('.').pop()?.toLowerCase();
+            if (ext !== 'spz') {
+              splatEntity.setLocalEulerAngles(0, 0, 180);
+            }
             splatEntity.addComponent('gsplat', { asset });
             app.root.addChild(splatEntity);
 

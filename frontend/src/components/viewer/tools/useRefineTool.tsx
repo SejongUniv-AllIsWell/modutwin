@@ -1,7 +1,11 @@
 'use client';
 
-import { useRef, useState, useCallback, useEffect, RefObject } from 'react';
+import { useRef, useState, useCallback, useEffect, RefObject, lazy, Suspense } from 'react';
 import { SplatData, SplatViewerCoreRef } from '../SplatViewerCore';
+import { useDepthNormal } from './useDepthNormal';
+
+const CeilingFloorModal = lazy(() => import('./CeilingFloorModal'));
+const WallModal = lazy(() => import('./WallModal'));
 
 // ── Types ──
 
@@ -53,6 +57,54 @@ function planeCorners(center: Vec3, normal: Vec3, size: number): Vec3[] {
     add3(add3(center, scale3(t1, size)), scale3(t2, size)),
     add3(add3(center, scale3(t1, -size)), scale3(t2, size)),
   ];
+}
+
+// ── PCA normal computation ──
+
+function symmetricEigen3x3(mat: number[][]): { values: number[]; vectors: number[][] } {
+  const a = mat.map(r => [...r]);
+  const v = [[1,0,0],[0,1,0],[0,0,1]];
+  for (let iter = 0; iter < 30; iter++) {
+    let maxVal = 0, p = 0, q = 1;
+    for (let i = 0; i < 3; i++) for (let j = i+1; j < 3; j++) {
+      if (Math.abs(a[i][j]) > maxVal) { maxVal = Math.abs(a[i][j]); p = i; q = j; }
+    }
+    if (maxVal < 1e-12) break;
+    const apq = a[p][q];
+    const diff = a[p][p] - a[q][q];
+    let t: number;
+    if (Math.abs(diff) < 1e-12) t = apq > 0 ? 1 : -1;
+    else { const phi = diff / (2 * apq); t = 1 / (Math.abs(phi) + Math.sqrt(phi*phi+1)); if (phi < 0) t = -t; }
+    const c = 1 / Math.sqrt(t*t+1), s = t*c, tau = s/(1+c);
+    a[p][p] -= t * apq; a[q][q] += t * apq; a[p][q] = 0; a[q][p] = 0;
+    for (let r = 0; r < 3; r++) {
+      if (r === p || r === q) continue;
+      const arp = a[r][p], arq = a[r][q];
+      a[r][p] = a[p][r] = arp - s*(arq + tau*arp);
+      a[r][q] = a[q][r] = arq + s*(arp - tau*arq);
+    }
+    for (let r = 0; r < 3; r++) {
+      const vrp = v[r][p], vrq = v[r][q];
+      v[r][p] = vrp - s*(vrq + tau*vrp);
+      v[r][q] = vrq + s*(vrp - tau*vrq);
+    }
+  }
+  return { values: [a[0][0], a[1][1], a[2][2]], vectors: v };
+}
+
+function pcaNormal(positions: Vec3[]): Vec3 {
+  const n = positions.length;
+  const mean: Vec3 = [0, 0, 0];
+  for (const p of positions) { mean[0] += p[0]; mean[1] += p[1]; mean[2] += p[2]; }
+  mean[0] /= n; mean[1] /= n; mean[2] /= n;
+  const cov = [[0,0,0],[0,0,0],[0,0,0]];
+  for (const p of positions) {
+    const d = [p[0]-mean[0], p[1]-mean[1], p[2]-mean[2]];
+    for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) cov[i][j] += d[i]*d[j];
+  }
+  const { values, vectors } = symmetricEigen3x3(cov);
+  const minIdx = values[0] <= values[1] && values[0] <= values[2] ? 0 : values[1] <= values[2] ? 1 : 2;
+  return normalize3([vectors[0][minIdx], vectors[1][minIdx], vectors[2][minIdx]]);
 }
 
 // ── Space partitioning ──
@@ -118,6 +170,91 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   const toolModeRef = useRef<ToolMode>('none');
   const hoveredAxisRef = useRef<number>(-1);
   const dragRef = useRef<any>(null);
+  const [pickingNormal, setPickingNormal] = useState(false);
+  const pickingNormalRef = useRef(false);
+  const normalDisplayRef = useRef<{ point: Vec3; normal: Vec3 } | null>(null);
+  const [depthLoading, setDepthLoading] = useState(false);
+  const { computeDepthMap, getNormalAt, isLoading: isDepthLoading, hasDepth, clearDepth } = useDepthNormal();
+
+  // ── Ceiling/Floor state ──
+  const [cfModalOpen, setCfModalOpen] = useState(false);
+  const [cfMode, setCfMode] = useState<'none' | 'confirmed'>('none');
+  const [ceilingY, setCeilingY] = useState(0);
+  const [floorY, setFloorY] = useState(0);
+  const ceilingYRef = useRef(0);
+  const floorYRef = useRef(0);
+  const cfModeRef = useRef<'none' | 'confirmed'>('none');
+
+  // ── Wall state ──
+  const [wallModalOpen, setWallModalOpen] = useState(false);
+  const [wallMode, setWallMode] = useState<'none' | 'confirmed'>('none');
+  const [wallAngle, setWallAngle] = useState<number | null>(null);
+  const [wallDistances, setWallDistances] = useState<[number, number, number, number] | null>(null);
+  const wallAngleRef = useRef<number | null>(null);
+  const wallDistancesRef = useRef<[number, number, number, number] | null>(null);
+  const wallModeRef = useRef<'none' | 'confirmed'>('none');
+  const selectedSurfacesRef = useRef<Set<string>>(new Set());
+
+  // ── Surface selection for flatten/remove ──
+  const ALL_SURFACES = ['ceiling', 'floor', 'w1a', 'w1b', 'w2a', 'w2b'] as const;
+  type Surface = typeof ALL_SURFACES[number];
+  const CF_SURFACES: Surface[] = ['ceiling', 'floor'];
+  const WALL_SURFACES: Surface[] = ['w1a', 'w1b', 'w2a', 'w2b'];
+  const [selectedSurfaces, setSelectedSurfaces] = useState<Set<Surface>>(new Set());
+  const [flattening, setFlattening] = useState(false);
+  const [surfaceOffsets, setSurfaceOffsets] = useState<Record<Surface, number>>({
+    ceiling: 0.15, floor: 0.15, w1a: 0.15, w1b: 0.15, w2a: 0.15, w2b: 0.15,
+  });
+  // 입력 중 임시 문자열 — 빈칸·'-'·'0.' 같은 중간 상태를 허용해 삭제/편집이 가능하게
+  const [offsetText, setOffsetText] = useState<Record<Surface, string>>({
+    ceiling: '0.15', floor: '0.15', w1a: '0.15', w1b: '0.15', w2a: '0.15', w2b: '0.15',
+  });
+
+  const toggleSurface = (s: Surface) => {
+    // Don't allow toggling disabled surfaces
+    if (CF_SURFACES.includes(s) && cfMode !== 'confirmed') return;
+    if (WALL_SURFACES.includes(s) && wallMode !== 'confirmed') return;
+    setSelectedSurfaces(prev => {
+      const next = new Set(prev);
+      if (next.has(s)) next.delete(s); else next.add(s);
+      return next;
+    });
+  };
+  const toggleAllSurfaces = () => {
+    const available: Surface[] = [
+      ...(cfMode === 'confirmed' ? CF_SURFACES : []),
+      ...(wallMode === 'confirmed' ? WALL_SURFACES : []),
+    ];
+    setSelectedSurfaces(prev => prev.size === available.length ? new Set() : new Set(available));
+  };
+  const applyFlatten = useCallback(async (action: 'project' | 'remove') => {
+    if (!options?.uploadId || !options?.reloadWithUrl) return;
+    if (selectedSurfaces.size === 0) { alert('경계면을 하나 이상 선택하세요.'); return; }
+    // 벽면이 포함된 경우에만 wall 설정 필요
+    const hasWall = Array.from(selectedSurfaces).some(s => WALL_SURFACES.includes(s));
+    if (hasWall && (wallAngleRef.current === null || !wallDistancesRef.current)) return;
+    setFlattening(true);
+    try {
+      const { api } = await import('@/lib/api');
+      const res = await api.post<{ url: string; source_key: string }>('/refine/flatten', {
+        upload_id: options.uploadId,
+        source_key: sourceKeyRef.current,
+        action,
+        surfaces: Array.from(selectedSurfaces),
+        angle_deg: wallAngleRef.current ?? 0,
+        walls: wallDistancesRef.current ?? [0, 0, 0, 0],
+        ceiling_y: ceilingYRef.current,
+        floor_y: floorYRef.current,
+        offsets: surfaceOffsets,
+      });
+      sourceKeyRef.current = res.source_key;
+      options.reloadWithUrl(res.url);
+    } catch (e: any) {
+      alert(`처리 실패: ${e.message || e}`);
+    } finally {
+      setFlattening(false);
+    }
+  }, [options, selectedSurfaces, surfaceOffsets]);
 
   // ── Brush/BBox state ──
   const [paintMode, setPaintMode] = useState<PaintMode>('union');
@@ -144,6 +281,13 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   useEffect(() => { refineModeRef.current = refineMode; }, [refineMode]);
   useEffect(() => { paintModeRef.current = paintMode; }, [paintMode]);
   useEffect(() => { brushSizeRef.current = brushSize; }, [brushSize]);
+  useEffect(() => { pickingNormalRef.current = pickingNormal; }, [pickingNormal]);
+  useEffect(() => { ceilingYRef.current = ceilingY; }, [ceilingY]);
+  useEffect(() => { floorYRef.current = floorY; }, [floorY]);
+  useEffect(() => { cfModeRef.current = cfMode; }, [cfMode]);
+  useEffect(() => { wallAngleRef.current = wallAngle; }, [wallAngle]);
+  useEffect(() => { wallDistancesRef.current = wallDistances; }, [wallDistances]);
+  useEffect(() => { wallModeRef.current = wallMode; }, [wallMode]);
 
   // ── Align API state ──
   const [aligning, setAligning] = useState(false);
@@ -201,6 +345,77 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     data.colorTexture.unlock();
   }, [coreRef]);
 
+  // ── Unified surface highlight: tint gaussians near selected surfaces ──
+  const SURFACE_COLORS: Record<string, [number, number, number]> = {
+    ceiling: [0.133, 0.827, 0.933], // #22d3ee cyan
+    floor:   [0.659, 0.333, 0.969], // #a855f7 violet
+    w1a:     [0.937, 0.267, 0.267], // #ef4444 red
+    w1b:     [0.925, 0.282, 0.600], // #ec4899 pink
+    w2a:     [0.976, 0.451, 0.086], // #f97316 orange
+    w2b:     [0.918, 0.702, 0.031], // #eab308 yellow
+  };
+  const applySurfaceHighlight = useCallback(() => {
+    const data = splatDataRef.current; const core = coreRef.current;
+    if (!data?.colorTexture || !data?.origColorData || !core) return;
+    const sel = selectedSurfacesRef.current;
+
+    const td = data.colorTexture.lock(); if (!td) return;
+    const orig = data.origColorData;
+    if (sel.size === 0) {
+      td.set(orig); data.colorTexture.unlock(); return;
+    }
+    const f2h = core.float2Half, h2f = core.half2Float;
+    const mixT = 0.75;
+
+    const cy = ceilingYRef.current, fy = floorYRef.current;
+    const bandCf = Math.abs(fy - cy) * 0.03;
+    const yLo = Math.min(cy, fy), yHi = Math.max(cy, fy);
+
+    let c1 = 0, s1 = 0, c2 = 0, s2 = 0, a1 = 0, b1 = 0, a2 = 0, b2 = 0, bandWall = 0;
+    const ang = wallAngleRef.current, walls = wallDistancesRef.current;
+    const wallsReady = ang !== null && walls !== null;
+    if (wallsReady) {
+      const rad = (ang as number) * Math.PI / 180;
+      c1 = Math.cos(rad); s1 = Math.sin(rad);
+      c2 = Math.cos(rad + Math.PI / 2); s2 = Math.sin(rad + Math.PI / 2);
+      [a1, b1, a2, b2] = walls as [number, number, number, number];
+      bandWall = Math.min(Math.abs(b1 - a1), Math.abs(b2 - a2)) * 0.03;
+    }
+
+    for (let i = 0; i < data.numSplats; i++) {
+      const idx = i * 4;
+      const x = data.posX[i], y = data.posY[i], z = data.posZ[i];
+      let bestSurf: string | null = null;
+      let bestD = Infinity;
+
+      if (sel.has('ceiling')) { const d = Math.abs(y - cy); if (d < bandCf && d < bestD) { bestD = d; bestSurf = 'ceiling'; } }
+      if (sel.has('floor'))   { const d = Math.abs(y - fy); if (d < bandCf && d < bestD) { bestD = d; bestSurf = 'floor'; } }
+      if (wallsReady && y >= yLo && y <= yHi) {
+        const d1 = x * c1 + z * s1;
+        const d2 = x * c2 + z * s2;
+        if (sel.has('w1a')) { const d = Math.abs(d1 - a1); if (d < bandWall && d < bestD) { bestD = d; bestSurf = 'w1a'; } }
+        if (sel.has('w1b')) { const d = Math.abs(d1 - b1); if (d < bandWall && d < bestD) { bestD = d; bestSurf = 'w1b'; } }
+        if (sel.has('w2a')) { const d = Math.abs(d2 - a2); if (d < bandWall && d < bestD) { bestD = d; bestSurf = 'w2a'; } }
+        if (sel.has('w2b')) { const d = Math.abs(d2 - b2); if (d < bandWall && d < bestD) { bestD = d; bestSurf = 'w2b'; } }
+      }
+
+      if (bestSurf) {
+        const [cr, cg, cb] = SURFACE_COLORS[bestSurf];
+        const r = h2f(orig[idx]), g = h2f(orig[idx+1]), b = h2f(orig[idx+2]);
+        td[idx] = f2h(r*(1-mixT)+cr*mixT); td[idx+1] = f2h(g*(1-mixT)+cg*mixT); td[idx+2] = f2h(b*(1-mixT)+cb*mixT); td[idx+3] = orig[idx+3];
+      } else {
+        td[idx]=orig[idx]; td[idx+1]=orig[idx+1]; td[idx+2]=orig[idx+2]; td[idx+3]=orig[idx+3];
+      }
+    }
+    data.colorTexture.unlock();
+  }, [coreRef]);
+
+  // Sync ref + re-tint whenever selection changes
+  useEffect(() => {
+    selectedSurfacesRef.current = selectedSurfaces;
+    applySurfaceHighlight();
+  }, [selectedSurfaces, applySurfaceHighlight]);
+
   // ── Restore original colors (mode switch) ──
   const clearHighlight = useCallback(() => {
     const data = splatDataRef.current;
@@ -215,6 +430,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     refineModeRef.current = mode;
     // Reset plane gizmo state
     setToolMode('none'); toolModeRef.current = 'none'; dragRef.current = null;
+    setPickingNormal(false); pickingNormalRef.current = false; normalDisplayRef.current = null; clearDepth();
     if (mode === 'plane') {
       // Restore plane preview if planes exist
       if (selectionRef.current) selectionRef.current.fill(0);
@@ -332,14 +548,39 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   }, [pushHistory, refreshSelection]);
 
   // ── Reset all (pristine) ──
-  const resetAll = useCallback(() => {
+  const resetAll = useCallback(async () => {
     const data = splatDataRef.current; const pristine = pristineRef.current;
-    if (!data || !pristine || !data.colorTexture) return;
-    data.origColorData = new Uint16Array(pristine);
-    const td = data.colorTexture.lock(); if (td) { td.set(pristine); data.colorTexture.unlock(); }
+    if (data && pristine && data.colorTexture) {
+      data.origColorData = new Uint16Array(pristine);
+      const td = data.colorTexture.lock(); if (td) { td.set(pristine); data.colorTexture.unlock(); }
+    }
     planesRef.current = []; setPlanes([]); setSelectedPlane(-1); selectedPlaneRef.current = -1; setOutsideCount(0); setClosed(false);
     if (selectionRef.current) selectionRef.current.fill(0); setSelectionCount(0);
-  }, []);
+    // 천장/바닥
+    setCfMode('none'); cfModeRef.current = 'none';
+    setCeilingY(0); setFloorY(0); ceilingYRef.current = 0; floorYRef.current = 0;
+    setCfModalOpen(false);
+    // 벽면
+    setWallMode('none'); wallModeRef.current = 'none';
+    setWallAngle(null); setWallDistances(null);
+    wallAngleRef.current = null; wallDistancesRef.current = null;
+    setWallModalOpen(false);
+    // 경계면 선택
+    setSelectedSurfaces(new Set()); selectedSurfacesRef.current = new Set();
+    // 정제 누적 결과
+    sourceKeyRef.current = null;
+    setSaved(false);
+    // 뷰어를 원본 PLY로 되돌림
+    if (options?.uploadId && options?.reloadWithUrl) {
+      try {
+        const { api } = await import('@/lib/api');
+        const res = await api.get<{ url: string }>(`/uploads/${options.uploadId}/presigned-url`);
+        options.reloadWithUrl(res.url);
+      } catch (e) {
+        console.error('원본 다시 불러오기 실패', e);
+      }
+    }
+  }, [options]);
 
   // ── BBox selection apply ──
   const applyBboxSel = useCallback((mn: Vec3, mx: Vec3) => {
@@ -480,6 +721,75 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
 
       // ── PLANE MODE ──
       if (mode === 'plane') {
+        // ── Normal picking via Depth Map ──
+        if (pickingNormalRef.current) {
+          e.preventDefault();
+          const sd = splatDataRef.current; const cam = cameraEntity.camera;
+          if (!sd || !cam || !pc) return;
+
+          // 1. Hit test to find the clicked gaussian (for display position)
+          const vpMat = new pc.Mat4(); vpMat.mul2(cam.projectionMatrix, cam.viewMatrix);
+          const mm = vpMat.data; const cw2 = canvas.clientWidth, ch2 = canvas.clientHeight;
+          const pickR2 = 20 * 20;
+          let bestIdx = -1, bestDepth = Infinity;
+          for (let i = 0; i < sd.numSplats; i++) {
+            const px = sd.posX[i], py = sd.posY[i], pz = sd.posZ[i];
+            const cww = mm[3]*px + mm[7]*py + mm[11]*pz + mm[15]; if (cww <= 0.01) continue;
+            const inv = 1/cww;
+            const sx = ((mm[0]*px + mm[4]*py + mm[8]*pz + mm[12])*inv + 1)*0.5*cw2;
+            const sy = (1 - (mm[1]*px + mm[5]*py + mm[9]*pz + mm[13])*inv)*0.5*ch2;
+            const dx = sx - mx, dy = sy - my;
+            if (dx*dx + dy*dy < pickR2 && cww < bestDepth) { bestDepth = cww; bestIdx = i; }
+          }
+          if (bestIdx < 0) return;
+          const hitPos: Vec3 = [sd.posX[bestIdx], sd.posY[bestIdx], sd.posZ[bestIdx]];
+
+          // 2. Compute depth map (with camera basis at capture time), then get normal
+          setDepthLoading(true);
+          (async () => {
+            try {
+              // Capture camera basis now — stored with depth map for consistent transform
+              const right = cameraEntity.right;
+              const up = cameraEntity.up;
+              const fwd = cameraEntity.forward;
+              const camRight: Vec3 = [right.x, right.y, right.z];
+              const camUp: Vec3 = [up.x, up.y, up.z];
+              const camForward: Vec3 = [fwd.x, fwd.y, fwd.z];
+
+              if (!hasDepth()) {
+                console.log('[DepthNormal] Computing depth map...');
+                const fov = cam.fov || 45;
+                await computeDepthMap(canvas, camRight, camUp, camForward, fov);
+                console.log('[DepthNormal] Depth map ready:', hasDepth());
+              }
+
+              let normal = getNormalAt(mx, my);
+              console.log('[DepthNormal] Depth-based normal:', normal);
+              if (!normal) {
+                // Fallback to PCA
+                console.log('[DepthNormal] Falling back to PCA');
+                const radius = bboxSizeRef.current * 0.03;
+                const r2 = radius * radius;
+                const neighbors: Vec3[] = [];
+                for (let i = 0; i < sd.numSplats; i++) {
+                  const dx = sd.posX[i]-hitPos[0], dy = sd.posY[i]-hitPos[1], dz = sd.posZ[i]-hitPos[2];
+                  if (dx*dx + dy*dy + dz*dz < r2) neighbors.push([sd.posX[i], sd.posY[i], sd.posZ[i]]);
+                }
+                if (neighbors.length >= 10) normal = pcaNormal(neighbors);
+              }
+              if (normal) {
+                // Ensure normal points toward camera
+                const cp = cameraEntity.getLocalPosition();
+                const toCamera: Vec3 = [cp.x-hitPos[0], cp.y-hitPos[1], cp.z-hitPos[2]];
+                if (dot3(normal, toCamera) < 0) normal = scale3(normal, -1);
+                normalDisplayRef.current = { point: hitPos, normal };
+              }
+            } finally {
+              setDepthLoading(false);
+            }
+          })();
+          return;
+        }
         const tm = toolModeRef.current; const selIdx = selectedPlaneRef.current;
         if (tm === 'translate' && selIdx >= 0) {
           e.preventDefault();
@@ -601,7 +911,9 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
 
       // ── Plane visualization ──
       if (mode === 'plane') {
-        const ps = planesRef.current; if (ps.length === 0) return;
+        const ps = planesRef.current;
+        if (ps.length === 0) { /* skip plane drawing but don't return — normal display below */ }
+        else {
         const size = bboxSizeRef.current * 0.6; const selIdx = selectedPlaneRef.current; const tm = toolModeRef.current;
         for (let pi = 0; pi < ps.length; pi++) {
           const { normal, center } = ps[pi]; const corners = planeCorners(center, normal, size); const isSel = pi === selIdx;
@@ -627,6 +939,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
               for(let i=0;i<=RING_SEGMENTS;i++){const ang=(i/RING_SEGMENTS)*Math.PI*2;const pt=add3(center,add3(scale3(rt1,Math.cos(ang)*gr),scale3(rt2,Math.sin(ang)*gr)));if(prev)core.drawLine(prev,pt,col,false);prev=pt;}}
           }
         }
+        } // end else (ps.length > 0)
       }
 
       // ── BBox wireframe ──
@@ -641,6 +954,18 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
           core.drawLine(cs[a],cs[b],col,false);
         }
       }
+
+      // ── Normal display ──
+      const nd = normalDisplayRef.current;
+      if (nd) {
+        const len = bboxSizeRef.current * 0.15;
+        core.drawLine(nd.point, add3(nd.point, scale3(nd.normal, len)), [0,1,1,1], false);
+        core.drawLine(nd.point, add3(nd.point, scale3(nd.normal, -len * 0.3)), [0,0.5,0.5,0.6], false);
+        const s = len * 0.03;
+        for (const ax of WORLD_AXES) core.drawLine(add3(nd.point, scale3(ax, -s)), add3(nd.point, scale3(ax, s)), [1,1,0,1], false);
+      }
+
+      // ── Ceiling/Floor: no per-frame work (coloring done on confirm/change) ──
     });
 
     return () => {
@@ -676,10 +1001,116 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         {/* ── Plane controls ── */}
         {refineMode === 'plane' && (
           <>
-            <button onClick={addPlane} disabled={planes.length>=20}
-              className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-600 text-white rounded cursor-pointer text-xs">
-              + 평면 추가
-            </button>
+            {/* Ceiling/Floor */}
+            <div className="border border-gray-600 rounded p-2 flex flex-col gap-1.5">
+              <div className="text-gray-400 text-[10px] font-bold">천장 / 바닥</div>
+              {cfMode === 'none' ? (
+                <button onClick={() => setCfModalOpen(true)}
+                  className="px-3 py-1.5 bg-teal-600 hover:bg-teal-500 text-white rounded cursor-pointer text-xs">
+                  천장/바닥 설정
+                </button>
+              ) : (
+                <>
+                  <div className="text-green-400 text-[10px] font-bold">천장/바닥 확정됨</div>
+                  <button onClick={() => setCfModalOpen(true)}
+                    className="px-2 py-1 bg-gray-600 hover:bg-gray-500 text-white rounded cursor-pointer text-xs">다시 수정</button>
+                </>
+              )}
+            </div>
+
+            {/* 벽면 */}
+            <div className="border border-gray-600 rounded p-2 flex flex-col gap-1.5">
+              <div className="text-gray-400 text-[10px] font-bold">벽면 (X/Z 정렬)</div>
+              {wallMode === 'none' && (
+                <button onClick={() => setWallModalOpen(true)} disabled={cfMode !== 'confirmed'}
+                  className="px-3 py-1.5 bg-teal-600 hover:bg-teal-500 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded cursor-pointer text-xs">
+                  {cfMode !== 'confirmed' ? '천장/바닥 먼저 확정' : '벽면 설정'}
+                </button>
+              )}
+              {wallMode === 'confirmed' && (
+                <>
+                  <div className="text-green-400 text-[10px] font-bold">
+                    벽면 확정됨 ({wallAngle?.toFixed(1)}°)
+                  </div>
+                  <button onClick={() => setWallModalOpen(true)}
+                    className="px-2 py-1 bg-gray-600 hover:bg-gray-500 text-white rounded cursor-pointer text-xs">다시 수정</button>
+                </>
+              )}
+            </div>
+
+            {/* 경계면 선택 + 투영/제거 — 체크박스는 해당 설정이 확정되어야 활성화 */}
+            <div className="border border-gray-600 rounded p-2 flex flex-col gap-1.5">
+              <div className="text-gray-400 text-[10px] font-bold">경계면 처리</div>
+              {(() => {
+                const labels: Record<Surface, { name: string; color: string }> = {
+                  ceiling: { name: '천장', color: '#22d3ee' },
+                  floor:   { name: '바닥', color: '#a855f7' },
+                  w1a:     { name: '벽1a', color: '#ef4444' },
+                  w1b:     { name: '벽1b', color: '#ec4899' },
+                  w2a:     { name: '벽2a', color: '#f97316' },
+                  w2b:     { name: '벽2b', color: '#eab308' },
+                };
+                const isDisabled = (s: Surface) =>
+                  CF_SURFACES.includes(s) ? cfMode !== 'confirmed' : wallMode !== 'confirmed';
+                return (
+                  <div className="flex flex-col gap-1">
+                    {ALL_SURFACES.map(s => {
+                      const disabled = isDisabled(s);
+                      return (
+                        <div key={s} className={`flex items-center gap-1.5 text-[11px] ${disabled ? 'opacity-40' : ''}`}>
+                          <label className={`flex items-center gap-1.5 flex-1 ${disabled ? 'cursor-not-allowed' : 'cursor-pointer'}`}>
+                            <input type="checkbox" checked={selectedSurfaces.has(s)} disabled={disabled}
+                              onChange={() => toggleSurface(s)}
+                              className="accent-blue-500" />
+                            <span style={{ color: labels[s].color }}>{labels[s].name}</span>
+                          </label>
+                          <span className="text-gray-500 text-[10px]">안전거리</span>
+                          <input type="text" inputMode="decimal" value={offsetText[s]} disabled={disabled}
+                            onChange={e => {
+                              const v = e.target.value;
+                              setOffsetText(prev => ({ ...prev, [s]: v }));
+                              const n = parseFloat(v);
+                              if (!isNaN(n)) setSurfaceOffsets(prev => ({ ...prev, [s]: n }));
+                            }}
+                            onBlur={() => {
+                              // 포커스 잃으면 숫자 상태와 동기화 (빈칸/부적합 입력 복구)
+                              setOffsetText(prev => ({ ...prev, [s]: String(surfaceOffsets[s]) }));
+                            }}
+                            className="w-14 px-1 py-0.5 bg-gray-800 border border-gray-600 rounded text-white text-[10px] font-mono disabled:opacity-50" />
+                        </div>
+                      );
+                    })}
+                  </div>
+                );
+              })()}
+              <button onClick={toggleAllSurfaces}
+                disabled={cfMode !== 'confirmed' && wallMode !== 'confirmed'}
+                className="px-2 py-1 bg-gray-700 hover:bg-gray-600 disabled:bg-gray-800 disabled:opacity-50 text-gray-200 rounded cursor-pointer disabled:cursor-not-allowed text-[11px]">
+                전체 선택/해제
+              </button>
+              <div className="flex gap-1">
+                <button onClick={() => applyFlatten('project')} disabled={flattening || selectedSurfaces.size === 0}
+                  className="flex-1 px-2 py-1.5 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-600 text-white rounded cursor-pointer text-xs font-bold">
+                  {flattening ? '처리 중...' : '투영'}
+                </button>
+                <button onClick={() => applyFlatten('remove')} disabled={flattening || selectedSurfaces.size === 0}
+                  className="flex-1 px-2 py-1.5 bg-red-600 hover:bg-red-500 disabled:bg-gray-600 text-white rounded cursor-pointer text-xs font-bold">
+                  제거
+                </button>
+              </div>
+            </div>
+
+            <div className="flex gap-1">
+              <button onClick={addPlane} disabled={planes.length>=20}
+                className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-600 text-white rounded cursor-pointer text-xs">
+                + 평면 추가
+              </button>
+              <button onClick={() => { const next = !pickingNormal; setPickingNormal(next); pickingNormalRef.current = next; if (!next) clearDepth(); }}
+                disabled={depthLoading}
+                className={`px-3 py-1.5 ${depthLoading ? 'bg-gray-500 text-gray-300 cursor-wait' : pickingNormal ? 'bg-yellow-500 hover:bg-yellow-400 text-black' : 'bg-purple-600 hover:bg-purple-500 text-white'} rounded cursor-pointer text-xs`}>
+                {depthLoading ? 'Depth 분석중...' : pickingNormal ? '점을 클릭...' : '법선 생성 (Depth)'}
+              </button>
+            </div>
             {planes.length > 0 && (
               <div className="flex flex-col gap-1 mt-1">
                 {planes.map((_,i) => (
@@ -799,6 +1230,62 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
           전체 리셋
         </button>
       </div>
+
+      {/* Ceiling/Floor Modal */}
+      {cfModalOpen && splatDataRef.current && (
+        <Suspense fallback={null}>
+          <CeilingFloorModal
+            posX={splatDataRef.current.posX}
+            posY={splatDataRef.current.posY}
+            posZ={splatDataRef.current.posZ}
+            numSplats={splatDataRef.current.numSplats}
+            initialCeiling={cfMode !== 'none' ? ceilingY : null}
+            initialFloor={cfMode !== 'none' ? floorY : null}
+            onConfirm={(lo, hi) => {
+              // modal: lo = 작은 Y (바닥), hi = 큰 Y (천장)
+              const c = hi, f = lo;
+              setCeilingY(c); setFloorY(f);
+              ceilingYRef.current = c; floorYRef.current = f;
+              setCfMode('confirmed'); cfModeRef.current = 'confirmed';
+              setCfModalOpen(false);
+              setSelectedSurfaces(prev => {
+                const next = new Set(prev);
+                CF_SURFACES.forEach(s => next.add(s));
+                return next;
+              });
+            }}
+            onClose={() => setCfModalOpen(false)}
+          />
+        </Suspense>
+      )}
+
+      {/* Wall Modal */}
+      {wallModalOpen && splatDataRef.current && cfMode === 'confirmed' && (
+        <Suspense fallback={null}>
+          <WallModal
+            posX={splatDataRef.current.posX}
+            posY={splatDataRef.current.posY}
+            posZ={splatDataRef.current.posZ}
+            numSplats={splatDataRef.current.numSplats}
+            ceilingY={ceilingY}
+            floorY={floorY}
+            initialAngle={wallAngle}
+            initialWalls={wallDistances}
+            onConfirm={(angleDeg, walls) => {
+              setWallAngle(angleDeg); wallAngleRef.current = angleDeg;
+              setWallDistances(walls); wallDistancesRef.current = walls;
+              setWallMode('confirmed'); wallModeRef.current = 'confirmed';
+              setWallModalOpen(false);
+              setSelectedSurfaces(prev => {
+                const next = new Set(prev);
+                WALL_SURFACES.forEach(s => next.add(s));
+                return next;
+              });
+            }}
+            onClose={() => setWallModalOpen(false)}
+          />
+        </Suspense>
+      )}
     </>
   ) : null;
 

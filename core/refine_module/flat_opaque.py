@@ -135,6 +135,8 @@ def align_single_plane(
     target_opacity: float = 0.99,
     flat_scale_log: float = -6.908,   # log(0.001) ≈ -6.908 → 1mm
     window_indices: np.ndarray | None = None,
+    near_protect: float = 0.0,
+    center: np.ndarray | None = None,   # 원근 투영 중심. None이면 직교(orthographic) 투영
 ) -> int:
     """
     단일 평면 기준으로 바깥 근처 가우시안을 벽면에 정렬.
@@ -164,6 +166,9 @@ def align_single_plane(
 
     outside_mask, signed_dist = determine_outside(xyz, normal, d)
 
+    if near_protect > 0:
+        outside_mask &= (np.abs(signed_dist) > near_protect)
+
     if window_indices is not None and len(window_indices) > 0:
         outside_mask[window_indices] = False
 
@@ -178,12 +183,33 @@ def align_single_plane(
     sub = data[target_indices]
     sub_signed_dist = signed_dist[target_indices]
 
-    # ── 1. 위치 스냅: x_new = x - signed_dist * normal ──
-    data['x'][target_indices] -= (sub_signed_dist * normal[0]).astype(data['x'].dtype)
-    data['y'][target_indices] -= (sub_signed_dist * normal[1]).astype(data['y'].dtype)
-    data['z'][target_indices] -= (sub_signed_dist * normal[2]).astype(data['z'].dtype)
+    # ── 1. 위치 스냅 ──
+    if center is None:
+        # orthographic: 법선 방향으로 곧바로 내려 평면에 스냅
+        data['x'][target_indices] -= (sub_signed_dist * normal[0]).astype(data['x'].dtype)
+        data['y'][target_indices] -= (sub_signed_dist * normal[1]).astype(data['y'].dtype)
+        data['z'][target_indices] -= (sub_signed_dist * normal[2]).astype(data['z'].dtype)
+    else:
+        # perspective: center C에서 P로 가는 광선이 평면과 만나는 지점으로 P 이동
+        # r(s) = C + s(P-C), n·r(s)=d → s = (d - n·C) / (n·(P-C))
+        C = np.asarray(center, dtype=np.float64)
+        P = xyz[target_indices]   # (M, 3)
+        denom = (P - C) @ normal            # (M,)
+        # denom ≈ 0 (광선이 평면과 평행) 방지
+        safe = np.abs(denom) > 1e-8
+        s = np.where(safe, (d - float(normal @ C)) / np.where(safe, denom, 1.0), 1.0)
+        P_new = C + s[:, None] * (P - C)
+        data['x'][target_indices] = P_new[:, 0].astype(data['x'].dtype)
+        data['y'][target_indices] = P_new[:, 1].astype(data['y'].dtype)
+        data['z'][target_indices] = P_new[:, 2].astype(data['z'].dtype)
 
-    # ── 2. 회전 정렬 ──
+    # 결과 확인용 출력만 남기고, flatten/회전/SH/opacity 조작은 일단 주석처리
+    # 위치만 옮긴 결과를 확인하기 위함. 필요시 아래 주석 해제해 복구.
+    PlyData([PlyElement.describe(data, 'vertex')], text=ply.text).write(out_path)
+    print(f"저장 완료(위치만 이동): {out_path}")
+    return len(target_indices)
+
+    # ── 2. 회전 정렬 ──  # noqa  (아래 블록 전체 주석처리)
     R = quat_to_rotation_matrix(
         sub['rot_0'].astype(np.float64),
         sub['rot_1'].astype(np.float64),

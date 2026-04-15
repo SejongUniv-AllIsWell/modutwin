@@ -42,52 +42,6 @@ https://splat.wiki/
 └── celery worker  ← connects to PC's RabbitMQ/Redis/MinIO over network
 ```
 
-## Directory Structure
-
-```
-/
-├── frontend/           # Next.js
-│   ├── src/app/        # Page routing
-│   ├── src/components/
-│   │   ├── viewer/
-│   │   │   ├── SplatViewerCore.tsx   # PlayCanvas 엔진 래퍼 (GPU 텍스처 접근)
-│   │   │   ├── SplatViewer.tsx       # 편집 모드 UI (선택/변환/문 애니메이션)
-│   │   │   ├── RefineViewer.tsx      # 정제(refine) 전용 뷰어
-│   │   │   └── tools/               # 도구 hooks
-│   │   │       ├── useGaussianSelector.tsx  # 브러쉬/BBox 가우시안 선택
-│   │   │       ├── useTransformTool.ts      # 이동/회전 기즈모
-│   │   │       ├── useRefineTool.tsx         # 평면 기반 벽면 정제
-│   │   │       ├── useDoorAnimation.ts      # 문 열림 애니메이션
-│   │   │       ├── usePivotEditor.ts        # 힌지 축 편집
-│   │   │       ├── gpuSync.ts               # GPU 텍스처 동기화
-│   │   │       └── quatUtils.ts             # 쿼터니언 연산
-│   │   ├── map/, upload/, dashboard/
-│   ├── src/lib/        # API client, WebSocket, Auth
-│   └── src/types/
-├── backend/            # FastAPI
-│   ├── app/main.py
-│   ├── app/core/       # config, security, database
-│   ├── app/api/        # auth, uploads, tasks, scenes, basemaps, ws, refine
-│   ├── app/models/     # SQLAlchemy ORM
-│   ├── app/schemas/    # Pydantic
-│   ├── app/services/   # minio_service, celery_service, notification_service
-│   ├── app/middleware/  # access_log
-│   └── alembic/
-├── core/               # Python 핵심 알고리즘
-│   ├── refine_module/  # 벽면 정제 (clip, flat_opaque)
-│   ├── select_gaussians/ # 가우시안 선택 (SAM3 auto, manual)
-│   ├── door_alignment/ # 문 기반 정합 (RANSAC+SVD)
-│   └── grouping/       # 시맨틱 그룹핑 (학습 시 per-Gaussian identity)
-├── worker/             # Celery (deployed on GPU server)
-│   ├── tasks/          # training.py, alignment.py
-│   ├── pipeline/       # base.py, runner.py, sog_converter.py (ffmpeg/colmap/gsplat은 별도 설치)
-│   └── celery_app.py
-├── utilities/          # 공용 유틸리티 (ply_io)
-├── nginx/nginx.conf
-├── docker-compose.yml
-└── .env
-```
-
 ## Core Rules
 
 ### Pipeline Modules
@@ -96,13 +50,6 @@ https://splat.wiki/
 - Inter-module communication via file paths (directories) ONLY. No direct imports between modules
 - Replacing any module MUST NOT affect adjacent modules
 - Pipeline: FFmpeg → BlurDetection → COLMAP → gsplat → SOG conversion
-
-### PlayCanvas Viewer
-
-- `SplatViewerCore.tsx`: PlayCanvas 2.x 엔진 래퍼 (GPU 텍스처 접근, 카메라 제어)
-- `SplatViewer.tsx`: 편집 모드 UI (가우시안 선택/변환/문 애니메이션/피벗 편집)
-- `RefineViewer.tsx`: 정제(refine) 전용 뷰어 (평면 기반 벽면 정제)
-- Viewer page modes: `?mode=refine` → RefineViewer, `?mode=align` or default → SplatViewer
 
 ### Authentication
 
@@ -135,48 +82,17 @@ https://splat.wiki/
 - GPU server: connects to PC via `PC_HOST_IP` environment variable
 - External exposure: Nginx 80/443 only. RabbitMQ/Redis/MinIO allow GPU server IP only
 
-## DB Tables
+## Refine Pipeline (벽면 정제 순서)
 
-users, access_logs, sessions, uploads, tasks, scene_outputs, basemaps, notifications
+스캔된 3DGS 씬을 정렬하는 파이프라인. 현재 4단계까지 작업 중.
 
-## Environment Variables
+1. **문 segmentation 기반 세로방향 벡터 추출** — 다른 팀원이 문 segmentation 결과 제공 예정. 이를 기반으로 세로(수직) 방향 벡터를 구함
+2. **세로방향 → Y축 정렬 회전** — 추출된 세로방향이 Y축과 나란하게 전체 씬을 회전
+3. **Y축 반전 기능** — 스캔 방향에 따라 씬이 뒤집혀 있을 수 있으므로 Y축 반전 기능 제공
+4. **히스토그램 기반 천장/바닥 추정** — Y축 히스토그램으로 천장/바닥 자동 감지. CeilingFloorModal 팝업으로 사용자 확인/조정. 3D 뷰어에서 반투명 평면으로 미리보기 **(현재 작업 중)**
+5. **X/Z축에 방 방향 맞추기** — 천장/바닥 정렬 완료 후, 방의 벽면 방향을 X/Z축에 나란하게 정렬 **(방법 미정)**
 
-```env
-# docker compose (.env)
-POSTGRES_USER=3dgs
-POSTGRES_PASSWORD=changeme
-POSTGRES_DB=3dgs_platform
-DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
-REDIS_URL=redis://redis:6379/0
-RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672//
-MINIO_ENDPOINT=minio:9000
-MINIO_ACCESS_KEY=minioadmin
-MINIO_SECRET_KEY=changeme
-MINIO_BUCKET=3dgs-platform
-GOOGLE_CLIENT_ID=...
-GOOGLE_CLIENT_SECRET=...
-JWT_SECRET_KEY=...
-JWT_ALGORITHM=HS256
-NEXT_PUBLIC_API_URL=/api
-NEXT_PUBLIC_KAKAO_MAP_KEY=...
-
-# GPU Worker (.env — uses PC's external IP)
-# RABBITMQ_URL=amqp://guest:guest@<PC_IP>:5672//
-# REDIS_URL=redis://<PC_IP>:6379/0
-# MINIO_ENDPOINT=<PC_IP>:9000
-```
-
-## Pages
-
-| Path                      | Description                                         | Auth     |
-| ------------------------- | --------------------------------------------------- | -------- |
-| `/`                       | Landing page                                        | None     |
-| `/login`                  | Google login                                        | None     |
-| `/dashboard`              | Upload/task list                                    | Required |
-| `/upload`                 | Video upload                                        | Required |
-| `/door-select/{scene_id}` | Door selection (edit mode)                          | Required |
-| `/viewer`                 | KakaoMap + viewer (readonly, `?mode=refine\|align`) | None     |
-| `/admin/basemaps`         | Basemap management                                  | Admin    |
+정렬 완료 후 각 벽면에 대해 `core/refine_module/`의 clip → flat_opaque 파이프라인으로 벽면 수직투영 처리.
 
 ## Commands
 

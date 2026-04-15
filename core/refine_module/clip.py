@@ -53,16 +53,18 @@ def clip_single_plane(
     d: float,
     out_path: str,
     thickness: float = 0.05,
+    near_protect: float = 0.0,
 ) -> int:
     """
     단일 평면 기준으로 바깥 가우시안 중 thickness 초과인 것을 삭제.
 
     Args:
-        ply_path:  입력 PLY
-        normal:    (3,) 평면 법선
-        d:         평면 상수 (normal . x = d)
-        out_path:  출력 PLY
-        thickness: 이 거리 이내 가우시안은 유지 (flat_opaque에서 처리)
+        ply_path:     입력 PLY
+        normal:       (3,) 평면 법선
+        d:            평면 상수 (normal . x = d)
+        out_path:     출력 PLY
+        thickness:    이 거리 이내 가우시안은 유지 (flat_opaque에서 처리)
+        near_protect: 평면에서 이 거리 이내 바깥 가우시안은 벽면 본체로 간주하고 보호 (삭제 금지)
 
     Returns:
         삭제된 가우시안 수
@@ -75,7 +77,7 @@ def clip_single_plane(
     outside_mask, signed_dist = determine_outside(xyz, normal, d)
     abs_dist = np.abs(signed_dist)
 
-    delete_mask = outside_mask & (abs_dist > thickness)
+    delete_mask = outside_mask & (abs_dist > thickness) & (abs_dist > near_protect)
     keep_mask = ~delete_mask
 
     n_removed = int(delete_mask.sum())
