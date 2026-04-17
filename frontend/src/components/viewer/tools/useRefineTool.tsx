@@ -3,6 +3,7 @@
 import { useRef, useState, useCallback, useEffect, RefObject, lazy, Suspense } from 'react';
 import { SplatData, SplatViewerCoreRef } from '../SplatViewerCore';
 import { useDepthNormal } from './useDepthNormal';
+import { surfacePlanesFromRoom, signedDistance } from '@/lib/gs/planes';
 
 const CeilingFloorModal = lazy(() => import('./CeilingFloorModal'));
 const WallModal = lazy(() => import('./WallModal'));
@@ -143,6 +144,7 @@ const RING_PICK_PX = 18;
 interface RefineToolOptions {
   uploadId?: string;
   reloadWithUrl?: (url: string) => void;
+  currentUrl?: string;
 }
 
 export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, options?: RefineToolOptions) {
@@ -202,13 +204,21 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   const WALL_SURFACES: Surface[] = ['w1a', 'w1b', 'w2a', 'w2b'];
   const [selectedSurfaces, setSelectedSurfaces] = useState<Set<Surface>>(new Set());
   const [flattening, setFlattening] = useState(false);
+  const [membraneApplying, setMembraneApplying] = useState(false);
+  const [membraneColorMode, setMembraneColorMode] = useState<'white' | 'knn-median'>('white');
+  const [showDeletedOnly, setShowDeletedOnly] = useState(false);
   const [surfaceOffsets, setSurfaceOffsets] = useState<Record<Surface, number>>({
-    ceiling: 0.15, floor: 0.15, w1a: 0.15, w1b: 0.15, w2a: 0.15, w2b: 0.15,
+    ceiling: 0.3, floor: 0.3, w1a: 0.3, w1b: 0.3, w2a: 0.3, w2b: 0.3,
   });
   // 입력 중 임시 문자열 — 빈칸·'-'·'0.' 같은 중간 상태를 허용해 삭제/편집이 가능하게
   const [offsetText, setOffsetText] = useState<Record<Surface, string>>({
-    ceiling: '0.15', floor: '0.15', w1a: '0.15', w1b: '0.15', w2a: '0.15', w2b: '0.15',
+    ceiling: '0.3', floor: '0.3', w1a: '0.3', w1b: '0.3', w2a: '0.3', w2b: '0.3',
   });
+
+  // 막 파라미터 (슬라이더)
+  const [membraneSpacing, setMembraneSpacing] = useState(0.02);   // 격자 간격 (작을수록 패치 많음)
+  const [membraneRadius, setMembraneRadius] = useState(0.05);     // 패치 반경
+  const [membraneOpacity, setMembraneOpacity] = useState(1.0);    // 선형 불투명도 0~1
 
   const toggleSurface = (s: Surface) => {
     // Don't allow toggling disabled surfaces
@@ -227,34 +237,128 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     ];
     setSelectedSurfaces(prev => prev.size === available.length ? new Set() : new Set(available));
   };
-  const applyFlatten = useCallback(async (action: 'project' | 'remove') => {
-    if (!options?.uploadId || !options?.reloadWithUrl) return;
+  const applyFlatten = useCallback(async () => {
+    if (!options?.uploadId || !options?.reloadWithUrl || !options?.currentUrl) return;
     if (selectedSurfaces.size === 0) { alert('경계면을 하나 이상 선택하세요.'); return; }
-    // 벽면이 포함된 경우에만 wall 설정 필요
     const hasWall = Array.from(selectedSurfaces).some(s => WALL_SURFACES.includes(s));
     if (hasWall && (wallAngleRef.current === null || !wallDistancesRef.current)) return;
+
     setFlattening(true);
     try {
+      const [{ fetchAndParsePly, serializePly }, { surfacePlanesFromRoom, deleteOutsideSurfaces }] = await Promise.all([
+        import('@/lib/ply'),
+        import('@/lib/gs'),
+      ]);
       const { api } = await import('@/lib/api');
-      const res = await api.post<{ url: string; source_key: string }>('/refine/flatten', {
-        upload_id: options.uploadId,
-        source_key: sourceKeyRef.current,
-        action,
-        surfaces: Array.from(selectedSurfaces),
-        angle_deg: wallAngleRef.current ?? 0,
+
+      const scene = await fetchAndParsePly(options.currentUrl);
+
+      const allPlanes = surfacePlanesFromRoom({
+        angleDeg: wallAngleRef.current ?? 0,
         walls: wallDistancesRef.current ?? [0, 0, 0, 0],
-        ceiling_y: ceilingYRef.current,
-        floor_y: floorYRef.current,
-        offsets: surfaceOffsets,
+        ceilingY: ceilingYRef.current,
+        floorY: floorYRef.current,
       });
-      sourceKeyRef.current = res.source_key;
-      options.reloadWithUrl(res.url);
+      const planes = allPlanes.filter(p => selectedSurfaces.has(p.id as Surface));
+
+      const marginOut = Math.max(...Array.from(selectedSurfaces).map(s => surfaceOffsets[s]));
+      const { scene: refined, deletedCount } = deleteOutsideSurfaces(scene, planes, { marginOut });
+      console.log(`[Shell] deleted ${deletedCount} / ${scene.numSplats} gaussians`);
+
+      const bytes = serializePly(refined);
+      const urlReq = await api.post<{ put_url: string; get_url: string; key: string }>(
+        '/refine/refined-upload-url',
+        { upload_id: options.uploadId, filename: 'refined.ply' },
+      );
+      const putResp = await fetch(urlReq.put_url, {
+        method: 'PUT',
+        body: bytes,
+        headers: { 'Content-Type': 'application/octet-stream' },
+      });
+      if (!putResp.ok) throw new Error(`MinIO PUT failed: ${putResp.status}`);
+
+      sourceKeyRef.current = urlReq.key;
+      options.reloadWithUrl(urlReq.get_url);
     } catch (e: any) {
       alert(`처리 실패: ${e.message || e}`);
     } finally {
       setFlattening(false);
     }
   }, [options, selectedSurfaces, surfaceOffsets]);
+
+  const applyMembrane = useCallback(async () => {
+    if (!options?.uploadId || !options?.reloadWithUrl || !options?.currentUrl) return;
+    if (selectedSurfaces.size === 0) { alert('경계면을 하나 이상 선택하세요.'); return; }
+    const hasWall = Array.from(selectedSurfaces).some(s => WALL_SURFACES.includes(s));
+    const hasCF = Array.from(selectedSurfaces).some(s => CF_SURFACES.includes(s));
+    if (hasWall && (wallAngleRef.current === null || !wallDistancesRef.current)) return;
+    if (hasCF && cfModeRef.current !== 'confirmed') return;
+
+    setMembraneApplying(true);
+    try {
+      const [
+        { fetchAndParsePly, serializePly, concatScenes },
+        { generateMembrane, surfacePlanesFromRoom, deleteOutsideSurfaces },
+      ] = await Promise.all([
+        import('@/lib/ply'),
+        import('@/lib/gs'),
+      ]);
+      const { api } = await import('@/lib/api');
+
+      const scene = await fetchAndParsePly(options.currentUrl);
+
+      const roomGeom = {
+        angleDeg: wallAngleRef.current ?? 0,
+        walls: wallDistancesRef.current ?? [0, 0, 0, 0] as [number, number, number, number],
+        ceilingY: ceilingYRef.current,
+        floorY: floorYRef.current,
+      };
+
+      // 1) 경계 바깥 삭제 → keep 마스크 획득
+      const allPlanes = surfacePlanesFromRoom(roomGeom);
+      const planes = allPlanes.filter(p => selectedSurfaces.has(p.id as Surface));
+      const marginOut = Math.max(...Array.from(selectedSurfaces).map(s => surfaceOffsets[s]));
+      const { scene: cleaned, deletedCount, keep } = deleteOutsideSurfaces(scene, planes, { marginOut });
+      console.log(`[Membrane] deleted ${deletedCount} / ${scene.numSplats} gaussians`);
+
+      // 2) 전체 씬으로 막 색상 샘플링 (삭제 전 원본이 벽 색 정보를 온전히 갖고 있음)
+      const membrane = await generateMembrane(
+        scene.propertyOrder,
+        Array.from(selectedSurfaces),
+        roomGeom,
+        surfaceOffsets,
+        membraneColorMode,
+        membraneColorMode !== 'white' ? scene : undefined,
+        {
+          gridSpacing: membraneSpacing,
+          patchRadius: membraneRadius,
+          patchOpacity: membraneOpacity,
+        },
+      );
+      console.log(`[Membrane] deleted ${deletedCount}, generated ${membrane.numSplats} patches (${membraneColorMode})`);
+
+      // 4) 정리된 씬 + 막 합치기
+      const merged = concatScenes(cleaned, membrane);
+      const bytes = serializePly(merged);
+      const urlReq = await api.post<{ put_url: string; get_url: string; key: string }>(
+        '/refine/refined-upload-url',
+        { upload_id: options.uploadId, filename: 'membrane.ply' },
+      );
+      const putResp = await fetch(urlReq.put_url, {
+        method: 'PUT',
+        body: bytes,
+        headers: { 'Content-Type': 'application/octet-stream' },
+      });
+      if (!putResp.ok) throw new Error(`MinIO PUT failed: ${putResp.status}`);
+
+      sourceKeyRef.current = urlReq.key;
+      options.reloadWithUrl(urlReq.get_url);
+    } catch (e: any) {
+      alert(`막 생성 실패: ${e.message || e}`);
+    } finally {
+      setMembraneApplying(false);
+    }
+  }, [options, selectedSurfaces, surfaceOffsets, membraneColorMode, membraneSpacing, membraneRadius, membraneOpacity]);
 
   // ── Brush/BBox state ──
   const [paintMode, setPaintMode] = useState<PaintMode>('union');
@@ -289,8 +393,14 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   useEffect(() => { wallDistancesRef.current = wallDistances; }, [wallDistances]);
   useEffect(() => { wallModeRef.current = wallMode; }, [wallMode]);
 
-  // ── Align API state ──
-  const [aligning, setAligning] = useState(false);
+  // URL 변경 시 stale splatDataRef를 즉시 비워 destroyed 텍스처 참조를 막는다
+  // (reloadWithUrl 후 SplatViewerCore는 unmount → 새 PLY 로드 전까지 ref가 무효)
+  useEffect(() => {
+    splatDataRef.current = null;
+    setSplatLoaded(false);
+  }, [options?.currentUrl]);
+
+  // ── 정제 파이프라인 state ──
   const sourceKeyRef = useRef<string | null>(null);
 
   const syncPlanes = useCallback(() => setPlanes([...planesRef.current]), []);
@@ -301,7 +411,9 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     if (!data || !core || planesRef.current.length === 0) {
       setOutsideCount(0); setClosed(false);
       if (data?.colorTexture && data?.origColorData) {
-        const td = data.colorTexture.lock(); if (td) { td.set(data.origColorData); data.colorTexture.unlock(); }
+        let td: Uint16Array | null = null;
+        try { td = data.colorTexture.lock(); } catch { return; }
+        if (td) { td.set(data.origColorData); try { data.colorTexture.unlock(); } catch {} }
       }
       return;
     }
@@ -312,7 +424,9 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     setOutsideCount(out); setClosed(isClosed(keep, planesRef.current.length));
 
     if (!data.colorTexture || !data.origColorData) return;
-    const td = data.colorTexture.lock(); if (!td) return;
+    let td: Uint16Array | null = null;
+    try { td = data.colorTexture.lock(); } catch { return; }
+    if (!td) return;
     const orig = data.origColorData; const f2h = core.float2Half; const h2f = core.half2Float;
     const cl = isClosed(keep, planesRef.current.length);
     for (let i = 0; i < data.numSplats; i++) {
@@ -323,7 +437,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         td[idx] = f2h(r*(1-t)+1.0*t); td[idx+1] = f2h(g*(1-t)+0.1*t); td[idx+2] = f2h(b*(1-t)+0.1*t); td[idx+3] = orig[idx+3];
       } else { td[idx]=orig[idx]; td[idx+1]=orig[idx+1]; td[idx+2]=orig[idx+2]; td[idx+3]=orig[idx+3]; }
     }
-    data.colorTexture.unlock();
+    try { data.colorTexture.unlock(); } catch {}
   }, [coreRef]);
 
   // ── Highlight: brush/bbox selection → red ──
@@ -333,7 +447,9 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     let cnt = 0; for (let i = 0; i < sel.length; i++) if (sel[i]) cnt++;
     setSelectionCount(cnt);
     if (!data.colorTexture || !data.origColorData) return;
-    const td = data.colorTexture.lock(); if (!td) return;
+    let td: Uint16Array | null = null;
+    try { td = data.colorTexture.lock(); } catch { return; }
+    if (!td) return;
     const orig = data.origColorData; const f2h = core.float2Half; const h2f = core.half2Float;
     for (let i = 0; i < data.numSplats; i++) {
       const idx = i * 4;
@@ -342,7 +458,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         td[idx] = f2h(r*0.3+1.0*0.7); td[idx+1] = f2h(g*0.3+0.1*0.7); td[idx+2] = f2h(b*0.3+0.1*0.7); td[idx+3] = orig[idx+3];
       } else { td[idx]=orig[idx]; td[idx+1]=orig[idx+1]; td[idx+2]=orig[idx+2]; td[idx+3]=orig[idx+3]; }
     }
-    data.colorTexture.unlock();
+    try { data.colorTexture.unlock(); } catch {}
   }, [coreRef]);
 
   // ── Unified surface highlight: tint gaussians near selected surfaces ──
@@ -359,10 +475,12 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     if (!data?.colorTexture || !data?.origColorData || !core) return;
     const sel = selectedSurfacesRef.current;
 
-    const td = data.colorTexture.lock(); if (!td) return;
+    let td: Uint16Array | null = null;
+    try { td = data.colorTexture.lock(); } catch { return; }
+    if (!td) return;
     const orig = data.origColorData;
     if (sel.size === 0) {
-      td.set(orig); data.colorTexture.unlock(); return;
+      td.set(orig); try { data.colorTexture.unlock(); } catch {} return;
     }
     const f2h = core.float2Half, h2f = core.half2Float;
     const mixT = 0.75;
@@ -407,14 +525,72 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         td[idx]=orig[idx]; td[idx+1]=orig[idx+1]; td[idx+2]=orig[idx+2]; td[idx+3]=orig[idx+3];
       }
     }
-    data.colorTexture.unlock();
+    try { data.colorTexture.unlock(); } catch {}
   }, [coreRef]);
+
+  const toggleDeletedPreview = useCallback((on: boolean) => {
+    const data = splatDataRef.current; const core = coreRef.current;
+    if (!data?.colorTexture || !data?.origColorData || !core) return;
+
+    if (!on) {
+      let td: Uint16Array | null = null;
+      try { td = data.colorTexture.lock(); } catch { return; }
+      if (!td) return;
+      td.set(data.origColorData);
+      try { data.colorTexture.unlock(); } catch {}
+      setShowDeletedOnly(false);
+      applySurfaceHighlight();
+      return;
+    }
+
+    if (selectedSurfaces.size === 0) return;
+    const hasWall = Array.from(selectedSurfaces).some(s => WALL_SURFACES.includes(s));
+    if (hasWall && (wallAngleRef.current === null || !wallDistancesRef.current)) return;
+
+    const allPlanes = surfacePlanesFromRoom({
+      angleDeg: wallAngleRef.current ?? 0,
+      walls: wallDistancesRef.current ?? [0, 0, 0, 0],
+      ceilingY: ceilingYRef.current,
+      floorY: floorYRef.current,
+    });
+    const planes = allPlanes.filter(p => selectedSurfaces.has(p.id as Surface));
+    const marginOut = Math.max(...Array.from(selectedSurfaces).map(s => surfaceOffsets[s]));
+
+    const keepMask = new Uint8Array(data.numSplats);
+    keepMask.fill(1);
+    for (let i = 0; i < data.numSplats; i++) {
+      const x = data.posX[i], y = data.posY[i], z = data.posZ[i];
+      for (const plane of planes) {
+        const sd = signedDistance(plane, x, y, z);
+        if (sd > 0.03 && sd > marginOut) { keepMask[i] = 0; break; }
+      }
+    }
+
+    let td: Uint16Array | null = null;
+    try { td = data.colorTexture.lock(); } catch { return; }
+    if (!td) return;
+    const orig = data.origColorData;
+    const f2h = core.float2Half;
+    const zeroAlpha = f2h(0);
+    for (let i = 0; i < data.numSplats; i++) {
+      const idx = i * 4;
+      if (keepMask[i]) {
+        td[idx] = orig[idx]; td[idx + 1] = orig[idx + 1]; td[idx + 2] = orig[idx + 2];
+        td[idx + 3] = zeroAlpha;
+      } else {
+        td[idx] = orig[idx]; td[idx + 1] = orig[idx + 1]; td[idx + 2] = orig[idx + 2]; td[idx + 3] = orig[idx + 3];
+      }
+    }
+    try { data.colorTexture.unlock(); } catch {}
+    setShowDeletedOnly(true);
+  }, [coreRef, selectedSurfaces, surfaceOffsets, applySurfaceHighlight]);
 
   // Sync ref + re-tint whenever selection changes
   useEffect(() => {
     selectedSurfacesRef.current = selectedSurfaces;
-    applySurfaceHighlight();
-  }, [selectedSurfaces, applySurfaceHighlight]);
+    if (showDeletedOnly) toggleDeletedPreview(true);
+    else applySurfaceHighlight();
+  }, [selectedSurfaces, applySurfaceHighlight, showDeletedOnly, toggleDeletedPreview]);
 
   // ── Restore original colors (mode switch) ──
   const clearHighlight = useCallback(() => {
@@ -468,30 +644,6 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     const snap = data.colorTexture.lock(); if (snap) { data.origColorData.set(snap); data.colorTexture.unlock(); }
     planesRef.current = []; syncPlanes(); setSelectedPlane(-1); selectedPlaneRef.current = -1; setOutsideCount(0); setClosed(false);
   }, [coreRef, syncPlanes]);
-
-  // ── Plane: align to wall (backend API call) ──
-  const alignToPlane = useCallback(async () => {
-    if (!options?.uploadId || !options?.reloadWithUrl || planesRef.current.length === 0) return;
-    setAligning(true);
-    try {
-      const { api } = await import('@/lib/api');
-      // 선택된 평면 사용, 없으면 첫 번째 평면
-      const planeIdx = selectedPlaneRef.current >= 0 ? selectedPlaneRef.current : 0;
-      const plane = planesRef.current[planeIdx];
-      const res = await api.post<{ url: string; source_key: string }>('/refine/align', {
-        upload_id: options.uploadId,
-        source_key: sourceKeyRef.current,
-        plane: { normal: [...plane.normal], d: plane.d },
-        thickness: 0.05,
-      });
-      sourceKeyRef.current = res.source_key;
-      options.reloadWithUrl(res.url);
-    } catch (e: any) {
-      alert(`정렬 실패: ${e.message || e}`);
-    } finally {
-      setAligning(false);
-    }
-  }, [options]);
 
   // ── Save refined result ──
   const [saving, setSaving] = useState(false);
@@ -653,12 +805,15 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     };
 
     // ── Brush apply ──
+    // posX/Y/Z는 원본 PLY 좌표이고 카메라 행렬은 월드 공간이므로 splatEntity의 world transform을 앞에 곱해야 함.
+    // (Z축 180° 회전이 반영되어 뷰어가 보여주는 위치와 실제 히트가 일치)
     const applyBrush = (mouseX: number, mouseY: number) => {
       const sd = splatDataRef.current; const sel = selectionRef.current;
       const cam = cameraEntity.camera; const pc = pcRef.current;
       if (!sd || !sel || !cam || !pc) return;
       const vpMat = new pc.Mat4(); vpMat.mul2(cam.projectionMatrix, cam.viewMatrix);
-      const m = vpMat.data; const w = canvas.clientWidth, h = canvas.clientHeight;
+      const mvpMat = new pc.Mat4(); mvpMat.mul2(vpMat, sd.splatEntity.getWorldTransform());
+      const m = mvpMat.data; const w = canvas.clientWidth, h = canvas.clientHeight;
       const r2 = brushSizeRef.current**2; const isUnion = paintModeRef.current === 'union';
       for (let i = 0; i < sd.numSplats; i++) {
         const px=sd.posX[i], py=sd.posY[i], pz=sd.posZ[i];
@@ -1038,7 +1193,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
               )}
             </div>
 
-            {/* 경계면 선택 + 투영/제거 — 체크박스는 해당 설정이 확정되어야 활성화 */}
+            {/* 경계면 선택 후 바깥 가우시안 제거 (Shell 제거) — 체크박스는 해당 설정이 확정되어야 활성화 */}
             <div className="border border-gray-600 rounded p-2 flex flex-col gap-1.5">
               <div className="text-gray-400 text-[10px] font-bold">경계면 처리</div>
               {(() => {
@@ -1089,13 +1244,69 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
                 전체 선택/해제
               </button>
               <div className="flex gap-1">
-                <button onClick={() => applyFlatten('project')} disabled={flattening || selectedSurfaces.size === 0}
-                  className="flex-1 px-2 py-1.5 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-600 text-white rounded cursor-pointer text-xs font-bold">
-                  {flattening ? '처리 중...' : '투영'}
-                </button>
-                <button onClick={() => applyFlatten('remove')} disabled={flattening || selectedSurfaces.size === 0}
+                <button onClick={() => applyFlatten()} disabled={flattening || membraneApplying || selectedSurfaces.size === 0}
                   className="flex-1 px-2 py-1.5 bg-red-600 hover:bg-red-500 disabled:bg-gray-600 text-white rounded cursor-pointer text-xs font-bold">
-                  제거
+                  {flattening ? '처리 중...' : '바깥 제거'}
+                </button>
+                <button onClick={() => toggleDeletedPreview(!showDeletedOnly)} disabled={selectedSurfaces.size === 0}
+                  className={`px-2 py-1.5 rounded cursor-pointer text-xs font-bold ${
+                    showDeletedOnly
+                      ? 'bg-yellow-500 text-black'
+                      : 'bg-gray-700 hover:bg-gray-600 text-gray-300'
+                  } disabled:bg-gray-800 disabled:text-gray-500`}>
+                  {showDeletedOnly ? '전체 보기' : '삭제 대상만'}
+                </button>
+              </div>
+              <div className="border-t border-gray-700 pt-2 mt-1 space-y-1.5">
+                <div className="text-gray-400 text-[10px]">막 색상 모드</div>
+                <div className="flex gap-1">
+                  {([['white', '흰색'], ['knn-median', 'K-NN']] as const).map(([mode, label]) => (
+                    <button key={mode}
+                      onClick={() => setMembraneColorMode(mode)}
+                      className={`flex-1 px-1 py-1 rounded text-[10px] font-bold cursor-pointer ${
+                        membraneColorMode === mode
+                          ? 'bg-blue-500 text-white'
+                          : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                      }`}
+                    >{label}</button>
+                  ))}
+                </div>
+                {/* 막 파라미터 슬라이더 */}
+                <div className="space-y-1">
+                  <div className="flex items-center gap-1.5 text-[10px]">
+                    <span className="text-gray-400 w-14">격자 간격</span>
+                    <input type="range" min={0.005} max={0.08} step={0.005}
+                      value={membraneSpacing}
+                      onChange={(e) => setMembraneSpacing(parseFloat(e.target.value))}
+                      className="flex-1 accent-blue-500 cursor-pointer" />
+                    <span className="text-white font-mono w-12 text-right">
+                      {(membraneSpacing * 100).toFixed(1)}cm
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-1.5 text-[10px]">
+                    <span className="text-gray-400 w-14">패치 반경</span>
+                    <input type="range" min={0.01} max={0.15} step={0.005}
+                      value={membraneRadius}
+                      onChange={(e) => setMembraneRadius(parseFloat(e.target.value))}
+                      className="flex-1 accent-blue-500 cursor-pointer" />
+                    <span className="text-white font-mono w-12 text-right">
+                      {(membraneRadius * 100).toFixed(1)}cm
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-1.5 text-[10px]">
+                    <span className="text-gray-400 w-14">불투명도</span>
+                    <input type="range" min={0.05} max={1.0} step={0.05}
+                      value={membraneOpacity}
+                      onChange={(e) => setMembraneOpacity(parseFloat(e.target.value))}
+                      className="flex-1 accent-blue-500 cursor-pointer" />
+                    <span className="text-white font-mono w-12 text-right">
+                      {membraneOpacity.toFixed(2)}
+                    </span>
+                  </div>
+                </div>
+                <button onClick={() => applyMembrane()} disabled={flattening || membraneApplying || selectedSurfaces.size === 0}
+                  className="w-full px-2 py-1.5 bg-white hover:bg-gray-200 disabled:bg-gray-600 disabled:text-gray-400 text-black rounded cursor-pointer text-xs font-bold">
+                  {membraneApplying ? '처리 중...' : '얇은 막 씌우기'}
                 </button>
               </div>
             </div>
@@ -1146,12 +1357,6 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
                 <button onClick={applyPlaneRefine} className="mt-1 px-3 py-2 bg-red-600 hover:bg-red-500 text-white rounded cursor-pointer font-bold text-xs">
                   다듬기 실행
                 </button>
-                {options?.uploadId && (
-                  <button onClick={alignToPlane} disabled={aligning}
-                    className="mt-1 px-3 py-2 bg-green-600 hover:bg-green-500 disabled:bg-gray-600 text-white rounded cursor-pointer font-bold text-xs">
-                    {aligning ? '정렬 중...' : '벽면 정렬'}
-                  </button>
-                )}
               </>
             )}
           </>
@@ -1241,9 +1446,50 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
             numSplats={splatDataRef.current.numSplats}
             initialCeiling={cfMode !== 'none' ? ceilingY : null}
             initialFloor={cfMode !== 'none' ? floorY : null}
-            onConfirm={(lo, hi) => {
+            onConfirm={async (lo, hi, rotX, rotZ) => {
               // modal: lo = 작은 Y (바닥), hi = 큰 Y (천장)
               const c = hi, f = lo;
+
+              // 회전이 있으면 PLY에 영구 적용 → 업로드 → 재로드
+              if ((rotX !== 0 || rotZ !== 0) && options?.uploadId && options?.reloadWithUrl && options?.currentUrl) {
+                setCfModalOpen(false);
+                try {
+                  const [
+                    { fetchAndParsePly, serializePly },
+                    { rotateScene },
+                  ] = await Promise.all([
+                    import('@/lib/ply'),
+                    import('@/lib/gs'),
+                  ]);
+                  const { api } = await import('@/lib/api');
+                  const scene = await fetchAndParsePly(options.currentUrl);
+                  rotateScene(scene, rotX, rotZ);
+                  const bytes = serializePly(scene);
+                  const urlReq = await api.post<{ put_url: string; get_url: string; key: string }>(
+                    '/refine/refined-upload-url',
+                    { upload_id: options.uploadId, filename: 'rotated.ply' },
+                  );
+                  const putResp = await fetch(urlReq.put_url, {
+                    method: 'PUT', body: bytes,
+                    headers: { 'Content-Type': 'application/octet-stream' },
+                  });
+                  if (!putResp.ok) throw new Error(`MinIO PUT failed: ${putResp.status}`);
+                  setCeilingY(c); setFloorY(f);
+                  ceilingYRef.current = c; floorYRef.current = f;
+                  setCfMode('confirmed'); cfModeRef.current = 'confirmed';
+                  setSelectedSurfaces(prev => {
+                    const next = new Set(prev);
+                    CF_SURFACES.forEach(s => next.add(s));
+                    return next;
+                  });
+                  sourceKeyRef.current = urlReq.key;
+                  options.reloadWithUrl(urlReq.get_url);
+                } catch (e: any) {
+                  alert(`회전 적용 실패: ${e.message || e}`);
+                }
+                return;
+              }
+
               setCeilingY(c); setFloorY(f);
               ceilingYRef.current = c; floorYRef.current = f;
               setCfMode('confirmed'); cfModeRef.current = 'confirmed';

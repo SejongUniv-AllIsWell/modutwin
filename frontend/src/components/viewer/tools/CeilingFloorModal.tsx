@@ -1,6 +1,6 @@
 'use client';
 
-import { useRef, useEffect, useState, useCallback } from 'react';
+import { useRef, useEffect, useState, useCallback, useMemo } from 'react';
 
 interface Props {
   posX: Float32Array;
@@ -9,7 +9,9 @@ interface Props {
   numSplats: number;
   initialCeiling: number | null;
   initialFloor: number | null;
-  onConfirm: (ceilingY: number, floorY: number) => void;
+  initialRotX?: number;
+  initialRotZ?: number;
+  onConfirm: (ceilingY: number, floorY: number, rotX: number, rotZ: number) => void;
   onClose: () => void;
 }
 
@@ -96,10 +98,15 @@ const PAD = 25;
 export default function CeilingFloorModal({
   posX, posY, posZ, numSplats,
   initialCeiling, initialFloor,
+  initialRotX, initialRotZ,
   onConfirm, onClose,
 }: Props) {
   const xyRef = useRef<HTMLCanvasElement>(null);
   const zyRef = useRef<HTMLCanvasElement>(null);
+
+  // 회전 (rad): R = Rz(rotZ) · Rx(rotX) 를 전체 포인트 클라우드에 적용
+  const [rotX, setRotX] = useState(initialRotX ?? 0);
+  const [rotZ, setRotZ] = useState(initialRotZ ?? 0);
 
   // Auto-detect or use initial values
   const [peaks] = useState(() => {
@@ -110,8 +117,8 @@ export default function CeilingFloorModal({
   const [lineB, setLineB] = useState(peaks[1]); // bottom line (likely floor)
   const [dragging, setDragging] = useState<'A' | 'B' | null>(null);
 
-  // Pre-compute sampled points and bounds (filter outliers in ALL axes)
-  const { sampleIdx, bounds } = useRef((() => {
+  // Pre-compute sampled indices (outlier 필터링 + 샘플링, 원본 좌표 기준)
+  const sampleIdx = useRef((() => {
     const pct = (arr: Float32Array, n: number, p: number) => {
       const sorted = new Float64Array(n);
       for (let i = 0; i < n; i++) sorted[i] = arr[i];
@@ -132,31 +139,57 @@ export default function CeilingFloorModal({
       }
     }
 
-    // Sample
     const max = 40000;
-    let idx: number[];
     if (valid.length > max) {
       const s = valid.length / max;
-      idx = [];
+      const idx: number[] = [];
       for (let i = 0; i < max; i++) idx.push(valid[Math.floor(i * s)]);
-    } else {
-      idx = valid;
+      return idx;
     }
-
-    let mnX = Infinity, mxX = -Infinity, mnY = Infinity, mxY = -Infinity, mnZ = Infinity, mxZ = -Infinity;
-    for (const i of idx) {
-      if (posX[i] < mnX) mnX = posX[i]; if (posX[i] > mxX) mxX = posX[i];
-      if (posY[i] < mnY) mnY = posY[i]; if (posY[i] > mxY) mxY = posY[i];
-      if (posZ[i] < mnZ) mnZ = posZ[i]; if (posZ[i] > mxZ) mxZ = posZ[i];
-    }
-    return { sampleIdx: idx, bounds: { mnX, mxX, mnY, mxY, mnZ, mxZ } };
+    return valid;
   })()).current;
+
+  // 회전된 샘플 좌표 + 경계 (rotX/rotZ 바뀔 때마다 재계산)
+  const { rotX_arr, rotY_arr, rotZ_arr, bounds } = useMemo(() => {
+    const cx = Math.cos(rotX), sx = Math.sin(rotX);
+    const cz = Math.cos(rotZ), sz = Math.sin(rotZ);
+    const N = sampleIdx.length;
+    const rx = new Float32Array(N), ry = new Float32Array(N), rz = new Float32Array(N);
+    let mnX = Infinity, mxX = -Infinity, mnY = Infinity, mxY = -Infinity, mnZ = Infinity, mxZ = -Infinity;
+    for (let k = 0; k < N; k++) {
+      const i = sampleIdx[k];
+      const x = posX[i], y = posY[i], z = posZ[i];
+      const nx = cz * x - sz * cx * y + sz * sx * z;
+      const ny = sz * x + cz * cx * y - cz * sx * z;
+      const nz = sx * y + cx * z;
+      rx[k] = nx; ry[k] = ny; rz[k] = nz;
+      if (nx < mnX) mnX = nx; if (nx > mxX) mxX = nx;
+      if (ny < mnY) mnY = ny; if (ny > mxY) mxY = ny;
+      if (nz < mnZ) mnZ = nz; if (nz > mxZ) mxZ = nz;
+    }
+    return { rotX_arr: rx, rotY_arr: ry, rotZ_arr: rz, bounds: { mnX, mxX, mnY, mxY, mnZ, mxZ } };
+  }, [posX, posY, posZ, sampleIdx, rotX, rotZ]);
+
+  // 회전된 샘플 기준으로 peaks 재감지
+  const redetectPeaks = useCallback(() => {
+    const N = rotX_arr.length;
+    // 전체 씬에 접근 불가능하므로 회전된 샘플만으로 peak 찾기
+    const tmpX = new Float32Array(N), tmpY = new Float32Array(N), tmpZ = new Float32Array(N);
+    for (let i = 0; i < N; i++) { tmpX[i] = rotX_arr[i]; tmpY[i] = rotY_arr[i]; tmpZ[i] = rotZ_arr[i]; }
+    const [a, b] = detectBoundaryPeaks(tmpX, tmpY, tmpZ, N);
+    setLineA(a); setLineB(b);
+  }, [rotX_arr, rotY_arr, rotZ_arr]);
 
   // Draw both canvases
   const draw = useCallback(() => {
     const { mnX, mxX, mnY, mxY, mnZ, mxZ } = bounds;
 
-    const drawView = (canvas: HTMLCanvasElement | null, getH: (i: number) => number, minH: number, maxH: number, hLabel: string) => {
+    const drawView = (
+      canvas: HTMLCanvasElement | null,
+      hArr: Float32Array,
+      minH: number, maxH: number,
+      hLabel: string,
+    ) => {
       if (!canvas) return;
       const ctx = canvas.getContext('2d');
       if (!ctx) return;
@@ -174,29 +207,27 @@ export default function CeilingFloorModal({
       const scV = plotH / (mxY - mnY || 1);
 
       const toX = (h: number) => PAD + (h - minH) * scH;
-      const toY = (v: number) => PAD + (mxY - v) * scV; // flip: Y increases upward
+      const toY = (v: number) => PAD + (v - mnY) * scV;
 
-      // Points
+      // 회전된 포인트
       ctx.fillStyle = 'rgba(180, 210, 255, 0.12)';
-      for (const i of sampleIdx) {
-        ctx.fillRect(toX(getH(i)), toY(posY[i]), 1.5, 1.5);
+      for (let k = 0; k < hArr.length; k++) {
+        ctx.fillRect(toX(hArr[k]), toY(rotY_arr[k]), 1.5, 1.5);
       }
 
-      // Line A (red)
-      const ayC = toY(lineA);
-      ctx.strokeStyle = '#ef4444'; ctx.lineWidth = 2; ctx.setLineDash([6, 4]);
-      ctx.beginPath(); ctx.moveTo(PAD, ayC); ctx.lineTo(CW - PAD, ayC); ctx.stroke();
-      ctx.setLineDash([]);
-      ctx.fillStyle = '#ef4444'; ctx.font = 'bold 11px monospace';
-      ctx.fillText(`Y=${lineA.toFixed(2)}`, PAD + 4, ayC - 6);
-
-      // Line B (orange)
-      const byC = toY(lineB);
-      ctx.strokeStyle = '#f97316'; ctx.lineWidth = 2; ctx.setLineDash([6, 4]);
-      ctx.beginPath(); ctx.moveTo(PAD, byC); ctx.lineTo(CW - PAD, byC); ctx.stroke();
-      ctx.setLineDash([]);
-      ctx.fillStyle = '#f97316'; ctx.font = 'bold 11px monospace';
-      ctx.fillText(`Y=${lineB.toFixed(2)}`, PAD + 4, byC + 14);
+      // 수평선
+      const drawLine = (baseY: number, color: string, labelAbove: boolean) => {
+        const y = toY(baseY);
+        ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.setLineDash([6, 4]);
+        ctx.beginPath();
+        ctx.moveTo(PAD, y); ctx.lineTo(CW - PAD, y);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = color; ctx.font = 'bold 11px monospace';
+        ctx.fillText(`Y=${baseY.toFixed(2)}`, PAD + 4, labelAbove ? y - 6 : y + 14);
+      };
+      drawLine(lineA, '#ef4444', true);
+      drawLine(lineB, '#f97316', false);
 
       // Axes
       ctx.strokeStyle = '#444'; ctx.lineWidth = 1; ctx.setLineDash([]);
@@ -209,20 +240,19 @@ export default function CeilingFloorModal({
       ctx.textAlign = 'left';
     };
 
-    drawView(xyRef.current, (i) => posX[i], mnX, mxX, 'X');
-    drawView(zyRef.current, (i) => posZ[i], mnZ, mxZ, 'Z');
-  }, [lineA, lineB, bounds, sampleIdx, posX, posY, posZ]);
+    drawView(xyRef.current, rotX_arr, mnX, mxX, 'X');
+    drawView(zyRef.current, rotZ_arr, mnZ, mxZ, 'Z');
+  }, [lineA, lineB, bounds, rotX_arr, rotY_arr, rotZ_arr]);
 
   useEffect(() => { draw(); }, [draw]);
 
-  // Mouse → Y value conversion
   const canvasToY = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     const rect = e.currentTarget.getBoundingClientRect();
     const mouseY = e.clientY - rect.top;
     const { mnY, mxY } = bounds;
     const plotH = CH - PAD * 2;
     const scV = plotH / (mxY - mnY || 1);
-    return mxY - (mouseY - PAD) / scV; // invert back
+    return mnY + (mouseY - PAD) / scV;
   }, [bounds]);
 
   const handleMouseDown = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -248,12 +278,17 @@ export default function CeilingFloorModal({
   // Ensure lineA < lineB (A is the smaller Y value)
   const sorted = lineA <= lineB ? { lo: lineA, hi: lineB } : { lo: lineB, hi: lineA };
 
+  const rad2deg = (r: number) => (r * 180) / Math.PI;
+  const deg2rad = (d: number) => (d * Math.PI) / 180;
+  const rotXDeg = rad2deg(rotX);
+  const rotZDeg = rad2deg(rotZ);
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70" onClick={onClose}>
       <div className="bg-gray-900 border border-gray-700 rounded-lg p-5 shadow-2xl" onClick={e => e.stopPropagation()}>
         <div className="text-white font-bold text-sm mb-1">천장 / 바닥 설정</div>
         <div className="text-gray-400 text-xs mb-3">
-          <span className="text-red-400">빨간선</span>과 <span className="text-orange-400">주황선</span>을 드래그하여 천장과 바닥 위치를 조정하세요
+          슬라이더로 포인트 클라우드를 회전해 천장/바닥이 수평이 되게 맞춘 뒤, <span className="text-red-400">빨간선</span>/<span className="text-orange-400">주황선</span>을 드래그하세요.
         </div>
         <div className="flex gap-3">
           <div>
@@ -262,6 +297,15 @@ export default function CeilingFloorModal({
               className="border border-gray-700 rounded cursor-ns-resize"
               onMouseDown={handleMouseDown} onMouseMove={handleMouseMove}
               onMouseUp={handleMouseUp} onMouseLeave={handleMouseUp} />
+            <div className="mt-2 flex items-center gap-2 text-xs">
+              <span className="text-gray-400 w-16">Z축 회전</span>
+              <input type="range" min={-180} max={180} step={0.5} value={rotZDeg}
+                onChange={(e) => setRotZ(deg2rad(parseFloat(e.target.value)))}
+                className="flex-1" />
+              <span className="text-white font-mono w-12 text-right">{rotZDeg.toFixed(1)}°</span>
+              <button onClick={() => setRotZ(0)}
+                className="text-gray-500 hover:text-white text-[10px]">리셋</button>
+            </div>
           </div>
           <div>
             <div className="text-gray-500 text-[10px] mb-1 text-center">측면 (ZY)</div>
@@ -269,6 +313,15 @@ export default function CeilingFloorModal({
               className="border border-gray-700 rounded cursor-ns-resize"
               onMouseDown={handleMouseDown} onMouseMove={handleMouseMove}
               onMouseUp={handleMouseUp} onMouseLeave={handleMouseUp} />
+            <div className="mt-2 flex items-center gap-2 text-xs">
+              <span className="text-gray-400 w-16">X축 회전</span>
+              <input type="range" min={-180} max={180} step={0.5} value={rotXDeg}
+                onChange={(e) => setRotX(deg2rad(parseFloat(e.target.value)))}
+                className="flex-1" />
+              <span className="text-white font-mono w-12 text-right">{rotXDeg.toFixed(1)}°</span>
+              <button onClick={() => setRotX(0)}
+                className="text-gray-500 hover:text-white text-[10px]">리셋</button>
+            </div>
           </div>
         </div>
         <div className="flex items-center justify-between mt-4">
@@ -278,11 +331,15 @@ export default function CeilingFloorModal({
             {' '}간격: <span className="text-white font-mono">{(sorted.hi - sorted.lo).toFixed(2)}</span>
           </div>
           <div className="flex gap-2">
+            <button onClick={redetectPeaks}
+              className="px-3 py-2 bg-gray-700 hover:bg-gray-600 text-gray-300 rounded text-xs cursor-pointer">
+              자동감지 재실행
+            </button>
             <button onClick={onClose}
               className="px-4 py-2 bg-gray-700 hover:bg-gray-600 text-gray-300 rounded text-sm cursor-pointer">
               취소
             </button>
-            <button onClick={() => onConfirm(sorted.lo, sorted.hi)}
+            <button onClick={() => onConfirm(sorted.lo, sorted.hi, rotX, rotZ)}
               className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded text-sm cursor-pointer font-bold">
               확인
             </button>

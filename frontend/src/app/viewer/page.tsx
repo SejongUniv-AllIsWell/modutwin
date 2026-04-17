@@ -104,7 +104,7 @@ function ViewerContent() {
             viewMode === 'refine' ? (
               <RefineViewer sogUrl={fileUrl} uploadId={uploadId ?? undefined} />
             ) : (
-              <SplatViewer sogUrl={fileUrl} mode={viewMode === 'align' ? 'edit' : 'readonly'} />
+              <SplatViewer sogUrl={fileUrl} mode={viewMode === 'align' ? 'edit' : 'readonly'} uploadId={uploadId ?? undefined} />
             )
           ) : (
             <div className="flex items-center justify-center h-full text-gray-600">

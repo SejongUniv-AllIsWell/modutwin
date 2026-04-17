@@ -3,7 +3,13 @@
 ## Overview
 
 A web platform that creates digital twins of building interiors using 3D Gaussian Splatting.
-Video upload → GPU server 3DGS training → door-based alignment → web viewer serving.
+
+Flow: 사용자가 외부에서 학습한 `.ply` 업로드 → 브라우저에서 정제·정합 → 서버에 결과 저장 → 웹 뷰어 서빙.
+
+컴퓨트 책임 분배:
+- 클라이언트(사용자 하드웨어): PLY 파싱·편집, Shell 정제, 문 정합(4꼭짓점 Kabsch 또는 SVD/RANSAC), 렌더링 — SuperSplat Editor 방식
+- 서버: 인증, MinIO 객체 스토리지 릴레이(프리사인드 URL), 메타데이터 CRUD, 실시간 알림, SOG 변환
+- GPU 서버(학습용): 현재 스코프 밖. 사용자가 외부 도구로 학습한 PLY 결과물을 직접 업로드함. 학습 파이프라인 코드는 기능만 남겨두고 미사용.
 
 ## Web page
 
@@ -14,13 +20,13 @@ https://splat.wiki/
 | Role        | Technology                                 |
 | ----------- | ------------------------------------------ |
 | Frontend    | Next.js (App Router, TypeScript, Tailwind) |
+| 3DGS Engine | PlayCanvas Engine + 자체 PLY 파서/라이터 (전 속성 접근) |
 | Backend     | FastAPI + SQLAlchemy (async) + Alembic     |
 | Database    | PostgreSQL                                 |
 | Cache       | Redis                                      |
 | Storage     | MinIO (S3-compatible object storage)       |
-| Queue       | RabbitMQ (Celery broker)                   |
-| GPU Worker  | Celery (separate physical machine)         |
-| 3DGS Viewer | PlayCanvas Engine (SOG format)             |
+| Queue       | RabbitMQ (Celery broker) — SOG 변환 전용       |
+| GPU Worker  | Celery (스코프 밖, 비활성)                        |
 | Map         | KakaoMap API                               |
 | Auth        | Google OAuth 2.0 + JWT                     |
 | Proxy       | Nginx                                      |
@@ -38,61 +44,81 @@ https://splat.wiki/
 ├── minio        :9000
 └── flower       :5555
 
-[GPU Server] separate machine
-└── celery worker  ← connects to PC's RabbitMQ/Redis/MinIO over network
+[GPU Server] 스코프 밖
+└── (비활성) 학습 파이프라인은 사용자가 외부 도구로 대체
 ```
 
 ## Core Rules
 
-### Pipeline Modules
+### Compute Boundary
 
-- All modules MUST inherit `PipelineModule(ABC)` with `run(input_path) → output_path` interface
-- Inter-module communication via file paths (directories) ONLY. No direct imports between modules
-- Replacing any module MUST NOT affect adjacent modules
-- Pipeline: FFmpeg → BlurDetection → COLMAP → gsplat → SOG conversion
+- 서버에서 하지 않는 것: 가우시안 편집, 평면 clip, 벽면 정제, 문 정합 연산, 변환 행렬 계산
+- 서버에서 하는 것: 파일 저장/전달, DB I/O, 인증, 알림 릴레이, SOG 변환(CPU-bound)
+- 원칙: SuperSplat Editor처럼 사용자 하드웨어가 무거운 연산을 맡는다. 서버는 가볍게.
 
 ### Authentication
 
 - Google OAuth → JWT (Access 30min / Refresh 7days)
-- Admin: `users.role = 'admin'` → basemap approval/modification privileges
+- Admin: `users.role = 'admin'` → basemap 승인/수정 권한
 
 ### MinIO Object Keys
 
-- `users/{user_id}/{building_name}/web_input/` — raw uploads (private)
-- `users/{user_id}/{building_name}/3dgs_output/` — training results (private)
-- `users/{user_id}/{building_name}/3dgs_output/refined/` — 정제된 PLY (private)
-- `buildings/{building_id}/{floor_id}/modules/{module_id}_{name}/alignment/` — 정합 결과
+- `users/{user_id}/{building_name}/web_input/` — 원본 PLY 업로드 (private)
+- `users/{user_id}/{building_name}/refined/` — 클라이언트에서 Shell 정제한 결과 PLY (private)
+- `buildings/{building_id}/{floor_id}/modules/{module_id}_{name}/alignment/` — 정합 결과(행렬 + 메타)
 - `buildings/{building_id}/{floor_id}/modules/{module_id}_{name}/web_output/` — 웹 뷰어용 SOG
-- Upload: Multipart + presigned PUT URL (client uploads directly to MinIO)
+- Upload: Multipart + presigned PUT URL (클라이언트가 MinIO로 직접 업로드)
 - Download: presigned GET URL
+
+### Door Alignment
+
+- basemap은 고정. module의 가우시안에 4×4 변환 행렬만 적용해 접합
+- 행렬은 클라이언트에서 계산해 서버에는 값만 저장(~64 bytes)
+- 정합 방식 2가지 (클라이언트 내부에서 전환):
+  1. Primary: 4꼭짓점 Kabsch — 문이 직사각형이라 가정하고 4점 대응 → Kabsch(3×3 SVD)로 rigid transform. 현재는 사용자가 수동 클릭. 추후 segmentation 자동 입력 연동 예정
+  2. Alternative: SVD/PCA + RANSAC — 문 영역 전체 가우시안에서 PCA로 u/v/n 기저 추출, RANSAC으로 이상치 제거. Python 구현을 TS로 포팅
 
 ### Basemap
 
-- Initially created by admin, fundamentally immutable
-- On change: compute transform matrix → apply to all existing aligned modules
+- 초기에는 관리자가 생성, 기본적으로 불변
+- 변경 시: 전역 변환 행렬 계산 → 기존 정합된 모든 모듈에 전파 적용
 
 ### Notifications
 
-- User online: WebSocket push (Redis `ws:online:{user_id}`)
-- User offline: save to PostgreSQL `notifications` → deliver on next login
+- 사용자 온라인: WebSocket 푸시 (Redis `ws:online:{user_id}`)
+- 사용자 오프라인: PostgreSQL `notifications` 저장 → 재접속 시 전달
 
 ### Networking
 
-- Inter-container communication: use docker service names (`postgres`, `redis`, etc.)
-- GPU server: connects to PC via `PC_HOST_IP` environment variable
-- External exposure: Nginx 80/443 only. RabbitMQ/Redis/MinIO allow GPU server IP only
+- 컨테이너 간 통신: docker service name 사용 (`postgres`, `redis`, ...)
+- 외부 노출: Nginx 80/443만. RabbitMQ/Redis/MinIO는 GPU 서버 IP만 허용 (GPU 비활성 중이지만 방화벽 설정은 유지)
 
-## Refine Pipeline (벽면 정제 순서)
+## Refine Pipeline (씬 정제 순서)
 
-스캔된 3DGS 씬을 정렬하는 파이프라인. 현재 4단계까지 작업 중.
+사용자가 업로드한 PLY를 정렬/정제하는 파이프라인. **전부 브라우저에서 수행.**
 
-1. **문 segmentation 기반 세로방향 벡터 추출** — 다른 팀원이 문 segmentation 결과 제공 예정. 이를 기반으로 세로(수직) 방향 벡터를 구함
-2. **세로방향 → Y축 정렬 회전** — 추출된 세로방향이 Y축과 나란하게 전체 씬을 회전
-3. **Y축 반전 기능** — 스캔 방향에 따라 씬이 뒤집혀 있을 수 있으므로 Y축 반전 기능 제공
-4. **히스토그램 기반 천장/바닥 추정** — Y축 히스토그램으로 천장/바닥 자동 감지. CeilingFloorModal 팝업으로 사용자 확인/조정. 3D 뷰어에서 반투명 평면으로 미리보기 **(현재 작업 중)**
-5. **X/Z축에 방 방향 맞추기** — 천장/바닥 정렬 완료 후, 방의 벽면 방향을 X/Z축에 나란하게 정렬 **(방법 미정)**
+1. 세로방향 벡터 추출 — 추후 문 segmentation 연동 예정. 현재는 사용자가 수동으로 방향 지정
+2. Y축 정렬 회전 — 세로방향이 Y축과 나란하도록 전체 씬 회전
+3. Y축 반전 — 스캔 방향에 따라 뒤집힐 수 있으므로 반전 옵션 제공
+4. 히스토그램 기반 천장/바닥 추정 — Y축 히스토그램으로 자동 감지, CeilingFloorModal에서 사용자 확인 (현재 작업 중)
+5. X/Z축 방 방향 정렬 — 벽면이 X/Z축과 나란하도록 회전 (WallModal)
+6. Shell 정제 — 각 경계면(천장/바닥/4벽)에 대해 얇은 불투명 막 생성
+   - 안쪽 `margin_in`, 바깥쪽 `margin_out` 밴드 마스킹
+   - 방 중심에서 큐브맵 렌더링 → 레이 교차 지점 색상 샘플 (median filter)
+   - 2DGS-style 얇은 디스크 패치 생성 (SH=0 단색, opacity=1)
+   - `margin_out` 초과 바깥 floater 삭제
+7. 문 정합 — 4꼭짓점 수동 클릭 → Kabsch → 4×4 행렬 서버 저장
 
-정렬 완료 후 각 벽면에 대해 `core/refine_module/`의 clip → flat_opaque 파이프라인으로 벽면 수직투영 처리.
+구 파이프라인(서버 측 벽면 수직투영)은 폐기됨. 기존 `core/refine_module/flat_opaque.py` 접근은 실패로 판명.
+
+## Frontend Client Modules
+
+- `frontend/src/lib/ply/` — PLY 전 속성 파서/라이터
+- `frontend/src/lib/gs/cubeMap.ts` — 방 중심 큐브맵 렌더링
+- `frontend/src/lib/gs/shell.ts` — Shell 정제 알고리즘
+- `frontend/src/lib/gs/kabsch.ts` — 4꼭짓점 Kabsch 정합
+- `frontend/src/lib/gs/doorPca.ts`, `ransac.ts` — 대체 정합 방식 (Python에서 포팅)
+- `frontend/src/components/viewer/tools/` — 각 도구 UI 컴포넌트
 
 ## Commands
 
@@ -104,6 +130,6 @@ docker-compose exec backend alembic upgrade head  # DB migration
 docker-compose exec backend pytest            # Backend tests
 docker-compose exec frontend npm test         # Frontend tests
 
-# GPU server
-celery -A celery_app worker -Q training,alignment -c 1
+# GPU server (비활성, 참고용)
+# celery -A celery_app worker -Q training,alignment -c 1
 ```

@@ -1,19 +1,31 @@
 'use client';
 
-import { useRef, useState } from 'react';
+import { useRef, useState, useCallback, Suspense, lazy } from 'react';
 import SplatViewerCore, { SplatViewerCoreRef } from './SplatViewerCore';
 import { useGaussianSelector } from './tools/useGaussianSelector';
 import { useDoorAnimation } from './tools/useDoorAnimation';
 import { usePivotEditor } from './tools/usePivotEditor';
 import { useTransformTool } from './tools/useTransformTool';
+
+const DoorAlignModal = lazy(() => import('./tools/DoorAlignModal'));
+
 interface SplatViewerProps {
   sogUrl: string;
   mode: 'edit' | 'readonly';
+  uploadId?: string;
   onSelectionDone?: (indices: number[]) => void;
 }
 
-export default function SplatViewer({ sogUrl, mode, onSelectionDone }: SplatViewerProps) {
+export default function SplatViewer({ sogUrl, mode, uploadId, onSelectionDone }: SplatViewerProps) {
   const coreRef = useRef<SplatViewerCoreRef>(null);
+  const [currentUrl, setCurrentUrl] = useState(sogUrl);
+  const [reloadKey, setReloadKey] = useState(0);
+  const [doorAlignOpen, setDoorAlignOpen] = useState(false);
+
+  const reloadWithUrl = useCallback((newUrl: string) => {
+    setCurrentUrl(newUrl);
+    setReloadKey(k => k + 1);
+  }, []);
   const selector = useGaussianSelector(coreRef, { onSelectionDone });
   const { openDoor, closeDoor } = useDoorAnimation(coreRef);
   const pivotEditor = usePivotEditor(coreRef);
@@ -53,8 +65,29 @@ export default function SplatViewer({ sogUrl, mode, onSelectionDone }: SplatView
   };
 
   return (
-    <SplatViewerCore ref={coreRef} sogUrl={sogUrl} onSplatLoaded={selector.onSplatLoaded}>
+    <SplatViewerCore key={reloadKey} ref={coreRef} sogUrl={currentUrl} onSplatLoaded={selector.onSplatLoaded}>
       {mode === 'edit' && selector.ui}
+      {mode === 'edit' && uploadId && (
+        <button
+          onClick={() => setDoorAlignOpen(v => !v)}
+          className={`absolute top-3 left-3 z-40 px-3 py-1.5 rounded cursor-pointer text-xs font-bold ${
+            doorAlignOpen ? 'bg-yellow-500 text-black' : 'bg-indigo-600 hover:bg-indigo-500 text-white'
+          }`}
+        >
+          {doorAlignOpen ? '문 정합 닫기' : '문 정합'}
+        </button>
+      )}
+      {doorAlignOpen && uploadId && (
+        <Suspense fallback={null}>
+          <DoorAlignModal
+            coreRef={coreRef}
+            uploadId={uploadId}
+            currentUrl={currentUrl}
+            onDone={(u) => { setDoorAlignOpen(false); reloadWithUrl(u); }}
+            onClose={() => setDoorAlignOpen(false)}
+          />
+        </Suspense>
+      )}
       {mode === 'edit' && (
         <div className="absolute top-3 right-3 bg-black/70 text-gray-300 text-xs rounded p-3 flex flex-col gap-2 select-none min-w-[180px]">
           {/* ── 변환 도구 ── */}

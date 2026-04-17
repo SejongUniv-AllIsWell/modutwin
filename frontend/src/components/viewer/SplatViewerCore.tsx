@@ -70,6 +70,7 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
     const [error, setError] = useState<string | null>(null);
     const [cameraMode, setCameraMode] = useState<CameraMode>('fly');
     const [moveSpeed, setMoveSpeed] = useState(0.5);
+    const [shiftActive, setShiftActive] = useState(false);
 
     const cameraModeRef = useRef<CameraMode>('fly');
     const moveSpeedRef = useRef(0.5);
@@ -108,6 +109,24 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
         );
       },
     }));
+
+    // ── Shift 키 상태 추적 (이동속도 표시에 반영) ──
+    useEffect(() => {
+      const onKey = (e: KeyboardEvent) => {
+        if (e.key === 'Shift') setShiftActive(e.type === 'keydown');
+      };
+      const clear = () => setShiftActive(false);
+      window.addEventListener('keydown', onKey);
+      window.addEventListener('keyup', onKey);
+      window.addEventListener('blur', clear);
+      document.addEventListener('visibilitychange', clear);
+      return () => {
+        window.removeEventListener('keydown', onKey);
+        window.removeEventListener('keyup', onKey);
+        window.removeEventListener('blur', clear);
+        document.removeEventListener('visibilitychange', clear);
+      };
+    }, []);
 
     // ── PlayCanvas 초기화 ──
     useEffect(() => {
@@ -516,7 +535,9 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
               onChange={(e) => { const v = parseFloat(e.target.value); setMoveSpeed(v); moveSpeedRef.current = v; }}
               onPointerUp={() => canvasRef.current?.focus()}
               className="w-20 h-1 accent-blue-500 cursor-pointer" />
-            <span className="pointer-events-none w-8 text-right">{moveSpeed.toFixed(1)}</span>
+            <span className={`pointer-events-none w-10 text-right font-mono ${shiftActive ? 'text-blue-400 font-bold' : ''}`}>
+              {(moveSpeed * (shiftActive ? 5 : 1)).toFixed(2)}
+            </span>
             <span className="pointer-events-none ml-1 text-gray-500">
               {cameraMode === 'fly'
                 ? '| 우클릭: 회전 | WASD: 이동 | QE: 상하 | 스크롤: 전후'

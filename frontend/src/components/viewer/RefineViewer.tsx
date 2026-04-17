@@ -19,7 +19,7 @@ export default function RefineViewer({ sogUrl, uploadId }: RefineViewerProps) {
     setReloadKey(k => k + 1);
   }, []);
 
-  const refine = useRefineTool(coreRef, { uploadId, reloadWithUrl });
+  const refine = useRefineTool(coreRef, { uploadId, reloadWithUrl, currentUrl });
 
   return (
     <SplatViewerCore
