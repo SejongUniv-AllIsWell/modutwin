@@ -142,14 +142,47 @@ export default function WallModal({
   }, [scores]);
 
   const [angle, setAngle] = useState(() => initialAngle ?? bestIdx * 0.5);
+  // 슬라이더 드래그가 끝났을 때만 갱신되는 angle (자동 벽 재검출 트리거용)
+  const [committedAngle, setCommittedAngle] = useState(() => initialAngle ?? bestIdx * 0.5);
 
-  // Auto-detected walls for selected angle
+  // rAF throttle: 슬라이더 input 이벤트를 frame당 1회로 묶음
+  const angleRef = useRef(angle);
+  useEffect(() => { angleRef.current = angle; }, [angle]);
+  const pendingAngle = useRef<number | null>(null);
+  const rafRef = useRef<number | null>(null);
+  const flushAngle = useCallback(() => {
+    rafRef.current = null;
+    if (pendingAngle.current !== null) { setAngle(pendingAngle.current); pendingAngle.current = null; }
+  }, []);
+  const scheduleFlush = useCallback(() => {
+    if (rafRef.current === null) rafRef.current = requestAnimationFrame(flushAngle);
+  }, [flushAngle]);
+  useEffect(() => () => { if (rafRef.current !== null) cancelAnimationFrame(rafRef.current); }, []);
+
+  // 캔버스 backing 크기는 mount 시 한 번만 설정 (draw마다 재할당 비용 제거)
+  useEffect(() => {
+    if (xzRef.current) { xzRef.current.width = CW; xzRef.current.height = CH; }
+  }, []);
+
+  // 드래그 끝나면 호출: 마지막 angle을 확정해 자동 벽 재검출 트리거
+  const commitAngle = useCallback(() => {
+    let v = angleRef.current;
+    if (pendingAngle.current !== null) {
+      v = pendingAngle.current;
+      pendingAngle.current = null;
+      if (rafRef.current !== null) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
+      setAngle(v);
+    }
+    setCommittedAngle(v);
+  }, []);
+
+  // 자동 검출 벽 — committedAngle 변경시에만 재계산 (드래그 중엔 stable)
   const autoWalls = useMemo(() => {
-    const rad = (angle * Math.PI) / 180;
+    const rad = (committedAngle * Math.PI) / 180;
     const p1 = peaksAtAngle(pts, n, rad);
     const p2 = peaksAtAngle(pts, n, rad + Math.PI / 2);
     return { dir1: p1, dir2: p2 };
-  }, [pts, n, angle]);
+  }, [pts, n, committedAngle]);
 
   // Editable wall values [a1, b1, a2, b2] — init from initialWalls, reset on angle change (not on mount)
   const [wallVals, setWallVals] = useState<[number, number, number, number]>(
@@ -192,13 +225,6 @@ export default function WallModal({
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
-    const dpr = window.devicePixelRatio || 1;
-    canvas.width = CW * dpr;
-    canvas.height = CH * dpr;
-    ctx.scale(dpr, dpr);
-
-    ctx.fillStyle = '#111827';
-    ctx.fillRect(0, 0, CW, CH);
 
     const rad = (angle * Math.PI) / 180;
     const c = Math.cos(rad), s = Math.sin(rad);
@@ -210,14 +236,28 @@ export default function WallModal({
     const toX = (rx: number) => PAD + (rx - mnR) * scR;
     const toY = (rz: number) => PAD + (rz - mnT) * scT;
 
-    // Points (rotated)
-    ctx.fillStyle = 'rgba(180, 210, 255, 0.18)';
+    // 배경 + 포인트를 픽셀 버퍼에 한 번에 누적해 putImageData 1회로 처리
+    // (점마다 fillRect 부르던 수만 번의 콜을 제거)
+    const img = ctx.createImageData(CW, CH);
+    const data = img.data;
+    for (let i = 0; i < CW * CH; i++) {
+      const o = i * 4;
+      data[o] = 17; data[o + 1] = 24; data[o + 2] = 39; data[o + 3] = 255;
+    }
+    const ALPHA = 0.22;
     for (let i = 0; i < n; i++) {
       const x = pts[i * 2], z = pts[i * 2 + 1];
       const rx = x * c + z * s;
       const rz = -x * s + z * c;
-      ctx.fillRect(toX(rx), toY(rz), 1.5, 1.5);
+      const px = (PAD + (rx - mnR) * scR) | 0;
+      const py = (PAD + (rz - mnT) * scT) | 0;
+      if (px < 0 || px >= CW || py < 0 || py >= CH) continue;
+      const o = (py * CW + px) * 4;
+      data[o]     += (180 - data[o])     * ALPHA;
+      data[o + 1] += (210 - data[o + 1]) * ALPHA;
+      data[o + 2] += (255 - data[o + 2]) * ALPHA;
     }
+    ctx.putImageData(img, 0, 0);
 
     const drawVLine = (v: number, color: string, bold: boolean) => {
       ctx.strokeStyle = color; ctx.lineWidth = bold ? 3 : 2; ctx.setLineDash([6, 4]);
@@ -304,10 +344,12 @@ export default function WallModal({
         <div className="mt-3 flex items-center gap-2">
           <span className="text-gray-400 text-xs w-14">회전각</span>
           <input type="range" min="0" max="90" step="0.5" value={angle}
-            onChange={(e) => setAngle(parseFloat(e.target.value))}
+            onChange={(e) => { pendingAngle.current = parseFloat(e.target.value); scheduleFlush(); }}
+            onMouseUp={commitAngle}
+            onTouchEnd={commitAngle}
             className="flex-1 h-1 accent-blue-500 cursor-pointer" />
           <span className="text-white font-mono text-xs w-14 text-right">{angle.toFixed(1)}°</span>
-          <button onClick={() => setAngle(bestIdx * 0.5)}
+          <button onClick={() => { setAngle(bestIdx * 0.5); setCommittedAngle(bestIdx * 0.5); }}
             className="px-2 py-1 bg-gray-700 hover:bg-gray-600 text-gray-200 rounded cursor-pointer text-xs">
             자동 ({(bestIdx * 0.5).toFixed(1)}°)
           </button>

@@ -74,9 +74,8 @@ https://splat.wiki/
 
 - basemap은 고정. module의 가우시안에 4×4 변환 행렬만 적용해 접합
 - 행렬은 클라이언트에서 계산해 서버에는 값만 저장(~64 bytes)
-- 정합 방식 2가지 (클라이언트 내부에서 전환):
-  1. Primary: 4꼭짓점 Kabsch — 문이 직사각형이라 가정하고 4점 대응 → Kabsch(3×3 SVD)로 rigid transform. 현재는 사용자가 수동 클릭. 추후 segmentation 자동 입력 연동 예정
-  2. Alternative: SVD/PCA + RANSAC — 문 영역 전체 가우시안에서 PCA로 u/v/n 기저 추출, RANSAC으로 이상치 제거. Python 구현을 TS로 포팅
+- 현재 사용: 4점 수동 클릭 → Kabsch(3×3 SVD)로 rigid transform 추정 (`DoorAlignModal` + `lib/alignment/kabsch.ts`). 추후 segmentation 자동 입력 연동 예정
+- `lib/alignment/`에는 Kabsch 외에 RANSAC rigid(`ransacRigid`), 평면 RANSAC fit(`ransacPlaneFit`), OBB 4꼭짓점 추출(`fitOrientedRectangle`) 등 보조 유틸이 함께 들어있음 (일부는 Python에서 포팅)
 
 ### Basemap
 
@@ -102,23 +101,25 @@ https://splat.wiki/
 3. Y축 반전 — 스캔 방향에 따라 뒤집힐 수 있으므로 반전 옵션 제공
 4. 히스토그램 기반 천장/바닥 추정 — Y축 히스토그램으로 자동 감지, CeilingFloorModal에서 사용자 확인 (현재 작업 중)
 5. X/Z축 방 방향 정렬 — 벽면이 X/Z축과 나란하도록 회전 (WallModal)
-6. Shell 정제 — 각 경계면(천장/바닥/4벽)에 대해 얇은 불투명 막 생성
-   - 안쪽 `margin_in`, 바깥쪽 `margin_out` 밴드 마스킹
-   - 방 중심에서 큐브맵 렌더링 → 레이 교차 지점 색상 샘플 (median filter)
-   - 2DGS-style 얇은 디스크 패치 생성 (SH=0 단색, opacity=1)
-   - `margin_out` 초과 바깥 floater 삭제
-7. 문 정합 — 4꼭짓점 수동 클릭 → Kabsch → 4×4 행렬 서버 저장
+6. Shell 단계 (`lib/gs/shell.ts`) — 각 경계면 바깥 `margin_out` 초과 가우시안 삭제. `near_protect` 이내 표면 본체는 항상 보호. 색 샘플링·패치 생성은 이 단계에 포함되지 않음
+7. Membrane 단계 (`lib/gs/membrane.ts`, `membraneGPU.ts`) — 각 경계면을 격자 패치로 새로 덮음
+   - 패치 위치마다 주변 원본 가우시안의 KNN(k=8)을 찾아 `f_dc_*` median을 색으로 사용 (WebGPU 컴퓨트 + CPU 폴백)
+   - 격자 위에서 [1,2,1]/4 separable Gaussian blur로 색 스무딩 (KNN median이 패치마다 독립적이라 인접 색이 튀는 걸 완화)
+   - 패치 모양: scale_xy = `patchRadius`, scale_z = `patchThickness` 인 납작한 가우시안. SH=0 단색, opacity는 옵션 (디폴트 0.25)
+8. 문 정합 — 4점 수동 클릭 → Kabsch → 4×4 행렬 서버 저장
 
 구 파이프라인(서버 측 벽면 수직투영)은 폐기됨. 기존 `core/refine_module/flat_opaque.py` 접근은 실패로 판명.
 
 ## Frontend Client Modules
 
 - `frontend/src/lib/ply/` — PLY 전 속성 파서/라이터
-- `frontend/src/lib/gs/cubeMap.ts` — 방 중심 큐브맵 렌더링
-- `frontend/src/lib/gs/shell.ts` — Shell 정제 알고리즘
-- `frontend/src/lib/gs/kabsch.ts` — 4꼭짓점 Kabsch 정합
-- `frontend/src/lib/gs/doorPca.ts`, `ransac.ts` — 대체 정합 방식 (Python에서 포팅)
-- `frontend/src/components/viewer/tools/` — 각 도구 UI 컴포넌트
+- `frontend/src/lib/gs/planes.ts` — 방 6면 평면 정의 / signed distance
+- `frontend/src/lib/gs/transform.ts` — 씬 회전·반전 등 강체 변환
+- `frontend/src/lib/gs/shell.ts` — 외부 가우시안 삭제 (`margin_out` 초과)
+- `frontend/src/lib/gs/membrane.ts`, `membraneGPU.ts` — 격자 패치 생성 + KNN median 채색 + 2D Gaussian blur 스무딩 (WebGPU 컴퓨트 + CPU 폴백)
+- `frontend/src/lib/alignment/` — Kabsch, RANSAC rigid, 평면 RANSAC fit, OBB 4꼭짓점, mat3/SVD 유틸
+- `frontend/src/lib/refine/persistence.ts` — 정제 상태 저장/복원
+- `frontend/src/components/viewer/tools/` — 각 도구 UI 컴포넌트 (CeilingFloorModal, WallModal, DoorAlignModal, …)
 
 ## Commands
 

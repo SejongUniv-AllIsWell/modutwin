@@ -4,6 +4,10 @@ import { useRef, useState, useCallback, useEffect, RefObject, lazy, Suspense } f
 import { SplatData, SplatViewerCoreRef } from '../SplatViewerCore';
 import { useDepthNormal } from './useDepthNormal';
 import { surfacePlanesFromRoom, signedDistance } from '@/lib/gs/planes';
+import { loadRefineState, saveRefineState, clearRefineState } from '@/lib/refine/persistence';
+import type { GaussianScene } from '@/lib/ply/types';
+
+const UNDO_STACK_LIMIT = 3;
 
 const CeilingFloorModal = lazy(() => import('./CeilingFloorModal'));
 const WallModal = lazy(() => import('./WallModal'));
@@ -205,8 +209,8 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   const [selectedSurfaces, setSelectedSurfaces] = useState<Set<Surface>>(new Set());
   const [flattening, setFlattening] = useState(false);
   const [membraneApplying, setMembraneApplying] = useState(false);
-  const [membraneColorMode, setMembraneColorMode] = useState<'white' | 'knn-median'>('white');
-  const [showDeletedOnly, setShowDeletedOnly] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
   const [surfaceOffsets, setSurfaceOffsets] = useState<Record<Surface, number>>({
     ceiling: 0.3, floor: 0.3, w1a: 0.3, w1b: 0.3, w2a: 0.3, w2b: 0.3,
   });
@@ -216,9 +220,9 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   });
 
   // 막 파라미터 (슬라이더)
-  const [membraneSpacing, setMembraneSpacing] = useState(0.02);   // 격자 간격 (작을수록 패치 많음)
-  const [membraneRadius, setMembraneRadius] = useState(0.05);     // 패치 반경
-  const [membraneOpacity, setMembraneOpacity] = useState(1.0);    // 선형 불투명도 0~1
+  const [membraneSpacing, setMembraneSpacing] = useState(0.04);   // 격자 간격 (작을수록 패치 많음)
+  const [membraneRadius, setMembraneRadius] = useState(0.08);     // 패치 반경
+  const [membraneOpacity, setMembraneOpacity] = useState(0.25);   // 선형 불투명도 0~1
 
   const toggleSurface = (s: Surface) => {
     // Don't allow toggling disabled surfaces
@@ -237,57 +241,362 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     ];
     setSelectedSurfaces(prev => prev.size === available.length ? new Set() : new Set(available));
   };
+
+  // ── 정제 파이프라인 state (lazy-bake 모델) ──
+  // 사용자가 "정제 결과 저장"을 누를 때까지 PLY/GPU 데이터는 일절 mutate하지 않는다.
+  // 모든 작업은 "의도(intent)"로만 메모리에 보관되고 시각 미리보기는 GPU side로만 처리.
+
+  // 원본 PLY 파싱본 캐시 (A 좌표계, 불변). 첫 정제 작업 또는 저장 시 lazy 파싱.
+  const originalSceneRef = useRef<GaussianScene | null>(null);
+
+  // 누적 회전 (rotX, rotZ) 라디안. CF 모달이 누적 입력. 옵션 A: 막 생성 후 lock.
+  const pendingRotationRef = useRef<{ rotX: number; rotZ: number }>({ rotX: 0, rotZ: 0 });
+  const [pendingRotation, setPendingRotation] = useState<{ rotX: number; rotZ: number }>({ rotX: 0, rotZ: 0 });
+
+  // flatten 마스크: 1=삭제(현재 회전된 프레임 기준 평면 외부). null=아직 적용 안 됨.
+  const flattenMaskRef = useRef<Uint8Array | null>(null);
+  const [flattenActive, setFlattenActive] = useState(false);
+  const flattenActiveRef = useRef(false);
+  const [flattenVisible, setFlattenVisible] = useState(true);
+  const flattenVisibleRef = useRef(true);
+
+  // 막: 별도 PlayCanvas gsplat 엔티티로 띄움. 진짜 토글 (reload 없음).
+  // 두 gsplat 엔티티가 나란히 있을 때 카메라 각도 변화로 알파 블렌드 순서가 흔들리는
+  // 문제는 별도 Layer를 메인 World 앞에 삽입해 강제 순서로 회피.
+  const membraneSceneRef = useRef<GaussianScene | null>(null);
+  const membraneEntityRef = useRef<any>(null);
+  const membraneAssetRef = useRef<any>(null);
+  const membraneBlobUrlRef = useRef<string | null>(null);
+  const membraneLayerRef = useRef<any>(null);
+  const [membraneActive, setMembraneActive] = useState(false);
+  const membraneActiveRef = useRef(false);
+
+  // 옵션 A: 막 생성 후 CF 모달의 회전 슬라이더 lock
+  const [cfRotationLocked, setCfRotationLocked] = useState(false);
+  const cfRotationLockedRef = useRef(false);
+
+  // 통합 undo 히스토리 (시간순 단일 스택)
+  type OpRecord =
+    | { type: 'rotation'; prevRotation: { rotX: number; rotZ: number } }
+    | { type: 'flatten'; prevMask: Uint8Array | null; prevActive: boolean }
+    | { type: 'membrane'; prevScene: GaussianScene | null; prevActive: boolean; prevLocked: boolean };
+  const opHistoryRef = useRef<OpRecord[]>([]);
+  const [undoDepth, setUndoDepth] = useState(0);
+
+  const [dirty, setDirty] = useState(false);
+  const dirtyRef = useRef(false);
+  const restoringRef = useRef(false);
+
+  const pushOp = useCallback((rec: OpRecord) => {
+    opHistoryRef.current.push(rec);
+    if (opHistoryRef.current.length > UNDO_STACK_LIMIT) opHistoryRef.current.shift();
+    setUndoDepth(opHistoryRef.current.length);
+  }, []);
+
+  // ── PLY 베이스 회전(180Z) + pendingRotation을 splatEntity transform에 적용 ──
+  const applyEntityRotation = useCallback(() => {
+    const data = splatDataRef.current;
+    const pc = coreRef.current?.getPC();
+    if (!data?.splatEntity || !pc) return;
+    const { rotX, rotZ } = pendingRotationRef.current;
+
+    // pendingRotation이 0이면 SplatViewerCore의 초기 설정과 정확히 동일한 API 사용 (회귀 방지)
+    if (rotX === 0 && rotZ === 0) {
+      data.splatEntity.setLocalEulerAngles(0, 0, 180);
+      return;
+    }
+
+    const rotXdeg = rotX * 180 / Math.PI;
+    const rotZdeg = rotZ * 180 / Math.PI;
+    // 180Z(베이스) ∘ Rz(rotZ) ∘ Rx(rotX)  — rotateScene과 동일 합성 (Rz·Rx · A)
+    const qx = new pc.Quat(); qx.setFromAxisAngle(new pc.Vec3(1, 0, 0), rotXdeg);
+    const qz = new pc.Quat(); qz.setFromAxisAngle(new pc.Vec3(0, 0, 1), rotZdeg);
+    const qBase = new pc.Quat(); qBase.setFromAxisAngle(new pc.Vec3(0, 0, 1), 180);
+    const qPending = new pc.Quat(); qPending.mul2(qz, qx);
+    const qTotal = new pc.Quat(); qTotal.mul2(qBase, qPending);
+    data.splatEntity.setLocalRotation(qTotal);
+  }, []);
+
+  // ── flatten 마스크를 colorTexture에 페인트 ──
+  // origColorData(브러시 삭제 누적)를 베이스로, 마스크된 곳만 alpha=0.
+  // showFlatten=false면 마스크 무시하고 origColorData 그대로 복원.
+  const paintFlattenMask = useCallback(() => {
+    const data = splatDataRef.current;
+    const core = coreRef.current;
+    if (!data || !core || !data.colorTexture || !data.origColorData) return;
+    const f2h = core.float2Half;
+    const td = data.colorTexture.lock();
+    if (!td) return;
+    const mask = flattenMaskRef.current;
+    const showFlatten = flattenActiveRef.current && flattenVisibleRef.current;
+    for (let i = 0; i < data.numSplats; i++) {
+      const idx = i * 4;
+      td[idx]   = data.origColorData[idx];
+      td[idx+1] = data.origColorData[idx+1];
+      td[idx+2] = data.origColorData[idx+2];
+      if (showFlatten && mask && mask[i]) {
+        td[idx+3] = f2h(0);
+      } else {
+        td[idx+3] = data.origColorData[idx+3];
+      }
+    }
+    data.colorTexture.unlock();
+  }, [coreRef]);
+
+  // ── 원본 GaussianScene 보장 (lazy 파싱, 캐시) ──
+  const ensureOriginalScene = useCallback(async (): Promise<GaussianScene> => {
+    if (originalSceneRef.current) return originalSceneRef.current;
+    if (!options?.currentUrl) throw new Error('currentUrl 없음');
+    const { fetchAndParsePly } = await import('@/lib/ply');
+    const scene = await fetchAndParsePly(options.currentUrl);
+    originalSceneRef.current = scene;
+    return scene;
+  }, [options]);
+
+  // ── 회전된 source scene 빌드 (A → A' = pendingRotation · A) ──
+  // 주의: posX/Y/Z + rot_0..3 만 새 배열, 나머지는 reference 공유 (메모리 절약)
+  const buildRotatedScene = useCallback(async (origin: GaussianScene): Promise<GaussianScene> => {
+    const { rotX, rotZ } = pendingRotationRef.current;
+    if (rotX === 0 && rotZ === 0) return origin;
+    const { rotateScene } = await import('@/lib/gs');
+    const cloned: GaussianScene = {
+      numSplats: origin.numSplats,
+      propertyOrder: [...origin.propertyOrder],
+      attrs: new Map(origin.attrs),
+    };
+    for (const p of ['x', 'y', 'z', 'rot_0', 'rot_1', 'rot_2', 'rot_3']) {
+      const arr = origin.attrs.get(p);
+      if (arr) cloned.attrs.set(p, new Float32Array(arr));
+    }
+    rotateScene(cloned, rotX, rotZ);
+    return cloned;
+  }, []);
+
+  // ── splatData 위치 배열을 pendingRotation으로 회전한 사본 (in-place 마스킹용) ──
+  const buildRotatedPositions = useCallback((px: Float32Array, py: Float32Array, pz: Float32Array): { x: Float32Array; y: Float32Array; z: Float32Array } => {
+    const { rotX, rotZ } = pendingRotationRef.current;
+    if (rotX === 0 && rotZ === 0) return { x: px, y: py, z: pz };
+    const n = px.length;
+    const cx = Math.cos(rotX), sx = Math.sin(rotX);
+    const cz = Math.cos(rotZ), sz = Math.sin(rotZ);
+    const rx = new Float32Array(n);
+    const ry = new Float32Array(n);
+    const rz = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const x = px[i], y = py[i], z = pz[i];
+      rx[i] = cz * x - sz * cx * y + sz * sx * z;
+      ry[i] = sz * x + cz * cx * y - cz * sx * z;
+      rz[i] = sx * y + cx * z;
+    }
+    return { x: rx, y: ry, z: rz };
+  }, []);
+
+  // 막 엔티티 cleanup
+  const removeMembraneEntity = useCallback(() => {
+    const app = coreRef.current?.getApp();
+    if (membraneEntityRef.current) {
+      try { membraneEntityRef.current.destroy(); } catch { /* ignore */ }
+      membraneEntityRef.current = null;
+    }
+    if (membraneAssetRef.current && app) {
+      try { app.assets.remove(membraneAssetRef.current); } catch { /* ignore */ }
+      membraneAssetRef.current = null;
+    }
+    if (membraneBlobUrlRef.current) {
+      URL.revokeObjectURL(membraneBlobUrlRef.current);
+      membraneBlobUrlRef.current = null;
+    }
+  }, [coreRef]);
+
+  // ── 막 전용 Layer 보장 (메인 World layer보다 먼저 렌더되도록) ──
+  // PlayCanvas가 두 transparent gsplat을 sortMode_BACK2FRONT로 혼합하면 각도 따라
+  // 순서가 흔들리는데, 별도 layer를 World 앞에 두면 강제로 막 → 메인 순서가 됨.
+  const ensureMembraneLayer = useCallback(() => {
+    const pc = coreRef.current?.getPC();
+    const app = coreRef.current?.getApp();
+    const cam = coreRef.current?.getCamera();
+    if (!pc || !app || !cam) return null;
+    if (membraneLayerRef.current) return membraneLayerRef.current;
+
+    const existing = app.scene.layers.getLayerByName('MembranePre');
+    if (existing) {
+      membraneLayerRef.current = existing;
+      return existing;
+    }
+    const layer = new pc.Layer({
+      name: 'MembranePre',
+      opaqueSortMode: pc.SORTMODE_NONE,
+      transparentSortMode: pc.SORTMODE_BACK2FRONT,
+    });
+    // World layer 뒤에 삽입 → 막이 메인보다 나중에 렌더 → 막이 메인 위에 보임
+    const layerList = app.scene.layers.layerList;
+    const worldIdx = layerList.findIndex((l: any) => l.name === 'World');
+    if (worldIdx >= 0) {
+      app.scene.layers.insert(layer, worldIdx + 1);
+    } else {
+      app.scene.layers.push(layer);
+    }
+    // 카메라가 이 layer를 렌더하도록 추가
+    if (cam.camera && Array.isArray(cam.camera.layers) && !cam.camera.layers.includes(layer.id)) {
+      cam.camera.layers = [...cam.camera.layers, layer.id];
+    }
+    membraneLayerRef.current = layer;
+    return layer;
+  }, [coreRef]);
+
+  // ── 막 GaussianScene을 별도 PlayCanvas gsplat 엔티티로 로드 ──
+  const loadMembraneEntity = useCallback(async (scene: GaussianScene): Promise<void> => {
+    const core = coreRef.current;
+    const pc = core?.getPC();
+    const app = core?.getApp();
+    if (!core || !pc || !app) throw new Error('PlayCanvas not ready');
+
+    removeMembraneEntity();
+    const layer = ensureMembraneLayer();
+
+    const { serializePly } = await import('@/lib/ply');
+    const bytes = serializePly(scene);
+    const blob = new Blob([bytes], { type: 'application/octet-stream' });
+    const url = URL.createObjectURL(blob);
+    membraneBlobUrlRef.current = url;
+
+    const asset = new pc.Asset('membrane', 'gsplat', { url: url + '#membrane.ply' });
+    app.assets.add(asset);
+    membraneAssetRef.current = asset;
+
+    await new Promise<void>((resolve, reject) => {
+      asset.once('error', (err: any) => reject(new Error(`membrane asset load failed: ${err?.message ?? err}`)));
+      asset.ready(() => resolve());
+      app.assets.load(asset);
+    });
+
+    const entity = new pc.Entity('membrane');
+    // 막 stored 위치 = A' (pendingRotation 적용된 프레임)
+    entity.setLocalEulerAngles(0, 0, 180);
+    entity.addComponent('gsplat', { asset });
+    // 막 전용 layer 지정 (메인 World 보다 먼저 렌더)
+    if (layer && entity.gsplat) {
+      try { entity.gsplat.layers = [layer.id]; } catch { /* API 미존재 시 무시 */ }
+    }
+    app.root.addChild(entity);
+    membraneEntityRef.current = entity;
+  }, [coreRef, removeMembraneEntity, ensureMembraneLayer]);
+
+  // 언마운트 시 막 cleanup
+  useEffect(() => {
+    return () => {
+      removeMembraneEntity();
+    };
+  }, [removeMembraneEntity]);
+
+  // ── applyFlatten: 토글식 — 비활성 → 마스크 계산 + 활성. 활성 → 비활성(복원). ──
+  // 저장 시 활성 상태일 때만 마스크가 베이크에 반영됨.
   const applyFlatten = useCallback(async () => {
-    if (!options?.uploadId || !options?.reloadWithUrl || !options?.currentUrl) return;
+    // 이미 활성 → 복원 (비활성화 + 시각 복원)
+    if (flattenActiveRef.current) {
+      pushOp({
+        type: 'flatten',
+        prevMask: flattenMaskRef.current ? new Uint8Array(flattenMaskRef.current) : null,
+        prevActive: true,
+      });
+      flattenActiveRef.current = false; setFlattenActive(false);
+      paintFlattenMask();
+      // 마스크 자체는 보관해 둘 수도 있지만, 다음 클릭에서 어차피 재계산하므로 비움 → 의도 명확화
+      flattenMaskRef.current = null;
+      // dirty/op 히스토리는 그대로. 토글 자체도 히스토리에 남음.
+      setSaved(false);
+      const stillDirty = opHistoryRef.current.length > 0
+        || pendingRotationRef.current.rotX !== 0
+        || pendingRotationRef.current.rotZ !== 0
+        || flattenActiveRef.current
+        || membraneActiveRef.current;
+      dirtyRef.current = stillDirty; setDirty(stillDirty);
+      return;
+    }
+
+    // 비활성 → 마스크 계산 + 활성
     if (selectedSurfaces.size === 0) { alert('경계면을 하나 이상 선택하세요.'); return; }
     const hasWall = Array.from(selectedSurfaces).some(s => WALL_SURFACES.includes(s));
     if (hasWall && (wallAngleRef.current === null || !wallDistancesRef.current)) return;
 
+    const data = splatDataRef.current;
+    if (!data) return;
+
     setFlattening(true);
     try {
-      const [{ fetchAndParsePly, serializePly }, { surfacePlanesFromRoom, deleteOutsideSurfaces }] = await Promise.all([
-        import('@/lib/ply'),
-        import('@/lib/gs'),
-      ]);
-      const { api } = await import('@/lib/api');
-
-      const scene = await fetchAndParsePly(options.currentUrl);
+      const { surfacePlanesFromRoom, signedDistance } = await import('@/lib/gs/planes');
 
       const allPlanes = surfacePlanesFromRoom({
         angleDeg: wallAngleRef.current ?? 0,
-        walls: wallDistancesRef.current ?? [0, 0, 0, 0],
+        walls: wallDistancesRef.current ?? [0, 0, 0, 0] as [number, number, number, number],
         ceilingY: ceilingYRef.current,
         floorY: floorYRef.current,
       });
       const planes = allPlanes.filter(p => selectedSurfaces.has(p.id as Surface));
-
       const marginOut = Math.max(...Array.from(selectedSurfaces).map(s => surfaceOffsets[s]));
-      const { scene: refined, deletedCount } = deleteOutsideSurfaces(scene, planes, { marginOut });
-      console.log(`[Shell] deleted ${deletedCount} / ${scene.numSplats} gaussians`);
+      const nearProtect = 0.03;  // DEFAULT_SHELL_OPTIONS.nearProtect
 
-      const bytes = serializePly(refined);
-      const urlReq = await api.post<{ put_url: string; get_url: string; key: string }>(
-        '/refine/refined-upload-url',
-        { upload_id: options.uploadId, filename: 'refined.ply' },
-      );
-      const putResp = await fetch(urlReq.put_url, {
-        method: 'PUT',
-        body: bytes,
-        headers: { 'Content-Type': 'application/octet-stream' },
-      });
-      if (!putResp.ok) throw new Error(`MinIO PUT failed: ${putResp.status}`);
+      // splatData posX/Y/Z (A 프레임)을 회전 → A' 프레임. 이 프레임에서 평면과 비교.
+      const rotPos = buildRotatedPositions(data.posX, data.posY, data.posZ);
 
-      sourceKeyRef.current = urlReq.key;
-      options.reloadWithUrl(urlReq.get_url);
+      const N = data.numSplats;
+      const newMask = new Uint8Array(N);
+      let deletedCount = 0;
+      const killByPlane: Record<string, number> = {};
+      for (const p of planes) killByPlane[p.id] = 0;
+      for (let i = 0; i < N; i++) {
+        const x = rotPos.x[i], y = rotPos.y[i], z = rotPos.z[i];
+        let outside = false;
+        for (const p of planes) {
+          const sd = signedDistance(p, x, y, z);
+          if (sd > nearProtect && sd > marginOut) {
+            outside = true;
+            killByPlane[p.id]++;
+            break;
+          }
+        }
+        if (outside) { newMask[i] = 1; deletedCount++; }
+      }
+      console.log(`[Shell] flatten mask: ${deletedCount} / ${N} gaussians`);
+      console.log('[Shell] kill-by-plane:', killByPlane);
+      console.log('[Shell] plane defs:', planes.map(p => ({ id: p.id, n: p.normal, d: p.d })));
+      console.log('[Shell] params:', { ceilingY: ceilingYRef.current, floorY: floorYRef.current, wallAngle: wallAngleRef.current, wallDistances: wallDistancesRef.current, marginOut, nearProtect, pendingRot: pendingRotationRef.current });
+
+      // undo 기록 (이전 상태 = 비활성 + 마스크 없음)
+      pushOp({ type: 'flatten', prevMask: null, prevActive: false });
+
+      flattenMaskRef.current = newMask;
+      flattenActiveRef.current = true; setFlattenActive(true);
+      flattenVisibleRef.current = true; setFlattenVisible(true);
+      paintFlattenMask();
+      dirtyRef.current = true; setDirty(true);
+      setSaved(false);
     } catch (e: any) {
       alert(`처리 실패: ${e.message || e}`);
     } finally {
       setFlattening(false);
     }
-  }, [options, selectedSurfaces, surfaceOffsets]);
+  }, [selectedSurfaces, surfaceOffsets, buildRotatedPositions, paintFlattenMask, pushOp]);
 
+  // ── applyMembrane: 진짜 토글 (reload 없음). flatten/회전 의도 보존. ──
+  // 두 gsplat 엔티티 정렬 흔들림 문제는 별도 Layer를 World 앞에 두어 회피.
   const applyMembrane = useCallback(async () => {
-    if (!options?.uploadId || !options?.reloadWithUrl || !options?.currentUrl) return;
+    // 이미 활성 → 막 엔티티만 제거. flatten/회전 의도는 그대로 유지.
+    if (membraneActiveRef.current) {
+      removeMembraneEntity();
+      membraneSceneRef.current = null;
+      membraneActiveRef.current = false; setMembraneActive(false);
+      cfRotationLockedRef.current = false; setCfRotationLocked(false);
+      setSaved(false);
+      const stillDirty = opHistoryRef.current.length > 0
+        || pendingRotationRef.current.rotX !== 0
+        || pendingRotationRef.current.rotZ !== 0
+        || flattenActiveRef.current;
+      dirtyRef.current = stillDirty; setDirty(stillDirty);
+      return;
+    }
+
+    // 비활성 → 막 생성
     if (selectedSurfaces.size === 0) { alert('경계면을 하나 이상 선택하세요.'); return; }
     const hasWall = Array.from(selectedSurfaces).some(s => WALL_SURFACES.includes(s));
     const hasCF = Array.from(selectedSurfaces).some(s => CF_SURFACES.includes(s));
@@ -296,16 +605,18 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
 
     setMembraneApplying(true);
     try {
-      const [
-        { fetchAndParsePly, serializePly, concatScenes },
-        { generateMembrane, surfacePlanesFromRoom, deleteOutsideSurfaces },
-      ] = await Promise.all([
-        import('@/lib/ply'),
-        import('@/lib/gs'),
-      ]);
-      const { api } = await import('@/lib/api');
+      const { generateMembrane } = await import('@/lib/gs');
+      const { filterScene } = await import('@/lib/ply');
 
-      const scene = await fetchAndParsePly(options.currentUrl);
+      // KNN source: 회전된 + flatten 적용된 씬 (브러시는 splatData origColorData 기반이라 별도 처리)
+      const original = await ensureOriginalScene();
+      const rotated = await buildRotatedScene(original);
+      let knnSource = rotated;
+      if (flattenActiveRef.current && flattenMaskRef.current) {
+        const keep = new Uint8Array(rotated.numSplats);
+        for (let i = 0; i < keep.length; i++) keep[i] = flattenMaskRef.current[i] ? 0 : 1;
+        knnSource = filterScene(rotated, keep);
+      }
 
       const roomGeom = {
         angleDeg: wallAngleRef.current ?? 0,
@@ -314,51 +625,41 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         floorY: floorYRef.current,
       };
 
-      // 1) 경계 바깥 삭제 → keep 마스크 획득
-      const allPlanes = surfacePlanesFromRoom(roomGeom);
-      const planes = allPlanes.filter(p => selectedSurfaces.has(p.id as Surface));
-      const marginOut = Math.max(...Array.from(selectedSurfaces).map(s => surfaceOffsets[s]));
-      const { scene: cleaned, deletedCount, keep } = deleteOutsideSurfaces(scene, planes, { marginOut });
-      console.log(`[Membrane] deleted ${deletedCount} / ${scene.numSplats} gaussians`);
+      console.log(`[Membrane] slider opacity=${membraneOpacity}`);
 
-      // 2) 전체 씬으로 막 색상 샘플링 (삭제 전 원본이 벽 색 정보를 온전히 갖고 있음)
       const membrane = await generateMembrane(
-        scene.propertyOrder,
+        knnSource.propertyOrder,
         Array.from(selectedSurfaces),
         roomGeom,
         surfaceOffsets,
-        membraneColorMode,
-        membraneColorMode !== 'white' ? scene : undefined,
+        knnSource,
         {
           gridSpacing: membraneSpacing,
           patchRadius: membraneRadius,
           patchOpacity: membraneOpacity,
         },
       );
-      console.log(`[Membrane] deleted ${deletedCount}, generated ${membrane.numSplats} patches (${membraneColorMode})`);
+      // 검증: 생성된 막 씬의 opacity 필드 실제값 확인
+      const opAttr = membrane.attrs.get('opacity');
+      const propIdx = membrane.propertyOrder.indexOf('opacity');
+      const expectedLogit = Math.log(Math.max(1e-4, Math.min(1-1e-4, membraneOpacity)) / (1 - Math.max(1e-4, Math.min(1-1e-4, membraneOpacity))));
+      console.log(`[Membrane] propertyOrder includes 'opacity'? idx=${propIdx}; opAttr=${opAttr ? `len=${opAttr.length} sample[0]=${opAttr[0]}` : 'MISSING'}; expected logit≈${expectedLogit.toFixed(3)}`);
+      console.log(`[Membrane] generated ${membrane.numSplats} patches`);
 
-      // 4) 정리된 씬 + 막 합치기
-      const merged = concatScenes(cleaned, membrane);
-      const bytes = serializePly(merged);
-      const urlReq = await api.post<{ put_url: string; get_url: string; key: string }>(
-        '/refine/refined-upload-url',
-        { upload_id: options.uploadId, filename: 'membrane.ply' },
-      );
-      const putResp = await fetch(urlReq.put_url, {
-        method: 'PUT',
-        body: bytes,
-        headers: { 'Content-Type': 'application/octet-stream' },
-      });
-      if (!putResp.ok) throw new Error(`MinIO PUT failed: ${putResp.status}`);
+      // 별도 gsplat 엔티티로 로드 (메인 씬은 안 건드림 → flatten/회전 의도 보존)
+      await loadMembraneEntity(membrane);
 
-      sourceKeyRef.current = urlReq.key;
-      options.reloadWithUrl(urlReq.get_url);
+      membraneSceneRef.current = membrane;
+      membraneActiveRef.current = true; setMembraneActive(true);
+      cfRotationLockedRef.current = true; setCfRotationLocked(true);
+      dirtyRef.current = true; setDirty(true);
+      setSaved(false);
     } catch (e: any) {
       alert(`막 생성 실패: ${e.message || e}`);
     } finally {
       setMembraneApplying(false);
     }
-  }, [options, selectedSurfaces, surfaceOffsets, membraneColorMode, membraneSpacing, membraneRadius, membraneOpacity]);
+  }, [selectedSurfaces, surfaceOffsets, membraneSpacing, membraneRadius, membraneOpacity, ensureOriginalScene, buildRotatedScene, loadMembraneEntity, removeMembraneEntity]);
 
   // ── Brush/BBox state ──
   const [paintMode, setPaintMode] = useState<PaintMode>('union');
@@ -400,8 +701,62 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     setSplatLoaded(false);
   }, [options?.currentUrl]);
 
-  // ── 정제 파이프라인 state ──
-  const sourceKeyRef = useRef<string | null>(null);
+  // ── localStorage 복원: uploadId 진입 시 1회 ──
+  const loadedUploadIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    const uid = options?.uploadId;
+    if (!uid || loadedUploadIdRef.current === uid) return;
+    const saved = loadRefineState(uid);
+    if (!saved) { loadedUploadIdRef.current = uid; return; }
+
+    restoringRef.current = true;
+    // 천장/바닥
+    if (saved.cfConfirmed) {
+      setCeilingY(saved.ceilingY); setFloorY(saved.floorY);
+      ceilingYRef.current = saved.ceilingY; floorYRef.current = saved.floorY;
+      setCfMode('confirmed'); cfModeRef.current = 'confirmed';
+    }
+    // 벽면
+    if (saved.wallConfirmed && saved.wallAngle !== null && saved.wallDistances) {
+      setWallAngle(saved.wallAngle); wallAngleRef.current = saved.wallAngle;
+      setWallDistances(saved.wallDistances); wallDistancesRef.current = saved.wallDistances;
+      setWallMode('confirmed'); wallModeRef.current = 'confirmed';
+    }
+    // 경계면 선택
+    setSelectedSurfaces(new Set(saved.selectedSurfaces as Surface[]));
+    setSurfaceOffsets(saved.surfaceOffsets as Record<Surface, number>);
+    setOffsetText(saved.offsetText as Record<Surface, string>);
+    // 막 파라미터
+    setMembraneSpacing(saved.membraneSpacing);
+    setMembraneRadius(saved.membraneRadius);
+    setMembraneOpacity(saved.membraneOpacity);
+    // PLY 자체는 메모리에서만 다루므로 세션 간 복원 안 함. 항상 원본부터 시작.
+
+    loadedUploadIdRef.current = uid;
+    // 한 틱 뒤 복원 플래그 해제
+    setTimeout(() => { restoringRef.current = false; }, 0);
+  }, [options?.uploadId]);
+
+  // ── localStorage 저장: 관련 state 변경 시마다 ──
+  useEffect(() => {
+    const uid = options?.uploadId;
+    if (!uid || restoringRef.current || loadedUploadIdRef.current !== uid) return;
+    saveRefineState(uid, {
+      cfConfirmed: cfMode === 'confirmed',
+      ceilingY, floorY,
+      wallConfirmed: wallMode === 'confirmed',
+      wallAngle, wallDistances,
+      selectedSurfaces: Array.from(selectedSurfaces),
+      surfaceOffsets, offsetText,
+      membraneSpacing, membraneRadius, membraneOpacity,
+    });
+  }, [
+    options?.uploadId, undoDepth,
+    cfMode, ceilingY, floorY,
+    wallMode, wallAngle, wallDistances,
+    selectedSurfaces, surfaceOffsets, offsetText,
+    membraneSpacing, membraneRadius, membraneOpacity,
+  ]);
 
   const syncPlanes = useCallback(() => setPlanes([...planesRef.current]), []);
 
@@ -500,9 +855,24 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       bandWall = Math.min(Math.abs(b1 - a1), Math.abs(b2 - a2)) * 0.03;
     }
 
+    // pendingRotation을 가우시안 좌표에 적용해서 평면(A' 프레임)과 비교 — flatten/막과 동일한 프레임
+    const { rotX, rotZ } = pendingRotationRef.current;
+    const rotActive = rotX !== 0 || rotZ !== 0;
+    const rcx = Math.cos(rotX), rsx = Math.sin(rotX);
+    const rcz = Math.cos(rotZ), rsz = Math.sin(rotZ);
+
     for (let i = 0; i < data.numSplats; i++) {
       const idx = i * 4;
-      const x = data.posX[i], y = data.posY[i], z = data.posZ[i];
+      const x0 = data.posX[i], y0 = data.posY[i], z0 = data.posZ[i];
+      // A → A' 회전 (rotateScene과 동일 식)
+      let x: number, y: number, z: number;
+      if (rotActive) {
+        x = rcz * x0 - rsz * rcx * y0 + rsz * rsx * z0;
+        y = rsz * x0 + rcz * rcx * y0 - rcz * rsx * z0;
+        z = rsx * y0 + rcx * z0;
+      } else {
+        x = x0; y = y0; z = z0;
+      }
       let bestSurf: string | null = null;
       let bestD = Infinity;
 
@@ -528,69 +898,11 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     try { data.colorTexture.unlock(); } catch {}
   }, [coreRef]);
 
-  const toggleDeletedPreview = useCallback((on: boolean) => {
-    const data = splatDataRef.current; const core = coreRef.current;
-    if (!data?.colorTexture || !data?.origColorData || !core) return;
-
-    if (!on) {
-      let td: Uint16Array | null = null;
-      try { td = data.colorTexture.lock(); } catch { return; }
-      if (!td) return;
-      td.set(data.origColorData);
-      try { data.colorTexture.unlock(); } catch {}
-      setShowDeletedOnly(false);
-      applySurfaceHighlight();
-      return;
-    }
-
-    if (selectedSurfaces.size === 0) return;
-    const hasWall = Array.from(selectedSurfaces).some(s => WALL_SURFACES.includes(s));
-    if (hasWall && (wallAngleRef.current === null || !wallDistancesRef.current)) return;
-
-    const allPlanes = surfacePlanesFromRoom({
-      angleDeg: wallAngleRef.current ?? 0,
-      walls: wallDistancesRef.current ?? [0, 0, 0, 0],
-      ceilingY: ceilingYRef.current,
-      floorY: floorYRef.current,
-    });
-    const planes = allPlanes.filter(p => selectedSurfaces.has(p.id as Surface));
-    const marginOut = Math.max(...Array.from(selectedSurfaces).map(s => surfaceOffsets[s]));
-
-    const keepMask = new Uint8Array(data.numSplats);
-    keepMask.fill(1);
-    for (let i = 0; i < data.numSplats; i++) {
-      const x = data.posX[i], y = data.posY[i], z = data.posZ[i];
-      for (const plane of planes) {
-        const sd = signedDistance(plane, x, y, z);
-        if (sd > 0.03 && sd > marginOut) { keepMask[i] = 0; break; }
-      }
-    }
-
-    let td: Uint16Array | null = null;
-    try { td = data.colorTexture.lock(); } catch { return; }
-    if (!td) return;
-    const orig = data.origColorData;
-    const f2h = core.float2Half;
-    const zeroAlpha = f2h(0);
-    for (let i = 0; i < data.numSplats; i++) {
-      const idx = i * 4;
-      if (keepMask[i]) {
-        td[idx] = orig[idx]; td[idx + 1] = orig[idx + 1]; td[idx + 2] = orig[idx + 2];
-        td[idx + 3] = zeroAlpha;
-      } else {
-        td[idx] = orig[idx]; td[idx + 1] = orig[idx + 1]; td[idx + 2] = orig[idx + 2]; td[idx + 3] = orig[idx + 3];
-      }
-    }
-    try { data.colorTexture.unlock(); } catch {}
-    setShowDeletedOnly(true);
-  }, [coreRef, selectedSurfaces, surfaceOffsets, applySurfaceHighlight]);
-
   // Sync ref + re-tint whenever selection changes
   useEffect(() => {
     selectedSurfacesRef.current = selectedSurfaces;
-    if (showDeletedOnly) toggleDeletedPreview(true);
-    else applySurfaceHighlight();
-  }, [selectedSurfaces, applySurfaceHighlight, showDeletedOnly, toggleDeletedPreview]);
+    applySurfaceHighlight();
+  }, [selectedSurfaces, applySurfaceHighlight]);
 
   // ── Restore original colors (mode switch) ──
   const clearHighlight = useCallback(() => {
@@ -646,16 +958,73 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   }, [coreRef, syncPlanes]);
 
   // ── Save refined result ──
-  const [saving, setSaving] = useState(false);
-  const [saved, setSaved] = useState(false);
+  // 정제 중에는 어떤 PLY/베이크도 일어나지 않는다. "정제 결과 저장"을 누를 때만
+  // 원본 PLY를 한 번 파싱하고, 누적된 의도(회전 + flatten 마스크 + 브러시 삭제 + 막)를
+  // 한 번에 베이크해 단일 PLY로 업로드한다.
   const saveRefined = useCallback(async () => {
-    if (!options?.uploadId || !sourceKeyRef.current) return;
+    if (!options?.uploadId) return;
+    if (!dirtyRef.current) {
+      alert('먼저 정제 작업을 한 번 이상 적용해야 합니다.');
+      return;
+    }
     setSaving(true);
     try {
+      const { serializePly, filterScene, concatScenes } = await import('@/lib/ply');
+      const { rotateScene } = await import('@/lib/gs');
       const { api } = await import('@/lib/api');
+
+      const original = await ensureOriginalScene();
+      const N = original.numSplats;
+      const data = splatDataRef.current;
+      const core = coreRef.current;
+
+      // 1) 통합 keep 마스크 빌드: 브러시 삭제(origColorData alpha=0) ∪ flatten 마스크
+      const keep = new Uint8Array(N).fill(1);
+      // 브러시 삭제 반영
+      if (data?.origColorData && core) {
+        const h2f = core.half2Float;
+        for (let i = 0; i < N; i++) {
+          const a = h2f(data.origColorData[i * 4 + 3]);
+          if (a < 1e-3) keep[i] = 0;
+        }
+      }
+      // flatten 마스크 반영
+      if (flattenMaskRef.current) {
+        for (let i = 0; i < N; i++) if (flattenMaskRef.current[i]) keep[i] = 0;
+      }
+
+      // 2) 필터링 (원본 → 살릴 가우시안만)
+      let baked = filterScene(original, keep);
+
+      // 3) 회전 베이크 (살린 가우시안만 회전)
+      const { rotX, rotZ } = pendingRotationRef.current;
+      if (rotX !== 0 || rotZ !== 0) {
+        rotateScene(baked, rotX, rotZ);
+      }
+
+      // 4) 막 합치기 (이미 A' 프레임으로 생성됨)
+      if (membraneSceneRef.current) {
+        baked = concatScenes(baked, membraneSceneRef.current);
+      }
+
+      console.log(`[Save] baked: ${baked.numSplats} gaussians (rot=${rotX},${rotZ}, membrane=${membraneSceneRef.current?.numSplats ?? 0})`);
+
+      const bytes = serializePly(baked);
+
+      const urlReq = await api.post<{ put_url: string; get_url: string; key: string }>(
+        '/refine/refined-upload-url',
+        { upload_id: options.uploadId, filename: 'final.ply' },
+      );
+      const putResp = await fetch(urlReq.put_url, {
+        method: 'PUT',
+        body: bytes,
+        headers: { 'Content-Type': 'application/octet-stream' },
+      });
+      if (!putResp.ok) throw new Error(`MinIO PUT failed: ${putResp.status}`);
+
       await api.post<{ scene_id: string; message: string }>('/refine/save', {
         upload_id: options.uploadId,
-        source_key: sourceKeyRef.current,
+        source_key: urlReq.key,
       });
       setSaved(true);
     } catch (e: any) {
@@ -663,7 +1032,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     } finally {
       setSaving(false);
     }
-  }, [options]);
+  }, [options, ensureOriginalScene, coreRef]);
 
   // ── Brush/BBox: delete selected (repeatable) ──
   const deleteSelected = useCallback(() => {
@@ -700,6 +1069,8 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   }, [pushHistory, refreshSelection]);
 
   // ── Reset all (pristine) ──
+  // 모든 의도(회전 / flatten / 막) 초기화 + GPU 색 복원 + 메인 entity transform 베이스로 복귀.
+  // 메인 씬 reload는 안 함 (PLY 데이터는 절대 안 건드리는 모델이라 reload 필요 없음).
   const resetAll = useCallback(async () => {
     const data = splatDataRef.current; const pristine = pristineRef.current;
     if (data && pristine && data.colorTexture) {
@@ -719,20 +1090,54 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     setWallModalOpen(false);
     // 경계면 선택
     setSelectedSurfaces(new Set()); selectedSurfacesRef.current = new Set();
-    // 정제 누적 결과
-    sourceKeyRef.current = null;
+    // 정제 의도 초기화
+    pendingRotationRef.current = { rotX: 0, rotZ: 0 };
+    setPendingRotation({ rotX: 0, rotZ: 0 });
+    flattenMaskRef.current = null;
+    flattenActiveRef.current = false; setFlattenActive(false);
+    flattenVisibleRef.current = true; setFlattenVisible(true);
+    membraneSceneRef.current = null;
+    membraneActiveRef.current = false; setMembraneActive(false);
+    cfRotationLockedRef.current = false; setCfRotationLocked(false);
+    removeMembraneEntity();
+    // 메인 entity transform 베이스 회전(180Z)으로 복귀
+    applyEntityRotation();
+    // undo + dirty
+    opHistoryRef.current = [];
+    setUndoDepth(0);
+    dirtyRef.current = false;
+    setDirty(false);
     setSaved(false);
-    // 뷰어를 원본 PLY로 되돌림
-    if (options?.uploadId && options?.reloadWithUrl) {
-      try {
-        const { api } = await import('@/lib/api');
-        const res = await api.get<{ url: string }>(`/uploads/${options.uploadId}/presigned-url`);
-        options.reloadWithUrl(res.url);
-      } catch (e) {
-        console.error('원본 다시 불러오기 실패', e);
-      }
+    if (options?.uploadId) clearRefineState(options.uploadId);
+  }, [options, applyEntityRotation, removeMembraneEntity]);
+
+  // ── Undo: 통합 op 히스토리에서 가장 최근 작업 하나 되돌림 ──
+  const undoLast = useCallback(async () => {
+    if (opHistoryRef.current.length === 0) return;
+    const rec = opHistoryRef.current.pop()!;
+    setUndoDepth(opHistoryRef.current.length);
+    setSaved(false);
+
+    if (rec.type === 'rotation') {
+      pendingRotationRef.current = rec.prevRotation;
+      setPendingRotation(rec.prevRotation);
+      applyEntityRotation();
+    } else if (rec.type === 'flatten') {
+      flattenMaskRef.current = rec.prevMask;
+      flattenActiveRef.current = rec.prevActive; setFlattenActive(rec.prevActive);
+      paintFlattenMask();
     }
-  }, [options]);
+    // membrane은 별도 op로 추적하지 않음 (apply 시 모든 의도가 베이크되어 op history가 비워짐).
+    // 막 제거 = 전체 리셋이라 undo로 도달할 수 없음.
+
+    const stillDirty = opHistoryRef.current.length > 0
+      || pendingRotationRef.current.rotX !== 0
+      || pendingRotationRef.current.rotZ !== 0
+      || flattenActiveRef.current
+      || membraneActiveRef.current;
+    dirtyRef.current = stillDirty;
+    setDirty(stillDirty);
+  }, [applyEntityRotation, paintFlattenMask]);
 
   // ── BBox selection apply ──
   const applyBboxSel = useCallback((mn: Vec3, mx: Vec3) => {
@@ -764,6 +1169,22 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     splatDataRef.current = data; setTotalCount(data.numSplats); setSplatLoaded(true);
     if (data.origColorData) pristineRef.current = new Uint16Array(data.origColorData);
     selectionRef.current = new Uint8Array(data.numSplats);
+
+    // 새 splatData 수신 시 누적 회전 / flatten 마스크가 있으면 즉시 시각 동기화
+    // (페이지 새로고침 후 persistence 복원이나 reset 후 등에서 호출됨)
+    setTimeout(() => {
+      applyEntityRotation();
+      if (flattenActiveRef.current && flattenMaskRef.current) {
+        // splatData가 새로 로드된 경우, 이전 마스크의 길이가 다를 수 있으니 검사
+        if (flattenMaskRef.current.length === data.numSplats) {
+          paintFlattenMask();
+        } else {
+          // 길이 불일치 → 마스크 무효
+          flattenMaskRef.current = null;
+          flattenActiveRef.current = false; setFlattenActive(false);
+        }
+      }
+    }, 0);
 
     let mnX=Infinity,mnY=Infinity,mnZ=Infinity,mxX=-Infinity,mxY=-Infinity,mxZ=-Infinity;
     for (let i = 0; i < data.numSplats; i++) {
@@ -1243,34 +1664,16 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
                 className="px-2 py-1 bg-gray-700 hover:bg-gray-600 disabled:bg-gray-800 disabled:opacity-50 text-gray-200 rounded cursor-pointer disabled:cursor-not-allowed text-[11px]">
                 전체 선택/해제
               </button>
-              <div className="flex gap-1">
-                <button onClick={() => applyFlatten()} disabled={flattening || membraneApplying || selectedSurfaces.size === 0}
-                  className="flex-1 px-2 py-1.5 bg-red-600 hover:bg-red-500 disabled:bg-gray-600 text-white rounded cursor-pointer text-xs font-bold">
-                  {flattening ? '처리 중...' : '바깥 제거'}
-                </button>
-                <button onClick={() => toggleDeletedPreview(!showDeletedOnly)} disabled={selectedSurfaces.size === 0}
-                  className={`px-2 py-1.5 rounded cursor-pointer text-xs font-bold ${
-                    showDeletedOnly
-                      ? 'bg-yellow-500 text-black'
-                      : 'bg-gray-700 hover:bg-gray-600 text-gray-300'
-                  } disabled:bg-gray-800 disabled:text-gray-500`}>
-                  {showDeletedOnly ? '전체 보기' : '삭제 대상만'}
-                </button>
-              </div>
+              <button onClick={() => applyFlatten()}
+                disabled={flattening || membraneApplying || (!flattenActive && selectedSurfaces.size === 0)}
+                className={`w-full px-2 py-1.5 rounded cursor-pointer text-xs font-bold disabled:bg-gray-600 disabled:text-gray-400 ${
+                  flattenActive
+                    ? 'bg-amber-600 hover:bg-amber-500 text-white'
+                    : 'bg-red-600 hover:bg-red-500 text-white'
+                }`}>
+                {flattening ? '처리 중...' : (flattenActive ? '바깥 복원' : '바깥 제거')}
+              </button>
               <div className="border-t border-gray-700 pt-2 mt-1 space-y-1.5">
-                <div className="text-gray-400 text-[10px]">막 색상 모드</div>
-                <div className="flex gap-1">
-                  {([['white', '흰색'], ['knn-median', 'K-NN']] as const).map(([mode, label]) => (
-                    <button key={mode}
-                      onClick={() => setMembraneColorMode(mode)}
-                      className={`flex-1 px-1 py-1 rounded text-[10px] font-bold cursor-pointer ${
-                        membraneColorMode === mode
-                          ? 'bg-blue-500 text-white'
-                          : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
-                      }`}
-                    >{label}</button>
-                  ))}
-                </div>
                 {/* 막 파라미터 슬라이더 */}
                 <div className="space-y-1">
                   <div className="flex items-center gap-1.5 text-[10px]">
@@ -1295,7 +1698,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
                   </div>
                   <div className="flex items-center gap-1.5 text-[10px]">
                     <span className="text-gray-400 w-14">불투명도</span>
-                    <input type="range" min={0.05} max={1.0} step={0.05}
+                    <input type="range" min={0.01} max={1.0} step={0.01}
                       value={membraneOpacity}
                       onChange={(e) => setMembraneOpacity(parseFloat(e.target.value))}
                       className="flex-1 accent-blue-500 cursor-pointer" />
@@ -1304,10 +1707,18 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
                     </span>
                   </div>
                 </div>
-                <button onClick={() => applyMembrane()} disabled={flattening || membraneApplying || selectedSurfaces.size === 0}
-                  className="w-full px-2 py-1.5 bg-white hover:bg-gray-200 disabled:bg-gray-600 disabled:text-gray-400 text-black rounded cursor-pointer text-xs font-bold">
-                  {membraneApplying ? '처리 중...' : '얇은 막 씌우기'}
+                <button onClick={() => applyMembrane()}
+                  disabled={flattening || membraneApplying || (!membraneActive && selectedSurfaces.size === 0)}
+                  className={`w-full px-2 py-1.5 rounded cursor-pointer text-xs font-bold disabled:bg-gray-600 disabled:text-gray-400 ${
+                    membraneActive
+                      ? 'bg-amber-600 hover:bg-amber-500 text-white'
+                      : 'bg-white hover:bg-gray-200 text-black'
+                  }`}>
+                  {membraneApplying ? '처리 중...' : (membraneActive ? '막 제거하기' : '얇은 막 씌우기')}
                 </button>
+                {cfRotationLocked && (
+                  <div className="text-[9px] text-amber-400/80 text-center">막 활성 — 회전 잠김</div>
+                )}
               </div>
             </div>
 
@@ -1417,7 +1828,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         )}
 
         {/* Save */}
-        {options?.uploadId && sourceKeyRef.current && (
+        {options?.uploadId && dirty && (
           saved ? (
             <div className="mt-2 px-3 py-2 bg-green-800/50 text-green-300 rounded text-xs text-center font-bold">
               저장 완료
@@ -1430,10 +1841,20 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
           )
         )}
 
-        {/* Reset (공통) */}
-        <button onClick={resetAll} className="mt-1 px-3 py-1.5 bg-gray-600 hover:bg-gray-500 text-white rounded cursor-pointer text-xs">
-          전체 리셋
-        </button>
+        {/* Undo / Reset (공통) */}
+        <div className="mt-1 flex gap-1">
+          <button
+            onClick={undoLast}
+            disabled={undoDepth === 0}
+            className="flex-1 px-3 py-1.5 bg-amber-700 hover:bg-amber-600 disabled:bg-gray-700 disabled:text-gray-500 text-white rounded cursor-pointer disabled:cursor-not-allowed text-xs"
+            title="마지막 파괴적 작업(회전/바깥 제거/막 씌우기) 되돌리기"
+          >
+            되돌리기 {undoDepth > 0 ? `(${undoDepth})` : ''}
+          </button>
+          <button onClick={resetAll} className="flex-1 px-3 py-1.5 bg-gray-600 hover:bg-gray-500 text-white rounded cursor-pointer text-xs">
+            전체 리셋
+          </button>
+        </div>
       </div>
 
       {/* Ceiling/Floor Modal */}
@@ -1446,56 +1867,50 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
             numSplats={splatDataRef.current.numSplats}
             initialCeiling={cfMode !== 'none' ? ceilingY : null}
             initialFloor={cfMode !== 'none' ? floorY : null}
+            initialRotX={pendingRotation.rotX}
+            initialRotZ={pendingRotation.rotZ}
             onConfirm={async (lo, hi, rotX, rotZ) => {
               // modal: lo = 작은 Y (바닥), hi = 큰 Y (천장)
+              // rotX/rotZ는 raw posX/Y/Z에 적용될 절대 회전 (모달이 항상 raw에서 시작).
+              // 우리는 이를 곧 새로운 절대 pendingRotation으로 본다 (composition 회피).
               const c = hi, f = lo;
 
-              // 회전이 있으면 PLY에 영구 적용 → 업로드 → 재로드
-              if ((rotX !== 0 || rotZ !== 0) && options?.uploadId && options?.reloadWithUrl && options?.currentUrl) {
-                setCfModalOpen(false);
-                try {
-                  const [
-                    { fetchAndParsePly, serializePly },
-                    { rotateScene },
-                  ] = await Promise.all([
-                    import('@/lib/ply'),
-                    import('@/lib/gs'),
-                  ]);
-                  const { api } = await import('@/lib/api');
-                  const scene = await fetchAndParsePly(options.currentUrl);
-                  rotateScene(scene, rotX, rotZ);
-                  const bytes = serializePly(scene);
-                  const urlReq = await api.post<{ put_url: string; get_url: string; key: string }>(
-                    '/refine/refined-upload-url',
-                    { upload_id: options.uploadId, filename: 'rotated.ply' },
-                  );
-                  const putResp = await fetch(urlReq.put_url, {
-                    method: 'PUT', body: bytes,
-                    headers: { 'Content-Type': 'application/octet-stream' },
-                  });
-                  if (!putResp.ok) throw new Error(`MinIO PUT failed: ${putResp.status}`);
-                  setCeilingY(c); setFloorY(f);
-                  ceilingYRef.current = c; floorYRef.current = f;
-                  setCfMode('confirmed'); cfModeRef.current = 'confirmed';
-                  setSelectedSurfaces(prev => {
-                    const next = new Set(prev);
-                    CF_SURFACES.forEach(s => next.add(s));
-                    return next;
-                  });
-                  sourceKeyRef.current = urlReq.key;
-                  options.reloadWithUrl(urlReq.get_url);
-                } catch (e: any) {
-                  alert(`회전 적용 실패: ${e.message || e}`);
+              const newRot = { rotX, rotZ };
+              const oldRot = pendingRotationRef.current;
+              const rotChanged = (newRot.rotX !== oldRot.rotX) || (newRot.rotZ !== oldRot.rotZ);
+
+              // 옵션 A — 막이 이미 만들어졌다면 회전 lock
+              if (rotChanged && cfRotationLockedRef.current) {
+                alert('막이 이미 생성되어 회전을 적용할 수 없습니다. 회전을 더 하려면 막을 먼저 되돌려 주세요.');
+              } else if (rotChanged) {
+                pushOp({ type: 'rotation', prevRotation: { ...oldRot } });
+                pendingRotationRef.current = newRot;
+                setPendingRotation(newRot);
+                applyEntityRotation();
+                dirtyRef.current = true; setDirty(true);
+                setSaved(false);
+              }
+
+              // 회전 변경 후 flatten 마스크 / 벽 정의 무효화 (이전 회전 프레임 기준이라 stale).
+              if (rotChanged) {
+                if (flattenMaskRef.current) {
+                  flattenMaskRef.current = null;
+                  flattenActiveRef.current = false; setFlattenActive(false);
+                  paintFlattenMask();
                 }
-                return;
+                if (wallModeRef.current === 'confirmed') {
+                  setWallMode('none'); wallModeRef.current = 'none';
+                  setWallAngle(null); wallAngleRef.current = null;
+                  setWallDistances(null); wallDistancesRef.current = null;
+                }
               }
 
               setCeilingY(c); setFloorY(f);
               ceilingYRef.current = c; floorYRef.current = f;
               setCfMode('confirmed'); cfModeRef.current = 'confirmed';
               setCfModalOpen(false);
-              setSelectedSurfaces(prev => {
-                const next = new Set(prev);
+              setSelectedSurfaces(prevSel => {
+                const next = new Set(prevSel);
                 CF_SURFACES.forEach(s => next.add(s));
                 return next;
               });
@@ -1505,13 +1920,19 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         </Suspense>
       )}
 
-      {/* Wall Modal */}
-      {wallModalOpen && splatDataRef.current && cfMode === 'confirmed' && (
+      {/* Wall Modal — pendingRotation 적용된 좌표를 넘겨 A' 프레임에서 작업하도록 */}
+      {wallModalOpen && splatDataRef.current && cfMode === 'confirmed' && (() => {
+        const rp = buildRotatedPositions(
+          splatDataRef.current.posX,
+          splatDataRef.current.posY,
+          splatDataRef.current.posZ,
+        );
+        return (
         <Suspense fallback={null}>
           <WallModal
-            posX={splatDataRef.current.posX}
-            posY={splatDataRef.current.posY}
-            posZ={splatDataRef.current.posZ}
+            posX={rp.x}
+            posY={rp.y}
+            posZ={rp.z}
             numSplats={splatDataRef.current.numSplats}
             ceilingY={ceilingY}
             floorY={floorY}
@@ -1531,7 +1952,8 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
             onClose={() => setWallModalOpen(false)}
           />
         </Suspense>
-      )}
+        );
+      })()}
     </>
   ) : null;
 

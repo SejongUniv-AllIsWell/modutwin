@@ -6,8 +6,6 @@ const SH0 = 0.28209479177387814;
 const WHITE_F_DC = (1.0 - 0.5) / SH0;
 const EPS = 1e-8;
 
-export type MembraneColorMode = 'white' | 'knn-median';
-
 export interface MembraneRoomGeometry {
   angleDeg: number;
   walls: [number, number, number, number];
@@ -23,24 +21,44 @@ export interface MembraneOptions {
   patchOpacity: number;
   /** 패치 색 스무딩 반복 횟수 (0 = off) */
   colorSmoothIters: number;
+  /** 색 샘플링 시 패치 평면 ±이 거리(m) 안 가우시안만 KNN 후보로 사용. floater 배제용. */
+  depthGate: number;
 }
 
 export const DEFAULT_MEMBRANE_OPTIONS: MembraneOptions = {
-  gridSpacing: 0.02,
-  patchRadius: 0.05,
+  gridSpacing: 0.04,
+  patchRadius: 0.08,
   patchThickness: 0.002,
-  patchOpacity: 1.0,
+  patchOpacity: 0.25,
   colorSmoothIters: 2,
+  depthGate: 0.05,
 };
+
+/** 패치 최대 개수 — 초과 시 gridSpacing 자동 확대 */
+const MAX_PATCHES = 200_000;
 
 /** 선형 불투명도 → sigmoid logit (3DGS opacity 필드는 pre-sigmoid). */
 function opacityToLogit(a: number): number {
-  const clamped = Math.max(1e-4, Math.min(1 - 1e-4, a));
+  const clamped = Math.max(1e-5, Math.min(1 - 1e-5, a));
   return Math.log(clamped / (1 - clamped));
+}
+
+/**
+ * 슬라이더 값(=원하는 최종 벽 불투명도)을 패치 1개의 알파로 변환.
+ * 3DGS 누적: final = 1 - (1-α)^N. 따라서 α = 1 - (1-slider)^(1/N).
+ * 슬라이더 1.0은 항상 per-patch 1.0 (완전 불투명) 보장.
+ */
+function targetToPerPatchAlpha(targetAlpha: number, patchRadius: number, gridSpacing: number): number {
+  if (targetAlpha >= 0.999) return 1 - 1e-5;
+  if (targetAlpha <= 0.001) return 1e-5;
+  const overlap = Math.max(1, Math.PI * (patchRadius / gridSpacing) * (patchRadius / gridSpacing));
+  return 1 - Math.pow(1 - targetAlpha, 1 / overlap);
 }
 
 interface PatchInfo {
   x: number; y: number; z: number;
+  // 색 샘플링용 위치 (벽 표면, off 미반영). 벽 가우시안에 가까워야 KNN이 동작.
+  sx: number; sy: number; sz: number;
   nx: number; ny: number; nz: number;
   qw: number; qx: number; qy: number; qz: number;
 }
@@ -140,8 +158,10 @@ function generatePatchPositions(
         const u = uLo + (uHi - uLo) * (i / nu);
         for (let j = 0; j <= nv; j++) {
           const v = vLo + (vHi - vLo) * (j / nv);
+          const px = c * u - s * v, pz = s * u + c * v;
           patches.push({
-            x: c * u - s * v, y: yOut, z: s * u + c * v,
+            x: px, y: yOut, z: pz,
+            sx: px, sy: yBase, sz: pz,  // 색 샘플링은 벽 표면(yBase)에서
             nx, ny, nz, qw: q[0], qx: q[1], qy: q[2], qz: q[3],
           });
         }
@@ -164,10 +184,15 @@ function generatePatchPositions(
           const t = tMin + (tMax - tMin) * (j / tN);
           const uu = uFix !== null ? uFix : t;
           const vv = vFix !== null ? vFix : t;
+          // 벽 표면 위치 (off 미반영) — 색 샘플링용
+          const wallX = c * uu - s * vv;
+          const wallY = yV;
+          const wallZ = s * uu + c * vv;
           patches.push({
-            x: c * uu - s * vv + off * nx,
-            y: yV + off * ny,
-            z: s * uu + c * vv + off * nz,
+            x: wallX + off * nx,
+            y: wallY + off * ny,
+            z: wallZ + off * nz,
+            sx: wallX, sy: wallY, sz: wallZ,
             nx, ny, nz, qw: q[0], qx: q[1], qy: q[2], qz: q[3],
           });
         }
@@ -238,6 +263,7 @@ function colorByKnnMedian(
   scene: GaussianScene,
   k = 8,
   searchR = 0.5,
+  depthGate = 0.05,
 ): Float32Array {
   const grid = buildGrid(scene, searchR / 3);
   const sx = scene.attrs.get('x')!, sy = scene.attrs.get('y')!, sz = scene.attrs.get('z')!;
@@ -247,12 +273,18 @@ function colorByKnnMedian(
   const colors = new Float32Array(N * 3);
 
   for (let p = 0; p < N; p++) {
-    const { x, y, z } = patches[p];
-    const cands = grid.queryRadius(x, y, z, searchR);
+    const patch = patches[p];
+    // 색 샘플링은 벽 표면 위치(sx/sy/sz)에서 수행 — patch.x/y/z는 off만큼 밀려있음
+    const cx = patch.sx, cy = patch.sy, cz = patch.sz;
+    const { nx, ny, nz } = patch;
+    const cands = grid.queryRadius(cx, cy, cz, searchR);
 
     const dists: { idx: number; d2: number }[] = [];
     for (const idx of cands) {
-      const dx = sx[idx] - x, dy = sy[idx] - y, dz = sz[idx] - z;
+      const dx = sx[idx] - cx, dy = sy[idx] - cy, dz = sz[idx] - cz;
+      // depth gate: 벽 표면 평면으로부터 수직 거리. floater 배제.
+      const sd = dx * nx + dy * ny + dz * nz;
+      if (sd > depthGate || sd < -depthGate) continue;
       dists.push({ idx, d2: dx * dx + dy * dy + dz * dz });
     }
     dists.sort((a, b) => a.d2 - b.d2);
@@ -290,7 +322,11 @@ function buildMembraneScene(
 
   const logR = Math.log(opts.patchRadius);
   const logT = Math.log(opts.patchThickness);
-  const opacityLogit = opacityToLogit(opts.patchOpacity);
+  // 슬라이더 = 원하는 최종 벽 불투명도. 중첩 N 만큼 보정해 per-patch 알파 계산.
+  const perPatchAlpha = targetToPerPatchAlpha(opts.patchOpacity, opts.patchRadius, opts.gridSpacing);
+  const opacityLogit = opacityToLogit(perPatchAlpha);
+  const overlap = Math.PI * (opts.patchRadius / opts.gridSpacing) ** 2;
+  console.log(`[Membrane] target wall α=${opts.patchOpacity}, overlap≈${overlap.toFixed(1)}, per-patch α=${perPatchAlpha.toFixed(4)}, logit=${opacityLogit.toFixed(3)}`);
 
   for (let i = 0; i < N; i++) {
     const p = patches[i];
@@ -325,38 +361,29 @@ export async function generateMembrane(
   surfaceIds: string[],
   room: MembraneRoomGeometry,
   surfaceOffsets: Record<string, number>,
-  colorMode: MembraneColorMode,
-  sourceScene?: GaussianScene,
+  sourceScene: GaussianScene,
   options: Partial<MembraneOptions> = {},
 ): Promise<GaussianScene> {
   const opts = { ...DEFAULT_MEMBRANE_OPTIONS, ...options };
-  const { patches, groups } = generatePatchPositions(surfaceIds, room, surfaceOffsets, opts);
 
-  let patchColors: Float32Array;
-  if (colorMode === 'knn-median' && sourceScene) {
-    const gpuResult = await knnMedianGPU(patches, sourceScene);
-    if (gpuResult) {
-      patchColors = gpuResult;
-    } else {
-      console.log('[Membrane] WebGPU unavailable, falling back to CPU KNN');
-      patchColors = colorByKnnMedian(patches, sourceScene);
-    }
-    if (opts.colorSmoothIters > 0) smoothPatchColors(patchColors, groups, opts.colorSmoothIters);
-  } else {
-    patchColors = new Float32Array(patches.length * 3);
-    patchColors.fill(WHITE_F_DC);
+  // 패치 수 초과 시 gridSpacing 자동 확대
+  let result = generatePatchPositions(surfaceIds, room, surfaceOffsets, opts);
+  while (result.patches.length > MAX_PATCHES) {
+    opts.gridSpacing *= 1.5;
+    console.warn(`[Membrane] ${result.patches.length} patches > ${MAX_PATCHES}, gridSpacing → ${opts.gridSpacing.toFixed(3)}`);
+    result = generatePatchPositions(surfaceIds, room, surfaceOffsets, opts);
   }
+  const { patches, groups } = result;
+
+  const gpuResult = await knnMedianGPU(patches, sourceScene, 0.5, opts.depthGate);
+  let patchColors: Float32Array;
+  if (gpuResult) {
+    patchColors = gpuResult;
+  } else {
+    console.log('[Membrane] WebGPU unavailable, falling back to CPU KNN');
+    patchColors = colorByKnnMedian(patches, sourceScene, 8, 0.5, opts.depthGate);
+  }
+  if (opts.colorSmoothIters > 0) smoothPatchColors(patchColors, groups, opts.colorSmoothIters);
 
   return buildMembraneScene(patches, patchColors, propertyOrder, opts);
-}
-
-/** @deprecated Use generateMembrane with colorMode='white' */
-export async function generateWhiteMembrane(
-  propertyOrder: string[],
-  surfaceIds: string[],
-  room: MembraneRoomGeometry,
-  surfaceOffsets: Record<string, number>,
-  options: Partial<MembraneOptions> = {},
-): Promise<GaussianScene> {
-  return generateMembrane(propertyOrder, surfaceIds, room, surfaceOffsets, 'white', undefined, options);
 }

@@ -9,7 +9,7 @@ struct Params {
   cell_size: f32,
   search_r: f32,
   num_patches: u32,
-  _pad0: u32,
+  depth_gate: f32,
   grid_min: vec4<f32>,
   grid_dim: vec4<u32>,
 };
@@ -21,6 +21,7 @@ struct Params {
 @group(0) @binding(4) var<storage, read> sorted_idx: array<u32>;
 @group(0) @binding(5) var<uniform> params: Params;
 @group(0) @binding(6) var<storage, read_write> out_fdc: array<f32>;
+@group(0) @binding(7) var<storage, read> p_norm: array<f32>;
 
 const K = 8u;
 const WHITE = 1.7724539;
@@ -33,7 +34,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let px = p_pos[pid * 3u];
   let py = p_pos[pid * 3u + 1u];
   let pz = p_pos[pid * 3u + 2u];
+  let nx = p_norm[pid * 3u];
+  let ny = p_norm[pid * 3u + 1u];
+  let nz = p_norm[pid * 3u + 2u];
   let sr2 = params.search_r * params.search_r;
+  let dgate = params.depth_gate;
   let cs = params.cell_size;
   let gmin = params.grid_min.xyz;
   let gdim = params.grid_dim.xyz;
@@ -61,6 +66,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
           let dx = px - g_pos[gi * 3u];
           let dy = py - g_pos[gi * 3u + 1u];
           let dz = pz - g_pos[gi * 3u + 2u];
+          // depth gate: 패치 평면으로부터 수직 거리. floater 배제.
+          let sd = dx * nx + dy * ny + dz * nz;
+          if (sd > dgate || sd < -dgate) { continue; }
           let d2 = dx * dx + dy * dy + dz * dz;
           if (d2 >= sr2 || d2 >= kd[K - 1u]) { continue; }
           var ins = K - 1u;
@@ -97,7 +105,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 `;
 
-interface PatchPos { x: number; y: number; z: number }
+interface PatchPos { x: number; y: number; z: number; sx: number; sy: number; sz: number; nx: number; ny: number; nz: number }
 
 let cachedDevice: GPUDevice | null = null;
 let cachedPipeline: GPUComputePipeline | null = null;
@@ -192,6 +200,7 @@ export async function knnMedianGPU(
   patches: PatchPos[],
   scene: GaussianScene,
   searchR = 0.5,
+  depthGate = 0.05,
 ): Promise<Float32Array | null> {
   const device = await getDevice();
   if (!device) return null;
@@ -218,15 +227,18 @@ export async function knnMedianGPU(
   }
 
   const patchArr = new Float32Array(M * 3);
+  const patchNormArr = new Float32Array(M * 3);
   for (let i = 0; i < M; i++) {
-    patchArr[i * 3] = patches[i].x; patchArr[i * 3 + 1] = patches[i].y; patchArr[i * 3 + 2] = patches[i].z;
+    // 색 샘플링은 벽 표면 위치(sx/sy/sz)에서 수행 — patch.x/y/z는 off만큼 밀려있음
+    patchArr[i * 3] = patches[i].sx; patchArr[i * 3 + 1] = patches[i].sy; patchArr[i * 3 + 2] = patches[i].sz;
+    patchNormArr[i * 3] = patches[i].nx; patchNormArr[i * 3 + 1] = patches[i].ny; patchNormArr[i * 3 + 2] = patches[i].nz;
   }
 
   // Params uniform (48 bytes)
   const paramsBuf = new ArrayBuffer(48);
   const pf = new Float32Array(paramsBuf);
   const pu = new Uint32Array(paramsBuf);
-  pf[0] = grid.cellSize; pf[1] = searchR; pu[2] = M; pu[3] = 0;
+  pf[0] = grid.cellSize; pf[1] = searchR; pu[2] = M; pf[3] = depthGate;
   pf[4] = grid.minX; pf[5] = grid.minY; pf[6] = grid.minZ; pf[7] = 0;
   pu[8] = grid.dimX; pu[9] = grid.dimY; pu[10] = grid.dimZ; pu[11] = 0;
 
@@ -240,6 +252,7 @@ export async function knnMedianGPU(
 
   const outSize = M * 3 * 4;
   const b6 = device.createBuffer({ size: outSize, usage: S | GPUBufferUsage.COPY_SRC });
+  const b7 = makeBuf(device, patchNormArr.buffer, S);
   const readBuf = device.createBuffer({ size: outSize, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
 
   const bindGroup = device.createBindGroup({
@@ -252,6 +265,7 @@ export async function knnMedianGPU(
       { binding: 4, resource: { buffer: b4 } },
       { binding: 5, resource: { buffer: b5 } },
       { binding: 6, resource: { buffer: b6 } },
+      { binding: 7, resource: { buffer: b7 } },
     ],
   });
 
@@ -268,7 +282,7 @@ export async function knnMedianGPU(
   const result = new Float32Array(readBuf.getMappedRange().slice(0));
   readBuf.unmap();
 
-  [b0, b1, b2, b3, b4, b5, b6, readBuf].forEach(b => b.destroy());
+  [b0, b1, b2, b3, b4, b5, b6, b7, readBuf].forEach(b => b.destroy());
 
   console.log(`[GPU KNN] ${M} patches, ${N} gaussians → ${(performance.now() - t0).toFixed(0)}ms`);
   return result;
