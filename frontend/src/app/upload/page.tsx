@@ -18,7 +18,7 @@ export default function UploadPage() {
   return (
     <div className="max-w-2xl mx-auto px-4 py-8">
       <h1 className="text-2xl font-bold mb-2">업로드</h1>
-      <p className="text-gray-400 text-sm mb-8">건물 내부 영상 또는 3D 씬 파일(.ply, .splat, .sog)을 업로드하세요.</p>
+      <p className="text-gray-400 text-sm mb-8">건물 내부 영상 또는 3DGS 결과 파일(.ply / .splat / .sog)을 업로드하세요.</p>
       <MultipartUploader />
     </div>
   );

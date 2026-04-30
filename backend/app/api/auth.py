@@ -15,7 +15,7 @@ from app.core.security import (
     hash_token,
     get_current_user,
 )
-from app.models import User, Session
+from app.models import User, Session, UserRole
 from app.schemas.auth import (
     TokenResponse,
     RefreshRequest,
@@ -78,8 +78,13 @@ async def dev_login(request: Request, db: AsyncSession = Depends(get_db)):
             email=DEV_EMAIL,
             name=DEV_NAME,
             avatar_url=None,
+            role=UserRole.admin,
         )
         db.add(user)
+        await db.flush()
+    elif user.role != UserRole.admin:
+        # DEV_MODE 진입 시 기존 dev 유저도 admin 으로 승격
+        user.role = UserRole.admin
         await db.flush()
 
     access_token = create_access_token(str(user.id), user.role.value)

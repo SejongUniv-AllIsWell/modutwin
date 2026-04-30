@@ -38,10 +38,13 @@ export interface SplatViewerCoreRef {
   onUpdate: (cb: (dt: number) => void) => () => void;
   /** PlayCanvas app.drawLine 래퍼 */
   drawLine: (a: [number, number, number], b: [number, number, number], color: [number, number, number, number], depthTest?: boolean) => void;
+  /** 메인 splat 엔티티 visibility 토글 */
+  setMainVisible: (visible: boolean) => void;
 }
 
 interface SplatViewerCoreProps {
-  sogUrl: string;
+  /** 없으면 빈 viewer만 표시 (카메라/기즈모만 활성). */
+  sogUrl?: string | null;
   onSplatLoaded?: (data: SplatData) => void;
   children?: React.ReactNode;
 }
@@ -71,6 +74,12 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
     const [cameraMode, setCameraMode] = useState<CameraMode>('fly');
     const [moveSpeed, setMoveSpeed] = useState(0.5);
     const [shiftActive, setShiftActive] = useState(false);
+    /**
+     * PlayCanvas 앱이 준비되어 splat 로드를 받을 수 있는 상태.
+     * - 마운트 시 false → init useEffect의 async 초기화가 끝나면 true
+     * - sogUrl 변경 → splat-load useEffect는 appReady===true일 때만 동작
+     */
+    const [appReady, setAppReady] = useState(false);
 
     const cameraModeRef = useRef<CameraMode>('fly');
     const moveSpeedRef = useRef(0.5);
@@ -78,10 +87,18 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
     const cameraEntityRef = useRef<any>(null);
     const canvasRef = useRef<HTMLCanvasElement | null>(null);
     const splatDataRef = useRef<SplatData | null>(null);
+    const splatEntityRef = useRef<any>(null);
     const syncOrbitFromFlyRef = useRef<() => void>(() => {});
     const float2HalfRef = useRef<(v: number) => number>((v) => v);
     const updateCallbacksRef = useRef<Set<(dt: number) => void>>(new Set());
     const pcRef = useRef<any>(null);
+    // splat 로드 인터페이스 — init 완료 후 첫 useEffect에서 채워짐.
+    // 두 번째 useEffect (sogUrl 변경 트리거) 가 호출.
+    const loadSplatRef = useRef<((url: string) => void) | null>(null);
+    const clearSplatRef = useRef<(() => void) | null>(null);
+    // 콜백 identity가 매 렌더마다 바뀌어도 effect가 재실행되지 않도록 ref로 보관
+    const onSplatLoadedRef = useRef(onSplatLoaded);
+    useEffect(() => { onSplatLoadedRef.current = onSplatLoaded; }, [onSplatLoaded]);
 
     // ── 외부 노출 API ──
     useImperativeHandle(ref, () => ({
@@ -108,6 +125,10 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
           depthTest,
         );
       },
+      setMainVisible: (visible: boolean) => {
+        const ent = splatEntityRef.current;
+        if (ent) ent.enabled = visible;
+      },
     }));
 
     // ── Shift 키 상태 추적 (이동속도 표시에 반영) ──
@@ -128,13 +149,17 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
       };
     }, []);
 
-    // ── PlayCanvas 초기화 ──
+    // ── PlayCanvas 초기화 (mount-once) ──
+    // 앱/카메라/입력 처리는 마운트 시 한 번만 만들어 splat 교체 시에도 유지한다.
+    // splat 자체의 로드/교체는 아래 두 번째 useEffect가 sogUrl을 보고 처리.
     useEffect(() => {
-      if (!containerRef.current || !sogUrl) return;
+      if (!containerRef.current) return;
 
       let app: any = null;
       let destroyed = false;
       const cleanups: (() => void)[] = [];
+      // 현재 진행 중인 splat 로드의 cancel 토큰. loadSplat 호출 시 이전 진행을 취소.
+      let activeCancel: (() => void) | null = null;
 
       (async () => {
         try {
@@ -383,84 +408,122 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
             syncCamera();
           }, { passive: false });
 
-          // ── GSplat 로딩 ──
-          const asset = new pc.Asset('splat', 'gsplat', { url: sogUrl });
-          app.assets.add(asset);
-          asset.on('error', (_: string, err: Error) => {
-            if (!destroyed) setError(`파일 로드 실패: ${err?.message ?? '알 수 없는 오류'}`);
-            setLoading(false);
-          });
+          // ── splat 로드/교체 인터페이스 ──
+          // 옛 entity는 새 asset이 ready된 시점에 destroy → 화면이 비는 순간이 없다.
+          const loadSplat = (url: string) => {
+            // 이전 진행 중 로드 취소 (asset.ready 콜백이 더 이상 entity를 만들지 않게 함)
+            activeCancel?.();
 
-          asset.ready(() => {
-            if (destroyed) return;
+            let cancelled = false;
+            activeCancel = () => { cancelled = true; };
 
-            const splatEntity = new pc.Entity('splat');
-            // SuperSplat과 동일한 PLY 로드 기본 회전 (SPZ는 (0,0,0), PLY/기타는 Z축 180°)
-            const ext = sogUrl.split('?')[0].split('.').pop()?.toLowerCase();
-            if (ext !== 'spz') {
-              splatEntity.setLocalEulerAngles(0, 0, 180);
-            }
-            splatEntity.addComponent('gsplat', { asset });
-            app.root.addChild(splatEntity);
+            setLoading(true);
+            setError(null);
 
-            // 카메라 초기 위치
-            const mi = (splatEntity as any).gsplat?.meshInstance;
-            if (mi?.aabb) {
-              const aabb = mi.aabb;
-              const size = aabb.halfExtents.length();
-              if (cameraModeRef.current === 'fly') {
-                camPos.set(aabb.center.x, aabb.center.y, aabb.center.z + size * 2.5);
-              } else {
-                orbitRadius = size * 2.5;
-                orbitTarget.copy(aabb.center);
+            const asset = new pc.Asset('splat', 'gsplat', { url });
+            app.assets.add(asset);
+
+            asset.on('error', (_msg: string, err: Error) => {
+              if (cancelled || destroyed) return;
+              setError(`파일 로드 실패: ${err?.message ?? '알 수 없는 오류'}`);
+              setLoading(false);
+            });
+
+            asset.ready(() => {
+              if (cancelled || destroyed) return;
+
+              // 이전 splat 제거 (이 시점에 이미 새 asset이 GPU에 올라왔으므로 화면이 비지 않음)
+              if (splatEntityRef.current) {
+                try { splatEntityRef.current.destroy(); } catch {}
+                splatEntityRef.current = null;
               }
-              azim = 0;
-              elev = 0;
-              syncCamera();
-            }
+              splatDataRef.current = null;
 
-            // PlayCanvas 2.x: gsplatData
-            const resource = asset.resource as any;
-            const gsplatData = resource?.gsplatData;
-            if (gsplatData) {
-              const n = gsplatData.numSplats;
-              const posX = gsplatData.getProp('x') as Float32Array;
-              const posY = gsplatData.getProp('y') as Float32Array;
-              const posZ = gsplatData.getProp('z') as Float32Array;
+              const splatEntity = new pc.Entity('splat');
+              // SuperSplat과 동일한 PLY 로드 기본 회전 (SPZ는 (0,0,0), PLY/기타는 Z축 180°)
+              const ext = url.split('?')[0].split('.').pop()?.toLowerCase();
+              if (ext !== 'spz') {
+                splatEntity.setLocalEulerAngles(0, 0, 180);
+              }
+              splatEntity.addComponent('gsplat', { asset });
+              app.root.addChild(splatEntity);
+              splatEntityRef.current = splatEntity;
 
-              const colorTex = resource?.streams?.textures?.get('splatColor') ?? null;
-              let origColorData: Uint16Array | null = null;
-              if (colorTex) {
-                const td = colorTex.lock();
-                if (td) {
-                  origColorData = new Uint16Array(td.length);
-                  origColorData.set(td);
-                  colorTex.unlock();
+              // 카메라 초기 위치
+              const mi = (splatEntity as any).gsplat?.meshInstance;
+              if (mi?.aabb) {
+                const aabb = mi.aabb;
+                const size = aabb.halfExtents.length();
+                if (cameraModeRef.current === 'fly') {
+                  camPos.set(aabb.center.x, aabb.center.y, aabb.center.z + size * 2.5);
+                } else {
+                  orbitRadius = size * 2.5;
+                  orbitTarget.copy(aabb.center);
                 }
+                azim = 0;
+                elev = 0;
+                syncCamera();
               }
 
-              const transformATex = resource?.streams?.textures?.get('transformA') ?? null;
-              const transformBTex = resource?.streams?.textures?.get('transformB') ?? null;
+              // PlayCanvas 2.x: gsplatData
+              const resource = asset.resource as any;
+              const gsplatData = resource?.gsplatData;
+              if (gsplatData) {
+                const n = gsplatData.numSplats;
+                const posX = gsplatData.getProp('x') as Float32Array;
+                const posY = gsplatData.getProp('y') as Float32Array;
+                const posZ = gsplatData.getProp('z') as Float32Array;
 
-              const data: SplatData = {
-                numSplats: n,
-                posX, posY, posZ,
-                colorTexture: colorTex,
-                origColorData,
-                splatEntity,
-                transformATexture: transformATex,
-                transformBTexture: transformBTex,
-                resource,
-                gsplatData,
-              };
-              splatDataRef.current = data;
-              onSplatLoaded?.(data);
+                const colorTex = resource?.streams?.textures?.get('splatColor') ?? null;
+                let origColorData: Uint16Array | null = null;
+                if (colorTex) {
+                  const td = colorTex.lock();
+                  if (td) {
+                    origColorData = new Uint16Array(td.length);
+                    origColorData.set(td);
+                    colorTex.unlock();
+                  }
+                }
+
+                const transformATex = resource?.streams?.textures?.get('transformA') ?? null;
+                const transformBTex = resource?.streams?.textures?.get('transformB') ?? null;
+
+                const data: SplatData = {
+                  numSplats: n,
+                  posX, posY, posZ,
+                  colorTexture: colorTex,
+                  origColorData,
+                  splatEntity,
+                  transformATexture: transformATex,
+                  transformBTexture: transformBTex,
+                  resource,
+                  gsplatData,
+                };
+                splatDataRef.current = data;
+                onSplatLoadedRef.current?.(data);
+              }
+
+              setLoading(false);
+            });
+
+            app.assets.load(asset);
+          };
+
+          const clearSplat = () => {
+            activeCancel?.();
+            activeCancel = null;
+            if (splatEntityRef.current) {
+              try { splatEntityRef.current.destroy(); } catch {}
+              splatEntityRef.current = null;
             }
-
+            splatDataRef.current = null;
             setLoading(false);
-          });
+            setError(null);
+          };
 
-          app.assets.load(asset);
+          loadSplatRef.current = loadSplat;
+          clearSplatRef.current = clearSplat;
+
           app.start();
 
           const ro = new ResizeObserver(() => {
@@ -474,6 +537,9 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
           ro.observe(containerRef.current!);
           const origDestroy = app.destroy.bind(app);
           app.destroy = () => { ro.disconnect(); origDestroy(); };
+
+          // 두 번째 useEffect (sogUrl-trigger)가 동작할 수 있도록 ready 신호.
+          if (!destroyed) setAppReady(true);
         } catch (e: any) {
           if (!destroyed) setError(e?.message ?? '뷰어 초기화에 실패했습니다.');
           setLoading(false);
@@ -482,9 +548,13 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
 
       return () => {
         destroyed = true;
+        activeCancel?.();
         cleanups.forEach(fn => fn());
         splatDataRef.current = null;
+        splatEntityRef.current = null;
         appRef.current = null;
+        loadSplatRef.current = null;
+        clearSplatRef.current = null;
         updateCallbacksRef.current.clear();
         if (app) { try { app.destroy(); } catch { } }
         if (containerRef.current) {
@@ -492,7 +562,18 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
           if (c) containerRef.current.removeChild(c);
         }
       };
-    }, [sogUrl, onSplatLoaded]);
+    }, []);
+
+    // ── splat 로드/교체 (sogUrl 변경 시) ──
+    // 앱은 그대로 유지하면서 entity만 교체. 옛 entity는 새 asset.ready 시점에 destroy.
+    useEffect(() => {
+      if (!appReady) return;
+      if (sogUrl) {
+        loadSplatRef.current?.(sogUrl);
+      } else {
+        clearSplatRef.current?.();
+      }
+    }, [sogUrl, appReady]);
 
     const toggleMode = () => {
       const next = cameraMode === 'fly' ? 'orbit' : 'fly';
@@ -505,7 +586,7 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
       <div className="relative w-full h-full min-h-[400px] bg-[#141414]">
         <div ref={containerRef} className="w-full h-full relative" />
 
-        {loading && (
+        {loading && sogUrl && (
           <div className="absolute inset-0 flex flex-col items-center justify-center bg-[#141414]/90 gap-3">
             <div className="w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
             <p className="text-sm text-gray-400">3DGS 파일 로딩 중...</p>

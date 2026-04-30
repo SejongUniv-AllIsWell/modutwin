@@ -149,6 +149,12 @@ interface RefineToolOptions {
   uploadId?: string;
   reloadWithUrl?: (url: string) => void;
   currentUrl?: string;
+  /**
+   * uploadId가 없을 때 (로컬 파일 다듬기) 호출되는 외부 업로드 핸들러.
+   * 베이크된 PLY 바이트를 받아서 자유롭게 처리(메타데이터 모달 → /uploads/init+complete 등).
+   * 성공 시 resolve, 실패 시 reject. resolve되면 setSaved(true) 처리됨.
+   */
+  onRequestUpload?: (bytes: Uint8Array, filename: string) => Promise<void>;
 }
 
 export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, options?: RefineToolOptions) {
@@ -694,11 +700,18 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   useEffect(() => { wallDistancesRef.current = wallDistances; }, [wallDistances]);
   useEffect(() => { wallModeRef.current = wallMode; }, [wallMode]);
 
-  // URL 변경 시 stale splatDataRef를 즉시 비워 destroyed 텍스처 참조를 막는다
-  // (reloadWithUrl 후 SplatViewerCore는 unmount → 새 PLY 로드 전까지 ref가 무효)
+  // URL이 비워지면 (메인 제거) splat 상태를 비운다.
+  // 새 URL로 바뀌는 경우에는 reset하지 않는다 — 그 이유는 PlayCanvas ResourceLoader가
+  // URL별로 리소스를 캐시하므로 같은 URL이 다시 로드될 때 asset.ready가 동기 실행되며,
+  // 자식(SplatViewerCore) effect가 부모(여기) effect보다 먼저 실행되는 React 순서 때문에
+  // 자식의 onSplatLoaded(true)가 먼저 큐에 들어간 뒤 여기서 setSplatLoaded(false)로
+  // 덮어써져 refine UI가 안 뜨는 버그가 생김. 새 URL 로드 시에는 onSplatLoaded가
+  // splatDataRef와 splatLoaded를 직접 갱신하도록 맡긴다.
   useEffect(() => {
-    splatDataRef.current = null;
-    setSplatLoaded(false);
+    if (!options?.currentUrl) {
+      splatDataRef.current = null;
+      setSplatLoaded(false);
+    }
   }, [options?.currentUrl]);
 
   // ── localStorage 복원: uploadId 진입 시 1회 ──
@@ -962,7 +975,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   // 원본 PLY를 한 번 파싱하고, 누적된 의도(회전 + flatten 마스크 + 브러시 삭제 + 막)를
   // 한 번에 베이크해 단일 PLY로 업로드한다.
   const saveRefined = useCallback(async () => {
-    if (!options?.uploadId) return;
+    if (!options?.uploadId && !options?.onRequestUpload) return;
     if (!dirtyRef.current) {
       alert('먼저 정제 작업을 한 번 이상 적용해야 합니다.');
       return;
@@ -1011,22 +1024,30 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
 
       const bytes = serializePly(baked);
 
-      const urlReq = await api.post<{ put_url: string; get_url: string; key: string }>(
-        '/refine/refined-upload-url',
-        { upload_id: options.uploadId, filename: 'final.ply' },
-      );
-      const putResp = await fetch(urlReq.put_url, {
-        method: 'PUT',
-        body: bytes,
-        headers: { 'Content-Type': 'application/octet-stream' },
-      });
-      if (!putResp.ok) throw new Error(`MinIO PUT failed: ${putResp.status}`);
+      if (options?.onRequestUpload) {
+        // 외부 업로드 흐름 (로컬 파일 다듬기) — 메타데이터 모달 후 /uploads/init+complete
+        const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+        await options.onRequestUpload(u8, 'refined.ply');
+        setSaved(true);
+      } else if (options?.uploadId) {
+        // 기존 흐름 (서버 upload 기반 다듬기) — /refine/refined-upload-url + /refine/save
+        const urlReq = await api.post<{ put_url: string; get_url: string; key: string }>(
+          '/refine/refined-upload-url',
+          { upload_id: options.uploadId, filename: 'final.ply' },
+        );
+        const putResp = await fetch(urlReq.put_url, {
+          method: 'PUT',
+          body: bytes,
+          headers: { 'Content-Type': 'application/octet-stream' },
+        });
+        if (!putResp.ok) throw new Error(`MinIO PUT failed: ${putResp.status}`);
 
-      await api.post<{ scene_id: string; message: string }>('/refine/save', {
-        upload_id: options.uploadId,
-        source_key: urlReq.key,
-      });
-      setSaved(true);
+        await api.post<{ scene_id: string; message: string }>('/refine/save', {
+          upload_id: options.uploadId,
+          source_key: urlReq.key,
+        });
+        setSaved(true);
+      }
     } catch (e: any) {
       alert(`저장 실패: ${e.message || e}`);
     } finally {
@@ -1561,7 +1582,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       {/* Brush cursor */}
       <div ref={brushCursorRef} className="absolute pointer-events-none rounded-full border border-red-400/60" style={{display:'none',boxShadow:'0 0 4px rgba(255,100,100,0.3)'}} />
 
-      <div className="absolute top-3 left-3 bg-black/70 text-gray-300 text-xs rounded p-3 flex flex-col gap-2 select-none min-w-[230px]">
+      <div className="absolute top-3 left-16 z-40 bg-black/70 text-gray-300 text-xs rounded p-3 flex flex-col gap-2 select-none min-w-[230px]">
         <div className="text-white font-bold text-sm mb-1">다듬기</div>
 
         {/* Mode tabs */}
@@ -1827,8 +1848,8 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
           </>
         )}
 
-        {/* Save */}
-        {options?.uploadId && dirty && (
+        {/* Save — 서버 업로드 기반(uploadId) 또는 외부 업로드 핸들러 둘 다 지원 */}
+        {(options?.uploadId || options?.onRequestUpload) && dirty && (
           saved ? (
             <div className="mt-2 px-3 py-2 bg-green-800/50 text-green-300 rounded text-xs text-center font-bold">
               저장 완료

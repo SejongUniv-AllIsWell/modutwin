@@ -4,11 +4,14 @@ import { useState, useRef, useCallback, useEffect } from 'react';
 import { api } from '@/lib/api';
 import { Building, Floor, Module, UploadInitResponse } from '@/types';
 
-const PLY_EXTENSIONS = ['.ply'];
+const SCENE_3D_EXTENSIONS = ['.ply', '.splat', '.sog'];
 
-function isPlyFile(filename: string): boolean {
-  const ext = filename.split('.').pop()?.toLowerCase() ?? '';
-  return PLY_EXTENSIONS.includes(`.${ext}`);
+function fileExt(filename: string): string {
+  return `.${filename.split('.').pop()?.toLowerCase() ?? ''}`;
+}
+
+function isScene3DFile(filename: string): boolean {
+  return SCENE_3D_EXTENSIONS.includes(fileExt(filename));
 }
 
 // 브라우저가 file.type을 빈 문자열로 반환할 때 확장자 기반 보완
@@ -25,6 +28,14 @@ function resolveContentType(file: File): string {
   if (file.type) return file.type;
   const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
   return EXT_TO_MIME[ext] ?? 'application/octet-stream';
+}
+
+function isVideoFile(file: File): boolean {
+  return resolveContentType(file).startsWith('video/');
+}
+
+function isAcceptedFile(file: File): boolean {
+  return isVideoFile(file) || isScene3DFile(file.name);
 }
 
 // "1","2" → 1,2 / "B1","B2" → -1,-2 / invalid → null
@@ -93,9 +104,6 @@ export default function MultipartUploader() {
   // Floor and Module (direct input)
   const [floorNumber, setFloorNumber] = useState('');
   const [moduleName, setModuleName] = useState('');
-
-  // PLY target
-  const [plyTargetAlignment, setPlyTargetAlignment] = useState(false);
 
   // Load buildings on mount
   useEffect(() => {
@@ -186,10 +194,15 @@ export default function MultipartUploader() {
     setIsDragging(false);
     if (uploading) return;
     const dropped = e.dataTransfer.files?.[0];
-    if (dropped) {
-      setFile(dropped);
-      if (!isPlyFile(dropped.name)) setPlyTargetAlignment(false);
+    if (!dropped) return;
+    if (!isAcceptedFile(dropped)) {
+      setMessage('영상 또는 .ply/.splat/.sog 파일만 업로드할 수 있습니다.');
+      setUploadStatus('error');
+      return;
     }
+    setFile(dropped);
+    setMessage('');
+    setUploadStatus('idle');
   }, [uploading]);
 
   const handleDragOver = useCallback((e: React.DragEvent<HTMLDivElement>) => {
@@ -201,8 +214,15 @@ export default function MultipartUploader() {
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0] || null;
+    if (f && !isAcceptedFile(f)) {
+      setMessage('영상 또는 .ply/.splat/.sog 파일만 업로드할 수 있습니다.');
+      setUploadStatus('error');
+      if (fileRef.current) fileRef.current.value = '';
+      return;
+    }
     setFile(f);
-    if (f && !isPlyFile(f.name)) setPlyTargetAlignment(false);
+    setMessage('');
+    setUploadStatus('idle');
   };
 
   const handleUpload = async () => {
@@ -222,7 +242,13 @@ export default function MultipartUploader() {
       const floorId = await findOrCreateFloor(buildingId, floorInt);
       const moduleId = await findOrCreateModule(floorId, moduleName.trim());
 
-      const plyTarget = isPlyFile(file.name) ? 'gsplat' : undefined;
+      // 파일 분기: 영상 → 학습 파이프라인, ply/splat/sog → refined 폴더
+      let plyTarget: 'gsplat' | 'alignment' | 'refined' | undefined;
+      if (isScene3DFile(file.name)) {
+        plyTarget = 'refined';
+      } else {
+        plyTarget = undefined; // 영상 — 기본 학습 흐름
+      }
 
       // 1. 업로드 초기화
       const initRes = await api.post<UploadInitResponse>('/uploads/init', {
@@ -272,8 +298,6 @@ export default function MultipartUploader() {
     }
   };
 
-  const fileIsPly = file ? isPlyFile(file.name) : false;
-
   return (
     <div className="max-w-lg mx-auto space-y-4">
       {/* 파일 선택 */}
@@ -296,14 +320,14 @@ export default function MultipartUploader() {
           ) : (
             <>
               <p className="text-sm text-gray-300">파일을 끌어다 놓거나 클릭하여 선택</p>
-              <p className="text-xs text-gray-500 mt-1">video, image, .ply</p>
+              <p className="text-xs text-gray-500 mt-1">video / .ply / .splat / .sog</p>
             </>
           )}
         </div>
         <input
           ref={fileRef}
           type="file"
-          accept="video/*,image/*,.ply,.splat,.sog"
+          accept="video/*,.ply,.splat,.sog"
           onChange={handleFileChange}
           className="hidden"
           disabled={uploading}

@@ -451,7 +451,7 @@ export function useGaussianSelector(
         style={{ display: 'none', boxShadow: '0 0 4px rgba(255,255,255,0.2)' }} />
 
       {/* 선택 도구 패널 */}
-      <div className="absolute top-3 left-3 bg-black/70 text-gray-300 text-xs rounded p-3 flex flex-col gap-2 select-none min-w-[220px]">
+      <div className="absolute top-3 left-16 z-40 bg-black/70 text-gray-300 text-xs rounded p-3 flex flex-col gap-2 select-none min-w-[220px]">
         <div className="text-white font-bold text-sm mb-1">가우시안 선택</div>
 
         <div className="flex gap-1">

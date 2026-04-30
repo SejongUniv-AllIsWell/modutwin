@@ -21,6 +21,7 @@ export interface TokenResponse {
 export interface Building {
   id: string;
   name: string;
+  is_visible: boolean;
   created_at: string;
 }
 
@@ -28,6 +29,7 @@ export interface Floor {
   id: string;
   building_id: string;
   floor_number: number;
+  is_visible: boolean;
   created_at: string;
 }
 
@@ -35,7 +37,18 @@ export interface Module {
   id: string;
   floor_id: string;
   name: string;
+  alignment_transform: Record<string, unknown> | null;
+  is_visible: boolean;
   created_at: string;
+}
+
+export interface ActiveBasemapResponse {
+  basemap_id: string;
+  floor_id: string;
+  building_id: string;
+  version: number;
+  url: string;
+  filename: string;
 }
 
 // ── Upload ──
@@ -47,7 +60,7 @@ export interface UploadInitRequest {
   building_id: string;
   floor_id: string;
   module_id: string;
-  ply_target?: 'gsplat' | 'alignment';
+  ply_target?: 'gsplat' | 'alignment' | 'refined';
 }
 
 export interface UploadInitResponse {

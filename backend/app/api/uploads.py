@@ -166,10 +166,17 @@ async def complete_upload(
 
     upload.status = UploadStatus.processing
 
-    # PLY alignment 파일은 학습 없이 바로 완료 처리
+    # 학습 없이 바로 완료 처리할 케이스
+    #  - PLY + alignment 타겟 (정합용 ply)
+    #  - PLY + refined 타겟 (다듬기 결과 ply)
+    #  - .splat / .sog (이미 학습 완료된 산출물)
     ext = os.path.splitext(upload.original_filename)[1].lower()
     is_ply = ext == ".ply"
-    skip_training = is_ply and upload.ply_target == PlyTarget.alignment
+    is_scene_artifact = ext in {".splat", ".sog"}
+    skip_training = (
+        (is_ply and upload.ply_target in (PlyTarget.alignment, PlyTarget.refined))
+        or is_scene_artifact
+    )
 
     if skip_training:
         upload.status = UploadStatus.completed
@@ -209,11 +216,13 @@ async def complete_upload(
 
     await db.commit()
 
-    msg = (
-        "업로드 완료. alignment 폴더에 저장되었습니다."
-        if skip_training
-        else "업로드 완료. 3DGS 학습이 시작됩니다."
-    )
+    if skip_training:
+        if is_scene_artifact or upload.ply_target == PlyTarget.refined:
+            msg = "업로드 완료. refined 폴더에 저장되었습니다."
+        else:
+            msg = "업로드 완료. alignment 폴더에 저장되었습니다."
+    else:
+        msg = "업로드 완료. 3DGS 학습이 시작됩니다."
 
     return UploadCompleteResponse(
         upload_id=upload.id,

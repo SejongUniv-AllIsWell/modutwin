@@ -119,6 +119,10 @@ class ApiClient {
       body: body ? JSON.stringify(body) : undefined,
     });
   }
+
+  async delete<T = any>(path: string): Promise<T> {
+    return this.fetch<T>(path, { method: 'DELETE' });
+  }
 }
 
 export const api = new ApiClient();

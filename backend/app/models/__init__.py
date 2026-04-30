@@ -5,8 +5,9 @@ from enum import Enum as PyEnum
 from sqlalchemy import (
     String, Integer, Boolean, DateTime, Text, BigInteger,
     ForeignKey, Enum, func, UniqueConstraint,
+    true as sa_true,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -29,6 +30,7 @@ class UploadStatus(str, PyEnum):
 class PlyTarget(str, PyEnum):
     gsplat = "gsplat"
     alignment = "alignment"
+    refined = "refined"
 
 
 class TaskType(str, PyEnum):
@@ -111,6 +113,7 @@ class Building(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    is_visible: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=sa_true(), default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     floors: Mapped[list["Floor"]] = relationship(back_populates="building", cascade="all, delete-orphan")
@@ -122,6 +125,7 @@ class Floor(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     building_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("buildings.id"), nullable=False)
     floor_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    is_visible: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=sa_true(), default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (UniqueConstraint("building_id", "floor_number", name="uq_floor_building_number"),)
@@ -137,6 +141,8 @@ class Module(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     floor_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("floors.id"), nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
+    alignment_transform: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    is_visible: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=sa_true(), default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (UniqueConstraint("floor_id", "name", name="uq_module_floor_name"),)
