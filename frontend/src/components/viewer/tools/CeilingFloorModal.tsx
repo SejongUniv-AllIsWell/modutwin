@@ -238,8 +238,9 @@ export default function CeilingFloorModal({
     const scH = plotW / (maxH - minH || 1);
     const scV = plotH / (b.mxY - b.mnY || 1);
     const toX = (h: number) => PAD + (h - minH) * scH;
-    // Y축 반전: 큰 Y(천장)가 캔버스 위쪽, 작은 Y(바닥)가 아래쪽으로 보이게
-    const toY = (v: number) => PAD + (b.mxY - v) * scV;
+    // 3D 뷰어가 PLY를 180Z 회전으로 표시 → 뷰어의 "위쪽"은 raw Y가 작은 방향.
+    // 모달도 동일 컨벤션: 작은 Y가 캔버스 위, 큰 Y가 아래.
+    const toY = (v: number) => PAD + (v - b.mnY) * scV;
 
     // 1) 빠른 background 클리어 — pre-built blank을 .set()으로 memcpy
     const blank = blankBufRef.current;
@@ -271,12 +272,12 @@ export default function CeilingFloorModal({
       ctx.fillStyle = color; ctx.font = 'bold 11px monospace';
       ctx.fillText(`Y=${baseY.toFixed(2)}`, PAD + 4, labelAbove ? y - 6 : y + 14);
     };
-    // viewer의 surface 색과 일치: 천장=cyan(#22d3ee), 바닥=violet(#a855f7)
-    // lineA = top line(보통 ceiling), lineB = bottom line(보통 floor)
-    // sorted.lo/hi로 비교해 위쪽이 ceiling, 아래쪽이 floor (Y 큰 쪽이 ceiling 가정)
-    const isAceiling = laVal >= lbVal;
-    const colorA = isAceiling ? '#22d3ee' : '#a855f7';
-    const colorB = isAceiling ? '#a855f7' : '#22d3ee';
+    // viewer의 surface 색과 일치: 천장=하늘색(#22d3ee), 바닥=밤색(#92400e).
+    // 뷰어가 180Z 회전으로 표시하므로 "위쪽 = 작은 raw Y = 천장".
+    // 작은 Y 라인을 cyan으로.
+    const isAceiling = laVal <= lbVal;
+    const colorA = isAceiling ? '#22d3ee' : '#92400e';
+    const colorB = isAceiling ? '#92400e' : '#22d3ee';
     drawLine(laVal, colorA, true);
     drawLine(lbVal, colorB, false);
 
@@ -295,7 +296,18 @@ export default function CeilingFloorModal({
     recomputeRotated();
     const buf = rotBuffersRef.current;
     const b = boundsRef.current;
-    const la = lineARef.current, lb = lineBRef.current;
+    // 회전으로 bounds 가 좁아져 line 이 캔버스 밖으로 나가는 경우 방지: 매 draw 시 clamp.
+    let la = lineARef.current, lb = lineBRef.current;
+    if (la < b.mnY) la = b.mnY; else if (la > b.mxY) la = b.mxY;
+    if (lb < b.mnY) lb = b.mnY; else if (lb > b.mxY) lb = b.mxY;
+    if (la !== lineARef.current || lb !== lineBRef.current) {
+      lineARef.current = la; lineBRef.current = lb;
+      // 라벨도 동기화
+      const lo = Math.min(la, lb), hi = Math.max(la, lb);
+      if (ceilingLabelRef.current) ceilingLabelRef.current.textContent = lo.toFixed(2);
+      if (floorLabelRef.current) floorLabelRef.current.textContent = hi.toFixed(2);
+      if (gapLabelRef.current) gapLabelRef.current.textContent = (hi - lo).toFixed(2);
+    }
     drawView(xyRef.current, xyImgRef.current, buf.x, b.mnX, b.mxX, 'X', la, lb);
     drawView(zyRef.current, zyImgRef.current, buf.z, b.mnZ, b.mxZ, 'Z', la, lb);
   }, [drawView, recomputeRotated]);
@@ -315,11 +327,12 @@ export default function CeilingFloorModal({
   useEffect(() => () => { if (rafRef.current !== null) cancelAnimationFrame(rafRef.current); }, []);
 
   // 하단 정보 라벨을 DOM 직접 갱신 (재렌더 우회)
+  // 컨벤션: viewer의 위쪽이 작은 raw Y → 천장 = 작은 Y, 바닥 = 큰 Y
   const updateInfoLabels = useCallback(() => {
     const a = lineARef.current, b = lineBRef.current;
     const lo = Math.min(a, b), hi = Math.max(a, b);
-    if (floorLabelRef.current) floorLabelRef.current.textContent = lo.toFixed(2);
-    if (ceilingLabelRef.current) ceilingLabelRef.current.textContent = hi.toFixed(2);
+    if (ceilingLabelRef.current) ceilingLabelRef.current.textContent = lo.toFixed(2);
+    if (floorLabelRef.current) floorLabelRef.current.textContent = hi.toFixed(2);
     if (gapLabelRef.current) gapLabelRef.current.textContent = (hi - lo).toFixed(2);
   }, []);
 
@@ -334,14 +347,14 @@ export default function CeilingFloorModal({
     scheduleDraw();
   }, [recomputeRotated, updateInfoLabels, scheduleDraw]);
 
-  // Y축 반전된 좌표 변환: 마우스 위로 갈수록 큰 Y(천장)
+  // toY와 동일 컨벤션: 캔버스 위쪽 = 작은 raw Y (= 뷰어의 천장 방향)
   const canvasToY = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     const rect = e.currentTarget.getBoundingClientRect();
     const mouseY = (e.clientY - rect.top) * (CH / rect.height);
     const b = boundsRef.current;
     const plotH = CH - PAD * 2;
     const scV = plotH / (b.mxY - b.mnY || 1);
-    return b.mxY - (mouseY - PAD) / scV;
+    return b.mnY + (mouseY - PAD) / scV;
   }, []);
 
   const handleMouseDown = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -399,7 +412,7 @@ export default function CeilingFloorModal({
       <div className="bg-gray-900 border border-gray-700 rounded-lg p-5 shadow-2xl" onClick={e => e.stopPropagation()}>
         <div className="text-white font-bold text-sm mb-1">천장 / 바닥 설정</div>
         <div className="text-gray-400 text-xs mb-3">
-          슬라이더로 포인트 클라우드를 회전해 천장/바닥이 수평이 되게 맞춘 뒤, <span style={{color:'#22d3ee'}}>천장선</span> / <span style={{color:'#a855f7'}}>바닥선</span>을 드래그하세요.
+          슬라이더로 포인트 클라우드를 회전해 천장/바닥이 수평이 되게 맞춘 뒤, <span style={{color:'#22d3ee'}}>천장선</span> / <span style={{color:'#92400e'}}>바닥선</span>을 드래그하세요.
         </div>
         <div className="flex gap-3">
           <div>
@@ -441,8 +454,8 @@ export default function CeilingFloorModal({
         </div>
         <div className="flex items-center justify-between mt-4">
           <div className="text-gray-500 text-xs">
-            바닥: <span ref={floorLabelRef} className="font-mono" style={{color:'#a855f7'}}>{initLo.toFixed(2)}</span>
-            {' '}천장: <span ref={ceilingLabelRef} className="font-mono" style={{color:'#22d3ee'}}>{initHi.toFixed(2)}</span>
+            천장: <span ref={ceilingLabelRef} className="font-mono" style={{color:'#22d3ee'}}>{initLo.toFixed(2)}</span>
+            {' '}바닥: <span ref={floorLabelRef} className="font-mono" style={{color:'#92400e'}}>{initHi.toFixed(2)}</span>
             {' '}간격: <span ref={gapLabelRef} className="text-white font-mono">{(initHi - initLo).toFixed(2)}</span>
           </div>
           <div className="flex gap-2">

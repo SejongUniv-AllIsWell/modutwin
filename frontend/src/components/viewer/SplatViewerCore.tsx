@@ -247,7 +247,8 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
           const makeLabel = (text: string, color: string) => {
             const el = document.createElement('div');
             el.textContent = text;
-            el.style.cssText = `position:absolute;pointer-events:none;font-size:11px;font-weight:bold;color:${color};text-shadow:0 0 3px #000;`;
+            // z-index 50: refine UI 패널보다 위에 보이도록
+            el.style.cssText = `position:absolute;pointer-events:none;font-size:13px;font-weight:bold;color:${color};text-shadow:0 0 4px #000, 0 0 2px #000;z-index:50;`;
             containerRef.current!.appendChild(el);
             return el;
           };
@@ -420,7 +421,9 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
             setLoading(true);
             setError(null);
 
-            const asset = new pc.Asset('splat', 'gsplat', { url });
+            // reorder=false: PlayCanvas 의 기본 Morton order 재배치 비활성. 활성 시 splatData 의
+            // 인덱스가 원본 PLY 순서와 달라져 save 시 alpha mask 가 엉뚱한 splat 에 매핑됨.
+            const asset = new pc.Asset('splat', 'gsplat', { url }, { reorder: false } as any);
             app.assets.add(asset);
 
             asset.on('error', (_msg: string, err: Error) => {

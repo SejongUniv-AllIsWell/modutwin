@@ -217,7 +217,8 @@ export default function WallModal({
 
   const [draggingLine, setDraggingLine] = useState<number | null>(null);
 
-  const COLORS = ['#ef4444', '#ec4899', '#f97316', '#eab308'];
+  // viewer의 SURFACE_COLORS와 일치: 벽1=emerald, 벽2=blue, 벽3=violet, 벽4=lime
+  const COLORS = ['#10b981', '#3b82f6', '#8b5cf6', '#84cc16'];
 
   // Draw canvas — rotate point cloud by -angle; walls become axis-aligned lines
   const draw = useCallback(() => {
@@ -330,7 +331,7 @@ export default function WallModal({
       <div className="bg-gray-900 border border-gray-700 rounded-lg p-5 shadow-2xl" onClick={e => e.stopPropagation()}>
         <div className="text-white font-bold text-sm mb-1">벽면 설정</div>
         <div className="text-gray-400 text-xs mb-3">
-          슬라이더로 회전, 각 선(<span style={{color:'#ef4444'}}>빨강</span>/<span style={{color:'#ec4899'}}>분홍</span>/<span style={{color:'#f97316'}}>주황</span>/<span style={{color:'#eab308'}}>노랑</span>)은 드래그해서 평행이동.
+          슬라이더로 회전, 각 선(<span style={{color:'#10b981'}}>벽1</span>/<span style={{color:'#3b82f6'}}>벽2</span>/<span style={{color:'#8b5cf6'}}>벽3</span>/<span style={{color:'#84cc16'}}>벽4</span>)은 드래그해서 평행이동.
         </div>
         <div>
           <div className="text-gray-500 text-[10px] mb-1 text-center">Top-down (XZ)</div>
@@ -356,10 +357,10 @@ export default function WallModal({
         </div>
         <div className="flex items-center justify-between mt-3">
           <div className="text-gray-500 text-xs font-mono">
-            <span style={{color:'#ef4444'}}>벽1a</span>: {wallVals[0].toFixed(2)}{' '}
-            <span style={{color:'#ec4899'}}>벽1b</span>: {wallVals[1].toFixed(2)}{' '}
-            <span style={{color:'#f97316'}}>벽2a</span>: {wallVals[2].toFixed(2)}{' '}
-            <span style={{color:'#eab308'}}>벽2b</span>: {wallVals[3].toFixed(2)}
+            <span style={{color:'#10b981'}}>벽1</span>: {wallVals[0].toFixed(2)}{' '}
+            <span style={{color:'#3b82f6'}}>벽2</span>: {wallVals[1].toFixed(2)}{' '}
+            <span style={{color:'#8b5cf6'}}>벽3</span>: {wallVals[2].toFixed(2)}{' '}
+            <span style={{color:'#84cc16'}}>벽4</span>: {wallVals[3].toFixed(2)}
           </div>
           <div className="flex gap-2">
             <button onClick={onClose}

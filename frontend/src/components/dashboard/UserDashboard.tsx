@@ -27,6 +27,20 @@ const STATUS_COLOR: Record<string, string> = {
   failed: 'text-red-400',
 };
 
+const SAM3_LABEL: Record<string, string> = {
+  pending: '대기',
+  running: 'SAM3 작동 중',
+  done: '완료',
+  failed: '실패',
+};
+
+const SAM3_COLOR: Record<string, string> = {
+  pending: 'text-gray-400',
+  running: 'text-yellow-400',
+  done: 'text-green-400',
+  failed: 'text-red-400',
+};
+
 interface Props {
   showHeader?: boolean;
 }
@@ -95,28 +109,50 @@ export default function UserDashboard({ showHeader = true }: Props) {
                 <tr className="text-gray-500 text-left border-b border-gray-800">
                   <th className="py-2 pr-4">파일명</th>
                   <th className="py-2 pr-4">상태</th>
-                  <th className="py-2">날짜</th>
+                  <th className="py-2 pr-4">SAM3</th>
+                  <th className="py-2 pr-4">날짜</th>
+                  <th className="py-2 pr-4 text-right">정합</th>
                 </tr>
               </thead>
               <tbody>
-                {uploads.map(u => (
-                  <tr key={u.id} className="border-b border-gray-800/50">
-                    <td className="py-3 pr-4">
-                      {isViewable(u.original_filename) ? (
-                        <Link
-                          href={`/viewer?upload_id=${u.id}`}
-                          className="text-blue-400 hover:underline"
-                        >
-                          {u.original_filename}
-                        </Link>
-                      ) : (
-                        <span className="text-gray-300">{u.original_filename}</span>
-                      )}
-                    </td>
-                    <td className={`py-3 pr-4 ${STATUS_COLOR[u.status]}`}>{STATUS_LABEL[u.status]}</td>
-                    <td className="py-3 text-gray-500">{new Date(u.uploaded_at).toLocaleDateString('ko-KR')}</td>
-                  </tr>
-                ))}
+                {uploads.map(u => {
+                  const sam = u.sam3_status ?? null;
+                  const canAlign = sam === 'done' || sam === 'failed' || u.has_refined;
+                  return (
+                    <tr key={u.id} className="border-b border-gray-800/50">
+                      <td className="py-3 pr-4">
+                        {isViewable(u.original_filename) ? (
+                          <Link
+                            href={`/viewer?upload_id=${u.id}`}
+                            className="text-blue-400 hover:underline"
+                          >
+                            {u.original_filename}
+                          </Link>
+                        ) : (
+                          <span className="text-gray-300">{u.original_filename}</span>
+                        )}
+                      </td>
+                      <td className={`py-3 pr-4 ${STATUS_COLOR[u.status]}`}>{STATUS_LABEL[u.status]}</td>
+                      <td className={`py-3 pr-4 ${sam ? SAM3_COLOR[sam] : 'text-gray-600'}`}>
+                        {sam ? SAM3_LABEL[sam] : '—'}
+                      </td>
+                      <td className="py-3 pr-4 text-gray-500">{new Date(u.uploaded_at).toLocaleDateString('ko-KR')}</td>
+                      <td className="py-3 pr-4 text-right">
+                        {canAlign ? (
+                          <Link
+                            href={`/viewer?upload_id=${u.id}&mode=align`}
+                            className="inline-block px-3 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold"
+                            title={sam === 'done' ? 'SAM3 결과로 정합 시작' : '수동으로 문 꼭짓점을 지정해 정합'}
+                          >
+                            정합하기
+                          </Link>
+                        ) : (
+                          <span className="text-gray-600 text-xs">—</span>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>

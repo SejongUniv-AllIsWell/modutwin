@@ -11,6 +11,11 @@ export interface MetadataResult {
   floor_number: number;
   module_id: string;
   module_name: string;
+  /** SAM3 자유 텍스트 프롬프트. showSamPrompt=true 일 때만 채워짐. */
+  sam_prompt?: string;
+  /** 로컬 파일에서 다듬기 저장 시점에 register-local 로 새로 생성된 upload_id.
+      서버 진입한 경우(이미 uploadId 가짐)는 비어있음. */
+  upload_id?: string;
 }
 
 interface KakaoPlace {
@@ -24,7 +29,9 @@ interface Props {
   title?: string;
   description?: string;
   /** 초기값 — 정합 모드 진입 시 이미 선택된 메타가 있으면 미리 채움 */
-  initial?: Partial<{ building_name: string; floor_number: number; module_name: string }>;
+  initial?: Partial<{ building_name: string; floor_number: number; module_name: string; sam_prompt: string }>;
+  /** 다듬기 저장 흐름에서만 true — SAM3 프롬프트 입력란을 함께 보여주고 결과에 동봉. */
+  showSamPrompt?: boolean;
   onConfirm: (result: MetadataResult) => Promise<void> | void;
   onClose: () => void;
 }
@@ -65,6 +72,7 @@ export default function MetadataPickerModal({
   title = '저장 정보 입력',
   description = '건물 / 층 / 모듈을 지정하세요.',
   initial,
+  showSamPrompt = false,
   onConfirm,
   onClose,
 }: Props) {
@@ -83,6 +91,7 @@ export default function MetadataPickerModal({
       : ''
   );
   const [moduleName, setModuleName] = useState(initial?.module_name ?? '');
+  const [samPrompt, setSamPrompt] = useState(initial?.sam_prompt ?? 'white wooden door');
 
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -173,6 +182,7 @@ export default function MetadataPickerModal({
         floor_number: floorInt,
         module_id: moduleId,
         module_name: moduleName.trim(),
+        sam_prompt: showSamPrompt ? samPrompt.trim() : undefined,
       });
     } catch (e: any) {
       setError(e?.message || '저장 중 오류가 발생했습니다.');
@@ -288,6 +298,23 @@ export default function MetadataPickerModal({
           </div>
         </div>
 
+        {showSamPrompt && (
+          <div>
+            <label className="block text-sm text-gray-400 mb-1">SAM3 프롬프트</label>
+            <input
+              type="text"
+              value={samPrompt}
+              onChange={e => setSamPrompt(e.target.value)}
+              placeholder='예: "white wooden door"'
+              disabled={submitting}
+              className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white text-sm focus:outline-none focus:border-blue-500 disabled:opacity-40"
+            />
+            <p className="text-[11px] text-gray-500 mt-1">
+              GPU worker 가 이 프롬프트로 문 꼭짓점을 자동 검출합니다. 비워두면 기본 프롬프트로 진행합니다.
+            </p>
+          </div>
+        )}
+
         {error && <p className="text-sm text-red-400">{error}</p>}
 
         <div className="flex gap-2 justify-end">
@@ -303,7 +330,7 @@ export default function MetadataPickerModal({
             disabled={submitting}
             className="px-4 py-1.5 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded disabled:opacity-40"
           >
-            {submitting ? '저장 중...' : '확인'}
+            {submitting ? '저장 중...' : (showSamPrompt ? '완료' : '확인')}
           </button>
         </div>
       </div>

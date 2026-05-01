@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
 import { api } from '@/lib/api';
 import { Building, Floor } from '@/types';
@@ -22,7 +22,6 @@ export default function ExplorePage() {
   const markersRef = useRef<any[]>([]);
 
   const [buildings, setBuildings] = useState<BuildingWithFloors[]>([]);
-  const [filteredBuildings, setFilteredBuildings] = useState<BuildingWithFloors[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
   const [mapLoaded, setMapLoaded] = useState(false);
   const [mapError, setMapError] = useState(false);
@@ -33,9 +32,10 @@ export default function ExplorePage() {
     }
   }, [user, loading, router]);
 
-  // 건물 목록 로드
-  useEffect(() => {
-    api.get<Building[]>('/buildings?has_output=true').then(async (data) => {
+  // 건물 목록 로드 — 백엔드의 has_output 필터로 visible 조건을 만족하는 것만 내려옴
+  const fetchBuildings = useCallback(async () => {
+    try {
+      const data = await api.get<Building[]>('/buildings?has_output=true');
       const withFloors: BuildingWithFloors[] = await Promise.all(
         data.map(async (b) => {
           try {
@@ -47,9 +47,35 @@ export default function ExplorePage() {
         })
       );
       setBuildings(withFloors);
-      setFilteredBuildings(withFloors);
-    }).catch(() => {});
+    } catch {
+      // 무시
+    }
   }, []);
+
+  useEffect(() => {
+    fetchBuildings();
+  }, [fetchBuildings]);
+
+  // 다른 탭/관리자 대시보드에서 visibility 가 바뀌었을 수 있으므로
+  // 창 포커스 또는 탭이 다시 보일 때 최신 목록으로 갱신.
+  useEffect(() => {
+    const onFocus = () => fetchBuildings();
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') fetchBuildings();
+    };
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, [fetchBuildings]);
+
+  const filteredBuildings = useMemo(() => {
+    if (!searchQuery.trim()) return buildings;
+    const lower = searchQuery.toLowerCase();
+    return buildings.filter((b) => b.name.toLowerCase().includes(lower));
+  }, [buildings, searchQuery]);
 
   // 카카오맵 초기화
   useEffect(() => {
@@ -131,12 +157,6 @@ export default function ExplorePage() {
 
   const handleSearch = (query: string) => {
     setSearchQuery(query);
-    if (!query.trim()) {
-      setFilteredBuildings(buildings);
-      return;
-    }
-    const lower = query.toLowerCase();
-    setFilteredBuildings(buildings.filter(b => b.name.toLowerCase().includes(lower)));
   };
 
   if (loading) return null;

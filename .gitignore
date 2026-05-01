@@ -43,6 +43,8 @@ env/
 # Next.js
 frontend/.next/
 frontend/out/
+frontend/tsconfig.tsbuildinfo
+frontend/next-env.d.ts
 
 # Testing
 .coverage

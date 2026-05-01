@@ -37,6 +37,14 @@ class TaskType(str, PyEnum):
     training_3dgs = "3dgs_training"
     door_alignment = "door_alignment"
     basemap_realign = "basemap_realign"
+    sam3_door_detection = "sam3_door_detection"
+
+
+class Sam3Status(str, PyEnum):
+    pending = "pending"
+    running = "running"
+    done = "done"
+    failed = "failed"
 
 
 class TaskStatus(str, PyEnum):
@@ -76,6 +84,7 @@ class User(Base):
 
     sessions: Mapped[list["Session"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     uploads: Mapped[list["Upload"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    modules: Mapped[list["Module"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     tasks: Mapped[list["Task"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     notifications: Mapped[list["Notification"]] = relationship(back_populates="user", cascade="all, delete-orphan")
 
@@ -140,14 +149,16 @@ class Module(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     floor_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("floors.id"), nullable=False)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     alignment_transform: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     is_visible: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=sa_true(), default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
-    __table_args__ = (UniqueConstraint("floor_id", "name", name="uq_module_floor_name"),)
+    __table_args__ = (UniqueConstraint("floor_id", "user_id", "name", name="uq_module_floor_user_name"),)
 
     floor: Mapped["Floor"] = relationship(back_populates="modules")
+    user: Mapped["User"] = relationship(back_populates="modules")
     uploads: Mapped[list["Upload"]] = relationship(back_populates="module", cascade="all, delete-orphan")
     scene_outputs: Mapped[list["SceneOutput"]] = relationship(back_populates="module", cascade="all, delete-orphan")
 
@@ -167,6 +178,15 @@ class Upload(Base):
     ply_target: Mapped[PlyTarget | None] = mapped_column(Enum(PlyTarget), nullable=True)
     status: Mapped[UploadStatus] = mapped_column(Enum(UploadStatus), default=UploadStatus.uploaded, nullable=False)
     uploaded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    # SAM3 / 정합 파이프라인 (docs/sam3_alignment_pipeline.md)
+    refined_ply_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    door_corners_json_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sam3_status: Mapped["Sam3Status | None"] = mapped_column(
+        Enum(Sam3Status, name="sam3status"), nullable=True,
+    )
+    sam3_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    alignment_transform: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
     user: Mapped["User"] = relationship(back_populates="uploads")
     module: Mapped["Module"] = relationship(back_populates="uploads")

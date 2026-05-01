@@ -3,8 +3,8 @@
 // 따라서 여기에는 PLY 참조 없이 사용자가 확정한 파라미터만 보관한다.
 // upload_id별로 독립된 엔트리.
 
-const KEY_PREFIX = 'refine_state_v2_';
-const STATE_VERSION = 2;
+const KEY_PREFIX = 'refine_state_v4_';
+const STATE_VERSION = 4;
 
 export type Surface = 'ceiling' | 'floor' | 'w1a' | 'w1b' | 'w2a' | 'w2b';
 
@@ -20,12 +20,9 @@ export interface PersistedRefineState {
   wallDistances: [number, number, number, number] | null;
 
   selectedSurfaces: Surface[];
-  surfaceOffsets: Record<Surface, number>;
-  offsetText: Record<Surface, string>;
-
-  membraneSpacing: number;
-  membraneRadius: number;
-  membraneOpacity: number;
+  // 모든 경계면이 공유하는 단일 안전거리 (m)
+  globalOffset: number;
+  globalOffsetText: string;
 }
 
 function storageKey(uploadId: string): string {

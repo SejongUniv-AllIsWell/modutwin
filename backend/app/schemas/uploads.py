@@ -140,6 +140,13 @@ class UploadResponse(BaseModel):
     ply_target: Optional[str] = None
     uploaded_at: datetime
 
+    # SAM3 / 정합 파이프라인 (docs/sam3_alignment_pipeline.md)
+    sam3_status: Optional[str] = None
+    sam3_prompt: Optional[str] = None
+    has_refined: bool = False
+    has_doors_json: bool = False
+    has_alignment: bool = False
+
     class Config:
         from_attributes = True
 

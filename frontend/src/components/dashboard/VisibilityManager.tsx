@@ -77,33 +77,30 @@ export default function VisibilityManager() {
       return next;
     });
 
-  // hide 시 cascade 가 백엔드에서 이뤄지므로 가시 상태만 다시 가져오기보다는
-  // 응답 본인 + 하위를 클라이언트에서도 동일하게 갱신.
+  // 백엔드의 양방향 cascade 와 동일하게 로컬 state 도 갱신:
+  //   hide → 자식 모두 hide
+  //   show → 자식 모두 show + 조상 모두 show
 
   const toggleBuildingVisibility = async (b: BuildingWithFloors) => {
     const key = `building:${b.id}`;
     setBusyKey(key);
     const next = !b.is_visible;
     try {
-      const updated = await api.put<Building>(
-        `/admin/buildings/${b.id}/visibility`,
-        { is_visible: next },
-      );
+      await api.put<Building>(`/admin/buildings/${b.id}/visibility`, {
+        is_visible: next,
+      });
       setBuildings((prev) =>
         prev.map((x) => {
           if (x.id !== b.id) return x;
-          if (updated.is_visible === false) {
-            return {
-              ...x,
-              is_visible: false,
-              floors: x.floors.map((f) => ({
-                ...f,
-                is_visible: false,
-                modules: f.modules.map((m) => ({ ...m, is_visible: false })),
-              })),
-            };
-          }
-          return { ...x, is_visible: true };
+          return {
+            ...x,
+            is_visible: next,
+            floors: x.floors.map((f) => ({
+              ...f,
+              is_visible: next,
+              modules: f.modules.map((m) => ({ ...m, is_visible: next })),
+            })),
+          };
         }),
       );
     } catch (e: any) {
@@ -118,24 +115,22 @@ export default function VisibilityManager() {
     setBusyKey(key);
     const next = !f.is_visible;
     try {
-      const updated = await api.put<Floor>(`/admin/floors/${f.id}/visibility`, {
+      await api.put<Floor>(`/admin/floors/${f.id}/visibility`, {
         is_visible: next,
       });
       setBuildings((prev) =>
         prev.map((x) => {
           if (x.id !== b.id) return x;
+          const nextBuilding = next ? { ...x, is_visible: true } : x;
           return {
-            ...x,
-            floors: x.floors.map((fl) => {
+            ...nextBuilding,
+            floors: nextBuilding.floors.map((fl) => {
               if (fl.id !== f.id) return fl;
-              if (updated.is_visible === false) {
-                return {
-                  ...fl,
-                  is_visible: false,
-                  modules: fl.modules.map((m) => ({ ...m, is_visible: false })),
-                };
-              }
-              return { ...fl, is_visible: true };
+              return {
+                ...fl,
+                is_visible: next,
+                modules: fl.modules.map((m) => ({ ...m, is_visible: next })),
+              };
             }),
           };
         }),
@@ -150,20 +145,30 @@ export default function VisibilityManager() {
   const toggleModuleVisibility = async (mod: Module) => {
     const key = `mod:${mod.id}`;
     setBusyKey(key);
+    const next = !mod.is_visible;
     try {
-      const updated = await api.put<Module>(`/admin/modules/${mod.id}/visibility`, {
-        is_visible: !mod.is_visible,
+      await api.put<Module>(`/admin/modules/${mod.id}/visibility`, {
+        is_visible: next,
       });
       setBuildings((prev) =>
-        prev.map((b) => ({
-          ...b,
-          floors: b.floors.map((f) => ({
-            ...f,
-            modules: f.modules.map((m) =>
-              m.id === mod.id ? { ...m, is_visible: updated.is_visible } : m,
-            ),
-          })),
-        })),
+        prev.map((b) => {
+          const owns = b.floors.some((f) => f.modules.some((m) => m.id === mod.id));
+          if (!owns) return b;
+          const nextBuilding = next ? { ...b, is_visible: true } : b;
+          return {
+            ...nextBuilding,
+            floors: nextBuilding.floors.map((f) => {
+              if (!f.modules.some((m) => m.id === mod.id)) return f;
+              const nextFloor = next ? { ...f, is_visible: true } : f;
+              return {
+                ...nextFloor,
+                modules: nextFloor.modules.map((m) =>
+                  m.id === mod.id ? { ...m, is_visible: next } : m,
+                ),
+              };
+            }),
+          };
+        }),
       );
     } catch (e: any) {
       showMessage(e.message || '변경 실패', 'err');
@@ -207,8 +212,7 @@ export default function VisibilityManager() {
         </button>
       </div>
       <p className="text-xs text-gray-500 mb-4">
-        상위를 숨기면 하위 항목이 자동으로 숨김 처리됩니다. 표시는 본인만 적용되며, 모든 모듈을 숨기면
-        해당 건물도 /explore 에서 사라집니다.
+        숨기기/표시는 하위 항목으로 자동 전파되며, 하위 항목을 표시하면 상위도 함께 표시됩니다.
       </p>
 
       {message && (

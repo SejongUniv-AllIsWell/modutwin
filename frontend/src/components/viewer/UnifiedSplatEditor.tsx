@@ -12,7 +12,7 @@ import { useTransformTool } from './tools/useTransformTool';
 import { useRefineTool } from './tools/useRefineTool';
 import { useAdditionalGsplats, AdditionalGsplatSource } from './tools/useAdditionalGsplats';
 import { api } from '@/lib/api';
-import { ActiveBasemapResponse, UploadInitResponse } from '@/types';
+import { ActiveBasemapResponse } from '@/types';
 
 const DoorAlignModal = lazy(() => import('./tools/DoorAlignModal'));
 
@@ -47,6 +47,8 @@ export default function UnifiedSplatEditor({
 
   // 로컬 파일 → Object URL 추적 (revoke 위해)
   const localObjectUrlRef = useRef<string | null>(null);
+  // 로컬 파일 크기 (다듬기 저장 시 register-local 의 quota 추적용 — 서버 파일이면 미사용)
+  const localFileSizeRef = useRef<number>(0);
 
   // ── 현재 작업 메타데이터 (다듬기 저장 후 또는 정합 진입 시 채워짐) ──
   const [metadata, setMetadata] = useState<MetadataResult | null>(null);
@@ -54,7 +56,7 @@ export default function UnifiedSplatEditor({
   // ── 모드 ──
   const [mode, setMode] = useState<EditorMode>(initialMode);
 
-  // ── 메타데이터 모달 (목적: 'save' = 다듬기 저장, 'align' = 정합 진입) ──
+  // ── 메타데이터 모달 (목적: 'save' = 다듬기 결과 저장, 'align' = 정합 진입) ──
   const [metadataModal, setMetadataModal] = useState<{
     purpose: 'save' | 'align';
     saveResolve?: (m: MetadataResult) => void;
@@ -83,6 +85,8 @@ export default function UnifiedSplatEditor({
   const additional = useAdditionalGsplats(coreRef);
 
   // ── 메타데이터 입력 모달 흐름 ──
+  // - purpose='save': 다듬기 결과 저장 (건물/층/모듈 입력)
+  // - purpose='align': 정합 모드 진입 (basemap 위치 지정)
   const requestMetadata = useCallback((purpose: 'save' | 'align'): Promise<MetadataResult> => {
     return new Promise((resolve, reject) => {
       setMetadataModal({ purpose, saveResolve: resolve, saveReject: reject });
@@ -90,57 +94,93 @@ export default function UnifiedSplatEditor({
   }, []);
 
   const handleMetadataConfirm = useCallback(async (result: MetadataResult) => {
+    let enriched: MetadataResult & { upload_id?: string } = result;
+    // purpose='save' + uploadId 없음 → 로컬 파일에서 다듬기 중 → register-local 로 upload 등록.
+    if (metadataModal?.purpose === 'save' && !uploadId) {
+      try {
+        const reg = await api.post<{ upload_id: string; minio_path: string }>(
+          '/uploads/register-local',
+          {
+            filename: displayName ?? 'local.ply',
+            building_id: result.building_id,
+            floor_id: result.floor_id,
+            module_id: result.module_id,
+            file_size: localFileSizeRef.current || 0,
+            content_type: 'application/octet-stream',
+          },
+        );
+        setUploadId(reg.upload_id);
+        setSource('server');
+        enriched = { ...result, upload_id: reg.upload_id };
+      } catch (e: any) {
+        alert(`업로드 등록 실패: ${e?.message || e}`);
+        metadataModal?.saveReject?.();
+        setMetadataModal(null);
+        return;
+      }
+    }
     setMetadata(result);
-    metadataModal?.saveResolve?.(result);
+    metadataModal?.saveResolve?.(enriched);
     setMetadataModal(null);
-  }, [metadataModal]);
+  }, [metadataModal, uploadId, displayName]);
 
   const handleMetadataClose = useCallback(() => {
     metadataModal?.saveReject?.();
     setMetadataModal(null);
   }, [metadataModal]);
 
-  // ── 다듬기 결과를 서버에 업로드 (메타데이터 없으면 모달) ──
-  const onRequestUpload = useCallback(async (bytes: Uint8Array, filename: string) => {
-    const meta = metadata ?? await requestMetadata('save');
-
-    // 1. /uploads/init
-    const initRes = await api.post<UploadInitResponse>('/uploads/init', {
-      filename,
-      file_size: bytes.byteLength,
-      content_type: 'application/octet-stream',
-      building_id: meta.building_id,
-      floor_id: meta.floor_id,
-      module_id: meta.module_id,
-      ply_target: 'refined',
-    });
-
-    // 2. parts PUT
-    const parts: { part_number: number; etag: string }[] = [];
-    for (let i = 0; i < initRes.presigned_urls.length; i++) {
-      const start = i * initRes.part_size;
-      const end = Math.min(start + initRes.part_size, bytes.byteLength);
-      const chunk = bytes.slice(start, end);
-      const res = await fetch(initRes.presigned_urls[i], { method: 'PUT', body: chunk });
-      if (!res.ok) throw new Error(`파트 ${i + 1} 업로드 실패`);
-      const etag = res.headers.get('etag')?.replace(/"/g, '') || '';
-      parts.push({ part_number: i + 1, etag });
+  // ── 모드 토글 ──
+  // useRefineTool 보다 먼저 정의해야 onSwitchToAlign 콜백에서 안전하게 참조 가능.
+  const handleToggleMode = useCallback(async (next: 'refine' | 'align') => {
+    if (mode === next) {
+      setMode(null);
+      return;
     }
-
-    // 3. /uploads/complete
-    await api.post('/uploads/complete', {
-      upload_id: initRes.upload_id,
-      minio_upload_id: initRes.minio_upload_id,
-      parts,
-    });
-  }, [metadata, requestMetadata]);
+    if (next === 'align') {
+      // 정합 진입: 메타데이터 없으면 모달
+      let meta = metadata;
+      if (!meta) {
+        try {
+          meta = await requestMetadata('align');
+        } catch {
+          return; // 사용자 취소
+        }
+      }
+      // basemap 자동 fetch → 추가 레이어
+      try {
+        const bm = await api.get<ActiveBasemapResponse>(`/basemaps/active?floor_id=${meta.floor_id}`);
+        const alreadyHas = additional.items.some(
+          it => it.source === 'basemap' && it.url === bm.url,
+        );
+        if (!alreadyHas) {
+          const resp = await fetch(bm.url);
+          if (!resp.ok) throw new Error(`basemap 다운로드 실패: ${resp.status}`);
+          const blob = await resp.blob();
+          const blobUrl = URL.createObjectURL(blob);
+          additional.add(blobUrl, { name: `basemap v${bm.version} (${bm.filename})`, source: 'basemap' });
+        }
+      } catch (e: any) {
+        alert(`basemap 가져오기 실패: ${e?.message || e}`);
+      }
+    }
+    setMode(next);
+  }, [mode, metadata, requestMetadata, additional]);
 
   // ── Refine tool ──
+  // 다듬기 → 정합 전환은 router 가 아니라 같은 페이지 내부 mode 전환으로 처리.
+  const requestSaveMetadata = useCallback(async (): Promise<MetadataResult> => {
+    // 이미 메타데이터가 있으면 (정합 단계를 거쳤거나 이전 저장에서 입력됨) 그대로 사용 가능하도록
+    // 모달에 prefill — 다만 prefill 만 해두고 사용자에게 한 번 더 확인받는다 (실수 방지).
+    return await requestMetadata('save');
+  }, [requestMetadata]);
+
   const refine = useRefineTool(coreRef, {
     uploadId,
+    currentUrl: currentUrl ?? undefined,
     reloadWithUrl,
-    currentUrl: currentUrl ?? '',
-    onRequestUpload: source === 'local' ? onRequestUpload : undefined,
+    originalFilename: displayName ?? undefined,
+    onSwitchToAlign: () => { void handleToggleMode('align'); },
+    onRequestMetadata: requestSaveMetadata,
   });
 
   // ── Align tool ──
@@ -181,6 +221,7 @@ export default function UnifiedSplatEditor({
       }
       const url = URL.createObjectURL(first);
       localObjectUrlRef.current = url;
+      localFileSizeRef.current = first.size;
 
       setCurrentUrl(url);
       setUploadId(undefined);
@@ -272,44 +313,6 @@ export default function UnifiedSplatEditor({
     };
   }, []);
 
-  // ── 모드 토글 ──
-  const handleToggleMode = useCallback(async (next: 'refine' | 'align') => {
-    if (mode === next) {
-      setMode(null);
-      return;
-    }
-    if (next === 'align') {
-      // 정합 진입: 메타데이터 없으면 모달
-      let meta = metadata;
-      if (!meta) {
-        try {
-          meta = await requestMetadata('align');
-        } catch {
-          return; // 사용자 취소
-        }
-      }
-      // basemap 자동 fetch → 추가 레이어
-      try {
-        const bm = await api.get<ActiveBasemapResponse>(`/basemaps/active?floor_id=${meta.floor_id}`);
-        // 같은 floor의 basemap이 이미 추가되어 있으면 중복 추가 방지
-        const alreadyHas = additional.items.some(
-          it => it.source === 'basemap' && it.url === bm.url,
-        );
-        if (!alreadyHas) {
-          // presigned URL을 fetch → blob → object URL로 변환해서 클라이언트 임시 다운로드
-          const resp = await fetch(bm.url);
-          if (!resp.ok) throw new Error(`basemap 다운로드 실패: ${resp.status}`);
-          const blob = await resp.blob();
-          const blobUrl = URL.createObjectURL(blob);
-          additional.add(blobUrl, { name: `basemap v${bm.version} (${bm.filename})`, source: 'basemap' });
-        }
-      } catch (e: any) {
-        alert(`basemap 가져오기 실패: ${e?.message || e}`);
-      }
-    }
-    setMode(next);
-  }, [mode, metadata, requestMetadata, additional]);
-
   // ── Align 도구 핸들러 ──
   const handleStartTransform = () => {
     const indices = selector.selectedIndices();
@@ -348,7 +351,12 @@ export default function UnifiedSplatEditor({
 
   // 정합 transform 저장 — 정합 결과를 DB에
   const handleSaveAlignmentTransform = useCallback(async () => {
-    if (!metadata) return;
+    // SPEC: upload-scoped 변환행렬 저장 — POST /uploads/{id}/alignment.
+    // upload_id 가 없으면(로컬 파일만 띄운 상태) 저장 불가.
+    if (!uploadId) {
+      alert('정합 결과 저장은 서버에 등록된 업로드에서만 가능합니다.');
+      return;
+    }
     const ent = (coreRef.current?.getSplatData() as any)?.splatEntity;
     if (!ent) return;
     const p = ent.getLocalPosition();
@@ -360,12 +368,17 @@ export default function UnifiedSplatEditor({
       scale: [s.x, s.y, s.z],
     };
     try {
-      await api.put(`/modules/${metadata.module_id}/alignment-transform`, { transform });
+      await api.post(`/uploads/${uploadId}/alignment`, {
+        transform,
+        rmsd: null,
+        // matches: 정합 UI(DoorAlignModal) 가 별도로 채우므로 여기서는 빈 배열.
+        matches: [],
+      });
       alert('정합 결과 저장 완료');
     } catch (e: any) {
       alert(`정합 결과 저장 실패: ${e?.message || e}`);
     }
-  }, [metadata]);
+  }, [uploadId]);
 
   // ── 레이어 패널용 메인 정보 ──
   const mainLayerInfo = useMemo(() => {
@@ -381,31 +394,136 @@ export default function UnifiedSplatEditor({
     if (typeof window !== 'undefined') window.history.back();
   }, []);
 
+  const alignPanel = mode === 'align' && currentUrl ? (
+    <div className="bg-black/70 backdrop-blur-sm border border-white/10 text-gray-300 text-xs rounded-lg shadow-lg p-3 flex flex-col gap-2 select-none w-64 max-h-[calc(100vh-200px)] overflow-y-auto">
+      {(uploadId || metadata) && (
+        <button
+          onClick={() => setDoorAlignOpen(v => !v)}
+          className={`px-2 py-1 rounded cursor-pointer text-xs font-bold ${
+            doorAlignOpen ? 'bg-yellow-500 text-black' : 'bg-indigo-600 hover:bg-indigo-500 text-white'
+          }`}
+        >
+          {doorAlignOpen ? '문 정합 닫기' : '문 정합'}
+        </button>
+      )}
+
+      <div className="text-white font-bold text-sm">변환</div>
+      {!transform.active ? (
+        <button
+          onClick={handleStartTransform}
+          className="px-2 py-1 bg-teal-600 hover:bg-teal-500 text-white rounded cursor-pointer"
+        >
+          선택 → 변환 시작
+        </button>
+      ) : (
+        <div className="flex flex-col gap-1">
+          <div className="flex gap-1">
+            <button
+              onClick={() => transform.setMode('translate')}
+              className={`flex-1 px-2 py-1 rounded cursor-pointer ${transform.mode === 'translate' ? 'bg-teal-600 text-white' : 'bg-gray-700 hover:bg-gray-600'}`}
+            >이동</button>
+            <button
+              onClick={() => transform.setMode('rotate')}
+              className={`flex-1 px-2 py-1 rounded cursor-pointer ${transform.mode === 'rotate' ? 'bg-teal-600 text-white' : 'bg-gray-700 hover:bg-gray-600'}`}
+            >회전</button>
+          </div>
+          <p className="text-[10px] text-gray-400">
+            {transform.mode === 'translate' ? '축 화살표를 드래그하여 이동' : '축 링을 드래그하여 회전'}
+          </p>
+          <div className="flex gap-1">
+            <button onClick={transform.confirmTransform}
+              className="flex-1 px-2 py-1 bg-green-600 hover:bg-green-500 text-white rounded cursor-pointer">확정</button>
+            <button onClick={transform.cancelTransform}
+              className="flex-1 px-2 py-1 bg-gray-600 hover:bg-gray-500 text-white rounded cursor-pointer">취소</button>
+          </div>
+        </div>
+      )}
+
+      <div className="border-t border-gray-600 my-1" />
+
+      <div className="text-white font-bold text-sm">문 애니메이션</div>
+      <button
+        onClick={handleSetDoor}
+        className="px-2 py-1 bg-purple-600 hover:bg-purple-500 text-white rounded cursor-pointer"
+      >
+        선택 → 문 지정 ({doorIndices ? `${doorIndices.length}개` : '없음'})
+      </button>
+
+      {doorIndices && !pivotEditor.editing && (
+        <button
+          onClick={handlePivotEdit}
+          className="px-2 py-1 bg-yellow-600 hover:bg-yellow-500 text-white rounded cursor-pointer"
+        >
+          {pivotEditor.confirmed ? '경첩 재지정' : '경첩 지정'}
+        </button>
+      )}
+      {pivotEditor.editing && (
+        <div className="flex flex-col gap-1">
+          <p className="text-[10px] text-gray-400">
+            끝점: 개별 이동 | 중앙: 평행이동
+            <br />Shift+드래그 또는 링: 회전
+          </p>
+          <div className="flex gap-1">
+            <button onClick={pivotEditor.confirmAxis}
+              className="flex-1 px-2 py-1 bg-green-600 hover:bg-green-500 text-white rounded cursor-pointer">확정</button>
+            <button onClick={pivotEditor.stopEditing}
+              className="flex-1 px-2 py-1 bg-gray-600 hover:bg-gray-500 text-white rounded cursor-pointer">취소</button>
+          </div>
+        </div>
+      )}
+
+      {doorIndices && pivotEditor.confirmed && !pivotEditor.editing && (
+        <div className="flex gap-1">
+          <button onClick={handleOpen}
+            className="flex-1 px-2 py-1 bg-blue-600 hover:bg-blue-500 text-white rounded cursor-pointer">열기</button>
+          <button onClick={handleClose}
+            className="flex-1 px-2 py-1 bg-orange-600 hover:bg-orange-500 text-white rounded cursor-pointer">닫기</button>
+        </div>
+      )}
+
+      {/* 정합 결과 transform 저장 (메타데이터 있을 때) */}
+      {metadata && (
+        <>
+          <div className="border-t border-gray-600 my-1" />
+          <button onClick={handleSaveAlignmentTransform}
+            className="px-2 py-1 bg-emerald-600 hover:bg-emerald-500 text-white rounded cursor-pointer">
+            정합 결과 저장
+          </button>
+        </>
+      )}
+    </div>
+  ) : null;
+
   return (
     <SplatViewerCore ref={coreRef} sogUrl={currentUrl} onSplatLoaded={handleSplatLoaded}>
-      {/* 좌측 사이드바 */}
-      <ViewerSidebar
-        mode={mode}
-        hasMain={!!currentUrl}
-        hasMetadata={!!metadata}
-        onPickFiles={handlePickFiles}
-        onToggleMode={handleToggleMode}
-        onBack={handleBack}
-      />
+      {/* 좌측 컬럼: 사이드바 → 레이어 패널 → 도구 패널 */}
+      <div className="absolute top-3 left-3 z-50 flex flex-col gap-2 items-start">
+        <ViewerSidebar
+          mode={mode}
+          hasMain={!!currentUrl}
+          hasMetadata={!!metadata}
+          onPickFiles={handlePickFiles}
+          onToggleMode={handleToggleMode}
+          onBack={handleBack}
+        />
 
-      {/* 우상단 레이어 패널 */}
-      <LayerPanel
-        main={mainLayerInfo}
-        onMainToggleVisible={handleToggleMainVisible}
-        onMainRemove={handleRemoveMain}
-        additional={additional.items}
-        onAdditionalToggleVisible={(id) => {
-          const item = additional.items.find(it => it.id === id);
-          if (item) additional.setVisible(id, !item.visible);
-        }}
-        onAdditionalRemove={additional.remove}
-        onAdditionalSelect={handleSelectAdditional}
-      />
+        <LayerPanel
+          main={mainLayerInfo}
+          onMainToggleVisible={handleToggleMainVisible}
+          onMainRemove={handleRemoveMain}
+          additional={additional.items}
+          onAdditionalToggleVisible={(id) => {
+            const item = additional.items.find(it => it.id === id);
+            if (item) additional.setVisible(id, !item.visible);
+          }}
+          onAdditionalRemove={additional.remove}
+          onAdditionalSelect={handleSelectAdditional}
+        />
+
+        {mode === 'refine' && currentUrl && refine.panel}
+        {mode === 'align' && currentUrl && selector.panel}
+        {alignPanel}
+      </div>
 
       {/* 빈 viewer 안내 */}
       {!currentUrl && (
@@ -417,23 +535,18 @@ export default function UnifiedSplatEditor({
         </div>
       )}
 
-      {/* 다듬기 모드 UI */}
-      {mode === 'refine' && currentUrl && refine.ui}
+      {/* 다듬기 모드 — 캔버스 오버레이 (브러쉬 커서 / 미리보기 / 모달) */}
+      {mode === 'refine' && currentUrl && (
+        <>
+          {refine.overlay}
+          {refine.modals}
+        </>
+      )}
 
-      {/* 정합 모드 UI */}
+      {/* 정합 모드 — 캔버스 오버레이 (선택 브러쉬 / 문 정합 모달) */}
       {mode === 'align' && currentUrl && (
         <>
-          {selector.ui}
-          {(uploadId || metadata) && (
-            <button
-              onClick={() => setDoorAlignOpen(v => !v)}
-              className={`absolute top-3 left-[110px] z-40 px-3 py-1.5 rounded cursor-pointer text-xs font-bold ${
-                doorAlignOpen ? 'bg-yellow-500 text-black' : 'bg-indigo-600 hover:bg-indigo-500 text-white'
-              }`}
-            >
-              {doorAlignOpen ? '문 정합 닫기' : '문 정합'}
-            </button>
-          )}
+          {selector.overlay}
           {doorAlignOpen && uploadId && (
             <Suspense fallback={null}>
               <DoorAlignModal
@@ -445,98 +558,12 @@ export default function UnifiedSplatEditor({
               />
             </Suspense>
           )}
-          <div className="absolute bottom-16 right-3 bg-black/70 text-gray-300 text-xs rounded p-3 flex flex-col gap-2 select-none min-w-[200px] z-40">
-            <div className="text-white font-bold text-sm">변환</div>
-            {!transform.active ? (
-              <button
-                onClick={handleStartTransform}
-                className="px-2 py-1 bg-teal-600 hover:bg-teal-500 text-white rounded cursor-pointer"
-              >
-                선택 → 변환 시작
-              </button>
-            ) : (
-              <div className="flex flex-col gap-1">
-                <div className="flex gap-1">
-                  <button
-                    onClick={() => transform.setMode('translate')}
-                    className={`flex-1 px-2 py-1 rounded cursor-pointer ${transform.mode === 'translate' ? 'bg-teal-600 text-white' : 'bg-gray-700 hover:bg-gray-600'}`}
-                  >이동</button>
-                  <button
-                    onClick={() => transform.setMode('rotate')}
-                    className={`flex-1 px-2 py-1 rounded cursor-pointer ${transform.mode === 'rotate' ? 'bg-teal-600 text-white' : 'bg-gray-700 hover:bg-gray-600'}`}
-                  >회전</button>
-                </div>
-                <p className="text-[10px] text-gray-400">
-                  {transform.mode === 'translate' ? '축 화살표를 드래그하여 이동' : '축 링을 드래그하여 회전'}
-                </p>
-                <div className="flex gap-1">
-                  <button onClick={transform.confirmTransform}
-                    className="flex-1 px-2 py-1 bg-green-600 hover:bg-green-500 text-white rounded cursor-pointer">확정</button>
-                  <button onClick={transform.cancelTransform}
-                    className="flex-1 px-2 py-1 bg-gray-600 hover:bg-gray-500 text-white rounded cursor-pointer">취소</button>
-                </div>
-              </div>
-            )}
-
-            <div className="border-t border-gray-600 my-1" />
-
-            <div className="text-white font-bold text-sm">문 애니메이션</div>
-            <button
-              onClick={handleSetDoor}
-              className="px-2 py-1 bg-purple-600 hover:bg-purple-500 text-white rounded cursor-pointer"
-            >
-              선택 → 문 지정 ({doorIndices ? `${doorIndices.length}개` : '없음'})
-            </button>
-
-            {doorIndices && !pivotEditor.editing && (
-              <button
-                onClick={handlePivotEdit}
-                className="px-2 py-1 bg-yellow-600 hover:bg-yellow-500 text-white rounded cursor-pointer"
-              >
-                {pivotEditor.confirmed ? '경첩 재지정' : '경첩 지정'}
-              </button>
-            )}
-            {pivotEditor.editing && (
-              <div className="flex flex-col gap-1">
-                <p className="text-[10px] text-gray-400">
-                  끝점: 개별 이동 | 중앙: 평행이동
-                  <br />Shift+드래그 또는 링: 회전
-                </p>
-                <div className="flex gap-1">
-                  <button onClick={pivotEditor.confirmAxis}
-                    className="flex-1 px-2 py-1 bg-green-600 hover:bg-green-500 text-white rounded cursor-pointer">확정</button>
-                  <button onClick={pivotEditor.stopEditing}
-                    className="flex-1 px-2 py-1 bg-gray-600 hover:bg-gray-500 text-white rounded cursor-pointer">취소</button>
-                </div>
-              </div>
-            )}
-
-            {doorIndices && pivotEditor.confirmed && !pivotEditor.editing && (
-              <div className="flex gap-1">
-                <button onClick={handleOpen}
-                  className="flex-1 px-2 py-1 bg-blue-600 hover:bg-blue-500 text-white rounded cursor-pointer">열기</button>
-                <button onClick={handleClose}
-                  className="flex-1 px-2 py-1 bg-orange-600 hover:bg-orange-500 text-white rounded cursor-pointer">닫기</button>
-              </div>
-            )}
-
-            {/* 정합 결과 transform 저장 (메타데이터 있을 때) */}
-            {metadata && (
-              <>
-                <div className="border-t border-gray-600 my-1" />
-                <button onClick={handleSaveAlignmentTransform}
-                  className="px-2 py-1 bg-emerald-600 hover:bg-emerald-500 text-white rounded cursor-pointer">
-                  정합 결과 저장
-                </button>
-              </>
-            )}
-          </div>
         </>
       )}
 
-      {/* 파일명 표시 (모드 비활성 시 좌하단에 두어 사이드바 가림 방지) */}
+      {/* 파일명 표시 */}
       {displayName && (
-        <div className="absolute bottom-3 left-16 z-40 bg-black/60 backdrop-blur-sm border border-white/10 rounded px-2.5 py-1.5 text-xs text-gray-300 max-w-[360px] truncate shadow-lg" title={displayName}>
+        <div className="absolute bottom-3 left-3 z-40 bg-black/60 backdrop-blur-sm border border-white/10 rounded px-2.5 py-1.5 text-xs text-gray-300 max-w-[360px] truncate shadow-lg" title={displayName}>
           {displayName}
           {metadata && <span className="ml-2 text-[10px] text-gray-500">[{metadata.building_name} / {metadata.floor_number}F / {metadata.module_name}]</span>}
         </div>
@@ -545,12 +572,13 @@ export default function UnifiedSplatEditor({
       {/* 메타데이터 모달 */}
       {metadataModal && (
         <MetadataPickerModal
-          title={metadataModal.purpose === 'save' ? '다듬기 결과 저장' : '정합 시작 — 위치 정보'}
+          title={metadataModal.purpose === 'save' ? '다듬기 저장 — 건물 정보 + SAM3 프롬프트' : '정합 시작 — 위치 정보'}
           description={
             metadataModal.purpose === 'save'
-              ? '이 결과를 어느 건물 / 층 / 모듈에 저장할지 지정하세요.'
+              ? '저장할 건물 / 층 / 모듈을 지정하고 SAM3 프롬프트를 입력하세요. 완료를 누르면 자동으로 정합으로 넘어가 SAM3 결과를 기다립니다.'
               : '정합에 사용할 basemap을 찾을 위치를 지정하세요.'
           }
+          showSamPrompt={metadataModal.purpose === 'save'}
           initial={metadata
             ? { building_name: metadata.building_name, floor_number: metadata.floor_number, module_name: metadata.module_name }
             : undefined}
