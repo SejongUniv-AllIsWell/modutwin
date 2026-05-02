@@ -234,9 +234,13 @@ export function useGaussianSelector(
       const pc = coreRef.current?.getPC();
       if (!splatData || !sel || !cam || !pc) return;
 
+      // posX/Y/Z 는 raw PLY 좌표, splat entity 에 Z-180 등 transform 이 걸려있을 수 있으므로
+      // 화면 투영 시 splatEntity.worldTransform 까지 같이 곱해야 사용자가 보는 위치와 일치.
       const vpMat = new pc.Mat4();
       vpMat.mul2(cam.projectionMatrix, cam.viewMatrix);
-      const m = vpMat.data;
+      const mvpMat = new pc.Mat4();
+      mvpMat.mul2(vpMat, splatData.splatEntity.getWorldTransform());
+      const m = mvpMat.data;
       const w = canvas.clientWidth, h = canvas.clientHeight;
       const r2 = brushSizeRef.current * brushSizeRef.current;
       const isUnion = paintModeRef.current === 'union';
@@ -443,15 +447,19 @@ export function useGaussianSelector(
   }, [coreRef, refreshHighlight, applyBboxSelection, pushHistory]);
 
   // ── UI ──
-  const ui = splatLoaded ? (
+  const overlay = splatLoaded ? (
     <>
       {/* 브러쉬 커서 */}
       <div ref={brushCursorRef}
         className="absolute pointer-events-none rounded-full border border-white/40"
         style={{ display: 'none', boxShadow: '0 0 4px rgba(255,255,255,0.2)' }} />
+    </>
+  ) : null;
 
+  const panel = splatLoaded ? (
+    <>
       {/* 선택 도구 패널 */}
-      <div className="absolute top-3 left-3 bg-black/70 text-gray-300 text-xs rounded p-3 flex flex-col gap-2 select-none min-w-[220px]">
+      <div className="bg-black/70 backdrop-blur-sm border border-white/10 text-gray-300 text-xs rounded-lg shadow-lg p-3 flex flex-col gap-2 select-none w-64">
         <div className="text-white font-bold text-sm mb-1">가우시안 선택</div>
 
         <div className="flex gap-1">
@@ -528,7 +536,8 @@ export function useGaussianSelector(
   ) : null;
 
   return {
-    ui,
+    overlay,
+    panel,
     onSplatLoaded,
     selectionCount,
     selectedIndices: () => {

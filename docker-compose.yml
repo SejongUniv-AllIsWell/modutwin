@@ -125,6 +125,7 @@ services:
     container_name: 3dgs-minio
     ports:
       - "${PC_HOST_IP}:9000:9000"   # GPU worker access — bind to PC's LAN IP only
+      - "127.0.0.1:9000:9000"       # Browser access for presigned URLs (MINIO_PUBLIC_ENDPOINT=localhost:9000)
       - "127.0.0.1:9001:9001"       # Management UI is local allowed only
     volumes:
       - miniodata:/data

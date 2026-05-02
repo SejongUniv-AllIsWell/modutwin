@@ -1,16 +1,20 @@
+import json
 import math
 import os
+import re
+from typing import Any
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.security import get_current_user
 from app.models import (
-    User, Upload, Task, Module, Floor, Building,
-    UploadStatus, TaskType, TaskStatus, PlyTarget,
+    User, UserRole, Upload, Task, Module, Floor, Building, SceneOutput,
+    UploadStatus, TaskType, TaskStatus, PlyTarget, Sam3Status,
 )
 from app.schemas.uploads import (
     UploadInitRequest,
@@ -21,7 +25,10 @@ from app.schemas.uploads import (
     get_upload_subfolder,
 )
 from app.services.minio_service import get_minio_service, PART_SIZE
-from app.services.celery_service import dispatch_training_task
+from app.services.celery_service import (
+    dispatch_training_task,
+    dispatch_sam3_door_detection_task,
+)
 
 router = APIRouter(prefix="/uploads", tags=["uploads"])
 
@@ -69,8 +76,8 @@ async def init_upload(
             detail=f"저장 용량 한도({limit_gb:.0f}GB)를 초과합니다. 현재 사용량: {used_gb:.1f}GB",
         )
 
-    # 모듈 조회 및 계층 검증
-    result = await db.execute(
+    # 모듈 조회 및 계층 검증 — 본인 module 만 (admin 면제)
+    module_stmt = (
         select(Module)
         .join(Floor, Module.floor_id == Floor.id)
         .join(Building, Floor.building_id == Building.id)
@@ -80,6 +87,9 @@ async def init_upload(
             Building.id == body.building_id,
         )
     )
+    if user.role != UserRole.admin:
+        module_stmt = module_stmt.where(Module.user_id == user.id)
+    result = await db.execute(module_stmt)
     module = result.scalar_one_or_none()
     if module is None:
         raise HTTPException(
@@ -166,10 +176,17 @@ async def complete_upload(
 
     upload.status = UploadStatus.processing
 
-    # PLY alignment 파일은 학습 없이 바로 완료 처리
+    # 학습 없이 바로 완료 처리할 케이스
+    #  - PLY + alignment 타겟 (정합용 ply)
+    #  - PLY + refined 타겟 (다듬기 결과 ply)
+    #  - .splat / .sog (이미 학습 완료된 산출물)
     ext = os.path.splitext(upload.original_filename)[1].lower()
     is_ply = ext == ".ply"
-    skip_training = is_ply and upload.ply_target == PlyTarget.alignment
+    is_scene_artifact = ext in {".splat", ".sog"}
+    skip_training = (
+        (is_ply and upload.ply_target in (PlyTarget.alignment, PlyTarget.refined))
+        or is_scene_artifact
+    )
 
     if skip_training:
         upload.status = UploadStatus.completed
@@ -209,16 +226,36 @@ async def complete_upload(
 
     await db.commit()
 
-    msg = (
-        "업로드 완료. alignment 폴더에 저장되었습니다."
-        if skip_training
-        else "업로드 완료. 3DGS 학습이 시작됩니다."
-    )
+    if skip_training:
+        if is_scene_artifact or upload.ply_target == PlyTarget.refined:
+            msg = "업로드 완료. refined 폴더에 저장되었습니다."
+        else:
+            msg = "업로드 완료. alignment 폴더에 저장되었습니다."
+    else:
+        msg = "업로드 완료. 3DGS 학습이 시작됩니다."
 
     return UploadCompleteResponse(
         upload_id=upload.id,
         status="processing" if not skip_training else "completed",
         message=msg,
+    )
+
+
+def _upload_to_response(upload: Upload) -> UploadResponse:
+    """Upload ORM → UploadResponse (SAM3 파이프라인 파생 플래그 포함)."""
+    return UploadResponse(
+        id=upload.id,
+        module_id=upload.module_id,
+        original_filename=upload.original_filename,
+        file_size=upload.file_size,
+        status=upload.status.value if upload.status else "uploaded",
+        ply_target=upload.ply_target.value if upload.ply_target else None,
+        uploaded_at=upload.uploaded_at,
+        sam3_status=upload.sam3_status.value if upload.sam3_status else None,
+        sam3_prompt=upload.sam3_prompt,
+        has_refined=bool(upload.refined_ply_path),
+        has_doors_json=bool(upload.door_corners_json_path),
+        has_alignment=bool(upload.alignment_transform),
     )
 
 
@@ -233,7 +270,7 @@ async def list_uploads(
         .where(Upload.user_id == user.id)
         .order_by(Upload.uploaded_at.desc())
     )
-    return result.scalars().all()
+    return [_upload_to_response(u) for u in result.scalars().all()]
 
 
 @router.get("/{upload_id}", response_model=UploadResponse)
@@ -254,7 +291,7 @@ async def get_upload(
             detail="업로드를 찾을 수 없습니다.",
         )
 
-    return upload
+    return _upload_to_response(upload)
 
 
 VIEWABLE_EXTENSIONS = {".ply", ".splat", ".sog"}
@@ -285,13 +322,386 @@ async def get_upload_presigned_url(
 
     minio = get_minio_service()
 
-    # refined 버전 요청 시, 스토리지에 정제 파일이 있으면 그것을 반환
+    # refined 버전 요청 시:
+    #   1순위: upload.refined_ply_path (SAM3 파이프라인 정식 경로)
+    #   2순위: 가장 최근 SceneOutput.ply_path (레거시 호환)
     if variant == "refined":
-        base_dir = os.path.dirname(upload.minio_path)
-        refined_key = f"{base_dir}/refined/{upload.id}_refined.ply"
-        if minio.object_exists(refined_key):
-            url = minio.get_presigned_download_url(refined_key)
+        if upload.refined_ply_path and minio.object_exists(upload.refined_ply_path):
+            url = minio.get_presigned_download_url(upload.refined_ply_path)
+            return {"url": url, "filename": upload.original_filename, "variant": "refined"}
+
+        scene_result = await db.execute(
+            select(SceneOutput)
+            .join(Task, SceneOutput.task_id == Task.id)
+            .where(Task.upload_id == upload_id, SceneOutput.user_id == user.id)
+            .order_by(SceneOutput.created_at.desc())
+            .limit(1)
+        )
+        scene = scene_result.scalar_one_or_none()
+        if scene and minio.object_exists(scene.ply_path):
+            url = minio.get_presigned_download_url(scene.ply_path)
             return {"url": url, "filename": upload.original_filename, "variant": "refined"}
 
     url = minio.get_presigned_download_url(upload.minio_path)
     return {"url": url, "filename": upload.original_filename, "variant": "original"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SAM3 / 정합 파이프라인 — docs/sam3_alignment_pipeline.md
+# ─────────────────────────────────────────────────────────────────────────────
+
+# 로컬 파일에서 다듬기를 시작한 사용자가 "다듬기 저장" 시점에 호출 — 원본 PLY 를 MinIO 에
+# 업로드하지 않고 upload 레코드만 생성한다 (refined PLY 만 영속화하면 충분).
+class RegisterLocalRequest(BaseModel):
+    filename: str
+    building_id: UUID
+    floor_id: UUID
+    module_id: UUID
+    file_size: int = 0       # 쿼터 추적용. 0 이면 단순 무시.
+    content_type: str = "application/octet-stream"
+
+
+class RegisterLocalResponse(BaseModel):
+    upload_id: UUID
+    minio_path: str   # placeholder (refined PLY 의 base_dir 계산에만 사용됨)
+
+
+@router.post("/register-local", response_model=RegisterLocalResponse)
+async def register_local_upload(
+    body: RegisterLocalRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """로컬에서 다듬기 중인 PLY 의 원본을 업로드 없이 등록.
+
+    - 원본 파일 자체는 MinIO 에 올라가지 않는다 (placeholder key 만 저장).
+    - status=completed, ply_target=alignment.
+    - 이후 /refine/refined-upload-url + /uploads/{id}/sam3/start 로 refined PLY 만 올림.
+    """
+    # 모듈 계층 검증 — 본인 module 만 (admin 면제)
+    module_stmt = (
+        select(Module)
+        .join(Floor, Module.floor_id == Floor.id)
+        .join(Building, Floor.building_id == Building.id)
+        .where(
+            Module.id == body.module_id,
+            Floor.id == body.floor_id,
+            Building.id == body.building_id,
+        )
+    )
+    if user.role != UserRole.admin:
+        module_stmt = module_stmt.where(Module.user_id == user.id)
+    result = await db.execute(module_stmt)
+    module = result.scalar_one_or_none()
+    if module is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="building_id / floor_id / module_id 조합이 유효하지 않습니다.",
+        )
+
+    # 사용자당 업로드 개수/용량 한도 (file_size 가 0 이면 용량은 그대로).
+    quota_result = await db.execute(
+        select(
+            func.count(Upload.id).label("upload_count"),
+            func.coalesce(func.sum(Upload.file_size), 0).label("total_size"),
+        ).where(
+            Upload.user_id == user.id,
+            Upload.status != UploadStatus.failed,
+        )
+    )
+    quota = quota_result.one()
+    if quota.upload_count >= MAX_UPLOADS_PER_USER:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"업로드 개수 한도({MAX_UPLOADS_PER_USER}개)를 초과했습니다.",
+        )
+    if body.file_size > 0 and quota.total_size + body.file_size > MAX_STORAGE_PER_USER:
+        used_gb = quota.total_size / (1024 ** 3)
+        limit_gb = MAX_STORAGE_PER_USER / (1024 ** 3)
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"저장 용량 한도({limit_gb:.0f}GB)를 초과합니다. 현재 사용량: {used_gb:.1f}GB",
+        )
+
+    # placeholder MinIO 경로 — 실제 객체는 없지만 base_dir 가 모듈 폴더 안에 있어야
+    # refined PLY / mesh / doors.json 의 키 계산이 일관됨.
+    ext = os.path.splitext(body.filename)[1].lower() or ".ply"
+    base_path = _module_base_path(
+        str(body.building_id), str(body.floor_id),
+        str(body.module_id), module.name,
+    )
+    placeholder_key = f"{base_path}/alignment/{uuid4()}_local{ext}"
+
+    upload = Upload(
+        user_id=user.id,
+        module_id=body.module_id,
+        original_filename=body.filename,
+        file_size=body.file_size,
+        content_type=body.content_type,
+        minio_path=placeholder_key,
+        ply_target=PlyTarget.alignment,
+        status=UploadStatus.completed,
+    )
+    db.add(upload)
+    await db.commit()
+
+    return RegisterLocalResponse(upload_id=upload.id, minio_path=placeholder_key)
+
+
+# refined PLY: 클라이언트가 /refine/refined-upload-url 로 단일 PUT 업로드 한 후,
+# 이 엔드포인트를 호출해 canonical refined_ply_path 등록 + SAM3 task 발행.
+class Sam3StartRequest(BaseModel):
+    refined_ply_key: str   # MinIO key
+    prompt: str = ""
+
+
+class Sam3StartResponse(BaseModel):
+    upload_id: UUID
+    sam3_status: str
+    celery_task_id: str | None
+
+
+def _doors_json_minio_key(upload: Upload) -> str:
+    base_dir = os.path.dirname(upload.minio_path)
+    return f"{base_dir}/refined/doors.json"
+
+
+@router.post("/{upload_id}/sam3/start", response_model=Sam3StartResponse)
+async def start_sam3(
+    upload_id: UUID,
+    body: Sam3StartRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """업로드 완료된 refined PLY 를 canonical 경로로 등록 + SAM3 문 검출 태스크 발행."""
+    result = await db.execute(
+        select(Upload).where(Upload.id == upload_id, Upload.user_id == user.id)
+    )
+    upload = result.scalar_one_or_none()
+    if not upload:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="업로드를 찾을 수 없습니다.")
+
+    minio = get_minio_service()
+    if not minio.object_exists(body.refined_ply_key):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="refined PLY 가 MinIO 에 없습니다.")
+
+    # refined PLY 가 사용자/업로드 본인 디렉토리 아래에 있는지 약식 확인 (path traversal 방지).
+    base_dir = os.path.dirname(upload.minio_path)
+    if not body.refined_ply_key.startswith(base_dir + "/"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="refined_ply_key 가 업로드 디렉토리 밖입니다.")
+
+    upload.refined_ply_path = body.refined_ply_key
+    upload.sam3_prompt = (body.prompt or "").strip() or None
+    upload.sam3_status = Sam3Status.pending
+
+    # 모듈/계층 정보 (SAM3 task 페이로드용)
+    mod_q = await db.execute(
+        select(Module, Floor).join(Floor, Module.floor_id == Floor.id)
+        .where(Module.id == upload.module_id)
+    )
+    mod, floor = mod_q.one()
+
+    celery_task_id: str | None = None
+    try:
+        celery_task_id = dispatch_sam3_door_detection_task(
+            upload_id=str(upload.id),
+            user_id=str(user.id),
+            refined_ply_key=body.refined_ply_key,
+            prompt=upload.sam3_prompt or "",
+            building_id=str(floor.building_id),
+            floor_id=str(floor.id),
+            floor_number=floor.floor_number,
+            module_id=str(mod.id),
+            module_name=mod.name,
+        )
+        upload.sam3_status = Sam3Status.running
+    except Exception as e:
+        # broker/worker 비가용 — failed 로 두면 사용자가 정합 단계에서 수동 지정 가능.
+        upload.sam3_status = Sam3Status.failed
+        print(f"[sam3] dispatch failed: {e}")
+
+    if celery_task_id:
+        task = Task(
+            upload_id=upload.id,
+            user_id=user.id,
+            task_type=TaskType.sam3_door_detection,
+            celery_task_id=celery_task_id,
+            status=TaskStatus.running,
+        )
+        db.add(task)
+
+    await db.commit()
+
+    return Sam3StartResponse(
+        upload_id=upload.id,
+        sam3_status=upload.sam3_status.value if upload.sam3_status else "pending",
+        celery_task_id=celery_task_id,
+    )
+
+
+class Sam3StatusResponse(BaseModel):
+    upload_id: UUID
+    sam3_status: str | None
+    sam3_prompt: str | None
+    has_doors_json: bool
+    refined_ply_present: bool
+
+
+@router.get("/{upload_id}/sam3", response_model=Sam3StatusResponse)
+async def get_sam3_status(
+    upload_id: UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """SAM3 진행 상태 폴링용 — 다듬기→정합 전환 로딩 화면이 호출."""
+    result = await db.execute(
+        select(Upload).where(Upload.id == upload_id, Upload.user_id == user.id)
+    )
+    upload = result.scalar_one_or_none()
+    if not upload:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="업로드를 찾을 수 없습니다.")
+
+    minio = get_minio_service()
+    has_doors = bool(upload.door_corners_json_path) and minio.object_exists(upload.door_corners_json_path)
+    has_refined = bool(upload.refined_ply_path) and minio.object_exists(upload.refined_ply_path)
+
+    return Sam3StatusResponse(
+        upload_id=upload.id,
+        sam3_status=upload.sam3_status.value if upload.sam3_status else None,
+        sam3_prompt=upload.sam3_prompt,
+        has_doors_json=has_doors,
+        refined_ply_present=has_refined,
+    )
+
+
+# ── doors.json: SAM3 결과 + 사용자 보정 ─────────────────────────────────────
+
+class DoorEntry(BaseModel):
+    id: str
+    corners: list[list[float]]  # 4 × [x, y, z]
+
+
+class DoorsJson(BaseModel):
+    doors: list[DoorEntry] = Field(default_factory=list)
+
+
+@router.get("/{upload_id}/doors", response_model=DoorsJson)
+async def get_doors(
+    upload_id: UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """저장된 doors.json 반환 (없으면 빈 리스트)."""
+    result = await db.execute(
+        select(Upload).where(Upload.id == upload_id, Upload.user_id == user.id)
+    )
+    upload = result.scalar_one_or_none()
+    if not upload:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="업로드를 찾을 수 없습니다.")
+
+    if not upload.door_corners_json_path:
+        return DoorsJson(doors=[])
+
+    minio = get_minio_service()
+    if not minio.object_exists(upload.door_corners_json_path):
+        return DoorsJson(doors=[])
+
+    try:
+        raw = minio.get_object_bytes(upload.door_corners_json_path)
+        parsed = json.loads(raw.decode("utf-8"))
+        doors = parsed.get("doors", []) if isinstance(parsed, dict) else []
+        # 가벼운 검증
+        clean: list[DoorEntry] = []
+        for d in doors:
+            if not isinstance(d, dict): continue
+            corners = d.get("corners") or []
+            if not isinstance(corners, list) or len(corners) != 4: continue
+            ok = all(
+                isinstance(c, list) and len(c) == 3 and
+                all(isinstance(v, (int, float)) for v in c)
+                for c in corners
+            )
+            if not ok: continue
+            clean.append(DoorEntry(id=str(d.get("id") or f"door_{len(clean)+1}"), corners=corners))
+        return DoorsJson(doors=clean)
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"doors.json 파싱 실패: {e}")
+
+
+@router.put("/{upload_id}/doors", response_model=DoorsJson)
+async def put_doors(
+    upload_id: UUID,
+    body: DoorsJson,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """doors.json 통째 덮어쓰기 (이력 보존 안 함 — 합의 사양)."""
+    result = await db.execute(
+        select(Upload).where(Upload.id == upload_id, Upload.user_id == user.id)
+    )
+    upload = result.scalar_one_or_none()
+    if not upload:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="업로드를 찾을 수 없습니다.")
+
+    minio = get_minio_service()
+    key = upload.door_corners_json_path or _doors_json_minio_key(upload)
+    payload = json.dumps({"doors": [d.model_dump() for d in body.doors]}).encode("utf-8")
+
+    # MinIO put_object 직접 호출 (작은 메타파일이라 단일 PUT)
+    from io import BytesIO
+    minio.client.put_object(
+        minio.bucket, key,
+        data=BytesIO(payload), length=len(payload),
+        content_type="application/json",
+    )
+    upload.door_corners_json_path = key
+    await db.commit()
+    return body
+
+
+# ── 정합 결과 저장 (변환행렬 + basemap/door 매칭) ────────────────────────────
+
+class AlignmentMatch(BaseModel):
+    """모듈 문 ID(doors.json 의 id) ↔ basemap 의 매칭."""
+    module_door_id: str
+    basemap_id: str
+    basemap_door_id: str | None = None  # basemap 측 문 식별자(있으면)
+
+
+class AlignmentSaveRequest(BaseModel):
+    transform: dict[str, Any]            # {position:[x,y,z], rotation:[x,y,z,w], scale:[x,y,z]}
+    rmsd: float | None = None
+    matches: list[AlignmentMatch] = Field(default_factory=list)
+
+
+class AlignmentSaveResponse(BaseModel):
+    upload_id: UUID
+    saved_at: str
+
+
+@router.post("/{upload_id}/alignment", response_model=AlignmentSaveResponse)
+async def save_alignment(
+    upload_id: UUID,
+    body: AlignmentSaveRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """정합 결과(변환행렬 + 매칭 정보) 를 upload-scoped 로 저장."""
+    from datetime import datetime, timezone
+
+    result = await db.execute(
+        select(Upload).where(Upload.id == upload_id, Upload.user_id == user.id)
+    )
+    upload = result.scalar_one_or_none()
+    if not upload:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="업로드를 찾을 수 없습니다.")
+
+    now = datetime.now(timezone.utc)
+    upload.alignment_transform = {
+        "transform": body.transform,
+        "rmsd": body.rmsd,
+        "matches": [m.model_dump() for m in body.matches],
+        "saved_at": now.isoformat(),
+    }
+    await db.commit()
+    return AlignmentSaveResponse(upload_id=upload.id, saved_at=now.isoformat())

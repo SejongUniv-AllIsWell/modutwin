@@ -30,6 +30,7 @@ MAX_FILENAME_LENGTH = 255
 PLY_EXTENSIONS = {".ply"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
+SCENE_3D_EXTENSIONS = {".ply", ".splat", ".sog"}
 
 
 def _sanitize_path_component(value: str, field_name: str) -> str:
@@ -40,10 +41,17 @@ def _sanitize_path_component(value: str, field_name: str) -> str:
 
 
 def get_upload_subfolder(filename: str, ply_target: str = "gsplat") -> str:
-    """파일 확장자에 따라 업로드 대상 서브폴더를 반환한다."""
+    """파일 확장자에 따라 업로드 대상 서브폴더를 반환한다.
+
+    - .ply: ply_target에 따라 'gsplat' / 'alignment' / 'refined'
+    - .splat / .sog: 항상 'refined' (3DGS 학습 결과 또는 다듬기 결과)
+    - 그 외 (영상/이미지): 'web_input'
+    """
     ext = os.path.splitext(filename)[1].lower()
     if ext in PLY_EXTENSIONS:
-        return ply_target  # "gsplat" or "alignment"
+        return ply_target  # "gsplat", "alignment", "refined"
+    if ext in SCENE_3D_EXTENSIONS:
+        return "refined"
     return "web_input"
 
 
@@ -54,7 +62,7 @@ class UploadInitRequest(BaseModel):
     building_id: UUID
     floor_id: UUID
     module_id: UUID
-    ply_target: Optional[Literal["gsplat", "alignment"]] = "gsplat"
+    ply_target: Optional[Literal["gsplat", "alignment", "refined"]] = "gsplat"
 
     @field_validator("filename")
     @classmethod
@@ -131,6 +139,13 @@ class UploadResponse(BaseModel):
     status: str
     ply_target: Optional[str] = None
     uploaded_at: datetime
+
+    # SAM3 / 정합 파이프라인 (docs/sam3_alignment_pipeline.md)
+    sam3_status: Optional[str] = None
+    sam3_prompt: Optional[str] = None
+    has_refined: bool = False
+    has_doors_json: bool = False
+    has_alignment: bool = False
 
     class Config:
         from_attributes = True

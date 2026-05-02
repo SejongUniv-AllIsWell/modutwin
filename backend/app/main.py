@@ -10,7 +10,7 @@ from app.api.scenes import router as scenes_router
 from app.api.tasks import router as tasks_router
 from app.api.ws import router as ws_router
 from app.api.notifications import router as notifications_router
-from app.api.basemaps import router as basemaps_router
+from app.api.basemaps import router as basemaps_router, public_router as basemaps_public_router
 from app.api.buildings import router as buildings_router
 from app.api.refine import router as refine_router
 
@@ -59,6 +59,7 @@ app.include_router(tasks_router)
 app.include_router(ws_router)
 app.include_router(notifications_router)
 app.include_router(basemaps_router)
+app.include_router(basemaps_public_router)
 app.include_router(buildings_router)
 app.include_router(refine_router)
 

@@ -21,6 +21,7 @@ export interface TokenResponse {
 export interface Building {
   id: string;
   name: string;
+  is_visible: boolean;
   created_at: string;
 }
 
@@ -28,14 +29,27 @@ export interface Floor {
   id: string;
   building_id: string;
   floor_number: number;
+  is_visible: boolean;
   created_at: string;
 }
 
 export interface Module {
   id: string;
   floor_id: string;
+  user_id: string;
   name: string;
+  alignment_transform: Record<string, unknown> | null;
+  is_visible: boolean;
   created_at: string;
+}
+
+export interface ActiveBasemapResponse {
+  basemap_id: string;
+  floor_id: string;
+  building_id: string;
+  version: number;
+  url: string;
+  filename: string;
 }
 
 // ── Upload ──
@@ -47,7 +61,7 @@ export interface UploadInitRequest {
   building_id: string;
   floor_id: string;
   module_id: string;
-  ply_target?: 'gsplat' | 'alignment';
+  ply_target?: 'gsplat' | 'alignment' | 'refined';
 }
 
 export interface UploadInitResponse {
@@ -64,6 +78,8 @@ export interface UploadCompleteRequest {
   parts: { part_number: number; etag: string }[];
 }
 
+export type Sam3Status = 'pending' | 'running' | 'done' | 'failed';
+
 export interface Upload {
   id: string;
   module_id: string;
@@ -72,6 +88,12 @@ export interface Upload {
   status: 'uploaded' | 'processing' | 'completed' | 'failed';
   ply_target: string | null;
   uploaded_at: string;
+  // SAM3 / 정합 파이프라인 (docs/sam3_alignment_pipeline.md)
+  sam3_status?: Sam3Status | null;
+  sam3_prompt?: string | null;
+  has_refined?: boolean;
+  has_doors_json?: boolean;
+  has_alignment?: boolean;
 }
 
 // ── Task ──

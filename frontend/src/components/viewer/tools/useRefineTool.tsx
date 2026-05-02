@@ -1,9 +1,14 @@
 'use client';
 
 import { useRef, useState, useCallback, useEffect, RefObject, lazy, Suspense } from 'react';
+import { useRouter } from 'next/navigation';
 import { SplatData, SplatViewerCoreRef } from '../SplatViewerCore';
 import { useDepthNormal } from './useDepthNormal';
 import { surfacePlanesFromRoom, signedDistance } from '@/lib/gs/planes';
+import { loadRefineState, saveRefineState, clearRefineState } from '@/lib/refine/persistence';
+import type { GaussianScene } from '@/lib/ply/types';
+
+const UNDO_STACK_LIMIT = 3;
 
 const CeilingFloorModal = lazy(() => import('./CeilingFloorModal'));
 const WallModal = lazy(() => import('./WallModal'));
@@ -20,8 +25,11 @@ interface Plane {
 }
 
 type ToolMode = 'none' | 'translate' | 'rotate';
-type RefineMode = 'plane' | 'brush' | 'bbox';
-type PaintMode = 'union' | 'diff';
+type RefineMode = 'plane' | 'brush' | 'bbox' | 'rect' | 'transparent';
+type PaintMode = 'union' | 'intersect' | 'diff';
+type SelectSubMode = 'brush' | 'bbox' | 'rect';
+const SELECT_SUB_MODES: ReadonlyArray<SelectSubMode> = ['brush', 'bbox', 'rect'];
+const isSelectMode = (m: RefineMode): m is SelectSubMode => (SELECT_SUB_MODES as readonly string[]).includes(m);
 
 // ── Vector utilities ──
 
@@ -141,10 +149,35 @@ const RING_PICK_PX = 18;
 
 // ── Hook ──
 
+interface SaveMetadata {
+  building_id: string;
+  floor_id: string;
+  module_id: string;
+  building_name?: string;
+  floor_number?: number;
+  module_name?: string;
+  /** 다듬기 저장 모달이 함께 받는 SAM3 자유 텍스트. */
+  sam_prompt?: string;
+  /** 로컬 파일에서 시작했을 때 register-local 로 새로 생성된 upload_id. */
+  upload_id?: string;
+}
+
 interface RefineToolOptions {
   uploadId?: string;
-  reloadWithUrl?: (url: string) => void;
+  // 다듬기가 베이스로 삼는 원본 PLY URL — ensureOriginalScene 에서 fetch&parse.
   currentUrl?: string;
+  // resetAll 에서 새 URL로 SplatViewerCore in-place reload.
+  reloadWithUrl?: (url: string) => void;
+  // 사용자에게 보여주는 파일명 (이미 'refined_' prefix 가 붙어있을 수도 있음 — 이중 prefix 방지용으로 strip).
+  // 저장 시 MinIO key 의 파일명에 사용: `refined_<원본>.ply`.
+  originalFilename?: string;
+  // 저장 성공 후 postSaveModal '예' 선택 시 호출. UnifiedSplatEditor 내부에서 mode='align' 으로 전환.
+  // 미지정이면 '예' 버튼은 모달만 닫고 아무 일도 안 함.
+  onSwitchToAlign?: () => void;
+  // 저장 클릭 시 호출 — 외부에서 메타데이터 입력 모달을 띄우고 결과 반환.
+  // 항상 호출되며, 받은 building/floor/module 로 새 upload 를 등록한 뒤 PLY+sidecar 를 그 위에 PUT.
+  // reject 되면 저장 흐름 취소.
+  onRequestMetadata?: () => Promise<SaveMetadata>;
 }
 
 export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, options?: RefineToolOptions) {
@@ -204,21 +237,22 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   const WALL_SURFACES: Surface[] = ['w1a', 'w1b', 'w2a', 'w2b'];
   const [selectedSurfaces, setSelectedSurfaces] = useState<Set<Surface>>(new Set());
   const [flattening, setFlattening] = useState(false);
-  const [membraneApplying, setMembraneApplying] = useState(false);
-  const [membraneColorMode, setMembraneColorMode] = useState<'white' | 'knn-median'>('white');
-  const [showDeletedOnly, setShowDeletedOnly] = useState(false);
-  const [surfaceOffsets, setSurfaceOffsets] = useState<Record<Surface, number>>({
-    ceiling: 0.3, floor: 0.3, w1a: 0.3, w1b: 0.3, w2a: 0.3, w2b: 0.3,
-  });
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  // SPEC: "다듬기 저장" → 건물 정보 + SAM3 프롬프트 단일 모달 → 완료 시 자동 정합 진입.
+  // (docs/sam3_alignment_pipeline.md "Happy path")
+  // 진행 중 전체 화면 오버레이 (업로드 → SAM3 폴링 단계 가시화)
+  const [samProgressOpen, setSamProgressOpen] = useState(false);
+  const [samProgressMessage, setSamProgressMessage] = useState('');
+  const router = useRouter();
+  // 단일 안전거리 — 모든 경계면(천장/바닥/4벽)이 공유
+  const [globalOffset, setGlobalOffset] = useState(0.05);
   // 입력 중 임시 문자열 — 빈칸·'-'·'0.' 같은 중간 상태를 허용해 삭제/편집이 가능하게
-  const [offsetText, setOffsetText] = useState<Record<Surface, string>>({
-    ceiling: '0.3', floor: '0.3', w1a: '0.3', w1b: '0.3', w2a: '0.3', w2b: '0.3',
-  });
-
-  // 막 파라미터 (슬라이더)
-  const [membraneSpacing, setMembraneSpacing] = useState(0.02);   // 격자 간격 (작을수록 패치 많음)
-  const [membraneRadius, setMembraneRadius] = useState(0.05);     // 패치 반경
-  const [membraneOpacity, setMembraneOpacity] = useState(1.0);    // 선형 불투명도 0~1
+  const [globalOffsetText, setGlobalOffsetText] = useState('0.05');
+  // shell 마스크 계산용 (모든 면 동일 globalOffset)
+  const surfaceOffsets: Record<Surface, number> = {
+    ceiling: globalOffset, floor: globalOffset, w1a: globalOffset, w1b: globalOffset, w2a: globalOffset, w2b: globalOffset,
+  };
 
   const toggleSurface = (s: Surface) => {
     // Don't allow toggling disabled surfaces
@@ -237,128 +271,723 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     ];
     setSelectedSurfaces(prev => prev.size === available.length ? new Set() : new Set(available));
   };
+
+  // ── 정제 파이프라인 state (lazy-bake 모델) ──
+  // 사용자가 "정제 결과 저장"을 누를 때까지 PLY/GPU 데이터는 일절 mutate하지 않는다.
+  // 모든 작업은 "의도(intent)"로만 메모리에 보관되고 시각 미리보기는 GPU side로만 처리.
+
+  // 원본 PLY 파싱본 캐시 (A 좌표계, 불변). 첫 정제 작업 또는 저장 시 lazy 파싱.
+  const originalSceneRef = useRef<GaussianScene | null>(null);
+
+  // 누적 회전 (rotX, rotZ) 라디안. CF 모달이 누적 입력. 옵션 A: 막 생성 후 lock.
+  const pendingRotationRef = useRef<{ rotX: number; rotZ: number }>({ rotX: 0, rotZ: 0 });
+  const [pendingRotation, setPendingRotation] = useState<{ rotX: number; rotZ: number }>({ rotX: 0, rotZ: 0 });
+
+  // flatten 마스크: 1=삭제(현재 회전된 프레임 기준 평면 외부). null=아직 적용 안 됨.
+  const flattenMaskRef = useRef<Uint8Array | null>(null);
+  const [flattenActive, setFlattenActive] = useState(false);
+  const flattenActiveRef = useRef(false);
+  const [flattenVisible, setFlattenVisible] = useState(true);
+  const flattenVisibleRef = useRef(true);
+
+  // ── Wall mesh test (texture-baked quad mesh, MVP)
+  const [wallMeshActive, setWallMeshActive] = useState(false);
+  const [wallMeshBaking, setWallMeshBaking] = useState(false);
+  const [wallMeshDebugWhite, setWallMeshDebugWhite] = useState(false);
+  const wallMeshEntitiesRef = useRef<any[]>([]);
+  // 가장 최근 베이크 결과 (디버그 다운로드 / 알파 그리드 진단 / 영속화용)
+  const lastBakesRef = useRef<Map<string, {
+    rgba: Uint8ClampedArray;
+    width: number;
+    height: number;
+    input: import('@/lib/gs/textureBake').PlaneBakeInput;
+    corners: import('@/lib/gs/textureBake').TextureBakeResult['corners'];
+    uvs: import('@/lib/gs/textureBake').TextureBakeResult['uvs'];
+  }>>(new Map());
+
+  // 알파 그리드 진단
+  const [alphaGridActive, setAlphaGridActive] = useState(false);
+  const alphaGridEntityRef = useRef<any>(null);
+
+  // 디버그: 원본 splat 엔티티 숨기기 (메시 단독 확인용)
+  const [splatHidden, setSplatHidden] = useState(false);
+
+  // 안전거리 실시간 미리보기 — 토글 ON 시 globalOffset / selectedSurfaces 변할 때마다
+  // 삭제될 가우시안을 즉시 투명 처리 (paintFlattenMask 재활용, 별도 preview 마스크).
+  const [flattenPreviewActive, setFlattenPreviewActive] = useState(false);
+  const flattenPreviewActiveRef = useRef(false);
+  const flattenPreviewMaskRef = useRef<Uint8Array | null>(null);
+
+  // ── 안전거리 / 알파블렌딩 시작 위치 시각화 (화살표) ──
+  const [safetyVizActive, setSafetyVizActive] = useState(false);
+  const [gateVizActive, setGateVizActive] = useState(false);
+  // depthGate (방 안쪽 alpha blending start 경계).
+  // 0 = 사용자가 모달에서 정의한 경계면(sd=0) 위치에서 베이크 시작 → 막 위치 (MESH_PLANE_INSET=0)
+  // 와 정확히 일치 → "층 두 개" 잔상 제거. 슬라이더로 더 안쪽까지 확장 가능.
+  const [bakeInnerGate, setBakeInnerGate] = useState(0);
+  const safetyVizEntityRef = useRef<any>(null);
+  const gateVizEntityRef = useRef<any>(null);
+
+  // 옵션 A: 막 생성 후 CF 모달의 회전 슬라이더 lock
+
+  // 통합 undo 히스토리 (시간순 단일 스택)
+  type OpRecord =
+    | { type: 'rotation'; prevRotation: { rotX: number; rotZ: number } }
+    | { type: 'flatten'; prevMask: Uint8Array | null; prevActive: boolean };
+  const opHistoryRef = useRef<OpRecord[]>([]);
+  const [undoDepth, setUndoDepth] = useState(0);
+
+  const [dirty, setDirty] = useState(false);
+  const dirtyRef = useRef(false);
+  const restoringRef = useRef(false);
+
+  const pushOp = useCallback((rec: OpRecord) => {
+    opHistoryRef.current.push(rec);
+    if (opHistoryRef.current.length > UNDO_STACK_LIMIT) opHistoryRef.current.shift();
+    setUndoDepth(opHistoryRef.current.length);
+  }, []);
+
+  // ── PLY 베이스 회전(180Z) + pendingRotation을 splatEntity transform에 적용 ──
+  const applyEntityRotation = useCallback(() => {
+    const data = splatDataRef.current;
+    const pc = coreRef.current?.getPC();
+    if (!data?.splatEntity || !pc) return;
+    const { rotX, rotZ } = pendingRotationRef.current;
+
+    // pendingRotation이 0이면 SplatViewerCore의 초기 설정과 정확히 동일한 API 사용 (회귀 방지)
+    if (rotX === 0 && rotZ === 0) {
+      data.splatEntity.setLocalEulerAngles(0, 0, 180);
+      return;
+    }
+
+    const rotXdeg = rotX * 180 / Math.PI;
+    const rotZdeg = rotZ * 180 / Math.PI;
+    // 180Z(베이스) ∘ Rz(rotZ) ∘ Rx(rotX)  — rotateScene과 동일 합성 (Rz·Rx · A)
+    const qx = new pc.Quat(); qx.setFromAxisAngle(new pc.Vec3(1, 0, 0), rotXdeg);
+    const qz = new pc.Quat(); qz.setFromAxisAngle(new pc.Vec3(0, 0, 1), rotZdeg);
+    const qBase = new pc.Quat(); qBase.setFromAxisAngle(new pc.Vec3(0, 0, 1), 180);
+    const qPending = new pc.Quat(); qPending.mul2(qz, qx);
+    const qTotal = new pc.Quat(); qTotal.mul2(qBase, qPending);
+    data.splatEntity.setLocalRotation(qTotal);
+  }, []);
+
+  // ── flatten 마스크를 colorTexture에 페인트 ──
+  // origColorData(브러시 삭제 누적)를 베이스로, 마스크된 곳만 alpha=0.
+  // showFlatten=false면 마스크 무시하고 origColorData 그대로 복원.
+  const paintFlattenMask = useCallback(() => {
+    const data = splatDataRef.current;
+    const core = coreRef.current;
+    if (!data || !core || !data.colorTexture || !data.origColorData) return;
+    const f2h = core.float2Half;
+    const td = data.colorTexture.lock();
+    if (!td) return;
+    // preview: 빨강으로 표시 (alpha 유지). applied: alpha=0 (실제 삭제 시각화).
+    // 둘 다 켜져있으면 preview가 우선.
+    const previewMask = flattenPreviewActiveRef.current ? flattenPreviewMaskRef.current : null;
+    const appliedMask = (flattenActiveRef.current && flattenVisibleRef.current) ? flattenMaskRef.current : null;
+    // 빨강 (R=1, G=0, B=0)
+    const redR = f2h(1.0), redG = f2h(0.0), redB = f2h(0.0);
+    for (let i = 0; i < data.numSplats; i++) {
+      const idx = i * 4;
+      if (previewMask && previewMask[i]) {
+        // 삭제될 가우시안 미리보기 — 빨강 + 원본 alpha 유지
+        td[idx]   = redR;
+        td[idx+1] = redG;
+        td[idx+2] = redB;
+        td[idx+3] = data.origColorData[idx+3];
+      } else if (appliedMask && appliedMask[i]) {
+        // 실제 적용된 flatten — alpha=0으로 가림
+        td[idx]   = data.origColorData[idx];
+        td[idx+1] = data.origColorData[idx+1];
+        td[idx+2] = data.origColorData[idx+2];
+        td[idx+3] = f2h(0);
+      } else {
+        td[idx]   = data.origColorData[idx];
+        td[idx+1] = data.origColorData[idx+1];
+        td[idx+2] = data.origColorData[idx+2];
+        td[idx+3] = data.origColorData[idx+3];
+      }
+    }
+    data.colorTexture.unlock();
+  }, [coreRef]);
+
+  // ── 원본 GaussianScene 보장 (lazy 파싱, 캐시) ──
+  const ensureOriginalScene = useCallback(async (): Promise<GaussianScene> => {
+    if (originalSceneRef.current) return originalSceneRef.current;
+    if (!options?.currentUrl) throw new Error('currentUrl 없음');
+    const { fetchAndParsePly } = await import('@/lib/ply');
+    const scene = await fetchAndParsePly(options.currentUrl);
+    originalSceneRef.current = scene;
+    return scene;
+  }, [options]);
+
+  // ── 회전된 source scene 빌드 (A → A' = pendingRotation · A) ──
+  // 주의: posX/Y/Z + rot_0..3 만 새 배열, 나머지는 reference 공유 (메모리 절약)
+  const buildRotatedScene = useCallback(async (origin: GaussianScene): Promise<GaussianScene> => {
+    const { rotX, rotZ } = pendingRotationRef.current;
+    if (rotX === 0 && rotZ === 0) return origin;
+    const { rotateScene } = await import('@/lib/gs');
+    const cloned: GaussianScene = {
+      numSplats: origin.numSplats,
+      propertyOrder: [...origin.propertyOrder],
+      attrs: new Map(origin.attrs),
+    };
+    for (const p of ['x', 'y', 'z', 'rot_0', 'rot_1', 'rot_2', 'rot_3']) {
+      const arr = origin.attrs.get(p);
+      if (arr) cloned.attrs.set(p, new Float32Array(arr));
+    }
+    rotateScene(cloned, rotX, rotZ);
+    return cloned;
+  }, []);
+
+  // ── splatData 위치 배열을 pendingRotation으로 회전한 사본 (in-place 마스킹용) ──
+  const buildRotatedPositions = useCallback((px: Float32Array, py: Float32Array, pz: Float32Array): { x: Float32Array; y: Float32Array; z: Float32Array } => {
+    const { rotX, rotZ } = pendingRotationRef.current;
+    if (rotX === 0 && rotZ === 0) return { x: px, y: py, z: pz };
+    const n = px.length;
+    const cx = Math.cos(rotX), sx = Math.sin(rotX);
+    const cz = Math.cos(rotZ), sz = Math.sin(rotZ);
+    const rx = new Float32Array(n);
+    const ry = new Float32Array(n);
+    const rz = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const x = px[i], y = py[i], z = pz[i];
+      rx[i] = cz * x - sz * cx * y + sz * sx * z;
+      ry[i] = sz * x + cz * cx * y - cz * sx * z;
+      rz[i] = sx * y + cx * z;
+    }
+    return { x: rx, y: ry, z: rz };
+  }, []);
+
+
+  // 원본 splat 엔티티 가리기 (디버그)
+  useEffect(() => {
+    const data = coreRef.current?.getSplatData();
+    if (!data?.splatEntity) return;
+    data.splatEntity.enabled = !splatHidden;
+    return () => {
+      // 언마운트 시 복구
+      if (data.splatEntity) data.splatEntity.enabled = true;
+    };
+  }, [splatHidden, coreRef]);
+
+  // ── 안전거리 / 알파블렌딩 시작 위치 화살표 시각화 ──
+  // 토글 ON + wallMode confirmed (방 기하 확정) 일 때만 그림.
+  // globalOffset / bakeInnerGate / pendingRotation 변할 때마다 재생성.
+  useEffect(() => {
+    const core = coreRef.current;
+    const app = core?.getApp();
+    const pc = core?.getPC();
+    if (!app || !pc) return;
+
+    // 항상 이전 엔티티 정리 후 다시 생성
+    const cleanup = () => {
+      if (safetyVizEntityRef.current) {
+        try { safetyVizEntityRef.current.destroy(); } catch {}
+        safetyVizEntityRef.current = null;
+      }
+      if (gateVizEntityRef.current) {
+        try { gateVizEntityRef.current.destroy(); } catch {}
+        gateVizEntityRef.current = null;
+      }
+    };
+    cleanup();
+
+    const wallReady = wallMode === 'confirmed' && wallAngle !== null && wallDistances !== null;
+    const cfReady = cfMode === 'confirmed';
+    if (!wallReady || !cfReady) return;
+    if (!safetyVizActive && !gateVizActive) return;
+
+    let cancelled = false;
+    (async () => {
+      const { createOffsetArrows } = await import('@/lib/gs/safetyArrows');
+      if (cancelled) return;
+      const room = {
+        angleDeg: wallAngle!,
+        walls: wallDistances! as [number, number, number, number],
+        ceilingY,
+        floorY,
+      };
+
+      if (safetyVizActive) {
+        const ent = createOffsetArrows(pc, room, globalOffset, {
+          direction: 'both',
+          name: 'safetyArrows',
+        });
+        app.root.addChild(ent);
+        safetyVizEntityRef.current = ent;
+      }
+      if (gateVizActive) {
+        // 알파블렌딩 시작 위치 = face center에서 normal 안쪽으로 bakeInnerGate.
+        // 거기서 +normal 방향(바깥)으로 길이 = bakeInnerGate + globalOffset 화살표.
+        // (시작점이 안쪽 경계, 끝점이 바깥쪽 안전거리 경계가 되어 두 시각화가 자연스럽게 이어짐)
+        const length = bakeInnerGate + globalOffset;
+        const ent = createOffsetArrows(pc, room, length, {
+          direction: 'outward',
+          colorOverride: [0.2, 1.0, 1.0],
+          originOffset: -bakeInnerGate,
+          thickness: 0.012,
+          name: 'gateArrows',
+        });
+        app.root.addChild(ent);
+        gateVizEntityRef.current = ent;
+      }
+    })();
+
+    return () => { cancelled = true; cleanup(); };
+  }, [
+    safetyVizActive, gateVizActive, globalOffset, bakeInnerGate,
+    wallMode, wallAngle, wallDistances, cfMode, ceilingY, floorY,
+    coreRef,
+  ]);
+
+  // ── 안전거리 실시간 미리보기: globalOffset/selectedSurfaces 변할 때마다 마스크 재계산 + 페인트 ──
+  useEffect(() => {
+    if (!flattenPreviewActive) {
+      // 끄기 — 마스크 비우고 paint 한번 (applied 마스크 / 원본 복원)
+      flattenPreviewActiveRef.current = false;
+      flattenPreviewMaskRef.current = null;
+      paintFlattenMask();
+      return;
+    }
+    flattenPreviewActiveRef.current = true;
+
+    const data = splatDataRef.current;
+    if (!data) return;
+    if (selectedSurfaces.size === 0) {
+      // 면 미선택 — 빈 마스크 (아무것도 가림 없음)
+      flattenPreviewMaskRef.current = new Uint8Array(data.numSplats);
+      paintFlattenMask();
+      return;
+    }
+    const hasWall = Array.from(selectedSurfaces).some(s => WALL_SURFACES.includes(s));
+    if (hasWall && (wallAngle === null || !wallDistances)) return;
+
+    let cancelled = false;
+    (async () => {
+      const { surfacePlanesFromRoom, signedDistance } = await import('@/lib/gs/planes');
+      if (cancelled) return;
+
+      const allPlanes = surfacePlanesFromRoom({
+        angleDeg: wallAngle ?? 0,
+        walls: (wallDistances ?? [0, 0, 0, 0]) as [number, number, number, number],
+        ceilingY, floorY,
+      });
+      const planes = allPlanes.filter(p => selectedSurfaces.has(p.id as Surface));
+      const marginOut = globalOffset;
+      const nearProtect = 0.03;
+
+      const rotPos = buildRotatedPositions(data.posX, data.posY, data.posZ);
+      const N = data.numSplats;
+      const mask = new Uint8Array(N);
+      for (let i = 0; i < N; i++) {
+        const x = rotPos.x[i], y = rotPos.y[i], z = rotPos.z[i];
+        for (const p of planes) {
+          const sd = signedDistance(p, x, y, z);
+          if (sd > nearProtect && sd > marginOut) { mask[i] = 1; break; }
+        }
+      }
+      if (cancelled) return;
+      flattenPreviewMaskRef.current = mask;
+      paintFlattenMask();
+    })();
+
+    return () => { cancelled = true; };
+  }, [
+    flattenPreviewActive, globalOffset, selectedSurfaces,
+    wallAngle, wallDistances, ceilingY, floorY,
+    buildRotatedPositions, paintFlattenMask,
+  ]);
+
+  // ── applyFlatten: 토글식 — 비활성 → 마스크 계산 + 활성. 활성 → 비활성(복원). ──
+  // 저장 시 활성 상태일 때만 마스크가 베이크에 반영됨.
   const applyFlatten = useCallback(async () => {
-    if (!options?.uploadId || !options?.reloadWithUrl || !options?.currentUrl) return;
+    // 이미 활성 → 복원 (비활성화 + 시각 복원)
+    if (flattenActiveRef.current) {
+      pushOp({
+        type: 'flatten',
+        prevMask: flattenMaskRef.current ? new Uint8Array(flattenMaskRef.current) : null,
+        prevActive: true,
+      });
+      flattenActiveRef.current = false; setFlattenActive(false);
+      paintFlattenMask();
+      // 마스크 자체는 보관해 둘 수도 있지만, 다음 클릭에서 어차피 재계산하므로 비움 → 의도 명확화
+      flattenMaskRef.current = null;
+      // dirty/op 히스토리는 그대로. 토글 자체도 히스토리에 남음.
+      setSaved(false);
+      const stillDirty = opHistoryRef.current.length > 0
+        || pendingRotationRef.current.rotX !== 0
+        || pendingRotationRef.current.rotZ !== 0
+        || flattenActiveRef.current;
+      dirtyRef.current = stillDirty; setDirty(stillDirty);
+      return;
+    }
+
+    // 비활성 → 마스크 계산 + 활성
     if (selectedSurfaces.size === 0) { alert('경계면을 하나 이상 선택하세요.'); return; }
     const hasWall = Array.from(selectedSurfaces).some(s => WALL_SURFACES.includes(s));
     if (hasWall && (wallAngleRef.current === null || !wallDistancesRef.current)) return;
 
+    const data = splatDataRef.current;
+    if (!data) return;
+
     setFlattening(true);
     try {
-      const [{ fetchAndParsePly, serializePly }, { surfacePlanesFromRoom, deleteOutsideSurfaces }] = await Promise.all([
-        import('@/lib/ply'),
-        import('@/lib/gs'),
-      ]);
-      const { api } = await import('@/lib/api');
-
-      const scene = await fetchAndParsePly(options.currentUrl);
+      const { surfacePlanesFromRoom, signedDistance } = await import('@/lib/gs/planes');
 
       const allPlanes = surfacePlanesFromRoom({
         angleDeg: wallAngleRef.current ?? 0,
-        walls: wallDistancesRef.current ?? [0, 0, 0, 0],
+        walls: wallDistancesRef.current ?? [0, 0, 0, 0] as [number, number, number, number],
         ceilingY: ceilingYRef.current,
         floorY: floorYRef.current,
       });
       const planes = allPlanes.filter(p => selectedSurfaces.has(p.id as Surface));
+      const marginOut = globalOffset;
+      const nearProtect = 0.03;  // DEFAULT_SHELL_OPTIONS.nearProtect
 
-      const marginOut = Math.max(...Array.from(selectedSurfaces).map(s => surfaceOffsets[s]));
-      const { scene: refined, deletedCount } = deleteOutsideSurfaces(scene, planes, { marginOut });
-      console.log(`[Shell] deleted ${deletedCount} / ${scene.numSplats} gaussians`);
+      // splatData posX/Y/Z (A 프레임)을 회전 → A' 프레임. 이 프레임에서 평면과 비교.
+      const rotPos = buildRotatedPositions(data.posX, data.posY, data.posZ);
 
-      const bytes = serializePly(refined);
-      const urlReq = await api.post<{ put_url: string; get_url: string; key: string }>(
-        '/refine/refined-upload-url',
-        { upload_id: options.uploadId, filename: 'refined.ply' },
-      );
-      const putResp = await fetch(urlReq.put_url, {
-        method: 'PUT',
-        body: bytes,
-        headers: { 'Content-Type': 'application/octet-stream' },
-      });
-      if (!putResp.ok) throw new Error(`MinIO PUT failed: ${putResp.status}`);
+      const N = data.numSplats;
+      const newMask = new Uint8Array(N);
+      let deletedCount = 0;
+      const killByPlane: Record<string, number> = {};
+      for (const p of planes) killByPlane[p.id] = 0;
+      for (let i = 0; i < N; i++) {
+        const x = rotPos.x[i], y = rotPos.y[i], z = rotPos.z[i];
+        let outside = false;
+        for (const p of planes) {
+          const sd = signedDistance(p, x, y, z);
+          if (sd > nearProtect && sd > marginOut) {
+            outside = true;
+            killByPlane[p.id]++;
+            break;
+          }
+        }
+        if (outside) { newMask[i] = 1; deletedCount++; }
+      }
+      console.log(`[Shell] flatten mask: ${deletedCount} / ${N} gaussians`);
+      console.log('[Shell] kill-by-plane:', killByPlane);
+      console.log('[Shell] plane defs:', planes.map(p => ({ id: p.id, n: p.normal, d: p.d })));
+      console.log('[Shell] params:', { ceilingY: ceilingYRef.current, floorY: floorYRef.current, wallAngle: wallAngleRef.current, wallDistances: wallDistancesRef.current, marginOut, nearProtect, pendingRot: pendingRotationRef.current });
 
-      sourceKeyRef.current = urlReq.key;
-      options.reloadWithUrl(urlReq.get_url);
+      // undo 기록 (이전 상태 = 비활성 + 마스크 없음)
+      pushOp({ type: 'flatten', prevMask: null, prevActive: false });
+
+      flattenMaskRef.current = newMask;
+      flattenActiveRef.current = true; setFlattenActive(true);
+      flattenVisibleRef.current = true; setFlattenVisible(true);
+      paintFlattenMask();
+      dirtyRef.current = true; setDirty(true);
+      setSaved(false);
     } catch (e: any) {
       alert(`처리 실패: ${e.message || e}`);
     } finally {
       setFlattening(false);
     }
-  }, [options, selectedSurfaces, surfaceOffsets]);
+  }, [selectedSurfaces, surfaceOffsets, buildRotatedPositions, paintFlattenMask, pushOp]);
 
-  const applyMembrane = useCallback(async () => {
-    if (!options?.uploadId || !options?.reloadWithUrl || !options?.currentUrl) return;
-    if (selectedSurfaces.size === 0) { alert('경계면을 하나 이상 선택하세요.'); return; }
+  // ── Wall mesh test (MVP): 선택된 면을 텍스처 메시로 굽고 splat entity child로 추가
+  const bakeWallMeshTest = useCallback(async () => {
+    // 기존 메시는 항상 먼저 제거하고 (만약 면이 선택돼있으면) 새로 베이크.
+    // 면이 0개면 그냥 제거만 (토글 OFF).
+    if (wallMeshEntitiesRef.current.length > 0) {
+      for (const e of wallMeshEntitiesRef.current) { try { e.destroy(); } catch { /* ignore */ } }
+      wallMeshEntitiesRef.current = [];
+      setWallMeshActive(false);
+      if (selectedSurfaces.size === 0) return; // 제거만 하고 끝
+      // 그 외엔 fall through 해서 새로 베이크
+    }
+    if (selectedSurfaces.size === 0) { alert('테스트할 면을 하나 이상 선택하세요.'); return; }
     const hasWall = Array.from(selectedSurfaces).some(s => WALL_SURFACES.includes(s));
     const hasCF = Array.from(selectedSurfaces).some(s => CF_SURFACES.includes(s));
-    if (hasWall && (wallAngleRef.current === null || !wallDistancesRef.current)) return;
-    if (hasCF && cfModeRef.current !== 'confirmed') return;
+    if (hasWall && (wallAngleRef.current === null || !wallDistancesRef.current)) { alert('벽 정보가 확정되지 않았습니다.'); return; }
+    if (hasCF && cfModeRef.current !== 'confirmed') { alert('천장/바닥 정보가 확정되지 않았습니다.'); return; }
 
-    setMembraneApplying(true);
+    setWallMeshBaking(true);
     try {
-      const [
-        { fetchAndParsePly, serializePly, concatScenes },
-        { generateMembrane, surfacePlanesFromRoom, deleteOutsideSurfaces },
-      ] = await Promise.all([
-        import('@/lib/ply'),
-        import('@/lib/gs'),
-      ]);
-      const { api } = await import('@/lib/api');
+      const { bakeTextureForPlane, planeBakeInputForSurface, MESH_PLANE_INSET } = await import('@/lib/gs/textureBake');
+      const { createWallMeshEntity } = await import('@/lib/gs/wallMesh');
+      const { filterScene } = await import('@/lib/ply');
 
-      const scene = await fetchAndParsePly(options.currentUrl);
+      // 텍스처 굽기에 사용할 source scene 구성:
+      //  - flatten(모듈 외부 제거) 마스크: ❌ 미적용 (depthGate가 표면 근방만 채택하므로 외부 floater 영향 X)
+      //  - 브러시/bbox 삭제: ✅ 적용 (origColorData alpha=0으로 누적돼 있음)
+      const original = await ensureOriginalScene();
+      const splatData0 = coreRef.current?.getSplatData();
+      const core0 = coreRef.current;
+      let brushFilteredOriginal = original;
+      if (splatData0?.origColorData && core0 && splatData0.numSplats === original.numSplats) {
+        const h2f = core0.half2Float;
+        const keep = new Uint8Array(original.numSplats);
+        let kept = 0;
+        for (let i = 0; i < original.numSplats; i++) {
+          const a = h2f(splatData0.origColorData[i * 4 + 3]);
+          if (a >= 1e-3) { keep[i] = 1; kept++; }
+        }
+        if (kept < original.numSplats) {
+          brushFilteredOriginal = filterScene(original, keep);
+          console.log(`[bakeWallMeshTest] 브러시/bbox 삭제 반영: ${original.numSplats - kept} 가우시안 제거 (남은 ${kept})`);
+        }
+      }
+      const rotated = await buildRotatedScene(brushFilteredOriginal);
+      const source = rotated;
 
-      const roomGeom = {
+      const room = {
         angleDeg: wallAngleRef.current ?? 0,
-        walls: wallDistancesRef.current ?? [0, 0, 0, 0] as [number, number, number, number],
+        walls: (wallDistancesRef.current ?? [0, 0, 0, 0]) as [number, number, number, number],
         ceilingY: ceilingYRef.current,
         floorY: floorYRef.current,
       };
 
-      // 1) 경계 바깥 삭제 → keep 마스크 획득
-      const allPlanes = surfacePlanesFromRoom(roomGeom);
-      const planes = allPlanes.filter(p => selectedSurfaces.has(p.id as Surface));
-      const marginOut = Math.max(...Array.from(selectedSurfaces).map(s => surfaceOffsets[s]));
-      const { scene: cleaned, deletedCount, keep } = deleteOutsideSurfaces(scene, planes, { marginOut });
-      console.log(`[Membrane] deleted ${deletedCount} / ${scene.numSplats} gaussians`);
+      const core = coreRef.current;
+      const splatData = core?.getSplatData();
+      const app = core?.getApp();
+      const pc = core?.getPC();
+      if (!app || !pc || !splatData?.splatEntity) {
+        alert('PlayCanvas 또는 splat entity가 초기화되지 않았습니다.');
+        return;
+      }
 
-      // 2) 전체 씬으로 막 색상 샘플링 (삭제 전 원본이 벽 색 정보를 온전히 갖고 있음)
-      const membrane = await generateMembrane(
-        scene.propertyOrder,
-        Array.from(selectedSurfaces),
-        roomGeom,
-        surfaceOffsets,
-        membraneColorMode,
-        membraneColorMode !== 'white' ? scene : undefined,
-        {
-          gridSpacing: membraneSpacing,
-          patchRadius: membraneRadius,
-          patchOpacity: membraneOpacity,
-        },
-      );
-      console.log(`[Membrane] deleted ${deletedCount}, generated ${membrane.numSplats} patches (${membraneColorMode})`);
+      // 메시는 6면 모두 평면(sd=0) 에서 법선 방향(=방 바깥) 으로 MESH_PLANE_INSET (1mm) 들여놓음.
+      // planeBakeInputForSurface 안의 extend* 도 같은 상수에서 파생 → 직육면체 코너 자동 정합.
+      console.log(`[bakeWallMeshTest] mesh inset: ${(MESH_PLANE_INSET * 1000).toFixed(1)}mm (모든 면 동일)`);
 
-      // 4) 정리된 씬 + 막 합치기
-      const merged = concatScenes(cleaned, membrane);
-      const bytes = serializePly(merged);
-      const urlReq = await api.post<{ put_url: string; get_url: string; key: string }>(
-        '/refine/refined-upload-url',
-        { upload_id: options.uploadId, filename: 'membrane.ply' },
-      );
-      const putResp = await fetch(urlReq.put_url, {
-        method: 'PUT',
-        body: bytes,
-        headers: { 'Content-Type': 'application/octet-stream' },
-      });
-      if (!putResp.ok) throw new Error(`MinIO PUT failed: ${putResp.status}`);
-
-      sourceKeyRef.current = urlReq.key;
-      options.reloadWithUrl(urlReq.get_url);
+      lastBakesRef.current.clear();
+      console.log(`[bakeWallMeshTest] CLICK — bakeInnerGate=${bakeInnerGate} (slider value at button click time)`);
+      for (const surfaceId of Array.from(selectedSurfaces)) {
+        const input = planeBakeInputForSurface(surfaceId, room);
+        console.log(`[bakeWallMeshTest] surface=${surfaceId} → calling bakeTextureForPlane with depthGate=${bakeInnerGate}`);
+        // autoMargin: 0 → 사용자 경계면을 strict 하게 사용. paintSd 기반 자동 확장 비활성화.
+        const bake = await bakeTextureForPlane(input, source, { depthGate: bakeInnerGate, autoMargin: 0 });
+        const ent = createWallMeshEntity(
+          pc, app, splatData.splatEntity, bake, `wallMesh_${surfaceId}`,
+          { solidWhite: wallMeshDebugWhite },
+        );
+        wallMeshEntitiesRef.current.push(ent);
+        // 디버그: 베이크 결과 보관 (PNG 다운로드용)
+        lastBakesRef.current.set(surfaceId, {
+          rgba: bake.rgba, width: bake.width, height: bake.height, input: bake.input,
+          corners: bake.corners, uvs: bake.uvs,
+        });
+      }
+      setWallMeshActive(true);
     } catch (e: any) {
       alert(`막 생성 실패: ${e.message || e}`);
     } finally {
-      setMembraneApplying(false);
+      setWallMeshBaking(false);
     }
-  }, [options, selectedSurfaces, surfaceOffsets, membraneColorMode, membraneSpacing, membraneRadius, membraneOpacity]);
+  }, [selectedSurfaces, surfaceOffsets, ensureOriginalScene, buildRotatedScene, coreRef, wallMeshDebugWhite, bakeInnerGate]);
+
+  // 가장 최근 베이크 결과를 PNG로 다운로드 (디버그)
+  const downloadBakedTextures = useCallback(() => {
+    const bakes = lastBakesRef.current;
+    if (bakes.size === 0) { alert('베이크된 텍스처가 없습니다. 먼저 "막 생성하기" 실행.'); return; }
+    const ts = Date.now();
+    bakes.forEach(({ rgba, width, height }, surfaceId) => {
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      const imgData = new ImageData(new Uint8ClampedArray(rgba), width, height);
+      ctx.putImageData(imgData, 0, 0);
+      canvas.toBlob((blob) => {
+        if (!blob) return;
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `bake_${surfaceId}_${ts}.png`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+      }, 'image/png');
+    });
+  }, []);
+
+  // ── 알파 그리드 진단: 50cm 간격 그리드, 베이크 텍스처에서 알파 샘플링 ──
+  // 빨강(α=0) → 초록(α=1) 컬러 구. 콘솔에 모든 (surface, u, v, r, g, b, a) 덤프.
+  const toggleAlphaGrid = useCallback(() => {
+    // OFF
+    if (alphaGridActive) {
+      if (alphaGridEntityRef.current) {
+        try { alphaGridEntityRef.current.destroy(); } catch {}
+        alphaGridEntityRef.current = null;
+      }
+      setAlphaGridActive(false);
+      return;
+    }
+    // ON
+    const bakes = lastBakesRef.current;
+    if (bakes.size === 0) { alert('베이크 결과가 없습니다. 먼저 "막 생성하기" 실행.'); return; }
+    const core = coreRef.current;
+    const app = core?.getApp();
+    const pc = core?.getPC();
+    if (!app || !pc) return;
+
+    const parent = new pc.Entity('alphaGrid');
+    parent.setLocalEulerAngles(0, 0, 180);
+
+    const SPACING = 0.5; // 50cm
+    const LABEL_W = 0.25; // 25cm 폭 라벨
+    const LABEL_H = 0.12; // 12cm 높이
+    const rows: Array<{ surface: string; u: string; v: string; r: number; g: number; b: number; a: number }> = [];
+
+    // canvas → texture 헬퍼. 알파 값에 따라 배경/글자색 변경.
+    const makeLabelTex = (alpha: number): any => {
+      const W = 256, H = 128;
+      const canvas = document.createElement('canvas');
+      canvas.width = W; canvas.height = H;
+      const ctx = canvas.getContext('2d')!;
+      // 배경 — 알파 0이면 빨강, 1이면 초록 (가독성용 톤)
+      const bgR = Math.round((1 - alpha) * 180);
+      const bgG = Math.round(alpha * 180);
+      ctx.fillStyle = `rgba(${bgR}, ${bgG}, 30, 0.85)`;
+      ctx.fillRect(0, 0, W, H);
+      ctx.strokeStyle = 'rgba(255,255,255,0.6)';
+      ctx.lineWidth = 4;
+      ctx.strokeRect(2, 2, W - 4, H - 4);
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 78px monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(alpha.toFixed(2), W / 2, H / 2);
+
+      const fmt = pc.PIXELFORMAT_SRGBA8 ?? pc.PIXELFORMAT_RGBA8;
+      const tex = new pc.Texture(app.graphicsDevice, {
+        width: W, height: H, format: fmt,
+        mipmaps: false,
+        addressU: pc.ADDRESS_CLAMP_TO_EDGE,
+        addressV: pc.ADDRESS_CLAMP_TO_EDGE,
+        magFilter: pc.FILTER_LINEAR,
+        minFilter: pc.FILTER_LINEAR,
+        name: 'alphaLabel',
+      });
+      // canvas → texture
+      if (typeof tex.setSource === 'function') {
+        tex.setSource(canvas);
+      } else {
+        const lvl = tex.lock();
+        const imgData = ctx.getImageData(0, 0, W, H);
+        lvl.set(imgData.data);
+        tex.unlock();
+      }
+      return tex;
+    };
+
+    // dir(=면 normal의 반대, 방 안쪽) 방향이 quad의 +Z (앞면)을 향하도록 회전.
+    // PlayCanvas plane primitive: XZ 평면, normal=+Y. 우리는 XY 평면+normal=+Z 가 필요.
+    // 대신 자체 quad mesh를 만들어 normal을 +Z 로 두고 dir에 맞게 rotate.
+    const makeLabelEntity = (
+      world: [number, number, number],
+      dirInward: [number, number, number],
+      uAxis: [number, number, number],
+      vAxis: [number, number, number],
+      alpha: number,
+      name: string,
+    ): any => {
+      const tex = makeLabelTex(alpha);
+      const mat = new pc.StandardMaterial();
+      mat.useLighting = false;
+      mat.diffuse.set(0, 0, 0);
+      mat.emissive.set(1, 1, 1);
+      mat.emissiveMap = tex;
+      mat.cull = pc.CULLFACE_NONE;
+      mat.update();
+
+      // quad: TL, TR, BR, BL  in (uAxis, vAxis) 평면
+      const hw = LABEL_W / 2, hh = LABEL_H / 2;
+      const positions = [
+        -hw * uAxis[0] + hh * vAxis[0], -hw * uAxis[1] + hh * vAxis[1], -hw * uAxis[2] + hh * vAxis[2],
+         hw * uAxis[0] + hh * vAxis[0],  hw * uAxis[1] + hh * vAxis[1],  hw * uAxis[2] + hh * vAxis[2],
+         hw * uAxis[0] - hh * vAxis[0],  hw * uAxis[1] - hh * vAxis[1],  hw * uAxis[2] - hh * vAxis[2],
+        -hw * uAxis[0] - hh * vAxis[0], -hw * uAxis[1] - hh * vAxis[1], -hw * uAxis[2] - hh * vAxis[2],
+      ];
+      const uvs = [0, 1,  1, 1,  1, 0,  0, 0];
+      const normals = [
+        dirInward[0], dirInward[1], dirInward[2],
+        dirInward[0], dirInward[1], dirInward[2],
+        dirInward[0], dirInward[1], dirInward[2],
+        dirInward[0], dirInward[1], dirInward[2],
+      ];
+      const indices = [0, 1, 2, 0, 2, 3];
+
+      const mesh = new pc.Mesh(app.graphicsDevice);
+      mesh.setPositions(positions);
+      mesh.setUvs(0, uvs);
+      mesh.setNormals(normals);
+      mesh.setIndices(indices);
+      mesh.update();
+
+      const meshInst = new pc.MeshInstance(mesh, mat);
+      const ent = new pc.Entity(name);
+      ent.addComponent('render', { meshInstances: [meshInst] });
+      ent.setLocalPosition(world[0], world[1], world[2]);
+      return ent;
+    };
+
+    bakes.forEach((bake, surfaceId) => {
+      const inp = bake.input;
+      const tpm = bake.width / (inp.uMax - inp.uMin);
+      // 라벨이 표면에 너무 붙어 z-fighting 나지 않도록 살짝 안쪽으로 띄움
+      const LIFT = 0.02;
+      // 면 normal 의 반대 = 방 안쪽 방향 (라벨 정면이 이쪽을 향함)
+      const inward: [number, number, number] = [-inp.normal[0], -inp.normal[1], -inp.normal[2]];
+
+      // u, v 그리드 — bake 범위 내 SPACING 간격
+      const us: number[] = [];
+      for (let u = inp.uMin; u <= inp.uMax + 1e-6; u += SPACING) us.push(u);
+      const vs: number[] = [];
+      for (let v = inp.vMin; v <= inp.vMax + 1e-6; v += SPACING) vs.push(v);
+
+      for (const u of us) {
+        for (const v of vs) {
+          const tx = Math.floor((u - inp.uMin) * tpm);
+          const ty = Math.floor((inp.vMax - v) * tpm);
+          if (tx < 0 || tx >= bake.width || ty < 0 || ty >= bake.height) continue;
+
+          const idx = (ty * bake.width + tx) * 4;
+          const rB = bake.rgba[idx], gB = bake.rgba[idx + 1], bB = bake.rgba[idx + 2], aB = bake.rgba[idx + 3];
+          const alpha = aB / 255;
+
+          const wx = inp.origin[0] + u * inp.uAxis[0] + v * inp.vAxis[0] + LIFT * inward[0];
+          const wy = inp.origin[1] + u * inp.uAxis[1] + v * inp.vAxis[1] + LIFT * inward[1];
+          const wz = inp.origin[2] + u * inp.uAxis[2] + v * inp.vAxis[2] + LIFT * inward[2];
+
+          const ent = makeLabelEntity(
+            [wx, wy, wz],
+            inward,
+            [inp.uAxis[0], inp.uAxis[1], inp.uAxis[2]],
+            [inp.vAxis[0], inp.vAxis[1], inp.vAxis[2]],
+            alpha,
+            `lbl_${surfaceId}_${u.toFixed(2)}_${v.toFixed(2)}`,
+          );
+          parent.addChild(ent);
+
+          rows.push({
+            surface: surfaceId,
+            u: u.toFixed(3),
+            v: v.toFixed(3),
+            r: rB, g: gB, b: bB, a: aB,
+          });
+        }
+      }
+    });
+
+    app.root.addChild(parent);
+    alphaGridEntityRef.current = parent;
+    setAlphaGridActive(true);
+
+    console.log(`[alphaGrid] sampled ${rows.length} grid points across ${bakes.size} surfaces (50cm spacing)`);
+    console.table(rows);
+    // 알파 분포 요약
+    const aVals = rows.map(r => r.a / 255);
+    const nZero = aVals.filter(a => a < 0.05).length;
+    const nFull = aVals.filter(a => a > 0.95).length;
+    const aMean = aVals.reduce((s, a) => s + a, 0) / Math.max(1, aVals.length);
+    console.log(`[alphaGrid] alpha summary: mean=${aMean.toFixed(3)}, α<0.05: ${nZero}/${aVals.length}, α>0.95: ${nFull}/${aVals.length}`);
+  }, [alphaGridActive, coreRef]);
 
   // ── Brush/BBox state ──
   const [paintMode, setPaintMode] = useState<PaintMode>('union');
@@ -377,6 +1006,28 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   const setSelBboxMin = (v: Vec3) => { selBboxMinRef.current = v; _setSelBboxMin(v); };
   const setSelBboxMax = (v: Vec3) => { selBboxMaxRef.current = v; _setSelBboxMax(v); };
   const bboxRangeRef = useRef<{min: Vec3; max: Vec3}>({min:[-1,-1,-1],max:[1,1,1]});
+
+  // Brush intersect: stroke 시작 시점 sel snapshot + 스트로크 동안 페인트된 splat 마스크.
+  // 교집합 모드에서 sel = strokeBaseSel ∩ strokeMask 로 매 프레임 재계산.
+  const strokeBaseSelRef = useRef<Uint8Array | null>(null);
+  const strokeMaskRef = useRef<Uint8Array | null>(null);
+
+  // 가우시안 선택/삭제 그룹의 마지막 서브모드 — 상위 탭(가우시안 선택/삭제) 클릭 시 복귀할 값.
+  const lastSelectSubModeRef = useRef<SelectSubMode>('brush');
+
+  // Rect (직사각형) tool: 화면 직사각형 드래그 → 영역 안에 투영되는 모든 splat 선택.
+  const rectPreviewRef = useRef<HTMLDivElement | null>(null);
+
+  // ── Transparent paint state (wall mesh 텍스처에 alpha=0 페인트 — 출입구/통로 등) ──
+  const [transBrushMeters, setTransBrushMeters] = useState(0.1);
+  const transBrushMetersRef = useRef(0.1);
+  useEffect(() => { transBrushMetersRef.current = transBrushMeters; }, [transBrushMeters]);
+  // 도형: 원형 브러시 (드래그 페인트) | 직사각형 (mousedown→up 으로 영역 지정)
+  type TransShape = 'circle' | 'rect';
+  const [transShape, setTransShape] = useState<TransShape>('circle');
+  const transShapeRef = useRef<TransShape>('circle');
+  useEffect(() => { transShapeRef.current = transShape; }, [transShape]);
+  const transRectPreviewRef = useRef<HTMLDivElement | null>(null);
 
   // Sync refs
   useEffect(() => { planesRef.current = planes; }, [planes]);
@@ -400,8 +1051,56 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     setSplatLoaded(false);
   }, [options?.currentUrl]);
 
-  // ── 정제 파이프라인 state ──
-  const sourceKeyRef = useRef<string | null>(null);
+  // ── localStorage 복원: uploadId 진입 시 1회 ──
+  const loadedUploadIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    const uid = options?.uploadId;
+    if (!uid || loadedUploadIdRef.current === uid) return;
+    const saved = loadRefineState(uid);
+    if (!saved) { loadedUploadIdRef.current = uid; return; }
+
+    restoringRef.current = true;
+    // 천장/바닥
+    if (saved.cfConfirmed) {
+      setCeilingY(saved.ceilingY); setFloorY(saved.floorY);
+      ceilingYRef.current = saved.ceilingY; floorYRef.current = saved.floorY;
+      setCfMode('confirmed'); cfModeRef.current = 'confirmed';
+    }
+    // 벽면
+    if (saved.wallConfirmed && saved.wallAngle !== null && saved.wallDistances) {
+      setWallAngle(saved.wallAngle); wallAngleRef.current = saved.wallAngle;
+      setWallDistances(saved.wallDistances); wallDistancesRef.current = saved.wallDistances;
+      setWallMode('confirmed'); wallModeRef.current = 'confirmed';
+    }
+    // 경계면 선택
+    setSelectedSurfaces(new Set(saved.selectedSurfaces as Surface[]));
+    setGlobalOffset(saved.globalOffset);
+    setGlobalOffsetText(saved.globalOffsetText);
+    // PLY 자체는 메모리에서만 다루므로 세션 간 복원 안 함. 항상 원본부터 시작.
+
+    loadedUploadIdRef.current = uid;
+    // 한 틱 뒤 복원 플래그 해제
+    setTimeout(() => { restoringRef.current = false; }, 0);
+  }, [options?.uploadId]);
+
+  // ── localStorage 저장: 관련 state 변경 시마다 ──
+  useEffect(() => {
+    const uid = options?.uploadId;
+    if (!uid || restoringRef.current || loadedUploadIdRef.current !== uid) return;
+    saveRefineState(uid, {
+      cfConfirmed: cfMode === 'confirmed',
+      ceilingY, floorY,
+      wallConfirmed: wallMode === 'confirmed',
+      wallAngle, wallDistances,
+      selectedSurfaces: Array.from(selectedSurfaces),
+      globalOffset, globalOffsetText,
+    });
+  }, [
+    options?.uploadId, undoDepth,
+    cfMode, ceilingY, floorY,
+    wallMode, wallAngle, wallDistances,
+    selectedSurfaces, globalOffset, globalOffsetText,
+  ]);
 
   const syncPlanes = useCallback(() => setPlanes([...planesRef.current]), []);
 
@@ -441,6 +1140,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   }, [coreRef]);
 
   // ── Highlight: brush/bbox selection → red ──
+  // flatten 마스크가 활성이면 alpha=0 유지해서 모듈 외부 제거 효과 보존.
   const refreshSelection = useCallback(() => {
     const data = splatDataRef.current; const core = coreRef.current; const sel = selectionRef.current;
     if (!data || !core || !sel) return;
@@ -451,24 +1151,40 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     try { td = data.colorTexture.lock(); } catch { return; }
     if (!td) return;
     const orig = data.origColorData; const f2h = core.float2Half; const h2f = core.half2Float;
+    // flatten 적용 마스크 — refreshSelection이 origColorData로 alpha 복원하면서 사라지지 않게 보존
+    const previewMask = flattenPreviewActiveRef.current ? flattenPreviewMaskRef.current : null;
+    const appliedMask = (flattenActiveRef.current && flattenVisibleRef.current) ? flattenMaskRef.current : null;
+    const zeroAlpha = f2h(0);
+    const redR = f2h(1.0), redG = f2h(0.0), redB = f2h(0.0);
     for (let i = 0; i < data.numSplats; i++) {
       const idx = i * 4;
-      if (sel[i]) {
+      if (previewMask && previewMask[i]) {
+        // flatten preview: 삭제될 가우시안 빨강 + alpha 유지
+        td[idx] = redR; td[idx+1] = redG; td[idx+2] = redB;
+        td[idx+3] = orig[idx+3];
+      } else if (sel[i]) {
+        // brush/bbox 선택: 빨강 톤 mix + alpha 보존 (flatten applied면 0으로 override)
         const r = h2f(orig[idx]), g = h2f(orig[idx+1]), b = h2f(orig[idx+2]);
-        td[idx] = f2h(r*0.3+1.0*0.7); td[idx+1] = f2h(g*0.3+0.1*0.7); td[idx+2] = f2h(b*0.3+0.1*0.7); td[idx+3] = orig[idx+3];
-      } else { td[idx]=orig[idx]; td[idx+1]=orig[idx+1]; td[idx+2]=orig[idx+2]; td[idx+3]=orig[idx+3]; }
+        td[idx] = f2h(r*0.3+1.0*0.7); td[idx+1] = f2h(g*0.3+0.1*0.7); td[idx+2] = f2h(b*0.3+0.1*0.7);
+        td[idx+3] = (appliedMask && appliedMask[i]) ? zeroAlpha : orig[idx+3];
+      } else {
+        td[idx]=orig[idx]; td[idx+1]=orig[idx+1]; td[idx+2]=orig[idx+2];
+        td[idx+3] = (appliedMask && appliedMask[i]) ? zeroAlpha : orig[idx+3];
+      }
     }
     try { data.colorTexture.unlock(); } catch {}
   }, [coreRef]);
 
   // ── Unified surface highlight: tint gaussians near selected surfaces ──
+  // 컨벤션 주의: PLY 프레임 'ceiling' = 시각적 바닥, 'floor' = 시각적 천장 (180Z 회전 영향)
+  // 따라서 색도 시각 의미에 맞게 swap: ceiling(=바닥)=밤색, floor(=천장)=하늘색
   const SURFACE_COLORS: Record<string, [number, number, number]> = {
-    ceiling: [0.133, 0.827, 0.933], // #22d3ee cyan
-    floor:   [0.659, 0.333, 0.969], // #a855f7 violet
-    w1a:     [0.937, 0.267, 0.267], // #ef4444 red
-    w1b:     [0.925, 0.282, 0.600], // #ec4899 pink
-    w2a:     [0.976, 0.451, 0.086], // #f97316 orange
-    w2b:     [0.918, 0.702, 0.031], // #eab308 yellow
+    ceiling: [0.573, 0.251, 0.055], // #92400e 밤색 (시각적 바닥)
+    floor:   [0.133, 0.827, 0.933], // #22d3ee 하늘색 (시각적 천장)
+    w1a:     [0.063, 0.725, 0.506], // #10b981 emerald
+    w1b:     [0.231, 0.510, 0.965], // #3b82f6 blue
+    w2a:     [0.545, 0.361, 0.965], // #8b5cf6 violet
+    w2b:     [0.518, 0.800, 0.086], // #84cc16 lime
   };
   const applySurfaceHighlight = useCallback(() => {
     const data = splatDataRef.current; const core = coreRef.current;
@@ -479,14 +1195,32 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     try { td = data.colorTexture.lock(); } catch { return; }
     if (!td) return;
     const orig = data.origColorData;
-    if (sel.size === 0) {
-      td.set(orig); try { data.colorTexture.unlock(); } catch {} return;
-    }
     const f2h = core.float2Half, h2f = core.half2Float;
+    // flatten 마스크 — surface highlight가 alpha를 origColorData로 복원할 때 함께 보존
+    const previewMask = flattenPreviewActiveRef.current ? flattenPreviewMaskRef.current : null;
+    const appliedMask = (flattenActiveRef.current && flattenVisibleRef.current) ? flattenMaskRef.current : null;
+    const zeroAlpha = f2h(0);
+    const redR = f2h(1.0), redG = f2h(0.0), redB = f2h(0.0);
+    if (sel.size === 0) {
+      // 선택 없음 → 기본 (orig + flatten)
+      for (let i = 0; i < data.numSplats; i++) {
+        const idx = i * 4;
+        if (previewMask && previewMask[i]) {
+          td[idx]=redR; td[idx+1]=redG; td[idx+2]=redB; td[idx+3]=orig[idx+3];
+        } else {
+          td[idx]=orig[idx]; td[idx+1]=orig[idx+1]; td[idx+2]=orig[idx+2];
+          td[idx+3] = (appliedMask && appliedMask[i]) ? zeroAlpha : orig[idx+3];
+        }
+      }
+      try { data.colorTexture.unlock(); } catch {}
+      return;
+    }
     const mixT = 0.75;
 
     const cy = ceilingYRef.current, fy = floorYRef.current;
-    const bandCf = Math.abs(fy - cy) * 0.03;
+    // 안전거리 슬라이더(globalOffset)에 따라 색칠 밴드 폭이 달라짐 — 사용자가 슬라이더로
+    // "어디까지 안전거리에 들어오는지" 시각적으로 확인 가능. 최소 3cm는 유지해 항상 보임.
+    const bandCf = Math.max(globalOffset, 0.03);
     const yLo = Math.min(cy, fy), yHi = Math.max(cy, fy);
 
     let c1 = 0, s1 = 0, c2 = 0, s2 = 0, a1 = 0, b1 = 0, a2 = 0, b2 = 0, bandWall = 0;
@@ -497,12 +1231,27 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       c1 = Math.cos(rad); s1 = Math.sin(rad);
       c2 = Math.cos(rad + Math.PI / 2); s2 = Math.sin(rad + Math.PI / 2);
       [a1, b1, a2, b2] = walls as [number, number, number, number];
-      bandWall = Math.min(Math.abs(b1 - a1), Math.abs(b2 - a2)) * 0.03;
+      bandWall = Math.max(globalOffset, 0.03);
     }
+
+    // pendingRotation을 가우시안 좌표에 적용해서 평면(A' 프레임)과 비교 — flatten/막과 동일한 프레임
+    const { rotX, rotZ } = pendingRotationRef.current;
+    const rotActive = rotX !== 0 || rotZ !== 0;
+    const rcx = Math.cos(rotX), rsx = Math.sin(rotX);
+    const rcz = Math.cos(rotZ), rsz = Math.sin(rotZ);
 
     for (let i = 0; i < data.numSplats; i++) {
       const idx = i * 4;
-      const x = data.posX[i], y = data.posY[i], z = data.posZ[i];
+      const x0 = data.posX[i], y0 = data.posY[i], z0 = data.posZ[i];
+      // A → A' 회전 (rotateScene과 동일 식)
+      let x: number, y: number, z: number;
+      if (rotActive) {
+        x = rcz * x0 - rsz * rcx * y0 + rsz * rsx * z0;
+        y = rsz * x0 + rcz * rcx * y0 - rcz * rsx * z0;
+        z = rsx * y0 + rcx * z0;
+      } else {
+        x = x0; y = y0; z = z0;
+      }
       let bestSurf: string | null = null;
       let bestD = Infinity;
 
@@ -517,93 +1266,41 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         if (sel.has('w2b')) { const d = Math.abs(d2 - b2); if (d < bandWall && d < bestD) { bestD = d; bestSurf = 'w2b'; } }
       }
 
-      if (bestSurf) {
+      // flatten preview 우선 (빨강) > surface highlight (혼합) > 기본 + flatten alpha
+      if (previewMask && previewMask[i]) {
+        td[idx] = redR; td[idx+1] = redG; td[idx+2] = redB; td[idx+3] = orig[idx+3];
+      } else if (bestSurf) {
         const [cr, cg, cb] = SURFACE_COLORS[bestSurf];
         const r = h2f(orig[idx]), g = h2f(orig[idx+1]), b = h2f(orig[idx+2]);
-        td[idx] = f2h(r*(1-mixT)+cr*mixT); td[idx+1] = f2h(g*(1-mixT)+cg*mixT); td[idx+2] = f2h(b*(1-mixT)+cb*mixT); td[idx+3] = orig[idx+3];
+        td[idx] = f2h(r*(1-mixT)+cr*mixT); td[idx+1] = f2h(g*(1-mixT)+cg*mixT); td[idx+2] = f2h(b*(1-mixT)+cb*mixT);
+        td[idx+3] = (appliedMask && appliedMask[i]) ? zeroAlpha : orig[idx+3];
       } else {
-        td[idx]=orig[idx]; td[idx+1]=orig[idx+1]; td[idx+2]=orig[idx+2]; td[idx+3]=orig[idx+3];
+        td[idx]=orig[idx]; td[idx+1]=orig[idx+1]; td[idx+2]=orig[idx+2];
+        td[idx+3] = (appliedMask && appliedMask[i]) ? zeroAlpha : orig[idx+3];
       }
     }
     try { data.colorTexture.unlock(); } catch {}
-  }, [coreRef]);
+  }, [coreRef, globalOffset]);
 
-  const toggleDeletedPreview = useCallback((on: boolean) => {
-    const data = splatDataRef.current; const core = coreRef.current;
-    if (!data?.colorTexture || !data?.origColorData || !core) return;
-
-    if (!on) {
-      let td: Uint16Array | null = null;
-      try { td = data.colorTexture.lock(); } catch { return; }
-      if (!td) return;
-      td.set(data.origColorData);
-      try { data.colorTexture.unlock(); } catch {}
-      setShowDeletedOnly(false);
-      applySurfaceHighlight();
-      return;
-    }
-
-    if (selectedSurfaces.size === 0) return;
-    const hasWall = Array.from(selectedSurfaces).some(s => WALL_SURFACES.includes(s));
-    if (hasWall && (wallAngleRef.current === null || !wallDistancesRef.current)) return;
-
-    const allPlanes = surfacePlanesFromRoom({
-      angleDeg: wallAngleRef.current ?? 0,
-      walls: wallDistancesRef.current ?? [0, 0, 0, 0],
-      ceilingY: ceilingYRef.current,
-      floorY: floorYRef.current,
-    });
-    const planes = allPlanes.filter(p => selectedSurfaces.has(p.id as Surface));
-    const marginOut = Math.max(...Array.from(selectedSurfaces).map(s => surfaceOffsets[s]));
-
-    const keepMask = new Uint8Array(data.numSplats);
-    keepMask.fill(1);
-    for (let i = 0; i < data.numSplats; i++) {
-      const x = data.posX[i], y = data.posY[i], z = data.posZ[i];
-      for (const plane of planes) {
-        const sd = signedDistance(plane, x, y, z);
-        if (sd > 0.03 && sd > marginOut) { keepMask[i] = 0; break; }
-      }
-    }
-
-    let td: Uint16Array | null = null;
-    try { td = data.colorTexture.lock(); } catch { return; }
-    if (!td) return;
-    const orig = data.origColorData;
-    const f2h = core.float2Half;
-    const zeroAlpha = f2h(0);
-    for (let i = 0; i < data.numSplats; i++) {
-      const idx = i * 4;
-      if (keepMask[i]) {
-        td[idx] = orig[idx]; td[idx + 1] = orig[idx + 1]; td[idx + 2] = orig[idx + 2];
-        td[idx + 3] = zeroAlpha;
-      } else {
-        td[idx] = orig[idx]; td[idx + 1] = orig[idx + 1]; td[idx + 2] = orig[idx + 2]; td[idx + 3] = orig[idx + 3];
-      }
-    }
-    try { data.colorTexture.unlock(); } catch {}
-    setShowDeletedOnly(true);
-  }, [coreRef, selectedSurfaces, surfaceOffsets, applySurfaceHighlight]);
-
-  // Sync ref + re-tint whenever selection changes
+  // Sync ref + re-tint whenever selection / 안전거리 / 회전 / 평면 변할 때
   useEffect(() => {
     selectedSurfacesRef.current = selectedSurfaces;
-    if (showDeletedOnly) toggleDeletedPreview(true);
-    else applySurfaceHighlight();
-  }, [selectedSurfaces, applySurfaceHighlight, showDeletedOnly, toggleDeletedPreview]);
+    applySurfaceHighlight();
+  }, [selectedSurfaces, applySurfaceHighlight, globalOffset, ceilingY, floorY, wallAngle, wallDistances]);
 
   // ── Restore original colors (mode switch) ──
+  // 단순히 origColorData로 덮어쓰면 flatten 마스크(alpha=0)가 사라지므로,
+  // paintFlattenMask로 base 색 + flatten 상태를 함께 복원.
   const clearHighlight = useCallback(() => {
-    const data = splatDataRef.current;
-    if (!data?.colorTexture || !data?.origColorData) return;
-    const td = data.colorTexture.lock(); if (td) { td.set(data.origColorData); data.colorTexture.unlock(); }
-  }, []);
+    paintFlattenMask();
+  }, [paintFlattenMask]);
 
   // ── Mode switch handler ──
   const switchMode = useCallback((mode: RefineMode) => {
     clearHighlight();
     setRefineMode(mode);
     refineModeRef.current = mode;
+    if (isSelectMode(mode)) lastSelectSubModeRef.current = mode;
     // Reset plane gizmo state
     setToolMode('none'); toolModeRef.current = 'none'; dragRef.current = null;
     setPickingNormal(false); pickingNormalRef.current = false; normalDisplayRef.current = null; clearDepth();
@@ -645,25 +1342,238 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     planesRef.current = []; syncPlanes(); setSelectedPlane(-1); selectedPlaneRef.current = -1; setOutsideCount(0); setClosed(false);
   }, [coreRef, syncPlanes]);
 
-  // ── Save refined result ──
-  const [saving, setSaving] = useState(false);
-  const [saved, setSaved] = useState(false);
+  // ── Save refined result + SAM3 dispatch ──
+  // "다듬기 저장" → 건물 정보 + SAM3 프롬프트 단일 모달 → 완료 시:
+  //   1) refined PLY 업로드  2) /uploads/{id}/sam3/start  3) 상태 폴링  4) 자동으로 정합 모드 진입.
+  // (docs/sam3_alignment_pipeline.md "Happy path")
   const saveRefined = useCallback(async () => {
-    if (!options?.uploadId || !sourceKeyRef.current) return;
-    setSaving(true);
+    // 단일 통합 모달: 메타데이터 + SAM3 프롬프트.
+    // 로컬 파일에서 시작한 경우 모달 콜백이 register-local 로 upload_id 도 같이 만들어 돌려준다.
+    // 사용자가 모달을 취소하면 저장 흐름을 중단.
+    if (!options?.onRequestMetadata) return;
+    let prompt = '';
+    let activeUploadId: string | undefined = options?.uploadId;
     try {
+      const meta = await options.onRequestMetadata();
+      prompt = (meta?.sam_prompt ?? '').trim();
+      // upload_id 우선순위: 모달이 새로 만든 id > 기존 options.uploadId
+      activeUploadId = meta?.upload_id ?? activeUploadId;
+    } catch {
+      return;
+    }
+    if (!activeUploadId) {
+      alert('업로드 등록에 실패했습니다.');
+      return;
+    }
+    setSaving(true);
+    setSamProgressOpen(true);
+    setSamProgressMessage('정제된 PLY 준비 중...');
+    try {
+      const { serializePly, filterScene } = await import('@/lib/ply');
       const { api } = await import('@/lib/api');
-      await api.post<{ scene_id: string; message: string }>('/refine/save', {
-        upload_id: options.uploadId,
-        source_key: sourceKeyRef.current,
+
+      const original = await ensureOriginalScene();
+      const N = original.numSplats;
+      const data = splatDataRef.current;
+      const core = coreRef.current;
+
+      // 1) 통합 keep 마스크 빌드: 브러시 삭제(origColorData alpha=0) ∪ flatten 마스크
+      const keep = new Uint8Array(N).fill(1);
+      let brushDeleted = 0;
+      if (data?.origColorData && core) {
+        const h2f = core.half2Float;
+        for (let i = 0; i < N; i++) {
+          const a = h2f(data.origColorData[i * 4 + 3]);
+          if (a < 1e-3) { keep[i] = 0; brushDeleted++; }
+        }
+      }
+      let flattenDeleted = 0;
+      if (flattenMaskRef.current) {
+        for (let i = 0; i < N; i++) {
+          if (flattenMaskRef.current[i] && keep[i]) { keep[i] = 0; flattenDeleted++; }
+        }
+      } else if (flattenActiveRef.current === false && !data?.origColorData) {
+        console.warn('[Save] flatten 마스크가 없습니다 — 모듈 외부 복원 상태이거나 적용 안 함.');
+      }
+
+      // 2) 필터링 (원본 → 살릴 가우시안만)
+      // SPEC: 다듬기는 포인트 제거만 수행한다 — 회전/스케일/translate 금지.
+      // (docs/sam3_alignment_pipeline.md "좌표계 정합성")
+      // 정합 단계는 refined PLY 의 raw 좌표계 위에서 수행되므로 어떤 좌표 변환도 베이크하지 않는다.
+      // pendingRotation, wallAngle 은 화면(entity)에만 적용된 표시용 변환으로,
+      // doors 4꼭짓점/평면 정의 등 정합에 필요한 메타데이터는 raw 프레임 그대로 저장한다.
+      const baked = filterScene(original, keep);
+
+      const wallAngleDeg = wallAngleRef.current ?? 0;
+      const { rotX, rotZ } = pendingRotationRef.current;
+
+      console.log(`[Save] N=${N}, brush삭제=${brushDeleted}, flatten삭제=${flattenDeleted}, 살아남음=${baked.numSplats} (좌표 변환 없음 — raw frame 유지). 화면 회전 표시값 rotX=${rotX.toFixed(3)}, rotZ=${rotZ.toFixed(3)}, wallY=${wallAngleDeg.toFixed(2)}°.`);
+      console.log(`[Save] flattenActive=${flattenActiveRef.current}, flattenMask 존재=${!!flattenMaskRef.current}`);
+
+      const bytes = serializePly(baked);
+      console.log(`[Save] PLY 크기 (정제 후): ${(bytes.byteLength / 1024 / 1024).toFixed(2)} MB`);
+
+      // session_id: 한 번의 저장에서 PLY + mesh.json + tex_*.png 가 같은 디렉토리로 가도록.
+      const sessionId = `s${Date.now()}`;
+
+      // 저장 PLY 파일명: refined_<원본basename>.ply.
+      // originalFilename 은 page.tsx 에서 'refined_' prefix 가 이미 붙은 채 내려올 수 있으니 한 번 벗겨서 재부착.
+      const stripPrefix = (s: string) => s.startsWith('refined_') ? s.slice('refined_'.length) : s;
+      const baseName = (() => {
+        const raw = options?.originalFilename ? stripPrefix(options.originalFilename) : 'scene.ply';
+        const dot = raw.lastIndexOf('.');
+        const stem = dot >= 0 ? raw.slice(0, dot) : raw;
+        return `refined_${stem}.ply`;
+      })();
+
+      // 3.1) PLY 업로드
+      setSamProgressMessage('파일 업로드 중...');
+      const plyUrl = await api.post<{ put_url: string; key: string }>(
+        '/refine/refined-upload-url',
+        { upload_id: activeUploadId, filename: baseName, session_id: sessionId },
+      );
+      const plyResp = await fetch(plyUrl.put_url, {
+        method: 'PUT', body: bytes, headers: { 'Content-Type': 'application/octet-stream' },
       });
+      if (!plyResp.ok) throw new Error(`PLY PUT failed: ${plyResp.status}`);
+
+      // 3.2) Wall mesh + 텍스처 영속화 (베이크된 면이 있을 때만)
+      const meshSurfaces: Array<{
+        surfaceId: string;
+        corners: number[][];
+        uvs: number[][];
+        normalInward: [number, number, number];
+        textureFilename: string;
+        textureWidth: number;
+        textureHeight: number;
+      }> = [];
+
+      if (lastBakesRef.current.size > 0) {
+        // RGBA → PNG Blob (Canvas 거쳐서 toBlob)
+        const rgbaToPng = async (rgba: Uint8ClampedArray, w: number, h: number): Promise<Blob> => {
+          const canvas = document.createElement('canvas');
+          canvas.width = w; canvas.height = h;
+          const ctx = canvas.getContext('2d');
+          if (!ctx) throw new Error('canvas 2d ctx failed');
+          ctx.putImageData(new ImageData(new Uint8ClampedArray(rgba), w, h), 0, 0);
+          return await new Promise<Blob>((res, rej) => {
+            canvas.toBlob(b => b ? res(b) : rej(new Error('toBlob null')), 'image/png');
+          });
+        };
+
+        for (const [surfaceId, bake] of Array.from(lastBakesRef.current.entries())) {
+          const texFilename = `tex_${surfaceId}.png`;
+          const texUrl = await api.post<{ put_url: string; key: string }>(
+            '/refine/refined-upload-url',
+            { upload_id: activeUploadId, filename: texFilename, session_id: sessionId },
+          );
+          const pngBlob = await rgbaToPng(bake.rgba, bake.width, bake.height);
+          const texResp = await fetch(texUrl.put_url, {
+            method: 'PUT', body: pngBlob, headers: { 'Content-Type': 'image/png' },
+          });
+          if (!texResp.ok) throw new Error(`tex PUT failed (${surfaceId}): ${texResp.status}`);
+
+          // 메시 메타: 코너(4×3) + UV(4×2) + 안쪽 normal(방 안쪽 향함, wallMesh 와 동일 규약).
+          // SPEC: refined PLY 가 raw 좌표계 그대로 저장되므로, mesh corners / normal 도 raw 프레임.
+          // (이전엔 가우시안과 동일한 회전+translate 를 메시에 베이크했으나 좌표가드 시행 후 불필요)
+          const inward: [number, number, number] = [
+            -bake.input.normal[0], -bake.input.normal[1], -bake.input.normal[2],
+          ];
+          const cornersOut = bake.corners.map(
+            c => [c[0], c[1], c[2]] as [number, number, number],
+          );
+          meshSurfaces.push({
+            surfaceId,
+            corners: cornersOut,
+            uvs: bake.uvs.map(u => [u[0], u[1]]),
+            normalInward: inward,
+            textureFilename: texFilename,
+            textureWidth: bake.width,
+            textureHeight: bake.height,
+          });
+        }
+
+        // 3.3) mesh.json 업로드
+        const meshMeta = {
+          version: 1,
+          sessionId,
+          surfaces: meshSurfaces,
+        };
+        const meshJson = JSON.stringify(meshMeta);
+        const metaUrl = await api.post<{ put_url: string; key: string }>(
+          '/refine/refined-upload-url',
+          { upload_id: activeUploadId, filename: 'mesh.json', session_id: sessionId },
+        );
+        const metaResp = await fetch(metaUrl.put_url, {
+          method: 'PUT', body: meshJson, headers: { 'Content-Type': 'application/json' },
+        });
+        if (!metaResp.ok) throw new Error(`mesh.json PUT failed: ${metaResp.status}`);
+
+        console.log(`[Save] mesh sidecar uploaded — ${meshSurfaces.length} surfaces, session=${sessionId}`);
+      } else {
+        console.log(`[Save] no wall mesh baked — skipping mesh sidecar`);
+      }
+
+      // 3.4) 백엔드에 SceneOutput 등록 (레거시 호환)
+      const saveResp = await api.post<{ scene_id: string; message: string }>('/refine/save', {
+        upload_id: activeUploadId,
+        source_key: plyUrl.key,
+      });
+      console.log(`[Save] SceneOutput 생성됨 — scene_id=${saveResp.scene_id}, ply_path=${plyUrl.key}`);
+
+      // 3.5) SAM3 자동 문 검출 task 발행 + canonical refined_ply_path 등록.
+      //      worker 가 비가용해도 sam3_status=failed 로 떨어져 사용자가 정합 단계에서 수동 지정 가능.
+      let sam3Started = false;
+      try {
+        const startResp = await api.post<{ sam3_status: string; celery_task_id: string | null }>(
+          `/uploads/${activeUploadId}/sam3/start`,
+          { refined_ply_key: plyUrl.key, prompt },
+        );
+        sam3Started = startResp.sam3_status === 'running';
+        console.log(`[Save] SAM3 dispatch — status=${startResp.sam3_status}, task=${startResp.celery_task_id ?? '-'}`);
+      } catch (e) {
+        console.warn('[Save] SAM3 dispatch 실패', e);
+      }
+
+      // 3.6) SAM3 폴링 — done/failed 까지 대기 (최대 5분), 그 동안 진행률 표시.
+      if (sam3Started) {
+        setSamProgressMessage('SAM3 작동 중...');
+        const startedAt = performance.now();
+        const TIMEOUT_MS = 5 * 60 * 1000;
+        // eslint-disable-next-line no-constant-condition
+        while (true) {
+          await new Promise(r => setTimeout(r, 1500));
+          try {
+            const s = await api.get<{ sam3_status: string | null; has_doors_json: boolean }>(
+              `/uploads/${activeUploadId}/sam3`,
+            );
+            if (s.sam3_status === 'done' || s.sam3_status === 'failed') {
+              console.log(`[Save] SAM3 종료 — status=${s.sam3_status}, doors=${s.has_doors_json}`);
+              break;
+            }
+          } catch (e) {
+            console.warn('[Save] SAM3 status 폴링 실패', e);
+          }
+          if (performance.now() - startedAt > TIMEOUT_MS) {
+            console.warn('[Save] SAM3 폴링 타임아웃 — 진행 상태 무시하고 정합으로 진입');
+            break;
+          }
+        }
+      }
+
+      // 저장 성공. SPEC상 좌표 변환을 베이크하지 않으므로 wallAngle/pendingRotation 등
+      // 화면 표시용 회전 값은 그대로 유지 (사용자가 다시 와도 같은 시야로 작업 이어가기 위함).
       setSaved(true);
+
+      // 단일 플로우 — SAM3 폴링 후 자동으로 정합 모드 진입.
+      options?.onSwitchToAlign?.();
     } catch (e: any) {
       alert(`저장 실패: ${e.message || e}`);
     } finally {
       setSaving(false);
+      setSamProgressOpen(false);
     }
-  }, [options]);
+  }, [options, ensureOriginalScene, coreRef]);
 
   // ── Brush/BBox: delete selected (repeatable) ──
   const deleteSelected = useCallback(() => {
@@ -671,13 +1581,27 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     if (!data || !core || !sel || !data.colorTexture || !data.origColorData) return;
     const td = data.colorTexture.lock(); if (!td) return;
     const f2h = core.float2Half;
+    const zeroH = f2h(0);
+    // flatten mask 보존: origColorData 에는 flatten 결과가 commit 되어있지 않으므로
+    // non-selected splat 의 alpha 를 origColorData 그대로 쓰면 flatten 으로 가려둔 외부 가우시안이 복원됨.
+    // → fmask 가 1 인 splat 은 GPU alpha=0 유지. origColorData 에는 selected splat 의 alpha=0 만 commit.
+    const fmask = flattenMaskRef.current;
+    const flattenVisible = flattenVisibleRef.current;
+    const fmaskActive = fmask !== null && flattenActiveRef.current && flattenVisible;
     for (let i = 0; i < data.numSplats; i++) {
       const idx = i * 4;
-      if (sel[i]) { td[idx+3] = f2h(0); }
-      else { td[idx]=data.origColorData[idx]; td[idx+1]=data.origColorData[idx+1]; td[idx+2]=data.origColorData[idx+2]; td[idx+3]=data.origColorData[idx+3]; }
+      if (sel[i]) {
+        td[idx+3] = zeroH;
+        // 영구 commit: brush 삭제 누적
+        data.origColorData[idx+3] = zeroH;
+      } else {
+        td[idx]   = data.origColorData[idx];
+        td[idx+1] = data.origColorData[idx+1];
+        td[idx+2] = data.origColorData[idx+2];
+        td[idx+3] = (fmaskActive && fmask![i]) ? zeroH : data.origColorData[idx+3];
+      }
     }
     data.colorTexture.unlock();
-    const snap = data.colorTexture.lock(); if (snap) { data.origColorData.set(snap); data.colorTexture.unlock(); }
     sel.fill(0); setSelectionCount(0);
   }, [coreRef]);
 
@@ -700,39 +1624,82 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   }, [pushHistory, refreshSelection]);
 
   // ── Reset all (pristine) ──
+  // 모든 의도(회전 / flatten / 막) 초기화 + GPU 색 복원 + 메인 entity transform 베이스로 복귀.
+  // 메인 씬 reload는 안 함 (PLY 데이터는 절대 안 건드리는 모델이라 reload 필요 없음).
   const resetAll = useCallback(async () => {
+    // 1) GPU 색 텍스처 복원 (in-place)
     const data = splatDataRef.current; const pristine = pristineRef.current;
     if (data && pristine && data.colorTexture) {
       data.origColorData = new Uint16Array(pristine);
       const td = data.colorTexture.lock(); if (td) { td.set(pristine); data.colorTexture.unlock(); }
     }
+    // 2) 평면/선택 상태
     planesRef.current = []; setPlanes([]); setSelectedPlane(-1); selectedPlaneRef.current = -1; setOutsideCount(0); setClosed(false);
     if (selectionRef.current) selectionRef.current.fill(0); setSelectionCount(0);
-    // 천장/바닥
+    // 3) 천장/바닥
     setCfMode('none'); cfModeRef.current = 'none';
     setCeilingY(0); setFloorY(0); ceilingYRef.current = 0; floorYRef.current = 0;
     setCfModalOpen(false);
-    // 벽면
+    // 4) 벽면
     setWallMode('none'); wallModeRef.current = 'none';
     setWallAngle(null); setWallDistances(null);
     wallAngleRef.current = null; wallDistancesRef.current = null;
     setWallModalOpen(false);
-    // 경계면 선택
+    // 5) 경계면 선택 + 안전거리
     setSelectedSurfaces(new Set()); selectedSurfacesRef.current = new Set();
-    // 정제 누적 결과
-    sourceKeyRef.current = null;
+    setGlobalOffset(0.3);
+    setGlobalOffsetText('0.3');
+    // 6) 정제 의도 초기화
+    pendingRotationRef.current = { rotX: 0, rotZ: 0 };
+    setPendingRotation({ rotX: 0, rotZ: 0 });
+    flattenMaskRef.current = null;
+    flattenActiveRef.current = false; setFlattenActive(false);
+    flattenVisibleRef.current = true; setFlattenVisible(true);
+    // 7) 메인 entity transform 베이스 회전(180Z)으로 복귀
+    applyEntityRotation();
+    // 8) undo + dirty
+    opHistoryRef.current = [];
+    setUndoDepth(0);
+    dirtyRef.current = false;
+    setDirty(false);
     setSaved(false);
-    // 뷰어를 원본 PLY로 되돌림
+    if (options?.uploadId) clearRefineState(options.uploadId);
+    // 9) 추가 안전장치: 원본 PLY로 강제 reload — in-place 정리에서 놓친 부분이 있어도 깨끗한 상태 보장
     if (options?.uploadId && options?.reloadWithUrl) {
       try {
         const { api } = await import('@/lib/api');
         const res = await api.get<{ url: string }>(`/uploads/${options.uploadId}/presigned-url`);
         options.reloadWithUrl(res.url);
       } catch (e) {
-        console.error('원본 다시 불러오기 실패', e);
+        console.error('원본 PLY reload 실패', e);
       }
     }
-  }, [options]);
+  }, [options, applyEntityRotation]);
+
+  // ── Undo: 통합 op 히스토리에서 가장 최근 작업 하나 되돌림 ──
+  const undoLast = useCallback(async () => {
+    if (opHistoryRef.current.length === 0) return;
+    const rec = opHistoryRef.current.pop()!;
+    setUndoDepth(opHistoryRef.current.length);
+    setSaved(false);
+
+    if (rec.type === 'rotation') {
+      pendingRotationRef.current = rec.prevRotation;
+      setPendingRotation(rec.prevRotation);
+      applyEntityRotation();
+    } else if (rec.type === 'flatten') {
+      flattenMaskRef.current = rec.prevMask;
+      flattenActiveRef.current = rec.prevActive; setFlattenActive(rec.prevActive);
+      paintFlattenMask();
+    }
+
+    const stillDirty = opHistoryRef.current.length > 0
+      || pendingRotationRef.current.rotX !== 0
+      || pendingRotationRef.current.rotZ !== 0
+      || flattenActiveRef.current;
+    dirtyRef.current = stillDirty;
+    setDirty(stillDirty);
+  }, [applyEntityRotation, paintFlattenMask]);
 
   // ── BBox selection apply ──
   const applyBboxSel = useCallback((mn: Vec3, mx: Vec3) => {
@@ -765,6 +1732,22 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     if (data.origColorData) pristineRef.current = new Uint16Array(data.origColorData);
     selectionRef.current = new Uint8Array(data.numSplats);
 
+    // 새 splatData 수신 시 누적 회전 / flatten 마스크가 있으면 즉시 시각 동기화
+    // (페이지 새로고침 후 persistence 복원이나 reset 후 등에서 호출됨)
+    setTimeout(() => {
+      applyEntityRotation();
+      if (flattenActiveRef.current && flattenMaskRef.current) {
+        // splatData가 새로 로드된 경우, 이전 마스크의 길이가 다를 수 있으니 검사
+        if (flattenMaskRef.current.length === data.numSplats) {
+          paintFlattenMask();
+        } else {
+          // 길이 불일치 → 마스크 무효
+          flattenMaskRef.current = null;
+          flattenActiveRef.current = false; setFlattenActive(false);
+        }
+      }
+    }, 0);
+
     let mnX=Infinity,mnY=Infinity,mnZ=Infinity,mxX=-Infinity,mxY=-Infinity,mxZ=-Infinity;
     for (let i = 0; i < data.numSplats; i++) {
       if(data.posX[i]<mnX)mnX=data.posX[i]; if(data.posX[i]>mxX)mxX=data.posX[i];
@@ -782,6 +1765,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
 
     // ── Local state for mouse handlers ──
     let painting = false;
+    let transPainting = false;
     let bboxDragAxis = -1, bboxDragIsMax = false, bboxDragStartVal = 0, bboxDragStartMouseY = 0, bboxDragScale = 1;
 
     // ── Plane pick ──
@@ -807,6 +1791,10 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     // ── Brush apply ──
     // posX/Y/Z는 원본 PLY 좌표이고 카메라 행렬은 월드 공간이므로 splatEntity의 world transform을 앞에 곱해야 함.
     // (Z축 180° 회전이 반영되어 뷰어가 보여주는 위치와 실제 히트가 일치)
+    // - union: 브러시 내부 → 1.
+    // - diff:  브러시 내부 → 0.
+    // - intersect: 스트로크 동안 누적된 strokeMask 와 stroke 시작 시점 sel(=strokeBaseSel) 의 교집합.
+    //   매 프레임 sel = strokeBaseSel ∩ strokeMask 로 갱신.
     const applyBrush = (mouseX: number, mouseY: number) => {
       const sd = splatDataRef.current; const sel = selectionRef.current;
       const cam = cameraEntity.camera; const pc = pcRef.current;
@@ -814,7 +1802,26 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       const vpMat = new pc.Mat4(); vpMat.mul2(cam.projectionMatrix, cam.viewMatrix);
       const mvpMat = new pc.Mat4(); mvpMat.mul2(vpMat, sd.splatEntity.getWorldTransform());
       const m = mvpMat.data; const w = canvas.clientWidth, h = canvas.clientHeight;
-      const r2 = brushSizeRef.current**2; const isUnion = paintModeRef.current === 'union';
+      const r2 = brushSizeRef.current**2;
+      const pmode = paintModeRef.current;
+      if (pmode === 'intersect') {
+        const baseSel = strokeBaseSelRef.current;
+        const strokeMask = strokeMaskRef.current;
+        if (!baseSel || !strokeMask) { refreshSelection(); return; }
+        for (let i = 0; i < sd.numSplats; i++) {
+          const px=sd.posX[i], py=sd.posY[i], pz=sd.posZ[i];
+          const cw = m[3]*px+m[7]*py+m[11]*pz+m[15]; if (cw<=0.01) continue;
+          const inv = 1/cw;
+          const sx = ((m[0]*px+m[4]*py+m[8]*pz+m[12])*inv+1)*0.5*w;
+          const sy = (1-(m[1]*px+m[5]*py+m[9]*pz+m[13])*inv)*0.5*h;
+          const dx = sx-mouseX, dy = sy-mouseY;
+          if (dx*dx+dy*dy < r2) strokeMask[i] = 1;
+        }
+        for (let i = 0; i < sd.numSplats; i++) sel[i] = (baseSel[i] && strokeMask[i]) ? 1 : 0;
+        refreshSelection();
+        return;
+      }
+      const setVal = pmode === 'union' ? 1 : 0;
       for (let i = 0; i < sd.numSplats; i++) {
         const px=sd.posX[i], py=sd.posY[i], pz=sd.posZ[i];
         const cw = m[3]*px+m[7]*py+m[11]*pz+m[15]; if (cw<=0.01) continue;
@@ -822,10 +1829,276 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         const sx = ((m[0]*px+m[4]*py+m[8]*pz+m[12])*inv+1)*0.5*w;
         const sy = (1-(m[1]*px+m[5]*py+m[9]*pz+m[13])*inv)*0.5*h;
         const dx = sx-mouseX, dy = sy-mouseY;
-        if (dx*dx+dy*dy < r2) sel[i] = isUnion ? 1 : 0;
+        if (dx*dx+dy*dy < r2) sel[i] = setVal;
       }
       refreshSelection();
     };
+
+    // ── Rect select: 화면 직사각형 안에 투영되는 모든 splat 을 선택. 깊이 무한대.
+    // 현재 sel 과 paintMode (union/intersect/diff) 에 따라 합성.
+    const applyRectSelect = (sx0: number, sy0: number, sx1: number, sy1: number) => {
+      const sd = splatDataRef.current; const sel = selectionRef.current;
+      const cam = cameraEntity.camera; const pc = pcRef.current;
+      if (!sd || !sel || !cam || !pc) return;
+      const xMin = Math.min(sx0, sx1), xMax = Math.max(sx0, sx1);
+      const yMin = Math.min(sy0, sy1), yMax = Math.max(sy0, sy1);
+      if (xMax - xMin < 2 || yMax - yMin < 2) return;
+      const vpMat = new pc.Mat4(); vpMat.mul2(cam.projectionMatrix, cam.viewMatrix);
+      const mvpMat = new pc.Mat4(); mvpMat.mul2(vpMat, sd.splatEntity.getWorldTransform());
+      const m = mvpMat.data; const w = canvas.clientWidth, h = canvas.clientHeight;
+      const pmode = paintModeRef.current;
+      pushHistory();
+      for (let i = 0; i < sd.numSplats; i++) {
+        const px=sd.posX[i], py=sd.posY[i], pz=sd.posZ[i];
+        const cw = m[3]*px+m[7]*py+m[11]*pz+m[15];
+        let inRect = 0;
+        if (cw > 0.01) {
+          const inv = 1/cw;
+          const sx = ((m[0]*px+m[4]*py+m[8]*pz+m[12])*inv+1)*0.5*w;
+          const sy = (1-(m[1]*px+m[5]*py+m[9]*pz+m[13])*inv)*0.5*h;
+          if (sx >= xMin && sx <= xMax && sy >= yMin && sy <= yMax) inRect = 1;
+        }
+        if (pmode === 'union') sel[i] = sel[i] || inRect ? 1 : 0;
+        else if (pmode === 'intersect') sel[i] = sel[i] && inRect ? 1 : 0;
+        else sel[i] = sel[i] && !inRect ? 1 : 0;
+      }
+      refreshSelection();
+    };
+
+    // ── Transparent paint: 마우스 위치에서 ray → wallMesh 충돌 → UV → 텍스처 alpha=0 ──
+    // 각 wallMesh entity 의 corners (TL,TR,BR,BL, raw+pendingRotation 프레임) 를 worldTransform 으로 변환,
+    // ray-quad 교차하여 가장 가까운 hit 찾음. 평면 내 (s,t) ∈ [0,1]² 파라미터 (s: TL→TR, t: TL→BL) 반환.
+    type WallHit = { ent: any; surfaceId: string; s: number; t: number; e1L: number; e2L: number; world: Vec3 };
+    const rayHitWallMesh = (mouseX: number, mouseY: number): WallHit | null => {
+      const cam = cameraEntity.camera; const pc = pcRef.current;
+      if (!cam || !pc) return null;
+      const ents = wallMeshEntitiesRef.current;
+      if (ents.length === 0) return null;
+
+      const near = new pc.Vec3(), far = new pc.Vec3();
+      cam.screenToWorld(mouseX, mouseY, cam.nearClip, near);
+      cam.screenToWorld(mouseX, mouseY, cam.farClip, far);
+      const ro: Vec3 = [near.x, near.y, near.z];
+      const rdRaw: Vec3 = [far.x - near.x, far.y - near.y, far.z - near.z];
+      const rdLen = Math.hypot(rdRaw[0], rdRaw[1], rdRaw[2]);
+      if (rdLen < 1e-8) return null;
+      const rd: Vec3 = [rdRaw[0] / rdLen, rdRaw[1] / rdLen, rdRaw[2] / rdLen];
+
+      let best: (WallHit & { tHit: number }) | null = null;
+      const tmp = new pc.Vec3();
+      for (const ent of ents) {
+        const name: string = ent.name || '';
+        const surfaceId = name.startsWith('wallMesh_') ? name.slice('wallMesh_'.length) : '';
+        const bake = lastBakesRef.current.get(surfaceId);
+        if (!bake) continue;
+        const wtm = ent.getWorldTransform();
+        const wc: Vec3[] = [];
+        for (const c of bake.corners) {
+          tmp.set(c[0], c[1], c[2]); wtm.transformPoint(tmp, tmp);
+          wc.push([tmp.x, tmp.y, tmp.z]);
+        }
+        const TL = wc[0], TR = wc[1], BL = wc[3];
+        const e1: Vec3 = [TR[0]-TL[0], TR[1]-TL[1], TR[2]-TL[2]];
+        const e2: Vec3 = [BL[0]-TL[0], BL[1]-TL[1], BL[2]-TL[2]];
+        const n = cross3(e1, e2);
+        const denom = dot3(rd, n);
+        if (Math.abs(denom) < 1e-8) continue;
+        const tHit = dot3([TL[0]-ro[0], TL[1]-ro[1], TL[2]-ro[2]], n) / denom;
+        if (tHit < 0) continue;
+        const P: Vec3 = [ro[0]+rd[0]*tHit, ro[1]+rd[1]*tHit, ro[2]+rd[2]*tHit];
+        const v: Vec3 = [P[0]-TL[0], P[1]-TL[1], P[2]-TL[2]];
+        const e1l2 = dot3(e1, e1), e2l2 = dot3(e2, e2);
+        if (e1l2 < 1e-8 || e2l2 < 1e-8) continue;
+        const s = dot3(v, e1) / e1l2;
+        const t = dot3(v, e2) / e2l2;
+        if (s < 0 || s > 1 || t < 0 || t > 1) continue;
+        if (!best || tHit < best.tHit) best = {
+          ent, surfaceId, s, t, tHit,
+          e1L: Math.sqrt(e1l2), e2L: Math.sqrt(e2l2),
+          world: P,
+        };
+      }
+      if (!best) return null;
+      return { ent: best.ent, surfaceId: best.surfaceId, s: best.s, t: best.t, e1L: best.e1L, e2L: best.e2L, world: best.world };
+    };
+
+    // (s,t) ∈ [0,1]² → 텍스처 픽셀 좌표
+    const stToPixel = (surfaceId: string, s: number, t: number): { px: number; py: number } | null => {
+      const bake = lastBakesRef.current.get(surfaceId); if (!bake) return null;
+      const U = bake.uvs;
+      const a00 = U[0], a10 = U[1], a11 = U[2], a01 = U[3];
+      const omS = 1 - s, omT = 1 - t;
+      const uvU = omS*omT*a00[0] + s*omT*a10[0] + s*t*a11[0] + omS*t*a01[0];
+      const uvV = omS*omT*a00[1] + s*omT*a10[1] + s*t*a11[1] + omS*t*a01[1];
+      return {
+        px: Math.max(0, Math.min(bake.width  - 1, Math.floor(uvU * bake.width))),
+        py: Math.max(0, Math.min(bake.height - 1, Math.floor(uvV * bake.height))),
+      };
+    };
+
+    // 텍스처 GPU 업로드 + dirty 마킹
+    const flushWallTexture = (hit: WallHit, rgba: Uint8ClampedArray) => {
+      const meshInst = hit.ent.render?.meshInstances?.[0];
+      const tex = meshInst?.material?.emissiveMap;
+      if (tex) {
+        const lvl = tex.lock();
+        lvl.set(rgba);
+        tex.unlock();
+      }
+      dirtyRef.current = true; setDirty(true);
+      setSaved(false);
+    };
+
+    // 원형 브러시 paint (월드 미터 반경 → 텍스처 픽셀 타원)
+    const paintTransparentAt = (mouseX: number, mouseY: number): boolean => {
+      const hit = rayHitWallMesh(mouseX, mouseY); if (!hit) return false;
+      const bake = lastBakesRef.current.get(hit.surfaceId)!;
+      const W = bake.width, H = bake.height;
+      const center = stToPixel(hit.surfaceId, hit.s, hit.t); if (!center) return false;
+      const cx = center.px, cy = center.py;
+      const U = bake.uvs;
+      const duU = Math.abs(U[1][0] - U[0][0]) * W;
+      const dvV = Math.abs(U[3][1] - U[0][1]) * H;
+      const pxPerMU = hit.e1L > 1e-8 ? duU / hit.e1L : 0;
+      const pxPerMV = hit.e2L > 1e-8 ? dvV / hit.e2L : 0;
+      const r = transBrushMetersRef.current;
+      const rU = r * pxPerMU, rV = r * pxPerMV;
+      if (rU < 0.5 && rV < 0.5) return false;
+
+      const xMin = Math.max(0, Math.floor(cx - rU));
+      const xMax = Math.min(W - 1, Math.ceil(cx + rU));
+      const yMin = Math.max(0, Math.floor(cy - rV));
+      const yMax = Math.min(H - 1, Math.ceil(cy + rV));
+      const rU2 = rU * rU, rV2 = rV * rV;
+      const rgba = bake.rgba;
+      let touched = 0;
+      for (let py = yMin; py <= yMax; py++) {
+        const dy = py - cy; const dy2 = dy * dy;
+        for (let px = xMin; px <= xMax; px++) {
+          const dx = px - cx;
+          if ((dx*dx)/rU2 + dy2/rV2 > 1) continue;
+          const idx = (py * W + px) * 4 + 3;
+          if (rgba[idx] === 0) continue;
+          rgba[idx] = 0;
+          touched++;
+        }
+      }
+      if (touched === 0) return false;
+      flushWallTexture(hit, rgba);
+      return true;
+    };
+
+    // 직사각형 paint: 두 (s,t) 점을 잇는 텍스처 픽셀 축정렬 사각 영역 alpha=0
+    // 직사각형 paint (화면 공간): 화면 직사각형 (xMin..xMax, yMin..yMax) 안에 투영되는
+    // 모든 wall mesh 텍셀의 alpha 를 0 으로 만든다. wall 평면 위 anchor 가 아니라 단순히
+    // 사용자가 화면에 그린 영역 그대로 처리 → 어느 면 위에 있든 시점 기준 직관적.
+    // Row 단위 incremental 투영 (clip 좌표가 s 에 affine → per-pixel +delta 누적) 으로 빠르게.
+    const paintRectScreenSpace = (sx0: number, sy0: number, sx1: number, sy1: number): boolean => {
+      const cam = cameraEntity.camera; const pc = pcRef.current;
+      if (!cam || !pc) return false;
+      const xMin = Math.min(sx0, sx1), xMax = Math.max(sx0, sx1);
+      const yMin = Math.min(sy0, sy1), yMax = Math.max(sy0, sy1);
+      if (xMax - xMin < 2 || yMax - yMin < 2) return false;
+
+      const ents = wallMeshEntitiesRef.current;
+      if (ents.length === 0) return false;
+
+      const cW = canvas.clientWidth, cH = canvas.clientHeight;
+      const vp = new pc.Mat4(); vp.mul2(cam.projectionMatrix, cam.viewMatrix);
+      const m = vp.data;
+
+      let touchedAny = false;
+      const tmp = new pc.Vec3();
+
+      for (const ent of ents) {
+        const name: string = ent.name || '';
+        const surfaceId = name.startsWith('wallMesh_') ? name.slice('wallMesh_'.length) : '';
+        const bake = lastBakesRef.current.get(surfaceId);
+        if (!bake) continue;
+
+        // bake.corners → world
+        const wtm = ent.getWorldTransform();
+        const wc: Vec3[] = [];
+        for (const c of bake.corners) {
+          tmp.set(c[0], c[1], c[2]); wtm.transformPoint(tmp, tmp);
+          wc.push([tmp.x, tmp.y, tmp.z]);
+        }
+        const TL = wc[0], TR = wc[1], BR = wc[2], BL = wc[3];
+
+        // 빠른 cull: 코너 투영 bbox 가 rect 와 안 겹치면 skip
+        let qxMin = Infinity, qxMax = -Infinity, qyMin = Infinity, qyMax = -Infinity;
+        let anyVisible = false;
+        for (const c of wc) {
+          const cw_ = m[3]*c[0] + m[7]*c[1] + m[11]*c[2] + m[15];
+          if (cw_ <= 0.01) continue;
+          anyVisible = true;
+          const inv = 1/cw_;
+          const px = ((m[0]*c[0]+m[4]*c[1]+m[8]*c[2]+m[12])*inv + 1) * 0.5 * cW;
+          const py = (1 - (m[1]*c[0]+m[5]*c[1]+m[9]*c[2]+m[13])*inv) * 0.5 * cH;
+          if (px < qxMin) qxMin = px; if (px > qxMax) qxMax = px;
+          if (py < qyMin) qyMin = py; if (py > qyMax) qyMax = py;
+        }
+        if (!anyVisible) continue;
+        if (qxMax < xMin || qxMin > xMax || qyMax < yMin || qyMin > yMax) continue;
+
+        const W = bake.width, H = bake.height;
+        const rgba = bake.rgba;
+        let touched = 0;
+        const ds = 1 / W;
+        const s0 = 0.5 / W;
+
+        for (let py = 0; py < H; py++) {
+          const t_ = (py + 0.5) / H;
+          const omT = 1 - t_;
+          // row 위 양 끝 world (s=0, s=1)
+          const Ax = omT*TL[0] + t_*BL[0];
+          const Ay = omT*TL[1] + t_*BL[1];
+          const Az = omT*TL[2] + t_*BL[2];
+          const Bx = omT*TR[0] + t_*BR[0];
+          const By = omT*TR[1] + t_*BR[1];
+          const Bz = omT*TR[2] + t_*BR[2];
+          const dWx = (Bx - Ax) * ds;
+          const dWy = (By - Ay) * ds;
+          const dWz = (Bz - Az) * ds;
+          // px=0 시작 world (s = s0)
+          let wx = Ax + s0*(Bx - Ax);
+          let wy = Ay + s0*(By - Ay);
+          let wz = Az + s0*(Bz - Az);
+          let cX = m[0]*wx + m[4]*wy + m[8]*wz + m[12];
+          let cY = m[1]*wx + m[5]*wy + m[9]*wz + m[13];
+          let cWv = m[3]*wx + m[7]*wy + m[11]*wz + m[15];
+          const dCX = m[0]*dWx + m[4]*dWy + m[8]*dWz;
+          const dCY = m[1]*dWx + m[5]*dWy + m[9]*dWz;
+          const dCW = m[3]*dWx + m[7]*dWy + m[11]*dWz;
+
+          const rowBase = py * W * 4 + 3;
+          for (let px = 0; px < W; px++) {
+            if (cWv > 0.01) {
+              const inv = 1/cWv;
+              const sxPx = (cX*inv + 1) * 0.5 * cW;
+              const syPx = (1 - cY*inv) * 0.5 * cH;
+              if (sxPx >= xMin && sxPx <= xMax && syPx >= yMin && syPx <= yMax) {
+                const idx = rowBase + px*4;
+                if (rgba[idx] !== 0) { rgba[idx] = 0; touched++; }
+              }
+            }
+            cX += dCX; cY += dCY; cWv += dCW;
+          }
+        }
+
+        if (touched > 0) {
+          flushWallTexture({ ent, surfaceId, s: 0, t: 0, e1L: 0, e2L: 0, world: [0,0,0] }, rgba);
+          touchedAny = true;
+        }
+      }
+
+      return touchedAny;
+    };
+
+    // 직사각형 드래그 시작 화면 좌표 (mousedown 시 기록)
+    let transRectStartScreen: { x: number; y: number } | null = null;
+    // 가우시안 선택용 rect 모드의 드래그 시작 좌표
+    let rectStartScreen: { x: number; y: number } | null = null;
 
     // ── BBox face pick ──
     const pickBboxFace = (mouseX: number, mouseY: number): {axis:number;isMax:boolean}|null => {
@@ -857,7 +2130,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         if (e.code === 'KeyT') { setToolMode('translate'); toolModeRef.current = 'translate'; }
         else if (e.code === 'KeyR') { setToolMode('rotate'); toolModeRef.current = 'rotate'; }
       }
-      if ((mode === 'brush' || mode === 'bbox') && e.code === 'Delete') {
+      if (isSelectMode(mode) && e.code === 'Delete') {
         deleteSelected();
       }
     };
@@ -978,7 +2251,50 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       }
 
       // ── BRUSH MODE ──
-      if (mode === 'brush') { painting = true; pushHistory(); applyBrush(mx, my); return; }
+      if (mode === 'brush') {
+        painting = true;
+        pushHistory();
+        // intersect: stroke 시작 시점 sel snapshot + 빈 strokeMask 할당.
+        if (paintModeRef.current === 'intersect' && selectionRef.current) {
+          strokeBaseSelRef.current = new Uint8Array(selectionRef.current);
+          strokeMaskRef.current = new Uint8Array(selectionRef.current.length);
+        }
+        applyBrush(mx, my);
+        return;
+      }
+
+      // ── RECT MODE (직사각형 영역 선택) ──
+      if (mode === 'rect') {
+        e.preventDefault();
+        rectStartScreen = { x: mx, y: my };
+        if (rectPreviewRef.current) {
+          const d = rectPreviewRef.current;
+          d.style.display = 'block';
+          d.style.left = `${mx}px`; d.style.top = `${my}px`;
+          d.style.width = '0px'; d.style.height = '0px';
+        }
+        return;
+      }
+
+      // ── TRANSPARENT PAINT MODE ──
+      if (mode === 'transparent') {
+        e.preventDefault();
+        if (transShapeRef.current === 'circle') {
+          transPainting = true;
+          paintTransparentAt(mx, my);
+        } else {
+          // rect: 화면 시작 좌표만 기록 (wall hit 검사 불필요 — 화면 전체 영역 기준)
+          if (wallMeshEntitiesRef.current.length === 0) return;
+          transRectStartScreen = { x: mx, y: my };
+          if (transRectPreviewRef.current) {
+            const d = transRectPreviewRef.current;
+            d.style.display = 'block';
+            d.style.left = `${mx}px`; d.style.top = `${my}px`;
+            d.style.width = '0px'; d.style.height = '0px';
+          }
+        }
+        return;
+      }
 
       // ── BBOX MODE ──
       if (mode === 'bbox') {
@@ -1035,6 +2351,68 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         return;
       }
 
+      // ── RECT (가우시안 선택): preview rect 갱신 ──
+      if (mode === 'rect') {
+        if (brushCursorRef.current) brushCursorRef.current.style.display = 'none';
+        if (rectStartScreen && rectPreviewRef.current) {
+          const rect = canvas.getBoundingClientRect();
+          const x = e.clientX - rect.left, y = e.clientY - rect.top;
+          const left = Math.min(rectStartScreen.x, x), top = Math.min(rectStartScreen.y, y);
+          const w = Math.abs(x - rectStartScreen.x), h = Math.abs(y - rectStartScreen.y);
+          const d = rectPreviewRef.current;
+          d.style.display = 'block';
+          d.style.left = `${left}px`; d.style.top = `${top}px`;
+          d.style.width = `${w}px`; d.style.height = `${h}px`;
+        }
+        return;
+      }
+
+      // ── TRANSPARENT: cursor + paint ──
+      if (mode === 'transparent') {
+        const rect = canvas.getBoundingClientRect();
+        const x = e.clientX - rect.left, y = e.clientY - rect.top;
+        if (transShapeRef.current === 'circle') {
+          if (brushCursorRef.current) {
+            // 실제 paint 와 일치: ray hit 의 월드 좌표에서 brush radius 만큼 떨어진 점을
+            // 화면에 투영해 화면 픽셀 반경 계산. wall hit 없으면 cursor 숨김.
+            const r = transBrushMetersRef.current;
+            const cam = cameraEntity.camera;
+            const pc = pcRef.current;
+            const hit = (cam && pc) ? rayHitWallMesh(x, y) : null;
+            if (hit && cam && pc) {
+              const right = cameraEntity.right;
+              const c0 = new pc.Vec3(); const c1 = new pc.Vec3();
+              cam.worldToScreen(new pc.Vec3(hit.world[0], hit.world[1], hit.world[2]), c0);
+              cam.worldToScreen(new pc.Vec3(hit.world[0] + right.x*r, hit.world[1] + right.y*r, hit.world[2] + right.z*r), c1);
+              const screenR = Math.hypot(c1.x - c0.x, c1.y - c0.y);
+              const sz = Math.max(2, screenR * 2);
+              brushCursorRef.current.style.display = 'block';
+              brushCursorRef.current.style.left = `${c0.x - sz / 2}px`;
+              brushCursorRef.current.style.top = `${c0.y - sz / 2}px`;
+              brushCursorRef.current.style.width = `${sz}px`;
+              brushCursorRef.current.style.height = `${sz}px`;
+            } else {
+              brushCursorRef.current.style.display = 'none';
+            }
+          }
+          if (transRectPreviewRef.current) transRectPreviewRef.current.style.display = 'none';
+          if (transPainting) paintTransparentAt(x, y);
+        } else {
+          // rect mode: brush cursor 숨기고, anchor 가 있으면 화면 preview 사각 갱신
+          if (brushCursorRef.current) brushCursorRef.current.style.display = 'none';
+          if (transRectStartScreen && transRectPreviewRef.current) {
+            const sx0 = transRectStartScreen.x, sy0 = transRectStartScreen.y;
+            const left = Math.min(sx0, x), top = Math.min(sy0, y);
+            const w = Math.abs(x - sx0), h = Math.abs(y - sy0);
+            const d = transRectPreviewRef.current;
+            d.style.display = 'block';
+            d.style.left = `${left}px`; d.style.top = `${top}px`;
+            d.style.width = `${w}px`; d.style.height = `${h}px`;
+          }
+        }
+        return;
+      }
+
       // ── BBOX: drag face ──
       if (mode === 'bbox' && bboxDragAxis >= 0) {
         const delta = (bboxDragStartMouseY-e.clientY)*bboxDragScale;
@@ -1052,9 +2430,31 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
 
     const onMouseUp = (e: MouseEvent) => {
       if (e.button !== 0) return;
-      dragRef.current = null; painting = false; bboxDragAxis = -1;
+      // 직사각형 커밋: 화면 시작점 ↔ 현재점 사이 영역 안의 모든 wall 텍셀 alpha=0
+      if (refineModeRef.current === 'transparent' && transShapeRef.current === 'rect' && transRectStartScreen) {
+        const rect = canvas.getBoundingClientRect();
+        const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+        paintRectScreenSpace(transRectStartScreen.x, transRectStartScreen.y, mx, my);
+      }
+      // 가우시안 선택 rect 커밋
+      if (refineModeRef.current === 'rect' && rectStartScreen) {
+        const rect = canvas.getBoundingClientRect();
+        const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+        applyRectSelect(rectStartScreen.x, rectStartScreen.y, mx, my);
+      }
+      transRectStartScreen = null;
+      rectStartScreen = null;
+      if (transRectPreviewRef.current) transRectPreviewRef.current.style.display = 'none';
+      if (rectPreviewRef.current) rectPreviewRef.current.style.display = 'none';
+      // brush intersect: stroke 종료 시 임시 마스크 해제
+      strokeBaseSelRef.current = null;
+      strokeMaskRef.current = null;
+      dragRef.current = null; painting = false; transPainting = false; bboxDragAxis = -1;
     };
-    const onMouseLeave = () => { if (brushCursorRef.current) brushCursorRef.current.style.display = 'none'; };
+    const onMouseLeave = () => {
+      if (brushCursorRef.current) brushCursorRef.current.style.display = 'none';
+      // rect preview 는 mouseup 까지 표시 (캔버스 밖 드래그 허용 → 표시는 유지)
+    };
 
     canvas.addEventListener('keydown', onKeyDown); canvas.addEventListener('keyup', onKeyUp);
     canvas.addEventListener('mousedown', onMouseDown); canvas.addEventListener('mousemove', onMouseMove);
@@ -1135,107 +2535,168 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   useEffect(() => { if (splatLoaded && refineModeRef.current === 'plane') recomputePlanes(); }, [planes, splatLoaded, recomputePlanes]);
 
   // ── UI ──
-  const ui = splatLoaded ? (
+  // overlay: brush cursor / rect previews / modals — 캔버스 위 레이어에 둠
+  // panel: 도구 패널 본체 — 외부에서 컬럼 안에 배치
+  const overlay = splatLoaded ? (
     <>
       {/* Brush cursor */}
       <div ref={brushCursorRef} className="absolute pointer-events-none rounded-full border border-red-400/60" style={{display:'none',boxShadow:'0 0 4px rgba(255,100,100,0.3)'}} />
+      <div ref={transRectPreviewRef} className="absolute pointer-events-none border-2 border-dashed border-pink-400 bg-pink-400/10" style={{display:'none'}} />
+      <div ref={rectPreviewRef} className="absolute pointer-events-none border-2 border-dashed border-blue-400 bg-blue-400/10" style={{display:'none'}} />
+    </>
+  ) : null;
 
-      <div className="absolute top-3 left-3 bg-black/70 text-gray-300 text-xs rounded p-3 flex flex-col gap-2 select-none min-w-[230px]">
+  const panel = splatLoaded ? (
+    <>
+      <div className="bg-black/70 backdrop-blur-sm border border-white/10 text-gray-300 text-xs rounded-lg shadow-lg p-3 flex flex-col gap-2 select-none w-64 max-h-[calc(100vh-200px)] overflow-y-auto">
         <div className="text-white font-bold text-sm mb-1">다듬기</div>
 
-        {/* Mode tabs */}
+        {/* 상위 모드 탭: 경계면 처리 / 가우시안 선택/삭제 / 투명영역 */}
         <div className="flex gap-1">
-          {([['plane','평면'],['brush','브러쉬'],['bbox','BBox']] as const).map(([key, label]) => (
-            <button key={key} onClick={() => switchMode(key as RefineMode)}
-              className={`px-2 py-1 rounded cursor-pointer text-xs ${refineMode===key?'bg-blue-600 text-white':'bg-gray-700 hover:bg-gray-600'}`}>
-              {label}
-            </button>
-          ))}
+          <button
+            onClick={() => switchMode('plane')}
+            className={`px-2 py-1 rounded cursor-pointer text-xs ${refineMode==='plane'?'bg-blue-600 text-white':'bg-gray-700 hover:bg-gray-600'}`}>
+            경계면 처리
+          </button>
+          <button
+            onClick={() => switchMode(lastSelectSubModeRef.current)}
+            className={`px-2 py-1 rounded cursor-pointer text-xs ${isSelectMode(refineMode)?'bg-blue-600 text-white':'bg-gray-700 hover:bg-gray-600'}`}>
+            가우시안 선택/삭제
+          </button>
+          <button
+            onClick={() => switchMode('transparent')}
+            className={`px-2 py-1 rounded cursor-pointer text-xs ${refineMode==='transparent'?'bg-blue-600 text-white':'bg-gray-700 hover:bg-gray-600'}`}>
+            투명영역
+          </button>
         </div>
+
+        {/* 가우시안 선택/삭제 하위 도구 탭 */}
+        {isSelectMode(refineMode) && (
+          <div className="flex gap-1 border border-gray-700 rounded p-1">
+            {([['brush','브러쉬'],['bbox','BBox'],['rect','직사각형']] as const).map(([key, label]) => (
+              <button key={key} onClick={() => switchMode(key as RefineMode)}
+                className={`flex-1 px-2 py-0.5 rounded cursor-pointer text-[11px] ${refineMode===key?'bg-indigo-600 text-white':'bg-gray-700 hover:bg-gray-600'}`}>
+                {label}
+              </button>
+            ))}
+          </div>
+        )}
 
         {/* ── Plane controls ── */}
         {refineMode === 'plane' && (
           <>
-            {/* Ceiling/Floor */}
-            <div className="border border-gray-600 rounded p-2 flex flex-col gap-1.5">
-              <div className="text-gray-400 text-[10px] font-bold">천장 / 바닥</div>
-              {cfMode === 'none' ? (
-                <button onClick={() => setCfModalOpen(true)}
-                  className="px-3 py-1.5 bg-teal-600 hover:bg-teal-500 text-white rounded cursor-pointer text-xs">
-                  천장/바닥 설정
-                </button>
-              ) : (
-                <>
-                  <div className="text-green-400 text-[10px] font-bold">천장/바닥 확정됨</div>
-                  <button onClick={() => setCfModalOpen(true)}
-                    className="px-2 py-1 bg-gray-600 hover:bg-gray-500 text-white rounded cursor-pointer text-xs">다시 수정</button>
-                </>
-              )}
+            {/* Ceiling/Floor — 한 줄 */}
+            <div className="border border-gray-600 rounded p-2 flex items-center gap-2">
+              <div className="text-gray-400 text-[11px] font-bold flex-1">
+                천장 / 바닥
+                {cfMode === 'confirmed' && <span className="ml-1 text-green-400">✓</span>}
+              </div>
+              <button onClick={() => setCfModalOpen(true)}
+                className={`px-3 py-1 rounded cursor-pointer text-xs ${
+                  cfMode === 'confirmed'
+                    ? 'bg-gray-600 hover:bg-gray-500 text-white'
+                    : 'bg-teal-600 hover:bg-teal-500 text-white'
+                }`}>
+                {cfMode === 'confirmed' ? '다시 수정' : '설정'}
+              </button>
             </div>
 
-            {/* 벽면 */}
-            <div className="border border-gray-600 rounded p-2 flex flex-col gap-1.5">
-              <div className="text-gray-400 text-[10px] font-bold">벽면 (X/Z 정렬)</div>
-              {wallMode === 'none' && (
-                <button onClick={() => setWallModalOpen(true)} disabled={cfMode !== 'confirmed'}
-                  className="px-3 py-1.5 bg-teal-600 hover:bg-teal-500 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded cursor-pointer text-xs">
-                  {cfMode !== 'confirmed' ? '천장/바닥 먼저 확정' : '벽면 설정'}
-                </button>
-              )}
-              {wallMode === 'confirmed' && (
-                <>
-                  <div className="text-green-400 text-[10px] font-bold">
-                    벽면 확정됨 ({wallAngle?.toFixed(1)}°)
-                  </div>
-                  <button onClick={() => setWallModalOpen(true)}
-                    className="px-2 py-1 bg-gray-600 hover:bg-gray-500 text-white rounded cursor-pointer text-xs">다시 수정</button>
-                </>
-              )}
+            {/* 벽면 — 한 줄 */}
+            <div className="border border-gray-600 rounded p-2 flex items-center gap-2">
+              <div className="text-gray-400 text-[11px] font-bold flex-1">
+                벽면 (X/Z)
+                {wallMode === 'confirmed' && (
+                  <span className="ml-1 text-green-400">✓ {wallAngle?.toFixed(1)}°</span>
+                )}
+              </div>
+              <button onClick={() => setWallModalOpen(true)}
+                disabled={cfMode !== 'confirmed'}
+                title={cfMode !== 'confirmed' ? '천장/바닥 먼저 확정' : ''}
+                className={`px-3 py-1 rounded cursor-pointer text-xs disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed ${
+                  wallMode === 'confirmed'
+                    ? 'bg-gray-600 hover:bg-gray-500 text-white'
+                    : 'bg-teal-600 hover:bg-teal-500 text-white'
+                }`}>
+                {wallMode === 'confirmed' ? '다시 수정' : '설정'}
+              </button>
             </div>
 
             {/* 경계면 선택 후 바깥 가우시안 제거 (Shell 제거) — 체크박스는 해당 설정이 확정되어야 활성화 */}
             <div className="border border-gray-600 rounded p-2 flex flex-col gap-1.5">
               <div className="text-gray-400 text-[10px] font-bold">경계면 처리</div>
               {(() => {
+                // 주의: PLY 좌표계에 Z-180 회전이 렌더링에 적용돼서 코드의 'ceiling' surfaceId 가
+                //  시각적으로 바닥 위치에 그려지고, 'floor' 가 시각적으로 천장 위치에 그려진다.
+                //  사용자에게는 시각적 위치 기준으로 라벨 표시.
                 const labels: Record<Surface, { name: string; color: string }> = {
-                  ceiling: { name: '천장', color: '#22d3ee' },
-                  floor:   { name: '바닥', color: '#a855f7' },
-                  w1a:     { name: '벽1a', color: '#ef4444' },
-                  w1b:     { name: '벽1b', color: '#ec4899' },
-                  w2a:     { name: '벽2a', color: '#f97316' },
-                  w2b:     { name: '벽2b', color: '#eab308' },
+                  ceiling: { name: '바닥', color: '#92400e' },  // 시각적 바닥 (PLY frame ceiling) — 밤색
+                  floor:   { name: '천장', color: '#22d3ee' },  // 시각적 천장 (PLY frame floor) — 하늘색
+                  w1a:     { name: '벽1', color: '#10b981' },
+                  w1b:     { name: '벽2', color: '#3b82f6' },
+                  w2a:     { name: '벽3', color: '#8b5cf6' },
+                  w2b:     { name: '벽4', color: '#84cc16' },
                 };
                 const isDisabled = (s: Surface) =>
                   CF_SURFACES.includes(s) ? cfMode !== 'confirmed' : wallMode !== 'confirmed';
                 return (
-                  <div className="flex flex-col gap-1">
-                    {ALL_SURFACES.map(s => {
-                      const disabled = isDisabled(s);
-                      return (
-                        <div key={s} className={`flex items-center gap-1.5 text-[11px] ${disabled ? 'opacity-40' : ''}`}>
-                          <label className={`flex items-center gap-1.5 flex-1 ${disabled ? 'cursor-not-allowed' : 'cursor-pointer'}`}>
+                  <>
+                    {/* 모든 경계면 공통 안전거리 */}
+                    <div className="flex items-center gap-1.5 text-[10px]">
+                      <span className="text-gray-400 w-14">안전거리</span>
+                      <input type="range" min={0.05} max={1.0} step={0.01}
+                        value={globalOffset}
+                        onChange={(e) => {
+                          const v = parseFloat(e.target.value);
+                          setGlobalOffset(v);
+                          setGlobalOffsetText(String(v));
+                        }}
+                        className="flex-1 accent-blue-500 cursor-pointer" />
+                      <span className="text-white font-mono w-12 text-right">
+                        {(globalOffset * 100).toFixed(0)}cm
+                      </span>
+                    </div>
+                    <div className="flex gap-1 mb-1">
+                      <button
+                        onClick={() => setSafetyVizActive(v => !v)}
+                        className={`flex-1 px-2 py-1 rounded cursor-pointer text-[10px] font-bold ${safetyVizActive ? 'bg-blue-600 hover:bg-blue-500 text-white' : 'bg-gray-700 hover:bg-gray-600 text-gray-300'}`}>
+                        {safetyVizActive ? '안전거리 범위 숨기기' : '안전거리 범위 확인'}
+                      </button>
+                      <button
+                        onClick={() => setFlattenPreviewActive(v => !v)}
+                        className={`flex-1 px-2 py-1 rounded cursor-pointer text-[10px] font-bold ${flattenPreviewActive ? 'bg-red-600 hover:bg-red-500 text-white' : 'bg-gray-700 hover:bg-gray-600 text-gray-300'}`}>
+                        {flattenPreviewActive ? '삭제될 가우시안 숨기기' : '삭제될 가우시안 확인'}
+                      </button>
+                    </div>
+                    {/* 알파블렌딩 시작 위치 (depthGate) */}
+                    <div className="flex items-center gap-1.5 text-[10px]">
+                      <span className="text-gray-400 w-14" title="텍스처 베이크 시 방 안쪽 가우시안 채택 한계">베이크 시작</span>
+                      <input type="range" min={0} max={2.0} step={0.005}
+                        value={bakeInnerGate}
+                        onChange={(e) => setBakeInnerGate(parseFloat(e.target.value))}
+                        className="flex-1 accent-cyan-500 cursor-pointer" />
+                      <span className="text-white font-mono w-12 text-right">
+                        {bakeInnerGate >= 1 ? `${bakeInnerGate.toFixed(2)}m` : `${(bakeInnerGate * 100).toFixed(1)}cm`}
+                      </span>
+                    </div>
+                    <button
+                      onClick={() => setGateVizActive(v => !v)}
+                      className={`w-full px-2 py-1 rounded cursor-pointer text-[10px] font-bold mb-1.5 ${gateVizActive ? 'bg-cyan-600 hover:bg-cyan-500 text-white' : 'bg-gray-700 hover:bg-gray-600 text-gray-300'}`}>
+                      {gateVizActive ? '베이크 위치 숨기기' : '베이크 위치 확인하기'}
+                    </button>
+                    <div className="grid grid-cols-3 gap-x-2 gap-y-1">
+                      {ALL_SURFACES.map(s => {
+                        const disabled = isDisabled(s);
+                        return (
+                          <label key={s} className={`flex items-center gap-1 text-[11px] ${disabled ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer'}`}>
                             <input type="checkbox" checked={selectedSurfaces.has(s)} disabled={disabled}
                               onChange={() => toggleSurface(s)}
                               className="accent-blue-500" />
                             <span style={{ color: labels[s].color }}>{labels[s].name}</span>
                           </label>
-                          <span className="text-gray-500 text-[10px]">안전거리</span>
-                          <input type="text" inputMode="decimal" value={offsetText[s]} disabled={disabled}
-                            onChange={e => {
-                              const v = e.target.value;
-                              setOffsetText(prev => ({ ...prev, [s]: v }));
-                              const n = parseFloat(v);
-                              if (!isNaN(n)) setSurfaceOffsets(prev => ({ ...prev, [s]: n }));
-                            }}
-                            onBlur={() => {
-                              // 포커스 잃으면 숫자 상태와 동기화 (빈칸/부적합 입력 복구)
-                              setOffsetText(prev => ({ ...prev, [s]: String(surfaceOffsets[s]) }));
-                            }}
-                            className="w-14 px-1 py-0.5 bg-gray-800 border border-gray-600 rounded text-white text-[10px] font-mono disabled:opacity-50" />
-                        </div>
-                      );
-                    })}
-                  </div>
+                        );
+                      })}
+                    </div>
+                  </>
                 );
               })()}
               <button onClick={toggleAllSurfaces}
@@ -1243,85 +2704,56 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
                 className="px-2 py-1 bg-gray-700 hover:bg-gray-600 disabled:bg-gray-800 disabled:opacity-50 text-gray-200 rounded cursor-pointer disabled:cursor-not-allowed text-[11px]">
                 전체 선택/해제
               </button>
-              <div className="flex gap-1">
-                <button onClick={() => applyFlatten()} disabled={flattening || membraneApplying || selectedSurfaces.size === 0}
-                  className="flex-1 px-2 py-1.5 bg-red-600 hover:bg-red-500 disabled:bg-gray-600 text-white rounded cursor-pointer text-xs font-bold">
-                  {flattening ? '처리 중...' : '바깥 제거'}
-                </button>
-                <button onClick={() => toggleDeletedPreview(!showDeletedOnly)} disabled={selectedSurfaces.size === 0}
-                  className={`px-2 py-1.5 rounded cursor-pointer text-xs font-bold ${
-                    showDeletedOnly
-                      ? 'bg-yellow-500 text-black'
-                      : 'bg-gray-700 hover:bg-gray-600 text-gray-300'
-                  } disabled:bg-gray-800 disabled:text-gray-500`}>
-                  {showDeletedOnly ? '전체 보기' : '삭제 대상만'}
-                </button>
-              </div>
+              <button onClick={() => applyFlatten()}
+                disabled={flattening || (!flattenActive && selectedSurfaces.size === 0)}
+                className={`w-full px-2 py-1.5 rounded cursor-pointer text-xs font-bold disabled:bg-gray-600 disabled:text-gray-400 ${
+                  flattenActive
+                    ? 'bg-amber-600 hover:bg-amber-500 text-white'
+                    : 'bg-red-600 hover:bg-red-500 text-white'
+                }`}>
+                {flattening ? '처리 중...' : (flattenActive ? '모듈 외부 복원' : '모듈 외부 제거')}
+              </button>
               <div className="border-t border-gray-700 pt-2 mt-1 space-y-1.5">
-                <div className="text-gray-400 text-[10px]">막 색상 모드</div>
+                {/* 얇은 막 (가우시안 패치) UI 는 wall mesh 가 대체해서 비활성화. 코드/상태는 보존 — 호환/롤백 위해. */}
                 <div className="flex gap-1">
-                  {([['white', '흰색'], ['knn-median', 'K-NN']] as const).map(([mode, label]) => (
-                    <button key={mode}
-                      onClick={() => setMembraneColorMode(mode)}
-                      className={`flex-1 px-1 py-1 rounded text-[10px] font-bold cursor-pointer ${
-                        membraneColorMode === mode
-                          ? 'bg-blue-500 text-white'
-                          : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
-                      }`}
-                    >{label}</button>
-                  ))}
+                  <button onClick={() => bakeWallMeshTest()}
+                    disabled={wallMeshBaking || selectedSurfaces.size === 0}
+                    className={`flex-1 px-2 py-1.5 rounded cursor-pointer text-xs font-bold disabled:bg-gray-600 disabled:text-gray-400 ${
+                      wallMeshActive
+                        ? 'bg-emerald-700 hover:bg-emerald-600 text-white'
+                        : 'bg-emerald-600 hover:bg-emerald-500 text-white'
+                    }`}>
+                    {wallMeshBaking ? '생성 중...' : (wallMeshActive ? '막 재생성하기' : '막 생성하기')}
+                  </button>
+                  {wallMeshActive && (
+                    <button
+                      onClick={() => {
+                        for (const e of wallMeshEntitiesRef.current) { try { e.destroy(); } catch {} }
+                        wallMeshEntitiesRef.current = [];
+                        setWallMeshActive(false);
+                      }}
+                      className="flex-1 px-2 py-1.5 rounded cursor-pointer text-xs font-bold bg-amber-600 hover:bg-amber-500 text-white">
+                      막 제거
+                    </button>
+                  )}
                 </div>
-                {/* 막 파라미터 슬라이더 */}
-                <div className="space-y-1">
-                  <div className="flex items-center gap-1.5 text-[10px]">
-                    <span className="text-gray-400 w-14">격자 간격</span>
-                    <input type="range" min={0.005} max={0.08} step={0.005}
-                      value={membraneSpacing}
-                      onChange={(e) => setMembraneSpacing(parseFloat(e.target.value))}
-                      className="flex-1 accent-blue-500 cursor-pointer" />
-                    <span className="text-white font-mono w-12 text-right">
-                      {(membraneSpacing * 100).toFixed(1)}cm
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-1.5 text-[10px]">
-                    <span className="text-gray-400 w-14">패치 반경</span>
-                    <input type="range" min={0.01} max={0.15} step={0.005}
-                      value={membraneRadius}
-                      onChange={(e) => setMembraneRadius(parseFloat(e.target.value))}
-                      className="flex-1 accent-blue-500 cursor-pointer" />
-                    <span className="text-white font-mono w-12 text-right">
-                      {(membraneRadius * 100).toFixed(1)}cm
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-1.5 text-[10px]">
-                    <span className="text-gray-400 w-14">불투명도</span>
-                    <input type="range" min={0.05} max={1.0} step={0.05}
-                      value={membraneOpacity}
-                      onChange={(e) => setMembraneOpacity(parseFloat(e.target.value))}
-                      className="flex-1 accent-blue-500 cursor-pointer" />
-                    <span className="text-white font-mono w-12 text-right">
-                      {membraneOpacity.toFixed(2)}
-                    </span>
-                  </div>
-                </div>
-                <button onClick={() => applyMembrane()} disabled={flattening || membraneApplying || selectedSurfaces.size === 0}
-                  className="w-full px-2 py-1.5 bg-white hover:bg-gray-200 disabled:bg-gray-600 disabled:text-gray-400 text-black rounded cursor-pointer text-xs font-bold">
-                  {membraneApplying ? '처리 중...' : '얇은 막 씌우기'}
+                <label className="flex items-center gap-2 text-[10px] text-gray-400 mt-1 cursor-pointer select-none">
+                  <input type="checkbox" checked={splatHidden}
+                    onChange={(e) => setSplatHidden(e.target.checked)}
+                    className="cursor-pointer" />
+                  <span>막만 보기</span>
+                </label>
+                <button onClick={() => toggleAlphaGrid()}
+                  className={`w-full mt-1 px-2 py-1 rounded cursor-pointer text-[10px] ${
+                    alphaGridActive
+                      ? 'bg-amber-600 hover:bg-amber-500 text-white'
+                      : 'bg-gray-700 hover:bg-gray-600 text-gray-200'
+                  }`}>
+                  {alphaGridActive ? '알파 그리드 끄기' : '알파 그리드 진단 (50cm)'}
                 </button>
               </div>
             </div>
 
-            <div className="flex gap-1">
-              <button onClick={addPlane} disabled={planes.length>=20}
-                className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-600 text-white rounded cursor-pointer text-xs">
-                + 평면 추가
-              </button>
-              <button onClick={() => { const next = !pickingNormal; setPickingNormal(next); pickingNormalRef.current = next; if (!next) clearDepth(); }}
-                disabled={depthLoading}
-                className={`px-3 py-1.5 ${depthLoading ? 'bg-gray-500 text-gray-300 cursor-wait' : pickingNormal ? 'bg-yellow-500 hover:bg-yellow-400 text-black' : 'bg-purple-600 hover:bg-purple-500 text-white'} rounded cursor-pointer text-xs`}>
-                {depthLoading ? 'Depth 분석중...' : pickingNormal ? '점을 클릭...' : '법선 생성 (Depth)'}
-              </button>
-            </div>
             {planes.length > 0 && (
               <div className="flex flex-col gap-1 mt-1">
                 {planes.map((_,i) => (
@@ -1367,6 +2799,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
           <>
             <div className="flex gap-1">
               <button onClick={()=>setPaintMode('union')} className={`px-2 py-0.5 rounded cursor-pointer ${paintMode==='union'?'bg-green-600 text-white':'bg-gray-700 hover:bg-gray-600'}`}>+ 합집합</button>
+              <button onClick={()=>setPaintMode('intersect')} className={`px-2 py-0.5 rounded cursor-pointer ${paintMode==='intersect'?'bg-yellow-600 text-white':'bg-gray-700 hover:bg-gray-600'}`}>∩ 교집합</button>
               <button onClick={()=>setPaintMode('diff')} className={`px-2 py-0.5 rounded cursor-pointer ${paintMode==='diff'?'bg-red-600 text-white':'bg-gray-700 hover:bg-gray-600'}`}>- 차집합</button>
             </div>
             <div className="flex items-center gap-2">
@@ -1416,26 +2849,112 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
           </>
         )}
 
-        {/* Save */}
-        {options?.uploadId && sourceKeyRef.current && (
-          saved ? (
-            <div className="mt-2 px-3 py-2 bg-green-800/50 text-green-300 rounded text-xs text-center font-bold">
-              저장 완료
+        {/* ── Rect (직사각형 영역) controls ── */}
+        {refineMode === 'rect' && (
+          <>
+            <div className="flex gap-1">
+              <button onClick={()=>setPaintMode('union')} className={`px-2 py-0.5 rounded cursor-pointer ${paintMode==='union'?'bg-green-600 text-white':'bg-gray-700 hover:bg-gray-600'}`}>+ 합집합</button>
+              <button onClick={()=>setPaintMode('intersect')} className={`px-2 py-0.5 rounded cursor-pointer ${paintMode==='intersect'?'bg-yellow-600 text-white':'bg-gray-700 hover:bg-gray-600'}`}>∩ 교집합</button>
+              <button onClick={()=>setPaintMode('diff')} className={`px-2 py-0.5 rounded cursor-pointer ${paintMode==='diff'?'bg-red-600 text-white':'bg-gray-700 hover:bg-gray-600'}`}>- 차집합</button>
             </div>
-          ) : (
-            <button onClick={saveRefined} disabled={saving}
-              className="mt-2 px-3 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:bg-gray-600 text-white rounded cursor-pointer font-bold text-xs">
-              {saving ? '저장 중...' : '정제 결과 저장'}
-            </button>
-          )
+            <div className="text-[10px] text-gray-500 leading-relaxed">
+              좌클릭 + 드래그로 화면에 직사각형 그리기 → 영역 안에 투영되는 모든 가우시안 선택 (깊이 무한대).
+            </div>
+            <div className="border-t border-gray-600 pt-2 mt-1">
+              <div className="mb-1.5">선택: <span className="text-red-400 font-bold">{selectionCount.toLocaleString()}</span> / {totalCount.toLocaleString()}</div>
+              <div className="flex gap-1 flex-wrap">
+                <button onClick={undo} className="px-2 py-1 bg-gray-700 hover:bg-gray-600 rounded cursor-pointer">Undo</button>
+                <button onClick={invertSelection} className="px-2 py-1 bg-gray-700 hover:bg-gray-600 rounded cursor-pointer">반전</button>
+                <button onClick={clearSelection} className="px-2 py-1 bg-gray-700 hover:bg-gray-600 rounded cursor-pointer">초기화</button>
+              </div>
+            </div>
+            {selectionCount > 0 && (
+              <button onClick={deleteSelected} className="mt-1 px-3 py-2 bg-red-600 hover:bg-red-500 text-white rounded cursor-pointer font-bold text-xs">
+                선택 삭제 (Delete)
+              </button>
+            )}
+          </>
         )}
 
-        {/* Reset (공통) */}
-        <button onClick={resetAll} className="mt-1 px-3 py-1.5 bg-gray-600 hover:bg-gray-500 text-white rounded cursor-pointer text-xs">
-          전체 리셋
-        </button>
-      </div>
+        {/* ── Transparent paint controls (wall mesh 텍스처 alpha=0 페인트) ── */}
+        {refineMode === 'transparent' && (
+          <>
+            <div className="text-[10px] text-gray-400">
+              막 텍스처의 투명영역(출입구/통로 등) 지정.
+              {wallMeshEntitiesRef.current.length === 0 && (
+                <div className="mt-1 text-amber-400">먼저 "막 생성하기"로 막을 만들어야 합니다.</div>
+              )}
+            </div>
+            <div className="flex gap-1">
+              <button
+                onClick={() => setTransShape('circle')}
+                className={`flex-1 px-2 py-1 rounded cursor-pointer text-[10px] font-bold ${transShape === 'circle' ? 'bg-pink-600 text-white' : 'bg-gray-700 hover:bg-gray-600 text-gray-300'}`}>
+                원형 브러시
+              </button>
+              <button
+                onClick={() => setTransShape('rect')}
+                className={`flex-1 px-2 py-1 rounded cursor-pointer text-[10px] font-bold ${transShape === 'rect' ? 'bg-pink-600 text-white' : 'bg-gray-700 hover:bg-gray-600 text-gray-300'}`}>
+                직사각형
+              </button>
+            </div>
+            {transShape === 'circle' ? (
+              <div className="flex items-center gap-1.5 text-[10px]">
+                <span className="text-gray-400 w-14">브러시</span>
+                <input type="range" min={0.02} max={0.5} step={0.01}
+                  value={transBrushMeters}
+                  onChange={(e) => setTransBrushMeters(parseFloat(e.target.value))}
+                  className="flex-1 accent-pink-500 cursor-pointer" />
+                <span className="text-white font-mono w-12 text-right">
+                  {(transBrushMeters * 100).toFixed(0)}cm
+                </span>
+              </div>
+            ) : (
+              <div className="text-[10px] text-gray-500">
+                좌클릭 + 드래그로 화면에 직사각형 그리기 → 영역 안의 모든 막 텍셀 투명
+              </div>
+            )}
+          </>
+        )}
 
+        {/* Undo / Reset (공통) */}
+        <div className="mt-1 flex gap-1">
+          <button
+            onClick={undoLast}
+            disabled={undoDepth === 0}
+            className="flex-1 px-3 py-1.5 bg-amber-700 hover:bg-amber-600 disabled:bg-gray-700 disabled:text-gray-500 text-white rounded cursor-pointer disabled:cursor-not-allowed text-xs"
+            title="마지막 파괴적 작업(회전/모듈 외부 제거/막 생성) 되돌리기"
+          >
+            되돌리기 {undoDepth > 0 ? `(${undoDepth})` : ''}
+          </button>
+          <button onClick={resetAll} className="flex-1 px-3 py-1.5 bg-gray-600 hover:bg-gray-500 text-white rounded cursor-pointer text-xs">
+            전체 리셋
+          </button>
+        </div>
+
+        {/* 다듬기 저장 — 모든 sub-tab(경계면 처리 / 가우시안 선택·삭제 / 투명영역) 공통 가장 하단.
+            로컬 파일에서도 누를 수 있음 — 모달이 건물 정보를 받으면 register-local 로 upload 를 만들어
+            그 위에 refined PLY 를 업로드하고 자동으로 정합으로 진입한다.
+            (docs/sam3_alignment_pipeline.md "Happy path") */}
+        {saved ? (
+          <div className="mt-2 px-3 py-2 bg-green-800/50 text-green-300 rounded text-xs text-center font-bold">
+            저장 완료
+          </div>
+        ) : (
+          <button
+            onClick={saveRefined}
+            disabled={saving}
+            title="건물 정보와 SAM3 프롬프트를 입력하면 다듬기 결과를 업로드하고 자동으로 정합으로 진입합니다."
+            className="mt-2 w-full px-3 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:bg-gray-600 disabled:text-gray-400 disabled:cursor-not-allowed text-white rounded cursor-pointer font-bold text-xs"
+          >
+            {saving ? '저장 중...' : '다듬기 저장'}
+          </button>
+        )}
+      </div>
+    </>
+  ) : null;
+
+  const modals = splatLoaded ? (
+    <>
       {/* Ceiling/Floor Modal */}
       {cfModalOpen && splatDataRef.current && (
         <Suspense fallback={null}>
@@ -1446,56 +2965,47 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
             numSplats={splatDataRef.current.numSplats}
             initialCeiling={cfMode !== 'none' ? ceilingY : null}
             initialFloor={cfMode !== 'none' ? floorY : null}
+            initialRotX={pendingRotation.rotX}
+            initialRotZ={pendingRotation.rotZ}
             onConfirm={async (lo, hi, rotX, rotZ) => {
               // modal: lo = 작은 Y (바닥), hi = 큰 Y (천장)
+              // rotX/rotZ는 raw posX/Y/Z에 적용될 절대 회전 (모달이 항상 raw에서 시작).
+              // 우리는 이를 곧 새로운 절대 pendingRotation으로 본다 (composition 회피).
               const c = hi, f = lo;
 
-              // 회전이 있으면 PLY에 영구 적용 → 업로드 → 재로드
-              if ((rotX !== 0 || rotZ !== 0) && options?.uploadId && options?.reloadWithUrl && options?.currentUrl) {
-                setCfModalOpen(false);
-                try {
-                  const [
-                    { fetchAndParsePly, serializePly },
-                    { rotateScene },
-                  ] = await Promise.all([
-                    import('@/lib/ply'),
-                    import('@/lib/gs'),
-                  ]);
-                  const { api } = await import('@/lib/api');
-                  const scene = await fetchAndParsePly(options.currentUrl);
-                  rotateScene(scene, rotX, rotZ);
-                  const bytes = serializePly(scene);
-                  const urlReq = await api.post<{ put_url: string; get_url: string; key: string }>(
-                    '/refine/refined-upload-url',
-                    { upload_id: options.uploadId, filename: 'rotated.ply' },
-                  );
-                  const putResp = await fetch(urlReq.put_url, {
-                    method: 'PUT', body: bytes,
-                    headers: { 'Content-Type': 'application/octet-stream' },
-                  });
-                  if (!putResp.ok) throw new Error(`MinIO PUT failed: ${putResp.status}`);
-                  setCeilingY(c); setFloorY(f);
-                  ceilingYRef.current = c; floorYRef.current = f;
-                  setCfMode('confirmed'); cfModeRef.current = 'confirmed';
-                  setSelectedSurfaces(prev => {
-                    const next = new Set(prev);
-                    CF_SURFACES.forEach(s => next.add(s));
-                    return next;
-                  });
-                  sourceKeyRef.current = urlReq.key;
-                  options.reloadWithUrl(urlReq.get_url);
-                } catch (e: any) {
-                  alert(`회전 적용 실패: ${e.message || e}`);
+              const newRot = { rotX, rotZ };
+              const oldRot = pendingRotationRef.current;
+              const rotChanged = (newRot.rotX !== oldRot.rotX) || (newRot.rotZ !== oldRot.rotZ);
+
+              if (rotChanged) {
+                pushOp({ type: 'rotation', prevRotation: { ...oldRot } });
+                pendingRotationRef.current = newRot;
+                setPendingRotation(newRot);
+                applyEntityRotation();
+                dirtyRef.current = true; setDirty(true);
+                setSaved(false);
+              }
+
+              // 회전 변경 후 flatten 마스크 / 벽 정의 무효화 (이전 회전 프레임 기준이라 stale).
+              if (rotChanged) {
+                if (flattenMaskRef.current) {
+                  flattenMaskRef.current = null;
+                  flattenActiveRef.current = false; setFlattenActive(false);
+                  paintFlattenMask();
                 }
-                return;
+                if (wallModeRef.current === 'confirmed') {
+                  setWallMode('none'); wallModeRef.current = 'none';
+                  setWallAngle(null); wallAngleRef.current = null;
+                  setWallDistances(null); wallDistancesRef.current = null;
+                }
               }
 
               setCeilingY(c); setFloorY(f);
               ceilingYRef.current = c; floorYRef.current = f;
               setCfMode('confirmed'); cfModeRef.current = 'confirmed';
               setCfModalOpen(false);
-              setSelectedSurfaces(prev => {
-                const next = new Set(prev);
+              setSelectedSurfaces(prevSel => {
+                const next = new Set(prevSel);
                 CF_SURFACES.forEach(s => next.add(s));
                 return next;
               });
@@ -1505,13 +3015,19 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         </Suspense>
       )}
 
-      {/* Wall Modal */}
-      {wallModalOpen && splatDataRef.current && cfMode === 'confirmed' && (
+      {/* Wall Modal — pendingRotation 적용된 좌표를 넘겨 A' 프레임에서 작업하도록 */}
+      {wallModalOpen && splatDataRef.current && cfMode === 'confirmed' && (() => {
+        const rp = buildRotatedPositions(
+          splatDataRef.current.posX,
+          splatDataRef.current.posY,
+          splatDataRef.current.posZ,
+        );
+        return (
         <Suspense fallback={null}>
           <WallModal
-            posX={splatDataRef.current.posX}
-            posY={splatDataRef.current.posY}
-            posZ={splatDataRef.current.posZ}
+            posX={rp.x}
+            posY={rp.y}
+            posZ={rp.z}
             numSplats={splatDataRef.current.numSplats}
             ceilingY={ceilingY}
             floorY={floorY}
@@ -1531,9 +3047,24 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
             onClose={() => setWallModalOpen(false)}
           />
         </Suspense>
+        );
+      })()}
+
+      {/* SPEC: 로딩 화면 — "파일 업로드 중..." → "SAM3 작동 중..." */}
+      {samProgressOpen && (
+        <div className="absolute inset-0 z-[101] bg-black/70 flex items-center justify-center">
+          <div className="bg-gray-900 border border-gray-700 rounded-lg p-8 min-w-[360px] shadow-2xl flex flex-col items-center">
+            <div className="w-10 h-10 border-2 border-blue-500 border-t-transparent rounded-full animate-spin mb-4" />
+            <div className="text-white font-bold text-sm mb-1">{samProgressMessage || '진행 중...'}</div>
+            <div className="text-gray-400 text-[11px] mt-3 text-center">
+              브라우저를 닫아도 백그라운드에서 계속 진행됩니다.<br />
+              완료 후 대시보드의 [정합하기] 버튼으로 다시 들어올 수 있습니다.
+            </div>
+          </div>
+        </div>
       )}
     </>
   ) : null;
 
-  return { ui, onSplatLoaded, planes };
+  return { overlay, panel, modals, onSplatLoaded, planes };
 }

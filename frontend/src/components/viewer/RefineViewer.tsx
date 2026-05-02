@@ -7,9 +7,10 @@ import { useRefineTool } from './tools/useRefineTool';
 interface RefineViewerProps {
   sogUrl: string;
   uploadId?: string;
+  originalFilename?: string;
 }
 
-export default function RefineViewer({ sogUrl, uploadId }: RefineViewerProps) {
+export default function RefineViewer({ sogUrl, uploadId, originalFilename }: RefineViewerProps) {
   const coreRef = useRef<SplatViewerCoreRef>(null);
   const [currentUrl, setCurrentUrl] = useState(sogUrl);
   const [reloadKey, setReloadKey] = useState(0);
@@ -19,7 +20,7 @@ export default function RefineViewer({ sogUrl, uploadId }: RefineViewerProps) {
     setReloadKey(k => k + 1);
   }, []);
 
-  const refine = useRefineTool(coreRef, { uploadId, reloadWithUrl, currentUrl });
+  const refine = useRefineTool(coreRef, { uploadId, reloadWithUrl, currentUrl, originalFilename });
 
   return (
     <SplatViewerCore
@@ -28,7 +29,11 @@ export default function RefineViewer({ sogUrl, uploadId }: RefineViewerProps) {
       sogUrl={currentUrl}
       onSplatLoaded={refine.onSplatLoaded}
     >
-      {refine.ui}
+      <div className="absolute top-3 left-3 z-50">
+        {refine.panel}
+      </div>
+      {refine.overlay}
+      {refine.modals}
     </SplatViewerCore>
   );
 }

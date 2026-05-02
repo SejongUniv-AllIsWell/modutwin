@@ -2,6 +2,8 @@
 .claude/
 *.sql
 nginx/nginx.conf
+claude.md
+docs/
 
 # data
 *.mp4
@@ -41,6 +43,8 @@ env/
 # Next.js
 frontend/.next/
 frontend/out/
+frontend/tsconfig.tsbuildinfo
+frontend/next-env.d.ts
 
 # Testing
 .coverage
@@ -73,3 +77,5 @@ temp/
 
 # OS
 Thumbs.db
+
+mlx_sam3/

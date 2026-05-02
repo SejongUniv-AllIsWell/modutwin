@@ -1,11 +1,44 @@
-# For GPU server deployment
-# How to use: docker compose -f docker-compose.gpu.yml up -d
+# GPU 서버 배포용 오버라이드
+#
+# 사용법:
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
 #
 # 사전 조건:
 #   - NVIDIA Container Toolkit 설치
-#   - .env.gpu 파일에 PC_HOST_IP 설정
+#   - .env 파일에 PC_HOST_IP, HF_TOKEN 설정
+#   - .env 파일에 HF_TOKEN 설정
+#     HF_TOKEN: facebook/sam3 gated model 접근 토큰
+#     (https://huggingface.co/facebook/sam3 에서 access request 후 발급)
+#
+# 네트워크(3dgs-net)는 docker-compose.yml 에서 driver:bridge 로 생성하므로
+# 이 파일에서 재선언하지 않는다. 새 팀원 환경에서도 external 네트워크를
+# 미리 만들 필요 없이 self-contained 로 동작한다.
 
 services:
+  door-ml:
+    build: ./door_ml
+    container_name: 3dgs-door-ml
+    volumes:
+      - ./core:/app/core:ro
+      - ./utilities:/app/utilities:ro
+      - hf_cache:/root/.cache/huggingface   # 체크포인트 재다운로드 방지
+    expose:
+      - "8000"
+    environment:
+      - TORCH_CUDA_ARCH_LIST=12.0
+      - HF_TOKEN=${HF_TOKEN}               # .env 에서 주입
+      - HF_HUB_DISABLE_PROGRESS_BARS=1
+    networks:
+      - 3dgs-net
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [ gpu ]
+    restart: unless-stopped
+
   worker:
     build: ./worker
     container_name: 3dgs-worker
@@ -27,3 +60,11 @@ services:
               count: all
               capabilities: [ gpu ]
     restart: unless-stopped
+
+volumes:
+  hf_cache:                                # SAM3 체크포인트 영구 캐시
+
+networks:
+  3dgs-net:
+    external: true
+  hf_cache:   # SAM3 체크포인트 영구 캐시 (컨테이너 재시작 시 재다운로드 방지)
