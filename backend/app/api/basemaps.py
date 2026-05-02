@@ -4,12 +4,15 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from typing import Optional
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.security import get_current_user, require_admin
-from app.models import User, Basemap, BasemapStatus, Floor, Building, Module, Upload
+from app.models import (
+    User, Basemap, BasemapStatus, Floor, Building, Module, Upload,
+    SceneOutput, Task,
+)
 from app.services.minio_service import get_minio_service
 
 router = APIRouter(prefix="/admin/basemaps", tags=["basemaps"])
@@ -129,18 +132,37 @@ async def list_basemap_candidates(
     admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """basemap 후보 = 업로드된 PLY 파일들 (관리자)
+    """basemap 후보 = 다듬기까지 끝난 업로드들 (관리자)
 
-    업로드 흐름을 통해 누구나 올린 .ply 파일을 모두 노출한다.
-    이미 basemap으로 등록된 파일은 already_registered=True 로 표시.
+    업로드의 원본 PLY 는 placeholder 경로(`<base>/alignment/<uuid>_local.ply`)로
+    저장되며 MinIO 에 실물이 없을 수 있다 (`uploads.py` register_local 참고).
+    실제로 MinIO 에 존재하는 PLY 는 다듬기 결과(`alignment/refined/.../refined_*.ply`)
+    이므로, 후보는 SceneOutput 가 1개 이상 있는 업로드로 한정한다.
     """
+    # 업로드별 가장 최근 SceneOutput 의 ply_path. 윈도우 함수로 1개만 뽑는다.
+    rn = func.row_number().over(
+        partition_by=Task.upload_id,
+        order_by=SceneOutput.created_at.desc(),
+    ).label("rn")
+    latest_scene_subq = (
+        select(
+            Task.upload_id.label("upload_id"),
+            SceneOutput.ply_path.label("ply_path"),
+            SceneOutput.created_at.label("scene_created_at"),
+            rn,
+        )
+        .join(SceneOutput, SceneOutput.task_id == Task.id)
+        .subquery()
+    )
+
     stmt = (
         select(
             Upload.id.label("upload_id"),
             Upload.original_filename,
             Upload.file_size,
             Upload.uploaded_at,
-            Upload.minio_path,
+            latest_scene_subq.c.ply_path,
+            latest_scene_subq.c.scene_created_at,
             User.name.label("uploaded_by_name"),
             Module.id.label("module_id"),
             Module.name.label("module_name"),
@@ -150,12 +172,13 @@ async def list_basemap_candidates(
             Building.name.label("building_name"),
         )
         .select_from(Upload)
+        .join(latest_scene_subq, latest_scene_subq.c.upload_id == Upload.id)
         .join(User, Upload.user_id == User.id)
         .join(Module, Upload.module_id == Module.id)
         .join(Floor, Module.floor_id == Floor.id)
         .join(Building, Floor.building_id == Building.id)
-        .where(Upload.original_filename.ilike("%.ply"))
-        .order_by(Upload.uploaded_at.desc())
+        .where(latest_scene_subq.c.rn == 1)
+        .order_by(latest_scene_subq.c.scene_created_at.desc())
     )
     result = await db.execute(stmt)
     rows = result.all()
@@ -179,7 +202,7 @@ async def list_basemap_candidates(
             floor_number=r.floor_number,
             building_id=r.building_id,
             building_name=r.building_name,
-            already_registered=r.minio_path in registered_paths,
+            already_registered=r.ply_path in registered_paths,
         )
         for r in rows
     ]
@@ -191,9 +214,10 @@ async def register_basemap_from_upload(
     admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """업로드된 PLY를 basemap 후보로 등록 (관리자).
+    """업로드의 다듬기 결과(refined PLY)를 basemap 으로 등록 (관리자).
 
-    파일은 복사하지 않고 Upload.minio_path를 그대로 참조한다.
+    Upload.minio_path 는 placeholder 라 MinIO 에 실물이 없을 수 있으므로,
+    가장 최근 SceneOutput.ply_path (실제 다듬기 결과)를 basemap 으로 사용한다.
     """
     # 업로드 + 모듈 + 층 조회
     result = await db.execute(
@@ -207,13 +231,33 @@ async def register_basemap_from_upload(
         raise HTTPException(status_code=404, detail="업로드를 찾을 수 없습니다.")
     upload, module, floor = row
 
-    if not upload.original_filename.lower().endswith(".ply"):
-        raise HTTPException(status_code=400, detail="PLY 파일만 basemap으로 등록할 수 있습니다.")
+    # 가장 최근 다듬기 결과 조회 — basemap 의 실제 PLY 경로
+    scene_result = await db.execute(
+        select(SceneOutput.ply_path)
+        .join(Task, SceneOutput.task_id == Task.id)
+        .where(Task.upload_id == upload.id)
+        .order_by(SceneOutput.created_at.desc())
+        .limit(1)
+    )
+    refined_ply_path = scene_result.scalar_one_or_none()
+    if refined_ply_path is None:
+        raise HTTPException(
+            status_code=400,
+            detail="다듬기 결과가 없는 업로드는 basemap 으로 등록할 수 없습니다.",
+        )
+
+    # MinIO 에 실물 존재 검증 — placeholder 만 등록되는 사고 재발 방지
+    minio = get_minio_service()
+    if not minio.object_exists(refined_ply_path):
+        raise HTTPException(
+            status_code=400,
+            detail="다듬기 결과 PLY 가 MinIO 에 존재하지 않습니다.",
+        )
 
     # 중복 등록 방지 — 거부된(rejected) 이력은 무시하고 재등록을 허용한다
     dup = await db.execute(
         select(Basemap).where(
-            Basemap.minio_path == upload.minio_path,
+            Basemap.minio_path == refined_ply_path,
             Basemap.status != BasemapStatus.rejected,
         )
     )
@@ -232,7 +276,7 @@ async def register_basemap_from_upload(
 
     basemap = Basemap(
         floor_id=floor.id,
-        minio_path=upload.minio_path,
+        minio_path=refined_ply_path,
         version=next_version,
         uploaded_by=admin.id,
         status=BasemapStatus.pending,

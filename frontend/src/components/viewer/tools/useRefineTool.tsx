@@ -1535,14 +1535,15 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         console.warn('[Save] SAM3 dispatch 실패', e);
       }
 
-      // 3.6) SAM3 폴링 — done/failed 까지 대기 (최대 5분), 그 동안 진행률 표시.
+      // 3.6) SAM3 폴링 — done/failed 까지 대기 (최대 1분), 그 동안 진행률 표시.
+      let sam3TimedOut = false;
       if (sam3Started) {
         setSamProgressMessage('SAM3 작동 중...');
         const startedAt = performance.now();
-        const TIMEOUT_MS = 5 * 60 * 1000;
+        const TIMEOUT_MS = 60 * 1000;
         // eslint-disable-next-line no-constant-condition
         while (true) {
-          await new Promise(r => setTimeout(r, 1500));
+          await new Promise(r => setTimeout(r, 5000));
           try {
             const s = await api.get<{ sam3_status: string | null; has_doors_json: boolean }>(
               `/uploads/${activeUploadId}/sam3`,
@@ -1555,7 +1556,8 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
             console.warn('[Save] SAM3 status 폴링 실패', e);
           }
           if (performance.now() - startedAt > TIMEOUT_MS) {
-            console.warn('[Save] SAM3 폴링 타임아웃 — 진행 상태 무시하고 정합으로 진입');
+            console.warn('[Save] SAM3 폴링 타임아웃 (1분) — 마이페이지로 이동');
+            sam3TimedOut = true;
             break;
           }
         }
@@ -1564,6 +1566,13 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       // 저장 성공. SPEC상 좌표 변환을 베이크하지 않으므로 wallAngle/pendingRotation 등
       // 화면 표시용 회전 값은 그대로 유지 (사용자가 다시 와도 같은 시야로 작업 이어가기 위함).
       setSaved(true);
+
+      // SAM3 타임아웃 시: 정합으로 넘어가지 않고 사용자에게 안내 후 마이페이지로 복귀.
+      if (sam3TimedOut) {
+        alert('SAM3 처리 시간이 초과되었습니다. 관리자에게 문의하세요.');
+        router.push('/dashboard');
+        return;
+      }
 
       // 단일 플로우 — SAM3 폴링 후 자동으로 정합 모드 진입.
       options?.onSwitchToAlign?.();
