@@ -13,19 +13,47 @@ function isViewable(filename: string): boolean {
   return VIEWABLE_EXTENSIONS.has(ext);
 }
 
-const STATUS_LABEL: Record<string, string> = {
-  uploaded: '업로드됨',
-  processing: '처리 중',
-  completed: '완료',
-  failed: '실패',
+// 파이프라인 진행 단계 라벨 — 업로드(MinIO) 상태가 아니라 사용자가 어디까지 진행했는지 표시.
+//   failed → 실패
+//   has_alignment → 정합 완료 (정합 행렬 저장됨)
+//   has_doors_json → 문 꼭짓점 지정 (정합 진행 중)
+//   has_refined → 다듬기 완료
+//   completed (refined 없음) → 업로드 완료
+//   uploaded / processing → 그대로
+type ProgressStage =
+  | 'failed' | 'aligned' | 'doors' | 'refined'
+  | 'uploaded_only' | 'uploaded' | 'processing';
+
+const STAGE_LABEL: Record<ProgressStage, string> = {
+  failed:        '실패',
+  aligned:       '정합 완료',
+  doors:         '문 꼭짓점 지정',
+  refined:       '다듬기 완료',
+  uploaded_only: '업로드 완료',
+  uploaded:      '업로드됨',
+  processing:    '처리 중',
 };
 
-const STATUS_COLOR: Record<string, string> = {
-  uploaded: 'text-gray-400',
-  processing: 'text-yellow-400',
-  completed: 'text-green-400',
-  failed: 'text-red-400',
+const STAGE_COLOR: Record<ProgressStage, string> = {
+  failed:        'text-red-400',
+  aligned:       'text-cyan-400',
+  doors:         'text-purple-400',
+  refined:       'text-blue-400',
+  uploaded_only: 'text-green-400',
+  uploaded:      'text-gray-400',
+  processing:    'text-yellow-400',
 };
+
+function progressStage(u: { status: string; has_refined?: boolean; has_doors_json?: boolean; has_alignment?: boolean }): ProgressStage {
+  if (u.status === 'failed') return 'failed';
+  if (u.status === 'processing') return 'processing';
+  if (u.status === 'uploaded') return 'uploaded';
+  // status === 'completed': 다듬기/정합 진행 단계로 더 세분화.
+  if (u.has_alignment) return 'aligned';
+  if (u.has_doors_json) return 'doors';
+  if (u.has_refined) return 'refined';
+  return 'uploaded_only';
+}
 
 const SAM3_LABEL: Record<string, string> = {
   pending: '대기',
@@ -118,12 +146,15 @@ export default function UserDashboard({ showHeader = true }: Props) {
                 {uploads.map(u => {
                   const sam = u.sam3_status ?? null;
                   const canAlign = sam === 'done' || sam === 'failed' || u.has_refined;
+                  const stage = progressStage(u);
                   return (
                     <tr key={u.id} className="border-b border-gray-800/50">
                       <td className="py-3 pr-4">
                         {isViewable(u.original_filename) ? (
                           <Link
-                            href={`/viewer?upload_id=${u.id}`}
+                            href={u.has_refined
+                              ? `/viewer?upload_id=${u.id}&mode=align`
+                              : `/viewer?upload_id=${u.id}`}
                             className="text-blue-400 hover:underline"
                           >
                             {u.original_filename}
@@ -132,7 +163,7 @@ export default function UserDashboard({ showHeader = true }: Props) {
                           <span className="text-gray-300">{u.original_filename}</span>
                         )}
                       </td>
-                      <td className={`py-3 pr-4 ${STATUS_COLOR[u.status]}`}>{STATUS_LABEL[u.status]}</td>
+                      <td className={`py-3 pr-4 ${STAGE_COLOR[stage]}`}>{STAGE_LABEL[stage]}</td>
                       <td className={`py-3 pr-4 ${sam ? SAM3_COLOR[sam] : 'text-gray-600'}`}>
                         {sam ? SAM3_LABEL[sam] : '—'}
                       </td>

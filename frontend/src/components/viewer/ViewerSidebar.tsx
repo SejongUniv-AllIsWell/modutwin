@@ -7,16 +7,24 @@ interface Props {
   mode: EditorMode;
   hasMain: boolean;
   hasMetadata: boolean;
+  /** 완료 버튼으로 통과한 단계들. 단방향 진행 — 잠긴 단계로 되돌아갈 수 없음. */
+  lockedStages: ReadonlySet<'upload' | 'refine' | 'door'>;
   onPickFiles: (files: File[]) => void;
-  onToggleMode: (next: 'refine' | 'align') => void;
-  onBack: () => void;
+  onToggleMode: (next: 'refine' | 'door' | 'align') => void;
+  /** 사이드바 + 레이어 + 툴 패널 전체를 왼쪽으로 밀어 숨긴다. (이전 onBack 자리). */
+  onCollapse: () => void;
 }
 
 const ACCEPT = '.ply,.splat,.sog';
 
 export default function ViewerSidebar({
-  mode, hasMain, hasMetadata, onPickFiles, onToggleMode, onBack,
+  mode, hasMain, hasMetadata, lockedStages, onPickFiles, onToggleMode, onCollapse,
 }: Props) {
+  const uploadLocked = lockedStages.has('upload');
+  const refineLocked = lockedStages.has('refine');
+  const doorLocked = lockedStages.has('door');
+  const lockTitle = '이전 단계는 완료된 상태로 잠겼습니다. 되돌릴 수 없습니다.';
+  const lockedClass = 'opacity-40 cursor-not-allowed line-through decoration-gray-500';
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleFile = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -28,8 +36,8 @@ export default function ViewerSidebar({
   return (
     <div className="flex flex-row items-stretch gap-1.5 bg-black/70 backdrop-blur-sm border border-white/10 rounded-lg p-1.5 shadow-lg">
       <button
-        onClick={onBack}
-        title="뒤로가기"
+        onClick={onCollapse}
+        title="패널 숨기기"
         className="flex items-center justify-center w-9 h-9 text-gray-300 hover:text-white hover:bg-gray-700/60 rounded transition cursor-pointer"
       >
         <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -40,24 +48,48 @@ export default function ViewerSidebar({
       <div className="w-px bg-white/10 my-1" />
 
       <button
-        onClick={() => fileInputRef.current?.click()}
-        title="로컬 파일 선택 (.ply / .splat / .sog)"
-        className="flex flex-col items-center justify-center gap-0.5 w-14 h-9 text-gray-200 hover:bg-gray-700/60 rounded transition cursor-pointer"
+        onClick={() => { if (!uploadLocked) fileInputRef.current?.click(); }}
+        disabled={uploadLocked}
+        title={uploadLocked ? lockTitle : '로컬 파일 선택 (.ply / .splat / .sog)'}
+        className={`flex flex-col items-center justify-center gap-0.5 w-14 h-9 rounded transition ${
+          uploadLocked
+            ? lockedClass
+            : !hasMain
+              ? 'bg-indigo-500/25 text-indigo-300 cursor-pointer'
+              : 'text-gray-200 hover:bg-gray-700/60 cursor-pointer'
+        }`}
       >
-        <span className="text-[11px] leading-none">파일</span>
+        <span className="text-[11px] leading-none">업로드</span>
       </button>
 
       <button
         onClick={() => onToggleMode('refine')}
-        disabled={!hasMain}
-        title={!hasMain ? '먼저 파일을 불러오세요' : '다듬기'}
-        className={`flex flex-col items-center justify-center gap-0.5 w-14 h-9 rounded transition cursor-pointer disabled:cursor-not-allowed disabled:opacity-40 ${
-          mode === 'refine'
-            ? 'bg-orange-500/25 text-orange-300'
-            : 'text-gray-200 hover:bg-gray-700/60'
+        disabled={!hasMain || refineLocked}
+        title={!hasMain ? '먼저 파일을 불러오세요' : refineLocked ? lockTitle : '다듬기'}
+        className={`flex flex-col items-center justify-center gap-0.5 w-14 h-9 rounded transition disabled:cursor-not-allowed ${
+          refineLocked
+            ? lockedClass
+            : hasMain && mode === 'refine'
+              ? 'bg-indigo-500/25 text-indigo-300 cursor-pointer'
+              : 'text-gray-200 hover:bg-gray-700/60 cursor-pointer disabled:opacity-40'
         }`}
       >
         <span className="text-[11px] leading-none">다듬기</span>
+      </button>
+
+      <button
+        onClick={() => onToggleMode('door')}
+        disabled={!hasMain || doorLocked}
+        title={!hasMain ? '먼저 파일을 불러오세요' : doorLocked ? lockTitle : '문 설정'}
+        className={`flex flex-col items-center justify-center gap-0.5 w-14 h-9 rounded transition disabled:cursor-not-allowed ${
+          doorLocked
+            ? lockedClass
+            : hasMain && mode === 'door'
+              ? 'bg-indigo-500/25 text-indigo-300 cursor-pointer'
+              : 'text-gray-200 hover:bg-gray-700/60 cursor-pointer disabled:opacity-40'
+        }`}
+      >
+        <span className="text-[11px] leading-none">문 설정</span>
       </button>
 
       <button
@@ -71,8 +103,8 @@ export default function ViewerSidebar({
               : '정합'
         }
         className={`flex flex-col items-center justify-center gap-0.5 w-14 h-9 rounded transition cursor-pointer disabled:cursor-not-allowed disabled:opacity-40 ${
-          mode === 'align'
-            ? 'bg-blue-500/25 text-blue-300'
+          hasMain && mode === 'align'
+            ? 'bg-indigo-500/25 text-indigo-300'
             : 'text-gray-200 hover:bg-gray-700/60'
         }`}
       >

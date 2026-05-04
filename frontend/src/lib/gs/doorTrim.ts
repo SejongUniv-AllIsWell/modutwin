@@ -82,11 +82,42 @@ export interface DecomposeOptions {
    */
   sigmaMultiplier?: number;
   /**
-   * 문 두께 (m). doorOriginalIndices 분류 시 4-edge inside 조건에 더해
-   * |center 의 벽 평면 signed distance| ≤ doorThickness/2 조건 추가.
-   * 미지정 시 깊이 필터 없음 (구버전 동작). 기본 미지정.
+   * 문 두께 (m). 벽 평면에서 **방 안쪽으로** 들어가는 단방향 깊이.
+   * 도어로 분류되려면 splat center 가 벽 평면 ~0 부터 -doorThickness 사이여야 함
+   * (방 바깥은 다듬기 단계에서 이미 alpha=0 처리되었으므로 슬랩이 비대칭).
+   * 손잡이/잠금처럼 벽에서 방 안쪽으로 돌출된 splat 도 doorThickness 이내면 도어로 잡힘.
+   * 미지정 또는 0 이하 시 깊이 필터 없음.
    */
   doorThickness?: number;
+  /**
+   * 벽 평면의 outward 방향 단위벡터 (방 바깥 방향). 슬랩의 비대칭 방향 결정에 사용.
+   * `surfacePlanesFromRoom` 의 plane.normal 을 그대로 넘기면 됨.
+   * 미지정 시 rectGeom.planeNormal 의 부호를 임의로 사용 — 비대칭이 의도와 반대로 동작할 수 있으므로 가능하면 명시.
+   */
+  wallOutwardNormal?: Vec3;
+}
+
+/**
+ * splat center 가 도어 슬랩 안인지 판정 (decompose 와 페인트 분류가 같은 기준 사용 위해 export).
+ *
+ * 슬랩: 벽 평면에서 방 안쪽으로 doorThickness 깊이까지의 단방향 영역.
+ * - sdOut = (c - pO) · wallOutward.  방 안쪽 → 음수, 방 바깥 → 양수.
+ * - 허용: -doorThickness ≤ sdOut ≤ EPS_OUT (벽 바깥 미세 누출 1mm 까지만 허용).
+ *
+ * doorThickness ≤ 0 이면 깊이 필터 없음 (true 항상).
+ */
+export function isInDoorSlab(
+  cx: number, cy: number, cz: number,
+  planeOrigin: Vec3,
+  wallOutward: Vec3,
+  doorThickness: number,
+): boolean {
+  if (!(doorThickness > 0)) return true;
+  const sdOut = (cx - planeOrigin[0]) * wallOutward[0]
+              + (cy - planeOrigin[1]) * wallOutward[1]
+              + (cz - planeOrigin[2]) * wallOutward[2];
+  const EPS_OUT = 1e-3; // 1mm — 부동소수 오차 허용.
+  return sdOut <= EPS_OUT && sdOut >= -doorThickness;
 }
 
 export interface BoundarySubUpdate {
@@ -137,12 +168,13 @@ export function decomposeBoundaryGaussians(
 ): DecomposeResult {
   const safety = Math.max(0, Math.min(0.5, opts.safetyMargin ?? 0));
   const kSigma = Math.max(2, opts.sigmaMultiplier ?? 3);
-  const halfThickness = opts.doorThickness !== undefined && opts.doorThickness > 0
-    ? opts.doorThickness / 2
-    : Infinity;
+  const doorThickness = (opts.doorThickness !== undefined && opts.doorThickness > 0)
+    ? opts.doorThickness
+    : 0; // 0 = 깊이 필터 비활성.
   const geom = rectGeom(rect.corners);
-  const pN = geom.planeNormal;
   const pO = geom.planeOrigin;
+  // 슬랩 방향: 명시된 wallOutwardNormal 우선. 없으면 rectGeom.planeNormal 부호를 임의로 사용 (구버전 호환).
+  const wallOut: Vec3 = opts.wallOutwardNormal ?? geom.planeNormal;
   const px = scene.attrs.get('x');
   const py = scene.attrs.get('y');
   const pz = scene.attrs.get('z');
@@ -184,6 +216,8 @@ export function decomposeBoundaryGaussians(
     let bestAbsSd = Infinity;
     let bestSd = 0, bestExt = 0;
     let bestN: Vec3 = [0, 0, 0];
+    // 비등방 분할용: 선택된 edge 의 n 이 splat local axis 들 (R 의 column) 에 갖는 방향 코사인.
+    let bestA0n = 0, bestA1n = 0, bestA2n = 0;
 
     for (let e = 0; e < 4; e++) {
       const n = geom.edgeNormals[e];
@@ -195,8 +229,7 @@ export function decomposeBoundaryGaussians(
       const variance = a0n*a0n*s0*s0 + a1n*a1n*s1*s1 + a2n*a2n*s2*s2;
       const ext = kSigma * Math.sqrt(variance);
       if (ext < 1e-6) continue;
-      // STRICT: center 가 어느 한 edge 의 outside (sd<0) 면 도어 영역 X.
-      // 기존 sd<=-ext 는 extent 까지 허용 → 멀리 있는 큰 splat 도 boundary 로 분류되는 버그.
+      // STRICT: center 가 어느 한 edge 의 outside (sd < 0) 면 도어 영역 X. 가로세로 방향 확장 없음.
       if (sd < 0) { isOutside = true; break; }
       if (sd < ext) {
         // 가로지름. 가장 깊게 가로지르는 (|sd| 작은) edge 를 분할 기준으로.
@@ -205,6 +238,7 @@ export function decomposeBoundaryGaussians(
           bestAbsSd = absSd;
           mostBoundaryEdge = e;
           bestSd = sd; bestExt = ext; bestN = n;
+          bestA0n = a0n; bestA1n = a1n; bestA2n = a2n;
         }
       }
     }
@@ -214,10 +248,9 @@ export function decomposeBoundaryGaussians(
       continue;
     }
 
-    // 벽 평면 깊이 필터 — center 가 ±halfThickness 밖이면 도어 영역 X. 분류 안 하고 넘김.
+    // 벽 평면 깊이 필터 — 비대칭 슬랩 (방 안쪽 단방향). 슬랩 밖이면 도어 영역 X.
     // (이 필터 없이 boundary 로 분류되면 door-side sub 가 깊은 위치에서 도어와 함께 회전 → 시각 이상)
-    const sdWall = (cx - pO[0]) * pN[0] + (cy - pO[1]) * pN[1] + (cz - pO[2]) * pN[2];
-    if (Math.abs(sdWall) > halfThickness) {
+    if (!isInDoorSlab(cx, cy, cz, pO, wallOut, doorThickness)) {
       continue;
     }
 
@@ -248,17 +281,35 @@ export function decomposeBoundaryGaussians(
       cz - n[2] * offsetOut,
     ];
 
-    const logFin  = Math.log(fInS);
-    const logFout = Math.log(fOutS);
+    // ── 비등방 (anisotropic) scale 보정 ──
+    // 변 normal n 방향만 fInS / fOutS 배 줄이고, n 에 수직인 방향은 거의 그대로 유지.
+    // 각 local axis i 에 곱할 배수 g_i:
+    //   g_i^2 = 1 - a_in^2 * (1 - f^2)
+    //   - axis 가 n 과 평행 (a_in^2 = 1): g_i = f → 그 축만 f 배 (1D 절단).
+    //   - axis 가 n 에 수직 (a_in = 0):    g_i = 1 → 그대로 (변 평행한 두께 유지 → 빈틈 없음).
+    //   - 중간 정렬: 부드러운 보간.
+    // 결과: splat extent 가 변 수직 방향으로만 줄어들어 인접 splat 끼리 변에서 정확히 맞물림.
+    const fIn2 = fInS * fInS;
+    const fOut2 = fOutS * fOutS;
+    const a0sq = bestA0n * bestA0n;
+    const a1sq = bestA1n * bestA1n;
+    const a2sq = bestA2n * bestA2n;
+    const gIn0_sq  = Math.max(1e-12, 1 - a0sq * (1 - fIn2));
+    const gIn1_sq  = Math.max(1e-12, 1 - a1sq * (1 - fIn2));
+    const gIn2_sq  = Math.max(1e-12, 1 - a2sq * (1 - fIn2));
+    const gOut0_sq = Math.max(1e-12, 1 - a0sq * (1 - fOut2));
+    const gOut1_sq = Math.max(1e-12, 1 - a1sq * (1 - fOut2));
+    const gOut2_sq = Math.max(1e-12, 1 - a2sq * (1 - fOut2));
+    // log-scale 공간이라 0.5 * log(g^2) = log(g) 더하면 결과 scale = 원본 * g.
     const wallNewLogScale: [number, number, number] = [
-      sc0[i] + logFout,
-      sc1[i] + logFout,
-      sc2[i] + logFout,
+      sc0[i] + 0.5 * Math.log(gOut0_sq),
+      sc1[i] + 0.5 * Math.log(gOut1_sq),
+      sc2[i] + 0.5 * Math.log(gOut2_sq),
     ];
     const doorNewLogScale: [number, number, number] = [
-      sc0[i] + logFin,
-      sc1[i] + logFin,
-      sc2[i] + logFin,
+      sc0[i] + 0.5 * Math.log(gIn0_sq),
+      sc1[i] + 0.5 * Math.log(gIn1_sq),
+      sc2[i] + 0.5 * Math.log(gIn2_sq),
     ];
 
     boundaryIndices.push(i);
@@ -440,4 +491,77 @@ export function punchAlphaZeroInDoorRegion(
     }
   }
   return touched;
+}
+
+/**
+ * 평면 4꼭짓점 (raw 프레임) + wall mesh 의 4꼭짓점/UVs 를 받아,
+ * 도어 영역에 해당하는 wall texture 픽셀들을 새 RGBA 버퍼로 잘라서 반환.
+ *
+ * `punchAlphaZeroInDoorRegion` 과 동일한 projection (wall plane (s,t) → wall UV → wall pixel).
+ * axis-aligned bbox 로 cut → 실제 도어 사각형이 wall 텍스쳐와 정렬돼 있을 때 정확.
+ * (도어가 wall 에 대해 회전돼 있으면 bbox 안에 도어 외부 픽셀도 포함되지만, 도어 mesh quad
+ *  의 UV [(0,0),(1,0),(1,1),(0,1)] 매핑상 quad 내부로만 매핑되므로 시각 영향 미미.)
+ *
+ * 정합 단계의 도어 mesh 텍스쳐 = wall 텍스쳐의 도어 영역 픽셀 그대로. 알파블렌딩 X.
+ *
+ * @returns rgba/width/height. 도어 mesh 의 emissiveMap 으로 직접 사용 가능.
+ */
+export function extractDoorRegionTexture(
+  wallRgba: Uint8ClampedArray | Uint8Array,
+  wallW: number,
+  wallH: number,
+  wallCorners: [Vec3, Vec3, Vec3, Vec3],
+  wallUvs: [[number, number], [number, number], [number, number], [number, number]],
+  doorCorners: [Vec3, Vec3, Vec3, Vec3],
+): { rgba: Uint8ClampedArray; width: number; height: number } {
+  const TLw = wallCorners[0], TRw = wallCorners[1], BLw = wallCorners[3];
+  const eU = vsub(TRw, TLw);
+  const eV = vsub(BLw, TLw);
+  const eUlen2 = vdot(eU, eU);
+  const eVlen2 = vdot(eV, eV);
+
+  const stOf = (P: Vec3): [number, number] => {
+    const d = vsub(P, TLw);
+    return [vdot(d, eU) / eUlen2, vdot(d, eV) / eVlen2];
+  };
+  const doorST: [number, number][] = [
+    stOf(doorCorners[0]),
+    stOf(doorCorners[1]),
+    stOf(doorCorners[2]),
+    stOf(doorCorners[3]),
+  ];
+
+  const stToPixel = (s: number, t: number): [number, number] => {
+    const omS = 1 - s, omT = 1 - t;
+    const u = omS*omT*wallUvs[0][0] + s*omT*wallUvs[1][0] + s*t*wallUvs[2][0] + omS*t*wallUvs[3][0];
+    const v = omS*omT*wallUvs[0][1] + s*omT*wallUvs[1][1] + s*t*wallUvs[2][1] + omS*t*wallUvs[3][1];
+    return [u * wallW, v * wallH];
+  };
+  const doorPx: [number, number][] = doorST.map(([s, t]) => stToPixel(s, t));
+
+  let xMin = Infinity, xMax = -Infinity, yMin = Infinity, yMax = -Infinity;
+  for (const [px, py] of doorPx) {
+    if (px < xMin) xMin = px; if (px > xMax) xMax = px;
+    if (py < yMin) yMin = py; if (py > yMax) yMax = py;
+  }
+  const xLo = Math.max(0, Math.floor(xMin));
+  const xHi = Math.min(wallW - 1, Math.ceil(xMax));
+  const yLo = Math.max(0, Math.floor(yMin));
+  const yHi = Math.min(wallH - 1, Math.ceil(yMax));
+  const cutW = Math.max(1, xHi - xLo + 1);
+  const cutH = Math.max(1, yHi - yLo + 1);
+  const rgba = new Uint8ClampedArray(cutW * cutH * 4);
+  for (let y = 0; y < cutH; y++) {
+    const srcRowBase = (yLo + y) * wallW * 4;
+    const dstRowBase = y * cutW * 4;
+    for (let x = 0; x < cutW; x++) {
+      const srcIdx = srcRowBase + (xLo + x) * 4;
+      const dstIdx = dstRowBase + x * 4;
+      rgba[dstIdx + 0] = wallRgba[srcIdx + 0];
+      rgba[dstIdx + 1] = wallRgba[srcIdx + 1];
+      rgba[dstIdx + 2] = wallRgba[srcIdx + 2];
+      rgba[dstIdx + 3] = wallRgba[srcIdx + 3];
+    }
+  }
+  return { rgba, width: cutW, height: cutH };
 }

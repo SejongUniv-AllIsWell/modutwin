@@ -13,7 +13,7 @@ export interface MetadataResult {
   module_name: string;
   /** SAM3 자유 텍스트 프롬프트. showSamPrompt=true 일 때만 채워짐. */
   sam_prompt?: string;
-  /** 로컬 파일에서 다듬기 저장 시점에 register-local 로 새로 생성된 upload_id.
+  /** 로컬 파일에서 문 설정 완료 시점에 register-local 로 새로 생성된 upload_id.
       서버 진입한 경우(이미 uploadId 가짐)는 비어있음. */
   upload_id?: string;
 }
@@ -30,7 +30,7 @@ interface Props {
   description?: string;
   /** 초기값 — 정합 모드 진입 시 이미 선택된 메타가 있으면 미리 채움 */
   initial?: Partial<{ building_name: string; floor_number: number; module_name: string; sam_prompt: string }>;
-  /** 다듬기 저장 흐름에서만 true — SAM3 프롬프트 입력란을 함께 보여주고 결과에 동봉. */
+  /** SAM3 프롬프트 입력란 동봉 여부 (현재 모든 흐름에서 false — SAM3 는 별도 팝업으로 분리됨). */
   showSamPrompt?: boolean;
   onConfirm: (result: MetadataResult) => Promise<void> | void;
   onClose: () => void;

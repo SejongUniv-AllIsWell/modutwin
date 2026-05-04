@@ -497,9 +497,9 @@ export async function bakeTextureForPlane(
   }
 
   // ── 코너: 메시는 베이크 범위보다 extend* 만큼 더 뻗음. ──
-  // 메시 위치는 방 경계 평면(sd=0) 에서 법선 방향(=방 바깥) 으로 MESH_PLANE_INSET (1mm) 들여놓음.
-  // paintSd 와 무관 → 6면 모두 동일한 오프셋을 가지므로, 인접 면도 같은 1mm 오프셋으로 extend
-  // 하면 직육면체 코너에서 메시들이 정확히 만남. (paintSd 는 autoGate 산정용으로만 사용.)
+  // 메시 위치는 방 경계 평면(sd=0) 에서 법선 방향(=방 바깥) 으로 MESH_PLANE_INSET 들여놓음 (현재 0).
+  // 6 면 모두 동일한 오프셋이라 인접 면 extend 도 같은 값. 직육면체 코너에서 메시들이 정확히 만남.
+  // (paintSd 는 autoGate 산정용으로만 사용.)
   const meshOffsetEff = MESH_PLANE_INSET;
   const mox = ox + meshOffsetEff * nx;
   const moy = oy + meshOffsetEff * ny;
@@ -557,7 +557,7 @@ export async function bakeTextureForPlane(
  * 방 기하 + 면 ID → PlaneBakeInput.
  *
  * - 샘플 평면(origin) = **벽 표면 sd=0**. 벽 paint 가우시안을 그대로 샘플.
- * - 메시는 `bakeTextureForPlane` 에서 항상 `MESH_PLANE_INSET` (1mm) 위치에 배치.
+ * - 메시는 `bakeTextureForPlane` 에서 항상 `MESH_PLANE_INSET` 위치에 배치 (현재 0 = 사용자 경계면 sd=0).
  * - (u, v) 범위는 인접 면의 메시 오프셋 (= MESH_PLANE_INSET) 만큼 양쪽 확장 → 직육면체 코너에서
  *   메시들이 정확히 만남. 본 면의 메시 오프셋과 인접 면의 extend 가 같은 상수에서 파생되므로 항상 동기화.
  *
