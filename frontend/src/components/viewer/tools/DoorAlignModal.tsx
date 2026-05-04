@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { SplatViewerCoreRef } from '../SplatViewerCore';
 import { loadRefineState } from '@/lib/refine/persistence';
+import { getEditorRotation, rawToA, aToRaw, rawToAY, type FrameRotation } from '@/lib/refine/coordFrames';
 import { surfacePlanesFromRoom, type SurfacePlane } from '@/lib/gs/planes';
 import { useAdditionalGsplats } from './useAdditionalGsplats';
 import type { GaussianScene } from '@/lib/ply/types';
@@ -26,8 +27,12 @@ interface Props {
   onSetupSaveDone?: () => Promise<void> | void;
   /** "문 설정 완료" 누른 직후 호출 — uploadId 가 없으면 부모가 모달 + register-local 처리하고 새 uploadId 반환. */
   ensureUploadId?: () => Promise<string>;
-  /** 도어 설정 영속화 직전 호출 — refined PLY + mesh.json + tex_*.png 일괄 업로드. */
-  onCommitRefined?: (uploadId: string) => Promise<void>;
+  /** 도어 설정 영속화 직전 호출 — refined PLY + mesh.json + tex_*.png 일괄 업로드.
+   *  반환: PLY 에 베이크된 회전값 (raw → A'+Y). doors corners 도 같은 프레임으로 변환해야 일관 유지. */
+  onCommitRefined?: (uploadId: string) => Promise<{ rotX: number; rotZ: number; wallAngleRad: number }>;
+  /** 다듬기 단계의 현재 keep mask (flatten/floater/brush 모두 반영). 문 추출이 cachedScene 에 적용해
+   *  외부 가우시안이 부활하는 문제 방지. 없으면 무필터로 동작. */
+  getCurrentKeepMask?: () => Uint8Array | null;
 }
 
 type Vec3 = [number, number, number];
@@ -268,7 +273,7 @@ function parseBasemapCorners(text: string): Vec3[] | null {
  * Apply/target은 추후 구현 — 지금은 추출만.
  */
 export default function DoorAlignModal({
-  coreRef, uploadId, currentUrl, onDone, onClose, view = 'setup', autoExtracting = false, onManualPickStart, onSetupSaveDone, ensureUploadId, onCommitRefined,
+  coreRef, uploadId, currentUrl, onDone, onClose, view = 'setup', autoExtracting = false, onManualPickStart, onSetupSaveDone, ensureUploadId, onCommitRefined, getCurrentKeepMask,
 }: Props) {
   const [picked, setPicked] = useState<Array<PickedCorner | null>>(() => emptyPicked());
 
@@ -364,6 +369,13 @@ export default function DoorAlignModal({
   // 클릭은 "평면 위의 점" 으로만 떨어진다 (가우시안 위치가 아니라 수학적 평면 교점).
   // forcePlaneId 가 주어지면 그 평면 하나에만 투영 — 4 코너가 같은 면 위에 있도록 보장.
   // (없으면 6개 평면 중 ray 가 가장 먼저 만나는 평면 — 첫 코너 픽 용도.)
+  //
+  // 좌표 프레임 정합:
+  //   `splatEntity.worldTransform` = Z-180 · Rz(rotZ) · Rx(rotX) (pendingRotation 포함).
+  //   inv 적용 결과는 raw 프레임 점/방향. surfacePlanesFromRoom 의 평면들은 A' 프레임 (= raw + pendingRotation) 에서 정의됨
+  //   (CeilingFloorModal 에서 잡은 ceilingY, WallModal 에서 잡은 wallAngle/walls 가 모두 A' 기준).
+  //   따라서 평면 테스트 전에 ray O, D 를 pendingRotation 으로 다시 회전 (raw → A') 해 t 를 정확히 산출.
+  //   최종 점은 raw 프레임으로 반환 — 다른 코드 (rendering, persist 등) 가 raw 가정.
   const raycastToPlanes = useCallback((mouseX: number, mouseY: number, forcePlaneId?: string): PickedCorner | null => {
     if (!planes) return null;
     const core = coreRef.current;
@@ -390,13 +402,18 @@ export default function DoorAlignModal({
     const dl = Math.hypot(dx, dy, dz) || 1;
     dx /= dl; dy /= dl; dz /= dl;
 
+    // pendingRotation 으로 ray 를 A' 프레임으로 lift — 평면 식과 동일 프레임에서 t 산출.
+    const r = getEditorRotation(uploadId);
+    const [oxA, oyA, ozA] = rawToA([ox, oy, oz], r);
+    const [dxA, dyA, dzA] = rawToA([dx, dy, dz], r);
+
     if (forcePlaneId) {
       // 잠금된 평면에만 투영 — t 의 부호 무관 (카메라 뒤로 가는 방향이어도 평면 위 점 보장).
       const p = planes.find(pl => pl.id === forcePlaneId);
       if (!p) return null;
-      const denom = p.normal[0]*dx + p.normal[1]*dy + p.normal[2]*dz;
+      const denom = p.normal[0]*dxA + p.normal[1]*dyA + p.normal[2]*dzA;
       if (Math.abs(denom) < 1e-6) return null;
-      const numer = p.d - (p.normal[0]*ox + p.normal[1]*oy + p.normal[2]*oz);
+      const numer = p.d - (p.normal[0]*oxA + p.normal[1]*oyA + p.normal[2]*ozA);
       const t = numer / denom;
       const pos: Vec3 = [ox + dx*t, oy + dy*t, oz + dz*t];
       return { pos, surfaceId: p.id };
@@ -407,9 +424,9 @@ export default function DoorAlignModal({
     let bestId = '';
     let bestPoint: Vec3 | null = null;
     for (const p of planes) {
-      const denom = p.normal[0]*dx + p.normal[1]*dy + p.normal[2]*dz;
+      const denom = p.normal[0]*dxA + p.normal[1]*dyA + p.normal[2]*dzA;
       if (Math.abs(denom) < 1e-6) continue;
-      const numer = p.d - (p.normal[0]*ox + p.normal[1]*oy + p.normal[2]*oz);
+      const numer = p.d - (p.normal[0]*oxA + p.normal[1]*oyA + p.normal[2]*ozA);
       const t = numer / denom;
       if (t <= 0 || t >= bestT) continue;
       bestT = t; bestId = p.id;
@@ -417,7 +434,7 @@ export default function DoorAlignModal({
     }
     if (!bestPoint) return null;
     return { pos: bestPoint, surfaceId: bestId };
-  }, [coreRef, planes]);
+  }, [coreRef, planes, uploadId]);
 
   // ── 순차 픽 클릭 + ESC 취소 (seqArmed 상태일 때만) ──
   // 픽 순서: CORNERS index 순 = TL(0) → TR(1) → BR(2) → BL(3) (시계방향).
@@ -712,11 +729,19 @@ export default function DoorAlignModal({
       if (!boundaryVisibleRef.current) return;
       const pcLib = core.getPC();
       const app = core.getApp();
-      if (!pcLib || !app) return;
+      const sd = core.getSplatData();
+      if (!pcLib || !app || !sd?.splatEntity) return;
       const ps = pickedRef.current;
       const yellow = new pcLib.Color(1, 1, 0);
       const yellowDim = new pcLib.Color(1, 1, 0, 0.6);
-      const toWorld = (p: Vec3) => new pcLib.Vec3(-p[0], -p[1], p[2]);
+      // raw → world 는 splatEntity.worldTransform 사용 — Z-180 + pendingRotation 모두 반영.
+      const m = sd.splatEntity.getWorldTransform();
+      const toWorld = (p: Vec3): any => {
+        const tmp = new pcLib.Vec3(p[0], p[1], p[2]);
+        const out = new pcLib.Vec3();
+        m.transformPoint(tmp, out);
+        return out;
+      };
       const armed = edgePickArmedRef.current;
       const drawDashed = (a: any, b: any) => {
         const dashLen = 0.08, gapLen = 0.05;
@@ -794,9 +819,16 @@ export default function DoorAlignModal({
       const a = ps[e];
       const b = ps[(e + 1) % 4];
       if (!a || !b) { cyl.enabled = false; return; }
-      // raw → world (z180): (x,y,z) → (-x,-y,z)
-      const ax = -a.pos[0], ay = -a.pos[1], az = a.pos[2];
-      const bx = -b.pos[0], by = -b.pos[1], bz = b.pos[2];
+      // raw → world: splatEntity.worldTransform 사용 — Z-180 + pendingRotation 모두 반영.
+      const sd = core!.getSplatData();
+      if (!sd?.splatEntity) { cyl.enabled = false; return; }
+      const m = sd.splatEntity.getWorldTransform();
+      const aRaw = new pcLib.Vec3(a.pos[0], a.pos[1], a.pos[2]);
+      const bRaw = new pcLib.Vec3(b.pos[0], b.pos[1], b.pos[2]);
+      const aW = new pcLib.Vec3(); m.transformPoint(aRaw, aW);
+      const bW = new pcLib.Vec3(); m.transformPoint(bRaw, bW);
+      const ax = aW.x, ay = aW.y, az = aW.z;
+      const bx = bW.x, by = bW.y, bz = bW.z;
       const dx = bx - ax, dy = by - ay, dz = bz - az;
       const length = Math.hypot(dx, dy, dz);
       if (length < 1e-4) { cyl.enabled = false; return; }
@@ -1404,12 +1436,15 @@ export default function DoorAlignModal({
         await revertDoorRefine();
       }
 
-      // 2. cachedScene 확보 (PLY parse 1회만)
+      // 2. cachedScene 확보 (PLY parse 1회만). full N 유지 — 라이브 splatData 와 인덱스 정합 필요.
       if (!cachedSceneRef.current) {
         const { fetchAndParsePly } = await import('@/lib/ply');
         cachedSceneRef.current = await fetchAndParsePly(currentUrl);
       }
       const scene = cachedSceneRef.current;
+      // 다듬기 단계의 keep mask (flatten/floater/brush 삭제). decomp 결과를 이걸로 거르면
+      // 외부 가우시안이 도어 영역에서 부활하는 문제 방지.
+      const keepMaskCurrent = getCurrentKeepMask?.() ?? null;
 
       // 라이브 splatData 의 scale 이 cachedScene 과 다를 수 있다 (예: 다듬기 단계의 경계 Clipping
       // 적용 후 정합으로 넘어온 경우 — 라이브에는 clip 된 scale, cachedScene 에는 PLY 원본 scale).
@@ -1432,10 +1467,20 @@ export default function DoorAlignModal({
       // projection 사용하므로 두 경로가 동일한 corners → 동일한 geom (pN, pO, edges) → 동일한 분류 결과.
       // 이걸 안 하면 raycast 의 floating-point 오차나 코너 drag 로 raw 코너가 평면에서 미세하게 어긋날 수
       // 있고 rect/slab boundary 근처 splat 이 페인트는 되는데 추출은 안 되거나 그 반대 케이스 발생.
+      //
+      // 좌표계 정합: planes 는 A' 프레임 (raw + pendingRotation), picked.pos 는 raw 프레임,
+      // scene (cachedSceneRef) 도 raw 프레임. 따라서 picked → projection 결과를 raw 프레임으로 유지해야
+      // decomposeBoundaryGaussians 가 raw scene 과 같은 좌표계로 비교됨.
+      // 방법: A' 평면의 normal 을 pendingRotation^-1 로 회전해 raw 프레임 평면으로 변환 후 그 위에 raw 점 투영.
       const wallPlaneForRefine = planes?.find(p => p.id === wallSurfaceId);
+      // 좌표 프레임: scene/picked 모두 raw, planes 는 A'. raw 프레임 평면을 만들어 동일 프레임에서 작업.
+      const rotR = getEditorRotation(uploadId);
+      const wallNormalRaw: Vec3 | null = wallPlaneForRefine
+        ? aToRaw(wallPlaneForRefine.normal as Vec3, rotR)
+        : null;
       const projectOnWall = (p: Vec3): Vec3 => {
-        if (!wallPlaneForRefine) return p;
-        const n = wallPlaneForRefine.normal;
+        if (!wallPlaneForRefine || !wallNormalRaw) return p;
+        const n = wallNormalRaw;
         const sd0 = n[0]*p[0] + n[1]*p[1] + n[2]*p[2] - wallPlaneForRefine.d;
         return [p[0] - sd0*n[0], p[1] - sd0*n[1], p[2] - sd0*n[2]];
       };
@@ -1445,15 +1490,35 @@ export default function DoorAlignModal({
         projectOnWall(picked[2]!.pos),
         projectOnWall(picked[3]!.pos),
       ];
+      // wall mesh corners (A' 프레임) 와 매칭하기 위한 A' 변환본 (punch/extract 가 사용).
+      const cornersA: [Vec3, Vec3, Vec3, Vec3] = [
+        rawToA(corners[0], rotR),
+        rawToA(corners[1], rotR),
+        rawToA(corners[2], rotR),
+        rawToA(corners[3], rotR),
+      ];
       const { decomposeBoundaryGaussians, buildDoorSubScene, doorPlaneBakeInput, punchAlphaZeroInDoorRegion }
         = await import('@/lib/gs/doorTrim');
-      const decomp = decomposeBoundaryGaussians(scene, { corners }, {
+      // wallOutwardNormal: scene/corners 가 raw 프레임이므로 raw 프레임 wall normal 을 넘겨줘야 isInDoorSlab 의 sdOut 부호가 정합.
+      // (wallPlaneForRefine.normal 은 A' 프레임. wallNormalRaw 는 위에서 pendingRotation^-1 으로 계산해뒀음.)
+      const decompRaw = decomposeBoundaryGaussians(scene, { corners }, {
         safetyMargin: DOOR_SAFETY_MARGIN,
         doorThickness,
-        wallOutwardNormal: wallPlaneForRefine?.normal,
+        wallOutwardNormal: wallNormalRaw ?? wallPlaneForRefine?.normal,
       });
+      // 다듬기에서 삭제된 가우시안 (flatten/floater/brush) 은 도어 영역에서 부활시키지 않도록
+      // decomp 결과의 인덱스 집합을 keep mask 로 거른다. boundary 갱신/wall-side 도 마찬가지.
+      const decomp = keepMaskCurrent
+        ? {
+            boundaryIndices: decompRaw.boundaryIndices.filter(i => keepMaskCurrent[i] === 1),
+            doorOriginalIndices: decompRaw.doorOriginalIndices.filter(i => keepMaskCurrent[i] === 1),
+            wallOriginalIndices: decompRaw.wallOriginalIndices.filter(i => keepMaskCurrent[i] === 1),
+            wallSideUpdates: decompRaw.wallSideUpdates.filter(u => keepMaskCurrent[u.idx] === 1),
+            doorSubMetadata: decompRaw.doorSubMetadata.filter(m => keepMaskCurrent[m.origIdx] === 1),
+          }
+        : decompRaw;
       doorOriginalIndicesRef.current = decomp.doorOriginalIndices.slice();
-      console.log(`[DoorRefine] N=${scene.numSplats}, boundary=${decomp.boundaryIndices.length}, doorOrig=${decomp.doorOriginalIndices.length}, wallOrig=${decomp.wallOriginalIndices.length}`);
+      console.log(`[DoorRefine] N=${scene.numSplats}, boundary=${decomp.boundaryIndices.length}, doorOrig=${decomp.doorOriginalIndices.length}, wallOrig=${decomp.wallOriginalIndices.length}${keepMaskCurrent ? ' (다듬기 삭제 반영)' : ''}`);
       setDoorRefineStats({
         N: scene.numSplats,
         nBoundary: decomp.boundaryIndices.length,
@@ -1508,6 +1573,14 @@ export default function DoorAlignModal({
           doorSubGsplatIdRef.current = id;
           // asset.ready 까지 정확히 대기 — Promise 기반, 폴링 불필요.
           await ready;
+          // 메인 splatEntity 와 동일 회전 (Z-180 + pendingRotation) 부여 — raw 좌표 기준 doorScene 이라
+          // 메인과 일치한 자리에 그려짐. additional.add 의 default 는 Z-180 만 부여.
+          const ent = additional.getEntity(id);
+          const splatEnt = sd?.splatEntity;
+          if (ent && splatEnt) {
+            const r = splatEnt.getLocalRotation();
+            ent.setLocalRotation(r.x, r.y, r.z, r.w);
+          }
         }
       }
 
@@ -1549,12 +1622,13 @@ export default function DoorAlignModal({
             ];
 
             // 2) wall 텍스쳐에서 도어 영역 픽셀 잘라내기 (read-only).
+            // wallCorners 는 A' 프레임 (mesh positions 그대로) 이므로 doorCorners 도 A' 프레임 (cornersA) 사용.
             const { extractDoorRegionTexture } = await import('@/lib/gs/doorTrim');
             const wallTexLvl = wallMeshTex.lock();
             const cut = extractDoorRegionTexture(
               wallTexLvl as Uint8ClampedArray,
               wallMeshTex.width, wallMeshTex.height,
-              wallCorners, wallUvs, corners,
+              wallCorners, wallUvs, cornersA,
             );
             wallMeshTex.unlock();
             console.log(`[DoorRefine] door tex cut: ${cut.width}×${cut.height} from wall ${wallMeshTex.width}×${wallMeshTex.height}`);
@@ -1569,18 +1643,30 @@ export default function DoorAlignModal({
             //    wall mesh 와 도어 mesh 가 모두 sd=0 평면이라 동일 깊이 → 깊이 충돌. 도어 mesh 만 살짝 안쪽으로
             //    빼서 카메라(방 안)에 더 가까운 위치 → 항상 wall mesh 위에 깨끗하게 그려짐.
             const Z_FIGHT_OFFSET = 0.001;
-            const inwardN: Vec3 = [-wallPlane.normal[0], -wallPlane.normal[1], -wallPlane.normal[2]];
+            // inwardN: corners 가 raw 프레임이므로 raw 프레임 normal 사용 — wallPlane.normal (A') 을 pendingRotation^-1 회전.
+            const wallNormalRawForOffset: Vec3 = wallNormalRaw ?? (wallPlane.normal as Vec3);
+            const inwardN: Vec3 = [-wallNormalRawForOffset[0], -wallNormalRawForOffset[1], -wallNormalRawForOffset[2]];
             const offsetCorners: [Vec3, Vec3, Vec3, Vec3] = corners.map(c => [
               c[0] + inwardN[0] * Z_FIGHT_OFFSET,
               c[1] + inwardN[1] * Z_FIGHT_OFFSET,
               c[2] + inwardN[2] * Z_FIGHT_OFFSET,
             ] as Vec3) as [Vec3, Vec3, Vec3, Vec3];
+            // 도어 mesh UV: 각 코너의 cut texture 픽셀 위치를 정규화. axis-aligned bbox crop 이라
+            //   사다리꼴 도어 코너가 bbox 코너와 일치하지 않을 수 있어 고정 UV 로는 텍스쳐 어긋남.
+            //   cut.doorCornerPx[i] = 도어 corner i 의 cut.rgba 픽셀 좌표.
+            const cw = cut.width, ch = cut.height;
+            const doorMeshUvs: [[number, number], [number, number], [number, number], [number, number]] = [
+              [cut.doorCornerPx[0][0] / cw, cut.doorCornerPx[0][1] / ch],
+              [cut.doorCornerPx[1][0] / cw, cut.doorCornerPx[1][1] / ch],
+              [cut.doorCornerPx[2][0] / cw, cut.doorCornerPx[2][1] / ch],
+              [cut.doorCornerPx[3][0] / cw, cut.doorCornerPx[3][1] / ch],
+            ];
             const doorMeshInput = {
               rgba: cut.rgba,
               width: cut.width,
               height: cut.height,
               corners: offsetCorners,
-              uvs: [[0, 1], [1, 1], [1, 0], [0, 0]] as [[number, number], [number, number], [number, number], [number, number]],
+              uvs: doorMeshUvs,
               input: {
                 origin: corners[0],
                 uAxis: [1, 0, 0] as Vec3,
@@ -1595,6 +1681,12 @@ export default function DoorAlignModal({
             pendingDoorMeshEnt = createWallMeshEntity(
               pc, app, sd.splatEntity, doorMeshInput as any, `doorMesh_${wallSurfaceId}`,
             );
+            // 도어 mesh corners 는 picked corners 기반 (raw frame). createWallMeshEntity 는 default
+            // Z-180 만 부여하므로 pendingRotation 까지 합쳐서 splatEntity 와 동일 변환으로 맞춤.
+            if (pendingDoorMeshEnt) {
+              const r = sd.splatEntity.getLocalRotation();
+              pendingDoorMeshEnt.setLocalRotation(r.x, r.y, r.z, r.w);
+            }
           }
         }
       }
@@ -1652,7 +1744,8 @@ export default function DoorAlignModal({
           const rgba = lvl as Uint8ClampedArray;
           wallTexSnapshotRef.current = new Uint8ClampedArray(rgba);
           wallMeshNameRef.current = wallEntName;
-          const touched = punchAlphaZeroInDoorRegion(rgba, wallMeshTex.width, wallMeshTex.height, wallCorners, wallUvs, corners);
+          // wallCorners 는 A' 프레임이므로 doorCorners 도 A' (cornersA) 로 매칭.
+          const touched = punchAlphaZeroInDoorRegion(rgba, wallMeshTex.width, wallMeshTex.height, wallCorners, wallUvs, cornersA);
           console.log(`[DoorRefine] wall mesh hole: ${touched} pixels`);
         }
         wallMeshTex.unlock();
@@ -1691,7 +1784,13 @@ export default function DoorAlignModal({
   const setDoorInternalShowAsync = useCallback(async (next: boolean) => {
     const core = coreRef.current;
     const sd = core?.getSplatData();
-    if (!core || !sd?.colorTexture || !sd?.origColorData) return;
+    if (!core || !sd?.colorTexture || !sd?.origColorData) {
+      console.warn('[DoorPreview] aborted: ',
+        !core ? 'core null' :
+        !sd?.colorTexture ? 'colorTexture missing' :
+        'origColorData missing — 다듬기 단계에서 가우시안 편집 1회 이상 필요할 수 있음.');
+      return;
+    }
     const f2h = core.float2Half;
 
     // 1. 기존 tint 가 있다면 (토글 ON 상태였다면) 일단 RGB 복원 — 마지막에 칠한 set 정확히 되돌리기.
@@ -1709,19 +1808,27 @@ export default function DoorAlignModal({
       doorPaintedIndicesRef.current = [];
     }
 
-    // 1b. 추가 gsplat 색 복원
-    // PlayCanvas 2.x gsplat 의 실제 GPU 색 텍스처는 asset.resource.streams.textures.get('splatColor') 에 있음.
+    // 1b. 추가 gsplat 색 복원.
+    // PlayCanvas 2.x: addComponent('gsplat') 후 asset.resource 가 비워지고 gsplat.instance.resource 로 이전됨.
+    // 따라서 아래 fallback 체인으로 접근. (paint 경로 step 3b 와 동일 로직.)
     if (doorInternalShow && doorGsplatOrigColorsRef.current && doorSubGsplatIdRef.current) {
       const doorEnt = additional.getEntity(doorSubGsplatIdRef.current);
-      const doorAsset = (doorEnt as any)?.gsplat?.asset;
-      const doorRes = doorAsset?.resource;
-      const doorColorTex = doorRes?.streams?.textures?.get('splatColor');
+      const gsplatComp = (doorEnt as any)?.gsplat;
+      const doorAsset = gsplatComp?.asset;
+      const doorRes = doorAsset?.resource
+        ?? gsplatComp?.instance?.resource
+        ?? gsplatComp?.instance?.splatData;
+      const doorColorTex = doorRes?.streams?.textures?.get('splatColor')
+        ?? gsplatComp?.material?.colorMap
+        ?? gsplatComp?.instance?.material?.colorMap;
       if (doorColorTex) {
         const dt = doorColorTex.lock();
         if (dt) {
           dt.set(doorGsplatOrigColorsRef.current);
           doorColorTex.unlock();
         }
+      } else {
+        console.warn('[DoorPreview] restore: doorColorTex 접근 실패 — paint 와 같은 경로 사용 중인지 확인.');
       }
       doorGsplatOrigColorsRef.current = null;
     }
@@ -1751,9 +1858,14 @@ export default function DoorAlignModal({
         cachedSceneRef.current = await fetchAndParsePly(currentUrl);
       }
       const wallPlanePrev = planes?.find(p => p.id === picked[0]!.surfaceId);
+      // 좌표 프레임 정합: planes A' → raw (splat/picked 가 raw).
+      const rotRprev = getEditorRotation(uploadId);
+      const wallNormalRawPrev: Vec3 | null = wallPlanePrev
+        ? aToRaw(wallPlanePrev.normal as Vec3, rotRprev)
+        : null;
       const projectPrev = (p: Vec3): Vec3 => {
-        if (!wallPlanePrev) return p;
-        const n = wallPlanePrev.normal;
+        if (!wallPlanePrev || !wallNormalRawPrev) return p;
+        const n = wallNormalRawPrev;
         const sd0 = n[0]*p[0] + n[1]*p[1] + n[2]*p[2] - wallPlanePrev.d;
         return [p[0] - sd0*n[0], p[1] - sd0*n[1], p[2] - sd0*n[2]];
       };
@@ -1770,7 +1882,8 @@ export default function DoorAlignModal({
       // 두 경로가 같은 helper 를 쓰므로 hide 와 tint 집합이 정확히 일치.
       const { rectGeom, isInDoorSlab } = await import('@/lib/gs/doorTrim');
       const geom = rectGeom(corners);
-      const wallOutward: Vec3 = wallPlanePrev?.normal ?? geom.planeNormal;
+      // wallOutward 도 raw 프레임 — splat 좌표 (raw) 와 비교용.
+      const wallOutward: Vec3 = wallNormalRawPrev ?? geom.planeNormal;
       const N = sd.numSplats;
       const px = sd.posX, py = sd.posY, pz = sd.posZ;
       const paintSet: number[] = [];
@@ -1808,29 +1921,53 @@ export default function DoorAlignModal({
     }
     sd.colorTexture.unlock();
 
-    // 3b. 추가 splat group (도어 entity) 의 colorTexture 전체 노랑 칠.
-    // applyDoorRefine 가 entity 의 asset.ready 까지 await 했고, 토글 ON/OFF 흐름에선 entity 가 이미
-    // 안정 상태이므로 단발 페인트로 충분.
+    // 3b. 추가 splat group (도어 entity) 의 splatColor 전체 노랑 칠.
+    //   doorFullScene = doorOrigScene + doorSubsScene 모두 이 entity 에 있음 → 한 번 칠하면 sub 까지 모두 노랑.
     if (doorSubGsplatIdRef.current) {
       const id = doorSubGsplatIdRef.current;
       const doorEnt = additional.getEntity(id);
-      const doorAsset = (doorEnt as any)?.gsplat?.asset;
-      const doorRes = doorAsset?.resource;
-      const doorColorTex = doorRes?.streams?.textures?.get('splatColor');
-      if (doorColorTex) {
+      const gsplatComp = (doorEnt as any)?.gsplat;
+      const doorAsset = gsplatComp?.asset;
+      // PlayCanvas 2.x: 여러 경로 시도. 일부 빌드에서 asset.resource 가 비어있고
+      // gsplat.instance.resource 또는 gsplat.instance.splatData 에 있음.
+      const doorRes = doorAsset?.resource
+        ?? gsplatComp?.instance?.resource
+        ?? gsplatComp?.instance?.splatData;
+      const doorColorTex = doorRes?.streams?.textures?.get('splatColor')
+        ?? gsplatComp?.material?.colorMap
+        ?? gsplatComp?.instance?.material?.colorMap;
+      const expectedN = doorRes?.gsplatData?.numSplats ?? doorRes?.numSplats;
+      if (!doorColorTex) {
+        console.warn('[DoorPreview] doorColorTex not found. 사용 가능한 키:', {
+          hasEnt: !!doorEnt,
+          hasAsset: !!doorAsset,
+          hasRes: !!doorRes,
+          gsplatCompKeys: gsplatComp ? Object.keys(gsplatComp) : [],
+          assetKeys: doorAsset ? Object.keys(doorAsset) : [],
+          assetResource: doorAsset?.resource,
+          instanceKeys: gsplatComp?.instance ? Object.keys(gsplatComp.instance) : [],
+        });
+      } else {
         const dt = doorColorTex.lock();
-        if (dt) {
+        if (!dt) {
+          console.warn('[DoorPreview] doorColorTex.lock() returned null');
+        } else {
           if (!doorGsplatOrigColorsRef.current) {
             doorGsplatOrigColorsRef.current = new Uint16Array(dt);
           }
+          let painted = 0;
           for (let i = 0; i < dt.length; i += 4) {
             dt[i + 0] = r;
             dt[i + 1] = g;
             dt[i + 2] = b;
+            painted++;
           }
           doorColorTex.unlock();
+          console.log(`[DoorPreview] splatColor texture painted: ${painted} pixels (expected ${expectedN} splats, texture ${doorColorTex.width}×${doorColorTex.height}).`);
         }
       }
+    } else {
+      console.log('[DoorPreview] doorSubGsplatIdRef null — 문 추출 안 한 상태이거나 sub-gsplat 미생성.');
     }
 
     // 3c. 도어 mesh material 노랑 emissive 칠 (snapshot 으로 복원 가능).
@@ -1878,7 +2015,8 @@ export default function DoorAlignModal({
 
   // ── 힌지 축 기준 문 회전 (애니메이션) ──
   // 각 프레임에서 angle 만 보간하고 transform 은 그 angle 로 다시 계산 → 힌지 축의 점은 항상 고정.
-  // localRot = Z180 ∘ R(angle), localPos = Z180 * (cA − R(angle)·cA)
+  // localRot = baseRot ∘ R(angle), localPos = baseRot * (cA − R(angle)·cA)
+  //   baseRot = splatEntity.localRotation = Z-180 ∘ pendingRotation. 메인과 동일 변환으로 맞춰 일치 유지.
   const doorAnimRef = useRef<{
     start: number;
     duration: number;
@@ -1907,16 +2045,20 @@ export default function DoorAlignModal({
       const half = angle / 2;
       const sH = Math.sin(half), cH = Math.cos(half);
       const qR = new pc.Quat(a.axis[0]*sH, a.axis[1]*sH, a.axis[2]*sH, cH);
-      const z180 = new pc.Quat();
-      z180.setFromEulerAngles(0, 0, 180);
+      // baseRot = splatEntity 의 현재 회전 (Z-180 ∘ pendingRotation). 메인과 동일.
+      const sd = core.getSplatData();
+      const sr = sd?.splatEntity?.getLocalRotation();
+      const baseRot = sr
+        ? new pc.Quat(sr.x, sr.y, sr.z, sr.w)
+        : (() => { const q = new pc.Quat(); q.setFromEulerAngles(0, 0, 180); return q; })();
       const localRot = new pc.Quat();
-      localRot.copy(z180).mul(qR);
+      localRot.copy(baseRot).mul(qR);
       const cAvec = new pc.Vec3(a.cA[0], a.cA[1], a.cA[2]);
       const rotatedCA = new pc.Vec3();
       qR.transformVector(cAvec, rotatedCA);
       const offsetRaw = new pc.Vec3(a.cA[0] - rotatedCA.x, a.cA[1] - rotatedCA.y, a.cA[2] - rotatedCA.z);
       const offsetWorld = new pc.Vec3();
-      z180.transformVector(offsetRaw, offsetWorld);
+      baseRot.transformVector(offsetRaw, offsetWorld);
 
       const doorEnt = doorSubGsplatIdRef.current ? additional.getEntity(doorSubGsplatIdRef.current) : null;
       if (doorEnt) {
@@ -1958,10 +2100,12 @@ export default function DoorAlignModal({
     const wallSurfaceId = picked[0]!.surfaceId;
     const wallPlane = planes.find(p => p.id === wallSurfaceId);
     if (!wallPlane) return;
-    const wn = wallPlane.normal;
+    // wallPlane.normal 은 A' 프레임. picked.pos (raw) 와 같은 프레임에서 비교하려면 raw 프레임으로 회전.
+    const wn = aToRaw(wallPlane.normal as Vec3, getEditorRotation(uploadId));
     const dotCN = crossX*wn[0] + crossY*wn[1] + crossZ*wn[2];
-    // planes.ts 의 normal 은 방 바깥 방향. 따라서 +angle 이 +wn 방향으로 P 를 보낸다 = 바깥쪽.
-    // doorSwing=1 (안쪽) → -wn 방향 → -insideSign 적용.
+    // planes.ts 의 normal 은 방 바깥 방향. (axis × d) 가 +wn 방향이면 +θ 회전이 P 를 방 바깥으로 보냄.
+    // doorSwing=1 (안쪽) → -wn 방향 → -θ 가 필요 → insideSign=-1.
+    // (이전 부호 뒤집기는 이번에 picked.pos / wn 의 raw 프레임 정합 후 원복.)
     const insideSign = dotCN > 0 ? -1 : 1;
     const angleSign = doorSwing * insideSign;
     const angleRad = angleSign * doorAngleDeg * Math.PI / 180;
@@ -2359,13 +2503,37 @@ export default function DoorAlignModal({
                   catch { setSaveDoorBusy(false); return; }
                 }
                 if (!activeUploadId) { setSaveDoorBusy(false); return; }
-                // 2) refined PLY + mesh.json + tex_*.png 일괄 업로드.
+                // 2) refined PLY + mesh.json + tex_*.png 일괄 업로드. 베이크된 회전값 받아옴.
+                let baked: { rotX: number; rotZ: number; wallAngleRad: number } | null = null;
                 if (onCommitRefined) {
-                  try { await onCommitRefined(activeUploadId); }
+                  try { baked = await onCommitRefined(activeUploadId); }
                   catch { setSaveDoorBusy(false); return; }
                 }
                 // 3) 도어 설정 (corners + 회전 메타) 저장.
-                await persistDoorsToServer(activeUploadId, picked, {
+                // SPEC: refined PLY 가 A'+Y 프레임 (pendingRotation rotX/rotZ + wallAngle Y) 으로 베이크됐으므로
+                //   picked 코너 (raw 프레임) 도 같은 변환을 적용해 doors.json 에 저장 → 재진입 시 PLY/mesh/doors 일관.
+                const r = baked ?? { rotX: 0, rotZ: 0, wallAngleRad: 0 };
+                const cx = Math.cos(r.rotX), sx = Math.sin(r.rotX);
+                const cz = Math.cos(r.rotZ), sz = Math.sin(r.rotZ);
+                const cy2 = Math.cos(r.wallAngleRad), sy2 = Math.sin(r.wallAngleRad);
+                // raw → A' (rotateScene: R = Rz · Rx).
+                const rotXZ = (v: [number, number, number]): [number, number, number] => [
+                  cz * v[0] - sz * cx * v[1] + sz * sx * v[2],
+                  sz * v[0] + cz * cx * v[1] - cz * sx * v[2],
+                  sx * v[1] + cx * v[2],
+                ];
+                // A' → A'+Y (rotateSceneY: Ry).
+                const rotYy = (v: [number, number, number]): [number, number, number] => [
+                  cy2 * v[0] + sy2 * v[2],
+                  v[1],
+                  -sy2 * v[0] + cy2 * v[2],
+                ];
+                const rotateForSave = (p: PickedCorner): PickedCorner => ({
+                  pos: rotYy(rotXZ([p.pos[0], p.pos[1], p.pos[2]])),
+                  surfaceId: p.surfaceId,
+                });
+                const pickedTransformed = picked.map(p => p ? rotateForSave(p) : null);
+                await persistDoorsToServer(activeUploadId, pickedTransformed, {
                   hingeEdge,
                   swing: doorSwing,
                   angleDeg: doorAngleDeg,

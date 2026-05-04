@@ -507,9 +507,10 @@ export default function UnifiedSplatEditor({
                 return newId;
               }}
               onCommitRefined={async (id) => {
-                // refined PLY + mesh.json + tex_*.png 일괄 업로드.
-                await refine.commitRefinedToServer(id);
+                // refined PLY + mesh.json + tex_*.png 일괄 업로드. 베이크된 회전값 그대로 반환.
+                return await refine.commitRefinedToServer(id);
               }}
+              getCurrentKeepMask={() => refine.getCurrentKeepMask?.() ?? null}
               onSetupSaveDone={async () => {
                 // 문 설정 완료 (모든 영속화 끝) → 'door' 단계 추가 잠금 → 정합 진입.
                 setLockedStages(s => {
