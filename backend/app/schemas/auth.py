@@ -39,3 +39,8 @@ class UserResponse(BaseModel):
 
 class LoginUrlResponse(BaseModel):
     url: str
+
+
+class WsTicketResponse(BaseModel):
+    ticket: str
+    expires_in: int

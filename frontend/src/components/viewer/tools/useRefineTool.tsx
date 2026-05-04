@@ -156,7 +156,7 @@ interface SaveMetadata {
   building_name?: string;
   floor_number?: number;
   module_name?: string;
-  /** 다듬기 저장 모달이 함께 받는 SAM3 자유 텍스트. */
+  /** SAM3 프롬프트 팝업의 자유 텍스트 (현재는 메타데이터 모달 외부에서 별도 수집). */
   sam_prompt?: string;
   /** 로컬 파일에서 시작했을 때 register-local 로 새로 생성된 upload_id. */
   upload_id?: string;
@@ -239,16 +239,16 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   const [flattening, setFlattening] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
-  // SPEC: "다듬기 저장" → 건물 정보 + SAM3 프롬프트 단일 모달 → 완료 시 자동 정합 진입.
-  // (docs/sam3_alignment_pipeline.md "Happy path")
-  // 진행 중 전체 화면 오버레이 (업로드 → SAM3 폴링 단계 가시화)
+  // 다듬기 완료 → 문 설정 (SAM3 프롬프트 팝업) → 문 설정 완료에서 일괄 영속.
+  // 진행 중 전체 화면 오버레이 (업로드 단계 가시화).
   const [samProgressOpen, setSamProgressOpen] = useState(false);
   const [samProgressMessage, setSamProgressMessage] = useState('');
   const router = useRouter();
   // 단일 안전거리 — 모든 경계면(천장/바닥/4벽)이 공유
-  const [globalOffset, setGlobalOffset] = useState(0.05);
-  // 입력 중 임시 문자열 — 빈칸·'-'·'0.' 같은 중간 상태를 허용해 삭제/편집이 가능하게
-  const [globalOffsetText, setGlobalOffsetText] = useState('0.05');
+  // 외부 splat 제거 임계값 (m). 0 이면 평면(sd=0) 보다 바깥(sd>0)인 모든 splat 을 제거.
+  // 사용자가 추가 안전거리 (e.g., 평면이 약간 부정확할 때 일부 보호) 원하면 양수 값으로 미세 조정.
+  const [globalOffset, setGlobalOffset] = useState(0);
+  const [globalOffsetText, setGlobalOffsetText] = useState('0');
   // shell 마스크 계산용 (모든 면 동일 globalOffset)
   const surfaceOffsets: Record<Surface, number> = {
     ceiling: globalOffset, floor: globalOffset, w1a: globalOffset, w1b: globalOffset, w2a: globalOffset, w2b: globalOffset,
@@ -290,6 +290,27 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   const [flattenVisible, setFlattenVisible] = useState(true);
   const flattenVisibleRef = useRef(true);
 
+  // floater 마스크: 1=삭제(저불투명 + 희소 가우시안). 모듈 외부 제거(flatten) 활성 상태에서만 적용 가능.
+  // excludeMask = brush 삭제 ∪ flatten 마스크 — 이 둘로 가린 상태에서 남은 가우시안만 후보.
+  const floaterMaskRef = useRef<Uint8Array | null>(null);
+  const [floaterActive, setFloaterActive] = useState(false);
+  const floaterActiveRef = useRef(false);
+  const [floatering, setFloatering] = useState(false);
+  const [floaterVoxelSize, setFloaterVoxelSize] = useState(0.05);
+  const [floaterOpacityCut, setFloaterOpacityCut] = useState(0.1);
+  const [floaterMinNeighbors, setFloaterMinNeighbors] = useState(3);
+
+  // 경계 clipping: 6 평면으로 비등방 scale 축소. center 가 안쪽인 splat 의 extent 가 평면을 넘지 않도록.
+  // ON: GPU sc0/sc1/sc2 in-place 변경 + transformB 재업로드. 저장 시 cached scene 의 scale 도 같이 적용.
+  // OFF: snapshot 으로 원본 scale 복원.
+  const [clippingActive, setClippingActive] = useState(false);
+  const clippingActiveRef = useRef(false);
+  const [clipping, setClipping] = useState(false); // 처리 중 플래그
+  // snapshot: clip 적용된 splat 들의 원본 log-scale (idx 별).
+  const clippingSnapshotRef = useRef<Array<{ idx: number; s0: number; s1: number; s2: number }>>([]);
+  // 평면 안쪽으로 끊어줄 여유 거리 (m). 사용자가 경험적으로 조절 후 적정값 찾으면 슬라이더 제거 예정.
+  const [clippingEpsilon, setClippingEpsilon] = useState(0.001);
+
   // ── Wall mesh test (texture-baked quad mesh, MVP)
   const [wallMeshActive, setWallMeshActive] = useState(false);
   const [wallMeshBaking, setWallMeshBaking] = useState(false);
@@ -318,22 +339,22 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   const flattenPreviewActiveRef = useRef(false);
   const flattenPreviewMaskRef = useRef<Uint8Array | null>(null);
 
-  // ── 안전거리 / 알파블렌딩 시작 위치 시각화 (화살표) ──
+  // ── 안전거리 시각화 (화살표) ──
   const [safetyVizActive, setSafetyVizActive] = useState(false);
-  const [gateVizActive, setGateVizActive] = useState(false);
-  // depthGate (방 안쪽 alpha blending start 경계).
-  // 0 = 사용자가 모달에서 정의한 경계면(sd=0) 위치에서 베이크 시작 → 막 위치 (MESH_PLANE_INSET=0)
-  // 와 정확히 일치 → "층 두 개" 잔상 제거. 슬라이더로 더 안쪽까지 확장 가능.
-  const [bakeInnerGate, setBakeInnerGate] = useState(0);
+  // depthGate (방 안쪽 alpha blending start 경계). 사용자가 모달에서 정의한 경계면(sd=0) 에서 시작 →
+  // 막 위치 (MESH_PLANE_INSET=0) 와 정확히 일치 → "층 두 개" 잔상 제거. 0 으로 고정.
+  const bakeInnerGate = 0;
   const safetyVizEntityRef = useRef<any>(null);
-  const gateVizEntityRef = useRef<any>(null);
 
   // 옵션 A: 막 생성 후 CF 모달의 회전 슬라이더 lock
 
   // 통합 undo 히스토리 (시간순 단일 스택)
   type OpRecord =
     | { type: 'rotation'; prevRotation: { rotX: number; rotZ: number } }
-    | { type: 'flatten'; prevMask: Uint8Array | null; prevActive: boolean };
+    | { type: 'flatten'; prevMask: Uint8Array | null; prevActive: boolean }
+    | { type: 'floater'; prevMask: Uint8Array | null; prevActive: boolean }
+    | { type: 'clipping'; prevSnapshot: Array<{ idx: number; s0: number; s1: number; s2: number }>; prevActive: boolean }
+    | { type: 'wallMesh'; prevEntities: any[]; prevActive: boolean };
   const opHistoryRef = useRef<OpRecord[]>([]);
   const [undoDepth, setUndoDepth] = useState(0);
 
@@ -385,6 +406,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     // 둘 다 켜져있으면 preview가 우선.
     const previewMask = flattenPreviewActiveRef.current ? flattenPreviewMaskRef.current : null;
     const appliedMask = (flattenActiveRef.current && flattenVisibleRef.current) ? flattenMaskRef.current : null;
+    const floaterMask = floaterActiveRef.current ? floaterMaskRef.current : null;
     // 빨강 (R=1, G=0, B=0)
     const redR = f2h(1.0), redG = f2h(0.0), redB = f2h(0.0);
     for (let i = 0; i < data.numSplats; i++) {
@@ -397,6 +419,12 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         td[idx+3] = data.origColorData[idx+3];
       } else if (appliedMask && appliedMask[i]) {
         // 실제 적용된 flatten — alpha=0으로 가림
+        td[idx]   = data.origColorData[idx];
+        td[idx+1] = data.origColorData[idx+1];
+        td[idx+2] = data.origColorData[idx+2];
+        td[idx+3] = f2h(0);
+      } else if (floaterMask && floaterMask[i]) {
+        // floater 삭제 — alpha=0
         td[idx]   = data.origColorData[idx];
         td[idx+1] = data.origColorData[idx+1];
         td[idx+2] = data.origColorData[idx+2];
@@ -473,7 +501,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
 
   // ── 안전거리 / 알파블렌딩 시작 위치 화살표 시각화 ──
   // 토글 ON + wallMode confirmed (방 기하 확정) 일 때만 그림.
-  // globalOffset / bakeInnerGate / pendingRotation 변할 때마다 재생성.
+  // globalOffset / pendingRotation 변할 때마다 재생성.
   useEffect(() => {
     const core = coreRef.current;
     const app = core?.getApp();
@@ -486,17 +514,13 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         try { safetyVizEntityRef.current.destroy(); } catch {}
         safetyVizEntityRef.current = null;
       }
-      if (gateVizEntityRef.current) {
-        try { gateVizEntityRef.current.destroy(); } catch {}
-        gateVizEntityRef.current = null;
-      }
     };
     cleanup();
 
     const wallReady = wallMode === 'confirmed' && wallAngle !== null && wallDistances !== null;
     const cfReady = cfMode === 'confirmed';
     if (!wallReady || !cfReady) return;
-    if (!safetyVizActive && !gateVizActive) return;
+    if (!safetyVizActive) return;
 
     let cancelled = false;
     (async () => {
@@ -508,35 +532,17 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         ceilingY,
         floorY,
       };
-
-      if (safetyVizActive) {
-        const ent = createOffsetArrows(pc, room, globalOffset, {
-          direction: 'both',
-          name: 'safetyArrows',
-        });
-        app.root.addChild(ent);
-        safetyVizEntityRef.current = ent;
-      }
-      if (gateVizActive) {
-        // 알파블렌딩 시작 위치 = face center에서 normal 안쪽으로 bakeInnerGate.
-        // 거기서 +normal 방향(바깥)으로 길이 = bakeInnerGate + globalOffset 화살표.
-        // (시작점이 안쪽 경계, 끝점이 바깥쪽 안전거리 경계가 되어 두 시각화가 자연스럽게 이어짐)
-        const length = bakeInnerGate + globalOffset;
-        const ent = createOffsetArrows(pc, room, length, {
-          direction: 'outward',
-          colorOverride: [0.2, 1.0, 1.0],
-          originOffset: -bakeInnerGate,
-          thickness: 0.012,
-          name: 'gateArrows',
-        });
-        app.root.addChild(ent);
-        gateVizEntityRef.current = ent;
-      }
+      const ent = createOffsetArrows(pc, room, globalOffset, {
+        direction: 'both',
+        name: 'safetyArrows',
+      });
+      app.root.addChild(ent);
+      safetyVizEntityRef.current = ent;
     })();
 
     return () => { cancelled = true; cleanup(); };
   }, [
-    safetyVizActive, gateVizActive, globalOffset, bakeInnerGate,
+    safetyVizActive, globalOffset,
     wallMode, wallAngle, wallDistances, cfMode, ceilingY, floorY,
     coreRef,
   ]);
@@ -574,8 +580,10 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         ceilingY, floorY,
       });
       const planes = allPlanes.filter(p => selectedSurfaces.has(p.id as Surface));
-      const marginOut = globalOffset;
-      const nearProtect = 0.03;
+      // 평면(sd=0) 바깥(sd > globalOffset) 인 splat 을 kill. globalOffset=0 이면 sd>0 모든 외부 splat.
+      // (이전 버전의 nearProtect=3cm hardcoded floor 제거 — 평면 본체 보호는 splat 위치 자체가 sd≤0
+      //  영역에 모여있어 자연스럽게 보장됨.)
+      const cutThreshold = globalOffset;
 
       const rotPos = buildRotatedPositions(data.posX, data.posY, data.posZ);
       const N = data.numSplats;
@@ -584,7 +592,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         const x = rotPos.x[i], y = rotPos.y[i], z = rotPos.z[i];
         for (const p of planes) {
           const sd = signedDistance(p, x, y, z);
-          if (sd > nearProtect && sd > marginOut) { mask[i] = 1; break; }
+          if (sd > cutThreshold) { mask[i] = 1; break; }
         }
       }
       if (cancelled) return;
@@ -610,6 +618,16 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         prevActive: true,
       });
       flattenActiveRef.current = false; setFlattenActive(false);
+      // floater 는 flatten 위에서만 의미 있어서 같이 해제
+      if (floaterActiveRef.current) {
+        pushOp({
+          type: 'floater',
+          prevMask: floaterMaskRef.current ? new Uint8Array(floaterMaskRef.current) : null,
+          prevActive: true,
+        });
+        floaterActiveRef.current = false; setFloaterActive(false);
+        floaterMaskRef.current = null;
+      }
       paintFlattenMask();
       // 마스크 자체는 보관해 둘 수도 있지만, 다음 클릭에서 어차피 재계산하므로 비움 → 의도 명확화
       flattenMaskRef.current = null;
@@ -642,8 +660,8 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         floorY: floorYRef.current,
       });
       const planes = allPlanes.filter(p => selectedSurfaces.has(p.id as Surface));
-      const marginOut = globalOffset;
-      const nearProtect = 0.03;  // DEFAULT_SHELL_OPTIONS.nearProtect
+      // 평면(sd=0) 바깥 (sd > globalOffset) 인 splat 을 kill. globalOffset=0 이면 sd>0 모든 외부 splat.
+      const cutThreshold = globalOffset;
 
       // splatData posX/Y/Z (A 프레임)을 회전 → A' 프레임. 이 프레임에서 평면과 비교.
       const rotPos = buildRotatedPositions(data.posX, data.posY, data.posZ);
@@ -658,7 +676,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         let outside = false;
         for (const p of planes) {
           const sd = signedDistance(p, x, y, z);
-          if (sd > nearProtect && sd > marginOut) {
+          if (sd > cutThreshold) {
             outside = true;
             killByPlane[p.id]++;
             break;
@@ -668,8 +686,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       }
       console.log(`[Shell] flatten mask: ${deletedCount} / ${N} gaussians`);
       console.log('[Shell] kill-by-plane:', killByPlane);
-      console.log('[Shell] plane defs:', planes.map(p => ({ id: p.id, n: p.normal, d: p.d })));
-      console.log('[Shell] params:', { ceilingY: ceilingYRef.current, floorY: floorYRef.current, wallAngle: wallAngleRef.current, wallDistances: wallDistancesRef.current, marginOut, nearProtect, pendingRot: pendingRotationRef.current });
+      console.log('[Shell] params:', { cutThreshold, pendingRot: pendingRotationRef.current });
 
       // undo 기록 (이전 상태 = 비활성 + 마스크 없음)
       pushOp({ type: 'flatten', prevMask: null, prevActive: false });
@@ -686,6 +703,186 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       setFlattening(false);
     }
   }, [selectedSurfaces, surfaceOffsets, buildRotatedPositions, paintFlattenMask, pushOp]);
+
+  // ── applyClipping: 토글식 — 비등방 scale 축소로 가우시안 extent 가 6 평면을 넘지 않게.
+  // ON: 평면별 g_i² = 1 - a_in² (1 - f²), f = |sd|/ext. axis 별 min(g²) 적용.
+  //     GPU sc0/1/2 prop in-place 변경 + transformB 재업로드. 원본 log-scale snapshot 보관.
+  // OFF: snapshot 으로 복원.
+  // 저장 시 (saveRefined 안): clippingActive 면 cached scene 의 scale 에도 적용.
+  const applyClipping = useCallback(async () => {
+    const data = splatDataRef.current;
+    const core = coreRef.current;
+    if (!data || !core) return;
+    const float2Half = core.float2Half;
+    const liveSc0 = data.gsplatData?.getProp('scale_0') as Float32Array | undefined;
+    const liveSc1 = data.gsplatData?.getProp('scale_1') as Float32Array | undefined;
+    const liveSc2 = data.gsplatData?.getProp('scale_2') as Float32Array | undefined;
+    if (!liveSc0 || !liveSc1 || !liveSc2) { alert('가우시안 scale 속성을 찾을 수 없습니다.'); return; }
+
+    setClipping(true);
+    try {
+      // OFF (현재 ON) → 원복: live + cached 둘 다 snapshot 으로 되돌림.
+      if (clippingActiveRef.current) {
+        const snap = clippingSnapshotRef.current;
+        const cached = originalSceneRef.current;
+        const cs0 = cached?.attrs.get('scale_0') as Float32Array | undefined;
+        const cs1 = cached?.attrs.get('scale_1') as Float32Array | undefined;
+        const cs2 = cached?.attrs.get('scale_2') as Float32Array | undefined;
+        for (const s of snap) {
+          liveSc0[s.idx] = s.s0; liveSc1[s.idx] = s.s1; liveSc2[s.idx] = s.s2;
+          if (cs0 && cs1 && cs2) {
+            cs0[s.idx] = s.s0; cs1[s.idx] = s.s1; cs2[s.idx] = s.s2;
+          }
+        }
+        const { syncScalesGPU } = await import('./gpuSync');
+        syncScalesGPU(snap.map(s => s.idx), data, float2Half);
+        clippingSnapshotRef.current = [];
+        clippingActiveRef.current = false;
+        setClippingActive(false);
+        return;
+      }
+
+      // ON → clip 계산 + 적용.
+      const wallReady = wallMode === 'confirmed' && wallAngleRef.current !== null && wallDistancesRef.current !== null;
+      const cfReady = cfMode === 'confirmed';
+      if (!wallReady || !cfReady) {
+        alert('천장/바닥 + 벽 4면을 먼저 확정하세요.');
+        return;
+      }
+
+      const { surfacePlanesFromRoom } = await import('@/lib/gs/planes');
+      const planes = surfacePlanesFromRoom({
+        angleDeg: wallAngleRef.current!,
+        walls: wallDistancesRef.current! as [number, number, number, number],
+        ceilingY: ceilingYRef.current,
+        floorY: floorYRef.current,
+      });
+
+      // 평면은 A' 프레임 (CF/Wall 모달이 정의). 따라서 splat 의 위치/회전도 A' 프레임으로 변환해야 일관.
+      // buildRotatedScene 은 cached scene 을 복제해 x/y/z + rot_* 를 A' 로 회전. scale_* 는 reference 공유
+      // (frame 무관하게 local-axis 에 정의된 양이라 회전 영향 없음 → clip 결과 그대로 cached 에 적용 가능).
+      const cached = await ensureOriginalScene();
+      const rotated = await buildRotatedScene(cached);
+      const { computeBoundaryClipping } = await import('@/lib/gs/clipping');
+      const updates = computeBoundaryClipping(rotated, planes, { epsilon: clippingEpsilon });
+      console.log(`[Clipping] ${updates.length} / ${cached.numSplats} splats clipped.`);
+
+      const cs0 = cached.attrs.get('scale_0') as Float32Array;
+      const cs1 = cached.attrs.get('scale_1') as Float32Array;
+      const cs2 = cached.attrs.get('scale_2') as Float32Array;
+
+      // snapshot — cached / live 둘 다 동일 origin (PLY parse 결과) 이므로 한쪽 값만 보관.
+      const snap: Array<{ idx: number; s0: number; s1: number; s2: number }> = [];
+      for (const u of updates) {
+        snap.push({ idx: u.idx, s0: u.origLogScale[0], s1: u.origLogScale[1], s2: u.origLogScale[2] });
+        // cached scene → 저장 시 PLY 에 baked in.
+        cs0[u.idx] = u.newLogScale[0]; cs1[u.idx] = u.newLogScale[1]; cs2[u.idx] = u.newLogScale[2];
+        // live PC gsplat data → 즉시 시각 반영.
+        liveSc0[u.idx] = u.newLogScale[0]; liveSc1[u.idx] = u.newLogScale[1]; liveSc2[u.idx] = u.newLogScale[2];
+      }
+      const { syncScalesGPU } = await import('./gpuSync');
+      syncScalesGPU(updates.map(u => u.idx), data, float2Half);
+      // undo 기록 — 이전 상태 (clipping 비활성).
+      pushOp({ type: 'clipping', prevSnapshot: [], prevActive: false });
+      clippingSnapshotRef.current = snap;
+      clippingActiveRef.current = true;
+      setClippingActive(true);
+      dirtyRef.current = true; setDirty(true);
+      setSaved(false);
+    } catch (e: any) {
+      alert(`clipping 처리 실패: ${e?.message ?? e}`);
+    } finally {
+      setClipping(false);
+    }
+  }, [coreRef, ensureOriginalScene, buildRotatedScene, wallMode, cfMode, clippingEpsilon, pushOp]);
+
+  // ── applyFloater: 토글식. flatten(모듈 외부 제거) 활성 상태일 때만 호출 가능.
+  // brush 삭제 ∪ flatten 마스크 = excludeMask. 남은 가우시안에 대해 voxel 카운트 + opacity 컷으로 floater 검출.
+  const applyFloater = useCallback(async () => {
+    // 활성 → 복원
+    if (floaterActiveRef.current) {
+      pushOp({
+        type: 'floater',
+        prevMask: floaterMaskRef.current ? new Uint8Array(floaterMaskRef.current) : null,
+        prevActive: true,
+      });
+      floaterActiveRef.current = false; setFloaterActive(false);
+      floaterMaskRef.current = null;
+      paintFlattenMask();
+      setSaved(false);
+      const stillDirty = opHistoryRef.current.length > 0
+        || pendingRotationRef.current.rotX !== 0
+        || pendingRotationRef.current.rotZ !== 0
+        || flattenActiveRef.current
+        || floaterActiveRef.current;
+      dirtyRef.current = stillDirty; setDirty(stillDirty);
+      return;
+    }
+
+    if (!flattenActiveRef.current) {
+      alert('먼저 "모듈 외부 제거" 를 적용해주세요. floater 는 그 이후 남은 가우시안 중에서만 찾습니다.');
+      return;
+    }
+
+    const data = splatDataRef.current;
+    const core = coreRef.current;
+    if (!data) return;
+
+    setFloatering(true);
+    try {
+      const { detectFloaters } = await import('@/lib/gs/floaters');
+
+      const N = data.numSplats;
+      // excludeMask = brush 삭제 (origColorData alpha=0) ∪ flatten 마스크
+      const exclude = new Uint8Array(N);
+      if (data.origColorData && core) {
+        const h2f = core.half2Float;
+        for (let i = 0; i < N; i++) {
+          const a = h2f(data.origColorData[i * 4 + 3]);
+          if (a < 1e-3) exclude[i] = 1;
+        }
+      }
+      if (flattenMaskRef.current) {
+        for (let i = 0; i < N; i++) if (flattenMaskRef.current[i]) exclude[i] = 1;
+      }
+
+      // detectFloaters 의 SplatData 시그니처 — opacity 는 원본 PLY 의 logit (sigmoid 전).
+      // splatDataRef 에는 'opacity' 가 없으므로 originalScene 을 fetch 해서 사용.
+      const original = await ensureOriginalScene();
+      if (original.numSplats !== N) {
+        throw new Error(`splatData(${N}) 와 original(${original.numSplats}) 입자 수 불일치`);
+      }
+
+      const t0 = performance.now();
+      const { mask, deletedCount, aliveCount } = detectFloaters(
+        original,
+        {
+          voxelSize: floaterVoxelSize,
+          opacityThreshold: floaterOpacityCut,
+          minNeighbors: floaterMinNeighbors,
+        },
+        exclude,
+      );
+      const dt = performance.now() - t0;
+      console.log(`[Floater] alive=${aliveCount}/${N}, deleted=${deletedCount}, took ${dt.toFixed(1)}ms`);
+      console.log('[Floater] params:', {
+        voxelSize: floaterVoxelSize,
+        opacityCut: floaterOpacityCut,
+        minNeighbors: floaterMinNeighbors,
+      });
+
+      pushOp({ type: 'floater', prevMask: null, prevActive: false });
+      floaterMaskRef.current = mask;
+      floaterActiveRef.current = true; setFloaterActive(true);
+      paintFlattenMask();
+      dirtyRef.current = true; setDirty(true);
+      setSaved(false);
+    } catch (e: any) {
+      alert(`floater 검출 실패: ${e.message || e}`);
+    } finally {
+      setFloatering(false);
+    }
+  }, [floaterVoxelSize, floaterOpacityCut, floaterMinNeighbors, ensureOriginalScene, paintFlattenMask, pushOp]);
 
   // ── Wall mesh test (MVP): 선택된 면을 텍스처 메시로 굽고 splat entity child로 추가
   const bakeWallMeshTest = useCallback(async () => {
@@ -771,13 +968,17 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
           corners: bake.corners, uvs: bake.uvs,
         });
       }
+      // undo 기록 — 이전 상태 (막 없음).
+      pushOp({ type: 'wallMesh', prevEntities: [], prevActive: false });
       setWallMeshActive(true);
+      dirtyRef.current = true; setDirty(true);
+      setSaved(false);
     } catch (e: any) {
       alert(`막 생성 실패: ${e.message || e}`);
     } finally {
       setWallMeshBaking(false);
     }
-  }, [selectedSurfaces, surfaceOffsets, ensureOriginalScene, buildRotatedScene, coreRef, wallMeshDebugWhite, bakeInnerGate]);
+  }, [selectedSurfaces, surfaceOffsets, ensureOriginalScene, buildRotatedScene, coreRef, wallMeshDebugWhite, bakeInnerGate, pushOp]);
 
   // 가장 최근 베이크 결과를 PNG로 다운로드 (디버그)
   const downloadBakedTextures = useCallback(() => {
@@ -1084,9 +1285,11 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   }, [options?.uploadId]);
 
   // ── localStorage 저장: 관련 state 변경 시마다 ──
+  // uploadId 가 없는 로컬 파일도 저장 (빈 문자열 키). 문 설정 단계가 같은 키로 읽어 평면 정보 복원 가능.
+  // restoringRef 가 true 인 동안 (서버 파일 로드 중) 만 skip.
   useEffect(() => {
-    const uid = options?.uploadId;
-    if (!uid || restoringRef.current || loadedUploadIdRef.current !== uid) return;
+    if (restoringRef.current) return;
+    const uid = options?.uploadId ?? '';
     saveRefineState(uid, {
       cfConfirmed: cfMode === 'confirmed',
       ceilingY, floorY,
@@ -1109,11 +1312,9 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     const data = splatDataRef.current; const core = coreRef.current;
     if (!data || !core || planesRef.current.length === 0) {
       setOutsideCount(0); setClosed(false);
-      if (data?.colorTexture && data?.origColorData) {
-        let td: Uint16Array | null = null;
-        try { td = data.colorTexture.lock(); } catch { return; }
-        if (td) { td.set(data.origColorData); try { data.colorTexture.unlock(); } catch {} }
-      }
+      // origColorData 로 단순 복원하면 flatten 마스크 (alpha=0) 가 사라져 외부 가우시안이 다시 보임.
+      // paintFlattenMask 는 base 색 + flatten 상태를 함께 복원.
+      paintFlattenMask();
       return;
     }
     const codes = computeCellCodes(data.posX, data.posY, data.posZ, data.numSplats, planesRef.current);
@@ -1137,7 +1338,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       } else { td[idx]=orig[idx]; td[idx+1]=orig[idx+1]; td[idx+2]=orig[idx+2]; td[idx+3]=orig[idx+3]; }
     }
     try { data.colorTexture.unlock(); } catch {}
-  }, [coreRef]);
+  }, [coreRef, paintFlattenMask]);
 
   // ── Highlight: brush/bbox selection → red ──
   // flatten 마스크가 활성이면 alpha=0 유지해서 모듈 외부 제거 효과 보존.
@@ -1218,9 +1419,8 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     const mixT = 0.75;
 
     const cy = ceilingYRef.current, fy = floorYRef.current;
-    // 안전거리 슬라이더(globalOffset)에 따라 색칠 밴드 폭이 달라짐 — 사용자가 슬라이더로
-    // "어디까지 안전거리에 들어오는지" 시각적으로 확인 가능. 최소 3cm는 유지해 항상 보임.
-    const bandCf = Math.max(globalOffset, 0.03);
+    // 색칠 밴드 = 평면 ±1cm. 시각 가이드 only — 후속 처리는 평면(sd=0) 자체를 strict 기준으로 사용.
+    const bandCf = 0.01;
     const yLo = Math.min(cy, fy), yHi = Math.max(cy, fy);
 
     let c1 = 0, s1 = 0, c2 = 0, s2 = 0, a1 = 0, b1 = 0, a2 = 0, b2 = 0, bandWall = 0;
@@ -1231,7 +1431,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       c1 = Math.cos(rad); s1 = Math.sin(rad);
       c2 = Math.cos(rad + Math.PI / 2); s2 = Math.sin(rad + Math.PI / 2);
       [a1, b1, a2, b2] = walls as [number, number, number, number];
-      bandWall = Math.max(globalOffset, 0.03);
+      bandWall = 0.01;
     }
 
     // pendingRotation을 가우시안 좌표에 적용해서 평면(A' 프레임)과 비교 — flatten/막과 동일한 프레임
@@ -1304,14 +1504,16 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     // Reset plane gizmo state
     setToolMode('none'); toolModeRef.current = 'none'; dragRef.current = null;
     setPickingNormal(false); pickingNormalRef.current = false; normalDisplayRef.current = null; clearDepth();
-    if (mode === 'plane') {
-      // Restore plane preview if planes exist
+    if (isSelectMode(mode)) {
+      // 가우시안 선택/삭제 sub-tab — selection preview 표시.
+      setTimeout(() => refreshSelection(), 0);
+    } else {
+      // plane / transparent — selection 클리어 후 빨간 페인트 제거.
+      // 사용자 의도: 다른 탭으로 전환 시 (브러시/BBox/직사각형 선택) 빨간 페인트 풀어주기.
       if (selectionRef.current) selectionRef.current.fill(0);
       setSelectionCount(0);
-      setTimeout(() => recomputePlanes(), 0);
-    } else {
-      // Restore selection preview if any
-      setTimeout(() => refreshSelection(), 0);
+      setTimeout(() => refreshSelection(), 0); // 페인트 갱신 (빨간색 제거).
+      if (mode === 'plane') setTimeout(() => recomputePlanes(), 0);
     }
   }, [clearHighlight, recomputePlanes, refreshSelection]);
 
@@ -1342,29 +1544,15 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     planesRef.current = []; syncPlanes(); setSelectedPlane(-1); selectedPlaneRef.current = -1; setOutsideCount(0); setClosed(false);
   }, [coreRef, syncPlanes]);
 
-  // ── Save refined result + SAM3 dispatch ──
-  // "다듬기 저장" → 건물 정보 + SAM3 프롬프트 단일 모달 → 완료 시:
-  //   1) refined PLY 업로드  2) /uploads/{id}/sam3/start  3) 상태 폴링  4) 자동으로 정합 모드 진입.
-  // (docs/sam3_alignment_pipeline.md "Happy path")
+  // ── 다듬기 완료 버튼 — 서버 통신 없음, 문 설정 단계로 transition 만. ──
+  // 모든 서버 영속은 문 설정 완료 시점에 한 번에 (commitRefinedToServer + persistDoors + register-local).
   const saveRefined = useCallback(async () => {
-    // 단일 통합 모달: 메타데이터 + SAM3 프롬프트.
-    // 로컬 파일에서 시작한 경우 모달 콜백이 register-local 로 upload_id 도 같이 만들어 돌려준다.
-    // 사용자가 모달을 취소하면 저장 흐름을 중단.
-    if (!options?.onRequestMetadata) return;
-    let prompt = '';
-    let activeUploadId: string | undefined = options?.uploadId;
-    try {
-      const meta = await options.onRequestMetadata();
-      prompt = (meta?.sam_prompt ?? '').trim();
-      // upload_id 우선순위: 모달이 새로 만든 id > 기존 options.uploadId
-      activeUploadId = meta?.upload_id ?? activeUploadId;
-    } catch {
-      return;
-    }
-    if (!activeUploadId) {
-      alert('업로드 등록에 실패했습니다.');
-      return;
-    }
+    setSaved(true);
+    options?.onSwitchToAlign?.();
+  }, [options]);
+
+  // 문 설정 완료 시점에 호출됨 — refined PLY + mesh.json + tex_*.png 일괄 업로드 + SceneOutput 등록.
+  const commitRefinedToServer = useCallback(async (activeUploadId: string) => {
     setSaving(true);
     setSamProgressOpen(true);
     setSamProgressMessage('정제된 PLY 준비 중...');
@@ -1395,10 +1583,15 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       } else if (flattenActiveRef.current === false && !data?.origColorData) {
         console.warn('[Save] flatten 마스크가 없습니다 — 모듈 외부 복원 상태이거나 적용 안 함.');
       }
+      let floaterDeleted = 0;
+      if (floaterActiveRef.current && floaterMaskRef.current) {
+        for (let i = 0; i < N; i++) {
+          if (floaterMaskRef.current[i] && keep[i]) { keep[i] = 0; floaterDeleted++; }
+        }
+      }
 
       // 2) 필터링 (원본 → 살릴 가우시안만)
       // SPEC: 다듬기는 포인트 제거만 수행한다 — 회전/스케일/translate 금지.
-      // (docs/sam3_alignment_pipeline.md "좌표계 정합성")
       // 정합 단계는 refined PLY 의 raw 좌표계 위에서 수행되므로 어떤 좌표 변환도 베이크하지 않는다.
       // pendingRotation, wallAngle 은 화면(entity)에만 적용된 표시용 변환으로,
       // doors 4꼭짓점/평면 정의 등 정합에 필요한 메타데이터는 raw 프레임 그대로 저장한다.
@@ -1407,7 +1600,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       const wallAngleDeg = wallAngleRef.current ?? 0;
       const { rotX, rotZ } = pendingRotationRef.current;
 
-      console.log(`[Save] N=${N}, brush삭제=${brushDeleted}, flatten삭제=${flattenDeleted}, 살아남음=${baked.numSplats} (좌표 변환 없음 — raw frame 유지). 화면 회전 표시값 rotX=${rotX.toFixed(3)}, rotZ=${rotZ.toFixed(3)}, wallY=${wallAngleDeg.toFixed(2)}°.`);
+      console.log(`[Save] N=${N}, brush삭제=${brushDeleted}, flatten삭제=${flattenDeleted}, floater삭제=${floaterDeleted}, 살아남음=${baked.numSplats} (좌표 변환 없음 — raw frame 유지). 화면 회전 표시값 rotX=${rotX.toFixed(3)}, rotZ=${rotZ.toFixed(3)}, wallY=${wallAngleDeg.toFixed(2)}°.`);
       console.log(`[Save] flattenActive=${flattenActiveRef.current}, flattenMask 존재=${!!flattenMaskRef.current}`);
 
       const bytes = serializePly(baked);
@@ -1521,54 +1714,14 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       });
       console.log(`[Save] SceneOutput 생성됨 — scene_id=${saveResp.scene_id}, ply_path=${plyUrl.key}`);
 
-      // 3.5) SAM3 자동 문 검출 task 발행 + canonical refined_ply_path 등록.
-      //      worker 가 비가용해도 sam3_status=failed 로 떨어져 사용자가 정합 단계에서 수동 지정 가능.
-      let sam3Started = false;
-      try {
-        const startResp = await api.post<{ sam3_status: string; celery_task_id: string | null }>(
-          `/uploads/${activeUploadId}/sam3/start`,
-          { refined_ply_key: plyUrl.key, prompt },
-        );
-        sam3Started = startResp.sam3_status === 'running';
-        console.log(`[Save] SAM3 dispatch — status=${startResp.sam3_status}, task=${startResp.celery_task_id ?? '-'}`);
-      } catch (e) {
-        console.warn('[Save] SAM3 dispatch 실패', e);
-      }
-
-      // 3.6) SAM3 폴링 — done/failed 까지 대기 (최대 5분), 그 동안 진행률 표시.
-      if (sam3Started) {
-        setSamProgressMessage('SAM3 작동 중...');
-        const startedAt = performance.now();
-        const TIMEOUT_MS = 5 * 60 * 1000;
-        // eslint-disable-next-line no-constant-condition
-        while (true) {
-          await new Promise(r => setTimeout(r, 1500));
-          try {
-            const s = await api.get<{ sam3_status: string | null; has_doors_json: boolean }>(
-              `/uploads/${activeUploadId}/sam3`,
-            );
-            if (s.sam3_status === 'done' || s.sam3_status === 'failed') {
-              console.log(`[Save] SAM3 종료 — status=${s.sam3_status}, doors=${s.has_doors_json}`);
-              break;
-            }
-          } catch (e) {
-            console.warn('[Save] SAM3 status 폴링 실패', e);
-          }
-          if (performance.now() - startedAt > TIMEOUT_MS) {
-            console.warn('[Save] SAM3 폴링 타임아웃 — 진행 상태 무시하고 정합으로 진입');
-            break;
-          }
-        }
-      }
-
-      // 저장 성공. SPEC상 좌표 변환을 베이크하지 않으므로 wallAngle/pendingRotation 등
-      // 화면 표시용 회전 값은 그대로 유지 (사용자가 다시 와도 같은 시야로 작업 이어가기 위함).
-      setSaved(true);
-
-      // 단일 플로우 — SAM3 폴링 후 자동으로 정합 모드 진입.
-      options?.onSwitchToAlign?.();
+      // commit 완료 — 호출자(문 설정 완료) 가 다음 단계 (정합) 진입을 처리함.
+      // SAM3 자동 문 검출은 비동기 백그라운드 모델로 변경됨: dispatch 는 Sam3PromptModal 의
+      // onStartAuto 핸들러(UnifiedSplatEditor) 에서 수행되고, 결과는 sam3_status 컬럼으로 추적된다.
+      // (이전 구조의 동기 폴링·1분 타임아웃·dashboard 강제 이동 로직은 새 파이프라인과 호환되지 않아 폐기)
+      return { plyKey: plyUrl.key, sessionId };
     } catch (e: any) {
-      alert(`저장 실패: ${e.message || e}`);
+      alert(`서버 저장 실패: ${e.message || e}`);
+      throw e;
     } finally {
       setSaving(false);
       setSamProgressOpen(false);
@@ -1655,6 +1808,8 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     flattenMaskRef.current = null;
     flattenActiveRef.current = false; setFlattenActive(false);
     flattenVisibleRef.current = true; setFlattenVisible(true);
+    floaterMaskRef.current = null;
+    floaterActiveRef.current = false; setFloaterActive(false);
     // 7) 메인 entity transform 베이스 회전(180Z)으로 복귀
     applyEntityRotation();
     // 8) undo + dirty
@@ -1691,12 +1846,28 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       flattenMaskRef.current = rec.prevMask;
       flattenActiveRef.current = rec.prevActive; setFlattenActive(rec.prevActive);
       paintFlattenMask();
+    } else if (rec.type === 'floater') {
+      floaterMaskRef.current = rec.prevMask;
+      floaterActiveRef.current = rec.prevActive; setFloaterActive(rec.prevActive);
+      paintFlattenMask();
+    } else if (rec.type === 'clipping') {
+      // clipping 토글 OFF — 현재 활성이면 snapshot 으로 복원.
+      if (clippingActiveRef.current) {
+        try { await applyClipping(); } catch {}
+      }
+      // 이전 스냅샷이 있었던 경우 (= clipping 이 ON 이었음) 그 상태로 복원하진 않음. 단순히 OFF 만.
+    } else if (rec.type === 'wallMesh') {
+      // 막 제거 — 현재 entity 들 destroy.
+      for (const e of wallMeshEntitiesRef.current) { try { e.destroy(); } catch {} }
+      wallMeshEntitiesRef.current = [];
+      setWallMeshActive(false);
     }
 
     const stillDirty = opHistoryRef.current.length > 0
       || pendingRotationRef.current.rotX !== 0
       || pendingRotationRef.current.rotZ !== 0
-      || flattenActiveRef.current;
+      || flattenActiveRef.current
+      || floaterActiveRef.current;
     dirtyRef.current = stillDirty;
     setDirty(stillDirty);
   }, [applyEntityRotation, paintFlattenMask]);
@@ -1744,6 +1915,14 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
           // 길이 불일치 → 마스크 무효
           flattenMaskRef.current = null;
           flattenActiveRef.current = false; setFlattenActive(false);
+        }
+      }
+      if (floaterActiveRef.current && floaterMaskRef.current) {
+        if (floaterMaskRef.current.length === data.numSplats) {
+          paintFlattenMask();
+        } else {
+          floaterMaskRef.current = null;
+          floaterActiveRef.current = false; setFloaterActive(false);
         }
       }
     }, 0);
@@ -2500,13 +2679,39 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       // ── BBox wireframe ──
       if (mode === 'bbox') {
         const mn=selBboxMinRef.current, mx=selBboxMaxRef.current;
-        const cs: Vec3[] = [[mn[0],mn[1],mn[2]],[mx[0],mn[1],mn[2]],[mx[0],mx[1],mn[2]],[mn[0],mx[1],mn[2]],[mn[0],mn[1],mx[2]],[mx[0],mn[1],mx[2]],[mx[0],mx[1],mx[2]],[mn[0],mx[1],mx[2]]];
+        const csRaw: Vec3[] = [[mn[0],mn[1],mn[2]],[mx[0],mn[1],mn[2]],[mx[0],mx[1],mn[2]],[mn[0],mx[1],mn[2]],[mn[0],mn[1],mx[2]],[mx[0],mn[1],mx[2]],[mx[0],mx[1],mx[2]],[mn[0],mx[1],mx[2]]];
+        // bbox 코너는 raw PLY 프레임 — splatEntity 의 world transform (Z-180 + pendingRotation) 적용해서
+        // 실제 splat 들이 보이는 world 위치와 정렬. 적용 안 하면 mirror 위치에 그려져 카메라 따라 움직이는 듯한 시각 버그.
+        const data = splatDataRef.current;
+        const ent = data?.splatEntity;
+        const wm = ent?.getWorldTransform();
+        const pc = pcRef.current;
+        const cs: Vec3[] = csRaw.map(c => {
+          if (wm && pc) {
+            const v = new pc.Vec3(c[0], c[1], c[2]);
+            const out = new pc.Vec3();
+            wm.transformPoint(v, out);
+            return [out.x, out.y, out.z];
+          }
+          return c;
+        });
         const es: [number,number][] = [[0,1],[1,2],[2,3],[3,0],[4,5],[5,6],[6,7],[7,4],[0,4],[1,5],[2,6],[3,7]];
-        const bc: Color4=[0,1,0.5,1], bh: Color4=[1,1,0,1];
+        // 빨간 BBox + 드래그 중인 변은 노랑 강조.
+        const bc: Color4=[1,0.2,0.2,1], bh: Color4=[1,1,0,1];
+        // 두께 시뮬레이션 — PC drawLine 은 1px 고정. 여러 평행 라인을 짧게 오프셋해 굵게 보이게.
+        const sizeRef = bboxSizeRef.current;
+        const t = Math.max(sizeRef * 0.0015, 0.005); // 두께 오프셋 (월드 단위, ~ 0.5cm).
+        const offsets: Vec3[] = [[0,0,0],[t,0,0],[-t,0,0],[0,t,0],[0,-t,0],[0,0,t],[0,0,-t]];
         for (const [a,b] of es) {
           let col=bc;
-          if(bboxDragAxis>=0){const dv=bboxDragIsMax?selBboxMaxRef.current[bboxDragAxis]:selBboxMinRef.current[bboxDragAxis];if(Math.abs(cs[a][bboxDragAxis]-dv)<0.001&&Math.abs(cs[b][bboxDragAxis]-dv)<0.001)col=bh;}
-          core.drawLine(cs[a],cs[b],col,false);
+          if(bboxDragAxis>=0){const dv=bboxDragIsMax?selBboxMaxRef.current[bboxDragAxis]:selBboxMinRef.current[bboxDragAxis];if(Math.abs(csRaw[a][bboxDragAxis]-dv)<0.001&&Math.abs(csRaw[b][bboxDragAxis]-dv)<0.001)col=bh;}
+          for (const o of offsets) {
+            core.drawLine(
+              [cs[a][0]+o[0], cs[a][1]+o[1], cs[a][2]+o[2]],
+              [cs[b][0]+o[0], cs[b][1]+o[1], cs[b][2]+o[2]],
+              col, false,
+            );
+          }
         }
       }
 
@@ -2548,7 +2753,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
 
   const panel = splatLoaded ? (
     <>
-      <div className="bg-black/70 backdrop-blur-sm border border-white/10 text-gray-300 text-xs rounded-lg shadow-lg p-3 flex flex-col gap-2 select-none w-64 max-h-[calc(100vh-200px)] overflow-y-auto">
+      <div className="bg-black/70 backdrop-blur-sm border border-white/10 text-gray-300 text-xs rounded-lg shadow-lg p-3 flex flex-col gap-2 select-none w-72 max-h-[calc(100vh-200px)] overflow-y-auto">
         <div className="text-white font-bold text-sm mb-1">다듬기</div>
 
         {/* 상위 모드 탭: 경계면 처리 / 가우시안 선택/삭제 / 투명영역 */}
@@ -2640,49 +2845,6 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
                   CF_SURFACES.includes(s) ? cfMode !== 'confirmed' : wallMode !== 'confirmed';
                 return (
                   <>
-                    {/* 모든 경계면 공통 안전거리 */}
-                    <div className="flex items-center gap-1.5 text-[10px]">
-                      <span className="text-gray-400 w-14">안전거리</span>
-                      <input type="range" min={0.05} max={1.0} step={0.01}
-                        value={globalOffset}
-                        onChange={(e) => {
-                          const v = parseFloat(e.target.value);
-                          setGlobalOffset(v);
-                          setGlobalOffsetText(String(v));
-                        }}
-                        className="flex-1 accent-blue-500 cursor-pointer" />
-                      <span className="text-white font-mono w-12 text-right">
-                        {(globalOffset * 100).toFixed(0)}cm
-                      </span>
-                    </div>
-                    <div className="flex gap-1 mb-1">
-                      <button
-                        onClick={() => setSafetyVizActive(v => !v)}
-                        className={`flex-1 px-2 py-1 rounded cursor-pointer text-[10px] font-bold ${safetyVizActive ? 'bg-blue-600 hover:bg-blue-500 text-white' : 'bg-gray-700 hover:bg-gray-600 text-gray-300'}`}>
-                        {safetyVizActive ? '안전거리 범위 숨기기' : '안전거리 범위 확인'}
-                      </button>
-                      <button
-                        onClick={() => setFlattenPreviewActive(v => !v)}
-                        className={`flex-1 px-2 py-1 rounded cursor-pointer text-[10px] font-bold ${flattenPreviewActive ? 'bg-red-600 hover:bg-red-500 text-white' : 'bg-gray-700 hover:bg-gray-600 text-gray-300'}`}>
-                        {flattenPreviewActive ? '삭제될 가우시안 숨기기' : '삭제될 가우시안 확인'}
-                      </button>
-                    </div>
-                    {/* 알파블렌딩 시작 위치 (depthGate) */}
-                    <div className="flex items-center gap-1.5 text-[10px]">
-                      <span className="text-gray-400 w-14" title="텍스처 베이크 시 방 안쪽 가우시안 채택 한계">베이크 시작</span>
-                      <input type="range" min={0} max={2.0} step={0.005}
-                        value={bakeInnerGate}
-                        onChange={(e) => setBakeInnerGate(parseFloat(e.target.value))}
-                        className="flex-1 accent-cyan-500 cursor-pointer" />
-                      <span className="text-white font-mono w-12 text-right">
-                        {bakeInnerGate >= 1 ? `${bakeInnerGate.toFixed(2)}m` : `${(bakeInnerGate * 100).toFixed(1)}cm`}
-                      </span>
-                    </div>
-                    <button
-                      onClick={() => setGateVizActive(v => !v)}
-                      className={`w-full px-2 py-1 rounded cursor-pointer text-[10px] font-bold mb-1.5 ${gateVizActive ? 'bg-cyan-600 hover:bg-cyan-500 text-white' : 'bg-gray-700 hover:bg-gray-600 text-gray-300'}`}>
-                      {gateVizActive ? '베이크 위치 숨기기' : '베이크 위치 확인하기'}
-                    </button>
                     <div className="grid grid-cols-3 gap-x-2 gap-y-1">
                       {ALL_SURFACES.map(s => {
                         const disabled = isDisabled(s);
@@ -2704,6 +2866,11 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
                 className="px-2 py-1 bg-gray-700 hover:bg-gray-600 disabled:bg-gray-800 disabled:opacity-50 text-gray-200 rounded cursor-pointer disabled:cursor-not-allowed text-[11px]">
                 전체 선택/해제
               </button>
+              <button
+                onClick={() => setFlattenPreviewActive(v => !v)}
+                className={`px-2 py-1 rounded cursor-pointer text-[10px] font-bold ${flattenPreviewActive ? 'bg-red-600 hover:bg-red-500 text-white' : 'bg-gray-700 hover:bg-gray-600 text-gray-300'}`}>
+                {flattenPreviewActive ? '삭제될 가우시안 숨기기' : '삭제될 가우시안 확인'}
+              </button>
               <button onClick={() => applyFlatten()}
                 disabled={flattening || (!flattenActive && selectedSurfaces.size === 0)}
                 className={`w-full px-2 py-1.5 rounded cursor-pointer text-xs font-bold disabled:bg-gray-600 disabled:text-gray-400 ${
@@ -2711,21 +2878,30 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
                     ? 'bg-amber-600 hover:bg-amber-500 text-white'
                     : 'bg-red-600 hover:bg-red-500 text-white'
                 }`}>
-                {flattening ? '처리 중...' : (flattenActive ? '모듈 외부 복원' : '모듈 외부 제거')}
+                {flattening ? '처리 중...' : (flattenActive ? '외부 가우시안 복원' : '외부 가우시안 제거')}
               </button>
-              <div className="border-t border-gray-700 pt-2 mt-1 space-y-1.5">
-                {/* 얇은 막 (가우시안 패치) UI 는 wall mesh 가 대체해서 비활성화. 코드/상태는 보존 — 호환/롤백 위해. */}
-                <div className="flex gap-1">
+
+              {/* 막 생성하기 — 외부 가우시안 제거 활성 후 사용 가능 (의존성: flatten 적용 후 막 생성 의미). */}
+              <div className={`border-t border-gray-700 pt-2 mt-1 space-y-1.5 ${flattenActive ? '' : 'opacity-50 pointer-events-none'}`}>
+                {!wallMeshActive ? (
                   <button onClick={() => bakeWallMeshTest()}
-                    disabled={wallMeshBaking || selectedSurfaces.size === 0}
-                    className={`flex-1 px-2 py-1.5 rounded cursor-pointer text-xs font-bold disabled:bg-gray-600 disabled:text-gray-400 ${
-                      wallMeshActive
-                        ? 'bg-emerald-700 hover:bg-emerald-600 text-white'
-                        : 'bg-emerald-600 hover:bg-emerald-500 text-white'
-                    }`}>
-                    {wallMeshBaking ? '생성 중...' : (wallMeshActive ? '막 재생성하기' : '막 생성하기')}
+                    disabled={!flattenActive || wallMeshBaking || selectedSurfaces.size === 0}
+                    title={!flattenActive ? '먼저 외부 가우시안 제거를 적용하세요.' : ''}
+                    className="w-full px-2 py-1.5 rounded cursor-pointer text-xs font-bold disabled:bg-gray-600 disabled:text-gray-400 bg-emerald-600 hover:bg-emerald-500 text-white">
+                    {wallMeshBaking ? '생성 중...' : '막 생성하기'}
                   </button>
-                  {wallMeshActive && (
+                ) : (
+                  // 막 활성 상태: [막만 보기 토글] [막 제거]. 재생성은 막 제거 → 막 생성으로 가능.
+                  <div className="flex gap-1">
+                    <button
+                      onClick={() => setSplatHidden(v => !v)}
+                      className={`flex-1 px-2 py-1.5 rounded cursor-pointer text-xs font-bold ${
+                        splatHidden
+                          ? 'bg-emerald-700 hover:bg-emerald-600 text-white'
+                          : 'bg-emerald-600 hover:bg-emerald-500 text-white'
+                      }`}>
+                      {splatHidden ? '막만 보기 해제' : '막만 보기'}
+                    </button>
                     <button
                       onClick={() => {
                         for (const e of wallMeshEntitiesRef.current) { try { e.destroy(); } catch {} }
@@ -2735,21 +2911,34 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
                       className="flex-1 px-2 py-1.5 rounded cursor-pointer text-xs font-bold bg-amber-600 hover:bg-amber-500 text-white">
                       막 제거
                     </button>
-                  )}
+                  </div>
+                )}
+              </div>
+
+              {/* 경계면 가우시안 다듬기 — 막 생성 후 사용 가능. */}
+              <div className={`border-t border-gray-700 pt-2 mt-1 space-y-1.5 ${wallMeshActive ? '' : 'opacity-50 pointer-events-none'}`}>
+                <div className="text-[10px] text-gray-400 font-bold">경계면 가우시안 다듬기</div>
+                <div className="flex items-center gap-1.5 text-[10px]"
+                  title={`가우시안이 경계면에서 ${(clippingEpsilon * 1000).toFixed(1)}mm 여유를 가지고 다듬어집니다. 여유를 너무 줄이면 가우시안 줄무늬가 나타날 수 있습니다.`}>
+                  <span className="text-gray-400 w-14">다듬기 여유</span>
+                  <input type="range" min={0} max={0.05} step={0.0005}
+                    value={clippingEpsilon}
+                    disabled={clippingActive}
+                    onChange={(e) => setClippingEpsilon(parseFloat(e.target.value))}
+                    className="flex-1 accent-cyan-500 cursor-pointer disabled:cursor-not-allowed disabled:opacity-50" />
+                  <span className="text-white font-mono w-14 text-right">
+                    {(clippingEpsilon * 1000).toFixed(1)}mm
+                  </span>
                 </div>
-                <label className="flex items-center gap-2 text-[10px] text-gray-400 mt-1 cursor-pointer select-none">
-                  <input type="checkbox" checked={splatHidden}
-                    onChange={(e) => setSplatHidden(e.target.checked)}
-                    className="cursor-pointer" />
-                  <span>막만 보기</span>
-                </label>
-                <button onClick={() => toggleAlphaGrid()}
-                  className={`w-full mt-1 px-2 py-1 rounded cursor-pointer text-[10px] ${
-                    alphaGridActive
+                <button onClick={() => applyClipping()}
+                  disabled={!wallMeshActive || clipping}
+                  title={!wallMeshActive ? '먼저 막을 생성하세요.' : ''}
+                  className={`w-full px-2 py-1.5 rounded cursor-pointer text-xs font-bold disabled:bg-gray-600 disabled:text-gray-400 disabled:cursor-not-allowed ${
+                    clippingActive
                       ? 'bg-amber-600 hover:bg-amber-500 text-white'
-                      : 'bg-gray-700 hover:bg-gray-600 text-gray-200'
+                      : 'bg-cyan-600 hover:bg-cyan-500 text-white'
                   }`}>
-                  {alphaGridActive ? '알파 그리드 끄기' : '알파 그리드 진단 (50cm)'}
+                  {clipping ? '처리 중...' : (clippingActive ? '경계면 다듬기 취소' : '경계면 다듬기')}
                 </button>
               </div>
             </div>
@@ -2771,9 +2960,6 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
                 {toolMode==='translate'?'이동 모드 (T)':'회전 모드 (R)'}
               </div>
             )}
-            <div className="text-[10px] text-gray-500 leading-relaxed">
-              좌클릭: 평면 선택 | T+드래그: 이동 | R+드래그: 회전
-            </div>
             {planes.length > 0 && (
               <div className="border-t border-gray-600 pt-2 mt-1">
                 <div className="mb-1">{closed?<span className="text-red-400 font-bold">폐공간 완성</span>:<span className="text-gray-400">폐공간 미완성</span>}</div>
@@ -2834,6 +3020,12 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
               Y: [{selBboxMin[1].toFixed(1)}, {selBboxMax[1].toFixed(1)}]<br/>
               Z: [{selBboxMin[2].toFixed(1)}, {selBboxMax[2].toFixed(1)}]
             </div>
+            {/* 내부 가우시안 표시 — 현재 BBox 안의 splat 들을 빨갛게 highlight. */}
+            <button
+              onClick={() => applyBboxSel(selBboxMinRef.current, selBboxMaxRef.current)}
+              className="w-full px-2 py-1.5 bg-red-600 hover:bg-red-500 text-white rounded cursor-pointer text-xs font-bold">
+              내부 가우시안 표시
+            </button>
             <div className="border-t border-gray-600 pt-2 mt-1">
               <div className="mb-1.5">선택: <span className="text-red-400 font-bold">{selectionCount.toLocaleString()}</span> / {totalCount.toLocaleString()}</div>
               <div className="flex gap-1">
@@ -2931,10 +3123,8 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
           </button>
         </div>
 
-        {/* 다듬기 저장 — 모든 sub-tab(경계면 처리 / 가우시안 선택·삭제 / 투명영역) 공통 가장 하단.
-            로컬 파일에서도 누를 수 있음 — 모달이 건물 정보를 받으면 register-local 로 upload 를 만들어
-            그 위에 refined PLY 를 업로드하고 자동으로 정합으로 진입한다.
-            (docs/sam3_alignment_pipeline.md "Happy path") */}
+        {/* 다듬기 완료 — 모든 sub-tab 공통 가장 하단. 서버 통신 없이 문 설정 단계로 transition.
+            register-local + 모든 영속화는 다음 단계(문 설정 완료) 에서 일괄 처리. */}
         {saved ? (
           <div className="mt-2 px-3 py-2 bg-green-800/50 text-green-300 rounded text-xs text-center font-bold">
             저장 완료
@@ -2942,11 +3132,11 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         ) : (
           <button
             onClick={saveRefined}
-            disabled={saving}
-            title="건물 정보와 SAM3 프롬프트를 입력하면 다듬기 결과를 업로드하고 자동으로 정합으로 진입합니다."
+            disabled={saving || !wallMeshActive}
+            title={!wallMeshActive ? '막 생성 후 다음 단계로 진입할 수 있습니다.' : '다음 단계인 문 설정으로 진입합니다.'}
             className="mt-2 w-full px-3 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:bg-gray-600 disabled:text-gray-400 disabled:cursor-not-allowed text-white rounded cursor-pointer font-bold text-xs"
           >
-            {saving ? '저장 중...' : '다듬기 저장'}
+            {saving ? '저장 중...' : '다듬기 완료'}
           </button>
         )}
       </div>
@@ -3066,5 +3256,5 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     </>
   ) : null;
 
-  return { overlay, panel, modals, onSplatLoaded, planes };
+  return { overlay, panel, modals, onSplatLoaded, planes, saveRefined, commitRefinedToServer };
 }

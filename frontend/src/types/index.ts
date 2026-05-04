@@ -140,7 +140,7 @@ export interface Notification {
 // ── WebSocket ──
 
 export interface WsMessage {
-  type: 'progress' | 'task_complete' | 'task_failed' | 'notification' | 'pong';
+  type: 'progress' | 'task_complete' | 'task_failed' | 'notification' | 'ping' | 'pong';
   task_id?: string;
   progress?: number;
   module?: string;

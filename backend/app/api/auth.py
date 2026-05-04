@@ -23,8 +23,10 @@ from app.schemas.auth import (
     UserResponse,
     LoginUrlResponse,
     AuthCodeExchangeRequest,
+    WsTicketResponse,
 )
 from app.services.auth_code_service import issue_auth_code, consume_auth_code
+from app.services.ws_ticket_service import issue_ws_ticket, WS_TICKET_TTL_SECONDS
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 settings = get_settings()
@@ -318,3 +320,14 @@ async def exchange(body: AuthCodeExchangeRequest):
 async def me(user: User = Depends(get_current_user)):
     """현재 로그인한 사용자 정보"""
     return user
+
+
+@router.post("/ws-ticket", response_model=WsTicketResponse)
+async def ws_ticket(user: User = Depends(get_current_user)):
+    """WebSocket 핸드셰이크용 1회용 ticket 발급.
+
+    클라이언트는 이 ticket을 `wss://.../api/ws?ticket=<ticket>` 으로 보낸다.
+    access token은 URL에 노출되지 않으며, ticket은 60s 단명·1회용이다.
+    """
+    ticket = await issue_ws_ticket(str(user.id), user.role.value)
+    return WsTicketResponse(ticket=ticket, expires_in=WS_TICKET_TTL_SECONDS)

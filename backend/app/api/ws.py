@@ -1,105 +1,148 @@
+"""WebSocket 엔드포인트.
+
+설계 원칙:
+- 핸드셰이크 인증은 1회용 ticket(`?ticket=<ticket>`)으로만. access token을 URL에 싣지 않는다.
+- WS 수명은 access token 수명과 무관하다. 한 번 인증되면 물리적으로 끊길 때까지 유지.
+- 같은 user_id가 여러 connection을 가질 수 있다(멀티 탭). 알림은 모든 connection에 fanout.
+- 서버 측 keepalive ping을 주기적으로 보내 dead connection을 빠르게 감지(half-open NAT 등).
+
+Close codes:
+- 1000 정상 종료 / 1001 going away
+- 4401 ticket 무효·만료(클라는 새 ticket 발급 후 재시도)
+- 4400 잘못된 요청
+"""
+
+import asyncio
 import json
 import logging
-from typing import Dict
+import uuid
+from typing import Dict, Set
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
-from jose import JWTError, jwt
+from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 
-from app.core.config import get_settings
+from app.services.ws_ticket_service import consume_ws_ticket
 
 logger = logging.getLogger(__name__)
-settings = get_settings()
-
 router = APIRouter()
+
+# 서버 → 클라 keepalive 주기. 무료 Cloudflare WS idle timeout(~100s)·각종 NAT 만료 보다 넉넉히 짧게.
+SERVER_PING_INTERVAL_SECONDS = 25
 
 
 class ConnectionManager:
-    """WebSocket 접속 관리자"""
+    """user_id → set[WebSocket] 매핑. 멀티 탭/디바이스 동시 접속 지원."""
 
-    def __init__(self):
-        # user_id → WebSocket 매핑
-        self.active_connections: Dict[str, WebSocket] = {}
+    def __init__(self) -> None:
+        self._by_user: Dict[str, Set[WebSocket]] = {}
+        self._lock = asyncio.Lock()
 
-    async def connect(self, user_id: str, websocket: WebSocket):
-        await websocket.accept()
-        # 기존 연결이 있으면 끊기
-        if user_id in self.active_connections:
-            try:
-                await self.active_connections[user_id].close()
-            except Exception:
-                pass
-        self.active_connections[user_id] = websocket
-        logger.info(f"WebSocket 연결: user_id={user_id}")
+    async def add(self, user_id: str, ws: WebSocket) -> None:
+        async with self._lock:
+            self._by_user.setdefault(user_id, set()).add(ws)
 
-    def disconnect(self, user_id: str):
-        self.active_connections.pop(user_id, None)
-        logger.info(f"WebSocket 해제: user_id={user_id}")
+    async def remove(self, user_id: str, ws: WebSocket) -> None:
+        async with self._lock:
+            conns = self._by_user.get(user_id)
+            if conns is None:
+                return
+            conns.discard(ws)
+            if not conns:
+                self._by_user.pop(user_id, None)
 
     def is_online(self, user_id: str) -> bool:
-        return user_id in self.active_connections
+        return bool(self._by_user.get(user_id))
 
     async def send_to_user(self, user_id: str, message: dict) -> bool:
-        """특정 사용자에게 메시지 전송. 성공하면 True."""
-        ws = self.active_connections.get(user_id)
-        if ws is None:
-            return False
-        try:
-            await ws.send_json(message)
-            return True
-        except Exception:
-            self.disconnect(user_id)
+        """user의 모든 connection에 fanout. 하나라도 성공이면 True.
+
+        실패한 socket은 즉시 제거하지 않는다(receive 루프의 except가 정리).
+        """
+        # snapshot — 전송 도중 set 변경에 대비
+        conns = list(self._by_user.get(user_id, set()))
+        if not conns:
             return False
 
+        results = await asyncio.gather(
+            *(ws.send_json(message) for ws in conns),
+            return_exceptions=True,
+        )
+        return any(not isinstance(r, Exception) for r in results)
 
-# 싱글톤 매니저
+
 manager = ConnectionManager()
 
 
-def _verify_ws_token(token: str) -> str | None:
-    """JWT 토큰 검증 → user_id 반환, 실패 시 None"""
+async def _server_keepalive(ws: WebSocket) -> None:
+    """주기적으로 ping을 보내 dead connection을 감지한다.
+
+    Starlette WebSocket에는 표준 ping API가 없어 application-level ping을 보낸다.
+    send 실패 시 receive 루프가 곧 disconnect로 빠지므로 여기서는 break만 한다.
+    """
     try:
-        payload = jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
-        if payload.get("type") != "access":
-            return None
-        return payload.get("sub")
-    except JWTError:
-        return None
+        while True:
+            await asyncio.sleep(SERVER_PING_INTERVAL_SECONDS)
+            try:
+                await ws.send_json({"type": "ping"})
+            except Exception:
+                return
+    except asyncio.CancelledError:
+        return
 
 
 @router.websocket("/ws")
 async def websocket_endpoint(
     websocket: WebSocket,
-    token: str = Query(default=""),
+    ticket: str = Query(default=""),
 ):
-    """WebSocket 엔드포인트
+    """WebSocket 엔드포인트.
 
-    연결: WS /api/ws?token={jwt_access_token}
+    연결: WS /api/ws?ticket=<one_time_ticket>
 
-    수신 메시지 형식:
-        {"type": "ping"}
+    수신 메시지:
+        {"type": "ping"} → {"type": "pong"}
+        {"type": "pong"} (서버 ping에 대한 응답, 그냥 무시)
 
-    발신 메시지 형식:
-        {"type": "progress", "task_id": "...", "progress": 50, "module": "COLMAP"}
-        {"type": "task_complete", "task_id": "...", "message": "..."}
-        {"type": "task_failed", "task_id": "...", "message": "..."}
-        {"type": "notification", "message": "...", "notification_type": "..."}
+    발신 메시지:
+        {"type": "ping"} (서버 keepalive)
+        {"type": "progress" | "task_complete" | "task_failed" | "notification", ...}
     """
-    # 토큰 검증
-    user_id = _verify_ws_token(token)
-    if user_id is None:
-        await websocket.close(code=4001, reason="인증 실패")
+    payload = await consume_ws_ticket(ticket)
+    if payload is None:
+        # accept() 전에 close()하면 핸드셰이크가 4xx로 거절된다(브라우저는 close code를 못 본다).
+        # accept 후 close하면 클라가 close code를 받을 수 있어 재시도 정책을 분기할 수 있다.
+        await websocket.accept()
+        await websocket.close(code=4401, reason="invalid or expired ticket")
         return
 
-    await manager.connect(user_id, websocket)
+    user_id = payload["user_id"]
+    conn_id = uuid.uuid4().hex[:8]
+
+    await websocket.accept()
+    await manager.add(user_id, websocket)
+    logger.info("ws connect: user=%s conn=%s", user_id, conn_id)
+
+    keepalive_task = asyncio.create_task(_server_keepalive(websocket))
 
     try:
         while True:
             data = await websocket.receive_text()
             try:
                 msg = json.loads(data)
-                if msg.get("type") == "ping":
-                    await websocket.send_json({"type": "pong"})
             except json.JSONDecodeError:
-                pass
+                continue
+            mtype = msg.get("type")
+            if mtype == "ping":
+                await websocket.send_json({"type": "pong"})
+            # 그 외 타입(특히 'pong')은 keepalive 응답으로 묵인
     except WebSocketDisconnect:
-        manager.disconnect(user_id)
+        pass
+    except Exception as e:
+        logger.warning("ws error user=%s conn=%s err=%s", user_id, conn_id, e)
+    finally:
+        keepalive_task.cancel()
+        try:
+            await keepalive_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        await manager.remove(user_id, websocket)
+        logger.info("ws disconnect: user=%s conn=%s", user_id, conn_id)
