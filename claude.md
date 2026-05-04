@@ -7,7 +7,7 @@ A web platform that creates digital twins of building interiors using 3D Gaussia
 Flow: 사용자가 외부에서 학습한 `.ply` 업로드 → 브라우저에서 정제·정합 → 서버에 결과 저장 → 웹 뷰어 서빙.
 
 컴퓨트 책임 분배:
-- 클라이언트(사용자 하드웨어): PLY 파싱·편집, Shell 정제, 텍스처 베이크 (WebGPU), 문 정합, 렌더링 — SuperSplat Editor 방식
+- 클라이언트(사용자 하드웨어): PLY 파싱·편집, 외부 가우시안 제거 + 경계면 정제, 텍스처 베이크 (WebGPU), 문 정합, 렌더링 — SuperSplat Editor 방식
 - 서버: 인증, MinIO 객체 스토리지 릴레이(프리사인드 URL), 메타데이터 CRUD, 실시간 알림
 - GPU 서버(학습용): 현재 스코프 밖. 사용자가 외부 도구로 학습한 PLY 결과물을 직접 업로드함. 학습 파이프라인 코드는 기능만 남겨두고 미사용.
 
@@ -176,11 +176,11 @@ localX = cross(localY, localZ)     # right
 
 ### 영속화 + 정합 연결 흐름
 
-- 다듬기 단계는 메모리 + localStorage (`refine_state_v4_{uploadId}`) 만 사용 — 평면/벽면 각도/선택된 면 등이 다음 단계에서 평면 6개 복원에 쓰임. 서버 통신 없음.
-- **문 설정 완료** 버튼 (DoorAlignModal) 이 모든 서버 영속을 일괄 트리거:
+- 다듬기 단계는 메모리 + localStorage (`refine_state_v5_{uploadId}`) 만 사용 — 평면/벽면 각도/선택된 면/pendingRotation rotX/rotZ 등이 다음 단계에서 평면 6개 복원 + raw↔A' 변환에 쓰임. 서버 통신 없음.
+- **문 설정 완료** 버튼 (DoorAlignModal) 이 모든 서버 영속을 순차 트리거:
   1. `ensureUploadId` — 로컬 파일이면 모듈 정보 모달 → `register-local` API → 새 `upload_id` 반환. 서버 진입이면 기존 `upload_id` 그대로 재사용.
-  2. `commitRefinedToServer` — refined PLY + mesh.json + tex_*.png 6장 일괄 업로드 (`/refine/refined-upload-url` + PUT) → `/refine/save` 로 `Task` + `SceneOutput` 생성.
-  3. `persistDoorsToServer` — doors.json 업로드 (corners + 회전 메타 + boundary split 파라미터).
+  2. `commitRefinedToServer` — refined PLY + mesh.json + tex_*.png 6장 일괄 업로드 (`/refine/refined-upload-url` + PUT) → `/refine/save` 로 `Task` + `SceneOutput` 생성. 베이크된 회전값 + plyKey 반환.
+  3. `persistDoorsToServer` — 별도 호출. doors.json 업로드 (corners + 회전 메타 + boundary split 파라미터).
   4. `lockedStages` 에 `'door'` 추가 + `setMode('align', { force: true })`.
 - 같은 모달의 재방문 (정합 → 사이드바 클릭은 lock 으로 막힘이지만 다른 경로로 복귀 시) 마다 `문 설정 완료` 누르면 1~3 재실행 (덮어쓰기) 가능.
 - `/viewer?upload_id=X` 베이스 뷰어 — `useRefinedMeshLoader` 가 가장 최근 SceneOutput 의 PLY + mesh + tex 자동 로드.
@@ -193,12 +193,13 @@ localX = cross(localY, localZ)     # right
 1. **가우시안 경계 clipping** — `lib/gs/clipping.ts` 1차 구현 완료 (단순 shrink: scale 을 `f = |sd| / 3σ_extent` 로 곱, 6평면 중 가장 제약 큰 f 적용).
    - **남은 작업**: 효과 검증 + 사용자 슬라이더 노출 정리. 시점 회전 시 결 artifact 가 충분히 완화되는지 실측.
 2. **문 경계 SAGS-style decomposition** — https://github.com/XuHu0529/SAGS 참고.
-   - 분할 구현 완료: `lib/gs/doorTrim.ts` 의 `decomposeBoundaryGaussians` + `lib/gs/doorDecompose.ts` (SAGS 방식 별도) — boundary 위치 기준 비대칭 분할 (door-side / wall-side sub).
-   - **남은 작업**: 도어 회전 애니메이션 (`useDoorAnimation`) 과 wire-up. 도어 그룹 = (도어 영역 안 원본 + door-side sub 들 in additional splat) 가 함께 변환되도록 연결. 회전 시 sub-gaussian 들이 자기 영역 안에서만 움직여 boundary tail artifact 제거.
+   - 분할 구현 완료: `lib/gs/doorTrim.ts` 의 `decomposeBoundaryGaussians` — boundary 위치 기준 비대칭 분할 (door-side / wall-side sub).
+   - 도어 회전 wire-up 완료: `DoorAlignModal::applyDoorRotation` 가 도어 entity (doorOrigScene + door-side subs in additional splat) 와 도어 mesh 를 같은 변환으로 회전. boundary tail artifact 제거 동작.
+   - **남은 작업**: 추후 basemap 도어와 묶어 단일 도어 객체로 머지하는 단계 (정합 후 통합).
 3. **창문 segmentation + 투명 텍스처** — 텍스처 베이크 시:
    - 창문 영역 자동 segmentation (SAM3 등 활용 검토).
    - 해당 영역 텍스처 알파를 0 으로 → 창문 너머 보이게 (또는 별도 처리).
-4. **SAM3 자동 문 지정 wire-up** — `Sam3PromptModal` UI 만 존재. 자동 문 지정 클릭 시 백엔드 SAM3 호출 + 4코너 자동 채움까지 연결 미구현.
+4. **SAM3 자동 문 지정 결과 반영** — 백엔드 dispatch 는 구현됨 (`UnifiedSplatEditor.tsx` 의 `Sam3PromptModal::onStartAuto` 가 `commitRefinedToServer` → `/uploads/{id}/sam3/start` 호출). **남은 작업**: SAM3 처리 결과 (4코너 좌표) 가 서버에서 도착하면 DoorAlignModal 의 picked 에 자동 채우기.
 
 ## Commands
 

@@ -88,7 +88,7 @@ export interface Upload {
   status: 'uploaded' | 'processing' | 'completed' | 'failed';
   ply_target: string | null;
   uploaded_at: string;
-  // SAM3 / 정합 파이프라인 (docs/sam3_alignment_pipeline.md)
+  // SAM3 자동 문 추출 + 정합 파이프라인 파생 플래그.
   sam3_status?: Sam3Status | null;
   sam3_prompt?: string | null;
   has_refined?: boolean;
