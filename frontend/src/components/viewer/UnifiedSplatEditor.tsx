@@ -531,8 +531,26 @@ export default function UnifiedSplatEditor({
                 setSam3Prompt(prompt);
                 setSam3PromptOpen(false);
                 setAutoExtracting(true);
-                // TODO: 실제 SAM3 자동 추출 로직 연결. 지금은 placeholder.
-                console.log('[Sam3] auto extract requested with prompt:', prompt);
+                // 백그라운드: refined PLY 업로드 → SAM3 dispatch.
+                // 로컬 파일(아직 register-local 안 한 경우) 이면 자동 추출 시작이 불가능하므로
+                // 그 경우 dispatch는 건너뛰고 사용자는 수동 지정으로 진행 (autoExtracting 은 UI 라벨만).
+                (async () => {
+                  if (!uploadId) {
+                    console.warn('[Sam3] uploadId 미확보 — 자동 추출 dispatch 스킵 (로컬 파일은 문 설정 완료 시 register-local).');
+                    return;
+                  }
+                  try {
+                    const { plyKey } = await refine.commitRefinedToServer(uploadId);
+                    await api.post(`/uploads/${uploadId}/sam3/start`, {
+                      refined_ply_key: plyKey,
+                      prompt,
+                    });
+                  } catch (e) {
+                    console.warn('[Sam3] dispatch 실패 — 사용자가 수동 지정으로 진행 가능', e);
+                    // dispatch 실패 시에도 autoExtracting 은 그대로 둠: DoorAlignModal 의 setup view 가
+                    // sam3_status 를 폴링해 failed 로 떨어지면 수동 모드로 자동 복귀하도록 처리.
+                  }
+                })();
               }}
               onSkipToManual={() => {
                 setSam3PromptOpen(false);
