@@ -55,9 +55,9 @@ const CORNERS = [
 // [TL, TR, BL, BR] = [0, 1, 3, 2]
 const DISPLAY_ORDER = [0, 1, 3, 2] as const;
 
-// SPEC (docs/sam3_alignment_pipeline.md): doors.json 은 서버 (`uploads/{id}/refined/doors.json`)
-// 에 저장된다. 통째 덮어쓰기 — 이력 보존 안 함. 본 모달은 단일 문(door_1)만 다루지만
-// SAM3 결과로 여러 문이 들어와있을 수 있으므로 door_1 (또는 첫 번째 항목) 만 추출해서 편집.
+// doors.json 은 서버 (`uploads/{id}/refined/doors.json`) 에 저장된다. 통째 덮어쓰기 —
+// 이력 보존 안 함. 본 모달은 단일 문(door_1)만 다루지만 SAM3 결과로 여러 문이 들어와있을 수
+// 있으므로 door_1 (또는 첫 번째 항목) 만 추출해서 편집.
 
 const PRIMARY_DOOR_ID = 'door_1';
 
@@ -263,14 +263,16 @@ function parseBasemapCorners(text: string): Vec3[] | null {
 }
 
 /**
- * 문 4꼭짓점 추출 모달 (정합 단계).
+ * 문 설정 + 정합 단일 모달.
  *
  * - 다듬기에서 저장된 벽/천장/바닥 6개 평면을 불러옴
  * - 사용자가 순서대로(시계방향: 왼위→오위→오아→왼아) 4번 클릭
  * - 각 클릭의 ray와 가장 가까운 평면의 교점을 raw 프레임에서 계산
  * - 각 코너마다 해당 색의 점 + 라벨을 화면에 표시
  *
- * Apply/target은 추후 구현 — 지금은 추출만.
+ * `view` prop:
+ *   - 'setup' (기본) — 문 설정 단계: 4꼭짓점 + 두께 + 추출 + 회전 + 문 설정 완료.
+ *   - 'align' — 정합 단계: basemap 4꼭짓점 픽 + Kabsch + applyAndSave 로 aligned.ply 업로드.
  */
 export default function DoorAlignModal({
   coreRef, uploadId, currentUrl, onDone, onClose, view = 'setup', autoExtracting = false, onManualPickStart, onSetupSaveDone, ensureUploadId, onCommitRefined, getCurrentKeepMask,

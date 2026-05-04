@@ -1,7 +1,6 @@
 'use client';
 
 import { useRef, useState, useCallback, useEffect, RefObject, lazy, Suspense } from 'react';
-import { useRouter } from 'next/navigation';
 import { SplatData, SplatViewerCoreRef } from '../SplatViewerCore';
 import { useDepthNormal } from './useDepthNormal';
 import { surfacePlanesFromRoom, signedDistance } from '@/lib/gs/planes';
@@ -241,9 +240,8 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   const [saved, setSaved] = useState(false);
   // 다듬기 완료 → 문 설정 (SAM3 프롬프트 팝업) → 문 설정 완료에서 일괄 영속.
   // 진행 중 전체 화면 오버레이 (업로드 단계 가시화).
-  const [samProgressOpen, setSamProgressOpen] = useState(false);
-  const [samProgressMessage, setSamProgressMessage] = useState('');
-  const router = useRouter();
+  const [uploadProgressOpen, setUploadProgressOpen] = useState(false);
+  const [uploadProgressMessage, setUploadProgressMessage] = useState('');
   // 단일 안전거리 — 모든 경계면(천장/바닥/4벽)이 공유
   // 외부 splat 제거 임계값 (m). 0 이면 평면(sd=0) 보다 바깥(sd>0)인 모든 splat 을 제거.
   // 사용자가 추가 안전거리 (e.g., 평면이 약간 부정확할 때 일부 보호) 원하면 양수 값으로 미세 조정.
@@ -708,7 +706,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   // ON: 평면별 g_i² = 1 - a_in² (1 - f²), f = |sd|/ext. axis 별 min(g²) 적용.
   //     GPU sc0/1/2 prop in-place 변경 + transformB 재업로드. 원본 log-scale snapshot 보관.
   // OFF: snapshot 으로 복원.
-  // 저장 시 (saveRefined 안): clippingActive 면 cached scene 의 scale 에도 적용.
+  // 저장 시 (`commitRefinedToServer` 안): clippingActive 면 cached scene 의 scale 에도 적용.
   const applyClipping = useCallback(async () => {
     const data = splatDataRef.current;
     const core = coreRef.current;
@@ -1566,8 +1564,8 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     rotX: number; rotZ: number; wallAngleRad: number; plyKey: string;
   }> => {
     setSaving(true);
-    setSamProgressOpen(true);
-    setSamProgressMessage('정제된 PLY 준비 중...');
+    setUploadProgressOpen(true);
+    setUploadProgressMessage('정제된 PLY 준비 중...');
     try {
       const { serializePly, filterScene } = await import('@/lib/ply');
       const { api } = await import('@/lib/api');
@@ -1640,7 +1638,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       })();
 
       // 3.1) PLY 업로드
-      setSamProgressMessage('파일 업로드 중...');
+      setUploadProgressMessage('파일 업로드 중...');
       const plyUrl = await api.post<{ put_url: string; key: string }>(
         '/refine/refined-upload-url',
         { upload_id: activeUploadId, filename: baseName, session_id: sessionId },
@@ -1750,7 +1748,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       throw e;
     } finally {
       setSaving(false);
-      setSamProgressOpen(false);
+      setUploadProgressOpen(false);
     }
   }, [options, ensureOriginalScene, coreRef, buildRotatedScene]);
 
@@ -3273,11 +3271,11 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       })()}
 
       {/* SPEC: 로딩 화면 — "파일 업로드 중..." → "SAM3 작동 중..." */}
-      {samProgressOpen && (
+      {uploadProgressOpen && (
         <div className="absolute inset-0 z-[101] bg-black/70 flex items-center justify-center">
           <div className="bg-gray-900 border border-gray-700 rounded-lg p-8 min-w-[360px] shadow-2xl flex flex-col items-center">
             <div className="w-10 h-10 border-2 border-blue-500 border-t-transparent rounded-full animate-spin mb-4" />
-            <div className="text-white font-bold text-sm mb-1">{samProgressMessage || '진행 중...'}</div>
+            <div className="text-white font-bold text-sm mb-1">{uploadProgressMessage || '진행 중...'}</div>
             <div className="text-gray-400 text-[11px] mt-3 text-center">
               브라우저를 닫아도 백그라운드에서 계속 진행됩니다.<br />
               완료 후 대시보드의 [정합하기] 버튼으로 다시 들어올 수 있습니다.
