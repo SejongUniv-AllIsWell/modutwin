@@ -896,9 +896,9 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       // 그 외엔 fall through 해서 새로 베이크
     }
     if (selectedSurfaces.size === 0) { alert('테스트할 면을 하나 이상 선택하세요.'); return; }
-    const hasWall = Array.from(selectedSurfaces).some(s => WALL_SURFACES.includes(s));
     const hasCF = Array.from(selectedSurfaces).some(s => CF_SURFACES.includes(s));
-    if (hasWall && (wallAngleRef.current === null || !wallDistancesRef.current)) { alert('벽 정보가 확정되지 않았습니다.'); return; }
+    // 벽 거리는 천장/바닥 막의 가로/세로 범위 산정에도 쓰이므로 어떤 면이든 벽면 설정이 확정돼야 함.
+    if (wallAngleRef.current === null || !wallDistancesRef.current) { alert('벽면 (X/Z) 설정이 먼저 확정돼야 합니다.'); return; }
     if (hasCF && cfModeRef.current !== 'confirmed') { alert('천장/바닥 정보가 확정되지 않았습니다.'); return; }
 
     setWallMeshBaking(true);
@@ -1261,11 +1261,14 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     if (!saved) { loadedUploadIdRef.current = uid; return; }
 
     restoringRef.current = true;
-    // 천장/바닥
+    // 천장/바닥 + pendingRotation
     if (saved.cfConfirmed) {
       setCeilingY(saved.ceilingY); setFloorY(saved.floorY);
       ceilingYRef.current = saved.ceilingY; floorYRef.current = saved.floorY;
       setCfMode('confirmed'); cfModeRef.current = 'confirmed';
+      const rot = { rotX: saved.rotX ?? 0, rotZ: saved.rotZ ?? 0 };
+      setPendingRotation(rot); pendingRotationRef.current = rot;
+      // entity 회전도 즉시 동기화 (다음 마운트 시 splatData 가 준비되면 자동 호출되지만 안전 차원).
     }
     // 벽면
     if (saved.wallConfirmed && saved.wallAngle !== null && saved.wallDistances) {
@@ -1293,6 +1296,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     saveRefineState(uid, {
       cfConfirmed: cfMode === 'confirmed',
       ceilingY, floorY,
+      rotX: pendingRotation.rotX, rotZ: pendingRotation.rotZ,
       wallConfirmed: wallMode === 'confirmed',
       wallAngle, wallDistances,
       selectedSurfaces: Array.from(selectedSurfaces),
@@ -1301,6 +1305,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   }, [
     options?.uploadId, undoDepth,
     cfMode, ceilingY, floorY,
+    pendingRotation.rotX, pendingRotation.rotZ,
     wallMode, wallAngle, wallDistances,
     selectedSurfaces, globalOffset, globalOffsetText,
   ]);
@@ -1552,7 +1557,10 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   }, [options]);
 
   // 문 설정 완료 시점에 호출됨 — refined PLY + mesh.json + tex_*.png 일괄 업로드 + SceneOutput 등록.
-  const commitRefinedToServer = useCallback(async (activeUploadId: string) => {
+  // 반환값: PLY 에 베이크된 회전값. 호출자가 doors corners 등 다른 좌표를 같은 프레임으로 정렬할 때 사용.
+  const commitRefinedToServer = useCallback(async (activeUploadId: string): Promise<{
+    rotX: number; rotZ: number; wallAngleRad: number;
+  }> => {
     setSaving(true);
     setSamProgressOpen(true);
     setSamProgressMessage('정제된 PLY 준비 중...');
@@ -1590,17 +1598,25 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         }
       }
 
-      // 2) 필터링 (원본 → 살릴 가우시안만)
-      // SPEC: 다듬기는 포인트 제거만 수행한다 — 회전/스케일/translate 금지.
-      // 정합 단계는 refined PLY 의 raw 좌표계 위에서 수행되므로 어떤 좌표 변환도 베이크하지 않는다.
-      // pendingRotation, wallAngle 은 화면(entity)에만 적용된 표시용 변환으로,
-      // doors 4꼭짓점/평면 정의 등 정합에 필요한 메타데이터는 raw 프레임 그대로 저장한다.
-      const baked = filterScene(original, keep);
-
+      // 2) 필터링 + 회전 베이크 (원본 → 회전 적용 + 살릴 가우시안만)
+      // SPEC 변경: 다듬기 단계의 정렬 회전 (pendingRotation rotX/rotZ + wallAngle Y) 을 PLY 에 베이크.
+      //   사용자가 천장/바닥/벽면 모달로 잡은 정렬 상태가 그대로 final.ply 에 들어감 →
+      //   재진입 시 splatEntity 에 default Z-180 만 적용해도 정렬된 상태로 보임.
+      //   mesh.json corners 도 같은 A'+Y 프레임 (planeBakeInputForSurface 가 wallAngle 반영) 이므로 일치.
       const wallAngleDeg = wallAngleRef.current ?? 0;
+      const wallAngleRad = (wallAngleDeg * Math.PI) / 180;
       const { rotX, rotZ } = pendingRotationRef.current;
 
-      console.log(`[Save] N=${N}, brush삭제=${brushDeleted}, flatten삭제=${flattenDeleted}, floater삭제=${floaterDeleted}, 살아남음=${baked.numSplats} (좌표 변환 없음 — raw frame 유지). 화면 회전 표시값 rotX=${rotX.toFixed(3)}, rotZ=${rotZ.toFixed(3)}, wallY=${wallAngleDeg.toFixed(2)}°.`);
+      const { rotateSceneY } = await import('@/lib/gs');
+      // original 은 reference 라 destructive rotateScene 호출 전에 cloned scene 사용.
+      let toRotate = original;
+      if (rotX !== 0 || rotZ !== 0 || wallAngleRad !== 0) {
+        toRotate = await buildRotatedScene(original);    // pendingRotation rotX/rotZ
+        if (wallAngleRad !== 0) rotateSceneY(toRotate, wallAngleRad);
+      }
+      const baked = filterScene(toRotate, keep);
+
+      console.log(`[Save] N=${N}, brush삭제=${brushDeleted}, flatten삭제=${flattenDeleted}, floater삭제=${floaterDeleted}, 살아남음=${baked.numSplats}. 베이크 회전 rotX=${rotX.toFixed(3)}, rotZ=${rotZ.toFixed(3)}, wallY=${wallAngleDeg.toFixed(2)}°.`);
       console.log(`[Save] flattenActive=${flattenActiveRef.current}, flattenMask 존재=${!!flattenMaskRef.current}`);
 
       const bytes = serializePly(baked);
@@ -1667,13 +1683,21 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
           if (!texResp.ok) throw new Error(`tex PUT failed (${surfaceId}): ${texResp.status}`);
 
           // 메시 메타: 코너(4×3) + UV(4×2) + 안쪽 normal(방 안쪽 향함, wallMesh 와 동일 규약).
-          // SPEC: refined PLY 가 raw 좌표계 그대로 저장되므로, mesh corners / normal 도 raw 프레임.
-          // (이전엔 가우시안과 동일한 회전+translate 를 메시에 베이크했으나 좌표가드 시행 후 불필요)
-          const inward: [number, number, number] = [
+          // SPEC: PLY 를 A'+Y 프레임 (pendingRotation + wallAngle Y) 으로 베이크하므로
+          //   mesh corners 도 같은 프레임으로 변환해 저장. bake corners 는 본래 A' 프레임 (pendingRotation 만 반영) 이라
+          //   wallAngle Y 회전만 추가 적용. normal 도 동일 변환.
+          const cy = Math.cos(wallAngleRad), sy = Math.sin(wallAngleRad);
+          const rotateY = (v: [number, number, number]): [number, number, number] => [
+            cy * v[0] + sy * v[2],
+            v[1],
+            -sy * v[0] + cy * v[2],
+          ];
+          const inwardRaw: [number, number, number] = [
             -bake.input.normal[0], -bake.input.normal[1], -bake.input.normal[2],
           ];
+          const inward = rotateY(inwardRaw);
           const cornersOut = bake.corners.map(
-            c => [c[0], c[1], c[2]] as [number, number, number],
+            c => rotateY([c[0], c[1], c[2]]),
           );
           meshSurfaces.push({
             surfaceId,
@@ -1715,10 +1739,8 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       console.log(`[Save] SceneOutput 생성됨 — scene_id=${saveResp.scene_id}, ply_path=${plyUrl.key}`);
 
       // commit 완료 — 호출자(문 설정 완료) 가 다음 단계 (정합) 진입을 처리함.
-      // SAM3 자동 문 검출은 비동기 백그라운드 모델로 변경됨: dispatch 는 Sam3PromptModal 의
-      // onStartAuto 핸들러(UnifiedSplatEditor) 에서 수행되고, 결과는 sam3_status 컬럼으로 추적된다.
-      // (이전 구조의 동기 폴링·1분 타임아웃·dashboard 강제 이동 로직은 새 파이프라인과 호환되지 않아 폐기)
-      return { plyKey: plyUrl.key, sessionId };
+      // 호출자가 doors corners 등을 같은 프레임으로 변환할 수 있도록 베이크된 회전값 반환.
+      return { rotX, rotZ, wallAngleRad };
     } catch (e: any) {
       alert(`서버 저장 실패: ${e.message || e}`);
       throw e;
@@ -1726,7 +1748,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       setSaving(false);
       setSamProgressOpen(false);
     }
-  }, [options, ensureOriginalScene, coreRef]);
+  }, [options, ensureOriginalScene, coreRef, buildRotatedScene]);
 
   // ── Brush/BBox: delete selected (repeatable) ──
   const deleteSelected = useCallback(() => {
@@ -2885,9 +2907,15 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
               <div className={`border-t border-gray-700 pt-2 mt-1 space-y-1.5 ${flattenActive ? '' : 'opacity-50 pointer-events-none'}`}>
                 {!wallMeshActive ? (
                   <button onClick={() => bakeWallMeshTest()}
-                    disabled={!flattenActive || wallMeshBaking || selectedSurfaces.size === 0}
-                    title={!flattenActive ? '먼저 외부 가우시안 제거를 적용하세요.' : ''}
-                    className="w-full px-2 py-1.5 rounded cursor-pointer text-xs font-bold disabled:bg-gray-600 disabled:text-gray-400 bg-emerald-600 hover:bg-emerald-500 text-white">
+                    disabled={!flattenActive || wallMeshBaking || selectedSurfaces.size === 0 || wallMode !== 'confirmed' || cfMode !== 'confirmed'}
+                    title={
+                      !flattenActive ? '먼저 외부 가우시안 제거를 적용하세요.'
+                      : cfMode !== 'confirmed' ? '천장/바닥 설정을 먼저 확정하세요.'
+                      : wallMode !== 'confirmed' ? '벽면 (X/Z) 설정을 먼저 확정하세요.'
+                      : selectedSurfaces.size === 0 ? '면을 하나 이상 선택하세요.'
+                      : ''
+                    }
+                    className="w-full px-2 py-1.5 rounded text-xs font-bold disabled:bg-gray-600 disabled:text-gray-400 disabled:cursor-not-allowed bg-emerald-600 hover:bg-emerald-500 text-white cursor-pointer">
                     {wallMeshBaking ? '생성 중...' : '막 생성하기'}
                   </button>
                 ) : (
@@ -3256,5 +3284,33 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     </>
   ) : null;
 
-  return { overlay, panel, modals, onSplatLoaded, planes, saveRefined, commitRefinedToServer };
+  // 현재 keep mask 반환 — flatten/floater/brush 삭제 모두 반영. 문 설정 단계에서 cachedScene 에 적용해
+  // refined 상태와 동기화된 가우시안 집합으로 도어 추출 작업 수행하도록 사용.
+  const getCurrentKeepMask = useCallback((): Uint8Array | null => {
+    const data = splatDataRef.current;
+    const core = coreRef.current;
+    if (!data || !core) return null;
+    const N = data.numSplats;
+    const keep = new Uint8Array(N).fill(1);
+    if (data.origColorData) {
+      const h2f = core.half2Float;
+      for (let i = 0; i < N; i++) {
+        const a = h2f(data.origColorData[i * 4 + 3]);
+        if (a < 1e-3) keep[i] = 0;
+      }
+    }
+    if (flattenMaskRef.current) {
+      for (let i = 0; i < N; i++) {
+        if (flattenMaskRef.current[i] && keep[i]) keep[i] = 0;
+      }
+    }
+    if (floaterActiveRef.current && floaterMaskRef.current) {
+      for (let i = 0; i < N; i++) {
+        if (floaterMaskRef.current[i] && keep[i]) keep[i] = 0;
+      }
+    }
+    return keep;
+  }, [coreRef]);
+
+  return { overlay, panel, modals, onSplatLoaded, planes, saveRefined, commitRefinedToServer, getCurrentKeepMask };
 }

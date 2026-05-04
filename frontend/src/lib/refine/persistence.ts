@@ -3,8 +3,8 @@
 // 따라서 여기에는 PLY 참조 없이 사용자가 확정한 파라미터만 보관한다.
 // upload_id별로 독립된 엔트리.
 
-const KEY_PREFIX = 'refine_state_v4_';
-const STATE_VERSION = 4;
+const KEY_PREFIX = 'refine_state_v5_';
+const STATE_VERSION = 5;
 
 export type Surface = 'ceiling' | 'floor' | 'w1a' | 'w1b' | 'w2a' | 'w2b';
 
@@ -14,6 +14,9 @@ export interface PersistedRefineState {
   cfConfirmed: boolean;
   ceilingY: number;
   floorY: number;
+  // pendingRotation (radians) — 천장/바닥 모달에서 잡은 X/Z 축 정렬. surfacePlanesFromRoom 의 평면이 정의되는 A' 프레임을 표현.
+  rotX: number;
+  rotZ: number;
 
   wallConfirmed: boolean;
   wallAngle: number | null;

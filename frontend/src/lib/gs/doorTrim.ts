@@ -513,7 +513,15 @@ export function extractDoorRegionTexture(
   wallCorners: [Vec3, Vec3, Vec3, Vec3],
   wallUvs: [[number, number], [number, number], [number, number], [number, number]],
   doorCorners: [Vec3, Vec3, Vec3, Vec3],
-): { rgba: Uint8ClampedArray; width: number; height: number } {
+): {
+  rgba: Uint8ClampedArray;
+  width: number;
+  height: number;
+  /** 도어 4 코너의 cut texture 픽셀 좌표 ([0..width-1] × [0..height-1]).
+   *  caller 가 정확한 mesh UV 를 산출하는 데 사용 (axis-aligned bbox crop 이라 도어 corner 가 bbox corner 와
+   *  꼭 일치하지 않을 수 있음 — 사다리꼴 등 비축정렬 케이스). */
+  doorCornerPx: [[number, number], [number, number], [number, number], [number, number]];
+} {
   const TLw = wallCorners[0], TRw = wallCorners[1], BLw = wallCorners[3];
   const eU = vsub(TRw, TLw);
   const eV = vsub(BLw, TLw);
@@ -563,5 +571,12 @@ export function extractDoorRegionTexture(
       rgba[dstIdx + 3] = wallRgba[srcIdx + 3];
     }
   }
-  return { rgba, width: cutW, height: cutH };
+  // 도어 4 코너의 cut texture 픽셀 좌표 — wall texture 픽셀 - bbox 좌상단.
+  const doorCornerPx: [[number, number], [number, number], [number, number], [number, number]] = [
+    [doorPx[0][0] - xLo, doorPx[0][1] - yLo],
+    [doorPx[1][0] - xLo, doorPx[1][1] - yLo],
+    [doorPx[2][0] - xLo, doorPx[2][1] - yLo],
+    [doorPx[3][0] - xLo, doorPx[3][1] - yLo],
+  ];
+  return { rgba, width: cutW, height: cutH, doorCornerPx };
 }
