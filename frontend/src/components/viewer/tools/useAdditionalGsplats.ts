@@ -32,10 +32,23 @@ export interface DetachedLayer {
   meta?: Record<string, any>;
 }
 
+export interface AddResult {
+  id: string;
+  /**
+   * Asset (gsplat) 가 fully loaded — entity 가 씬에 부착되고 splatColor 등 GPU 텍스처가
+   * lock 가능해진 시점에 resolve. 로드 실패 시 reject. 호출자가 entity 의 colorTexture 를
+   * 즉시 조작해야 할 때 사용 (폴링 대체).
+   */
+  ready: Promise<void>;
+}
+
 export interface AdditionalGsplatsApi {
   items: AdditionalGsplat[];
-  /** PlayCanvas 준비 완료 전이면 빈 문자열 반환. 성공 시 새 id 반환 */
-  add: (url: string, opts?: AddOptions) => string;
+  /**
+   * 새 splat group 추가. id 즉시 반환 + asset.ready 까지 awaitable Promise.
+   * 기존 동기 사용처는 `.id` 만 접근하면 호환.
+   */
+  add: (url: string, opts?: AddOptions) => AddResult;
   remove: (id: string) => void;
   /** 추가된 gsplat의 local transform을 한 번에 갱신 (raw frame, Z180 baked-in 기준) */
   setTransform: (id: string, position: [number, number, number], quatXYZW: [number, number, number, number]) => void;
@@ -73,6 +86,8 @@ export function useAdditionalGsplats(
 
   const cancelMapRef = useRef<Map<string, () => void>>(new Map());
   const urlMapRef = useRef<Map<string, string>>(new Map());
+  // id → ready Promise resolver/rejector (asset.ready / asset.error 시 호출).
+  const readyMapRef = useRef<Map<string, { resolve: () => void; reject: (e: Error) => void }>>(new Map());
 
   const revokeIfBlob = (url: string) => {
     if (url.startsWith('blob:')) {
@@ -101,10 +116,16 @@ export function useAdditionalGsplats(
 
       asset.on('error', (_msg: string, err: Error) => {
         setItems(prev => prev.map(it => it.id === id ? { ...it, error: err?.message ?? '로드 실패' } : it));
+        const r = readyMapRef.current.get(id);
+        if (r) { r.reject(err ?? new Error('asset load error')); readyMapRef.current.delete(id); }
       });
 
       asset.ready(() => {
-        if (cancelled) return;
+        if (cancelled) {
+          const r = readyMapRef.current.get(id);
+          if (r) { r.reject(new Error('cancelled')); readyMapRef.current.delete(id); }
+          return;
+        }
         const ext = url.split('?')[0].split('.').pop()?.toLowerCase();
         const ent = new pc.Entity(`add_splat_${id}`);
         if (ext !== 'spz') {
@@ -116,6 +137,8 @@ export function useAdditionalGsplats(
         app.root.addChild(ent);
         entityMapRef.current.set(id, ent);
         setItems(prev => prev.map(it => it.id === id ? { ...it, loaded: true, error: null } : it));
+        const r = readyMapRef.current.get(id);
+        if (r) { r.resolve(); readyMapRef.current.delete(id); }
       });
 
       app.assets.load(asset);
@@ -134,10 +157,13 @@ export function useAdditionalGsplats(
     assetMapRef.current.delete(id);
     const url = urlMapRef.current.get(id);
     if (url) { revokeIfBlob(url); urlMapRef.current.delete(id); }
+    // 미해결 ready Promise 가 있으면 reject (await 가 hang 되지 않도록).
+    const r = readyMapRef.current.get(id);
+    if (r) { r.reject(new Error('removed before ready')); readyMapRef.current.delete(id); }
     setItems(prev => prev.filter(it => it.id !== id));
   }, [coreRef]);
 
-  const add = useCallback((url: string, opts?: AddOptions): string => {
+  const add = useCallback((url: string, opts?: AddOptions): AddResult => {
     const id = (typeof crypto !== 'undefined' && (crypto as any).randomUUID)
       ? (crypto as any).randomUUID()
       : `gsplat_${Date.now()}_${Math.random().toString(36).slice(2)}`;
@@ -149,6 +175,11 @@ export function useAdditionalGsplats(
     const source = opts?.source ?? 'local';
     const visible = opts?.visible ?? true;
 
+    // ready Promise 등록 — asset.ready 또는 error 시 resolve/reject.
+    const ready = new Promise<void>((resolve, reject) => {
+      readyMapRef.current.set(id, { resolve, reject });
+    });
+
     setItems(prev => [
       ...prev,
       { id, url, name, source, visible, loaded: false, error: null, meta: opts?.meta },
@@ -157,7 +188,7 @@ export function useAdditionalGsplats(
 
     loadEntity(id, url, source, visible);
 
-    return id;
+    return { id, ready };
   }, [loadEntity]);
 
   const setVisible = useCallback((id: string, visible: boolean) => {

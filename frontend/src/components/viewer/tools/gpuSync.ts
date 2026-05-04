@@ -64,6 +64,38 @@ export function syncGPU(
 }
 
 /**
+ * 가우시안 scale (log-scale) 만 변경한 후 GPU 동기화. 위치/쿼터니언은 손대지 않음.
+ *
+ * 호출 전에 gsplatData.scale_0/1/2 가 새 log-scale 로 업데이트되어 있어야 한다.
+ * (transformBTexture 의 scale 슬롯은 exp(log-scale) 의 half-float — 이 함수가 GPU 에 동기화.)
+ */
+export function syncScalesGPU(
+  indices: number[],
+  splatData: SplatData,
+  float2HalfFn: (v: number) => number,
+) {
+  const transformB = splatData.transformBTexture;
+  const dataB = transformB?.lock();
+  const gsplatData = splatData.gsplatData;
+  const sc0 = gsplatData?.getProp('scale_0');
+  const sc1 = gsplatData?.getProp('scale_1');
+  const sc2 = gsplatData?.getProp('scale_2');
+  if (!sc0 || !sc1 || !sc2) {
+    if (transformB) transformB.unlock();
+    return;
+  }
+  if (dataB) {
+    for (const idx of indices) {
+      // transformB: [scaleX(half), scaleY(half), scaleZ(half), rotZ(half)]
+      dataB[idx * 4 + 0] = float2HalfFn(Math.exp(sc0[idx]));
+      dataB[idx * 4 + 1] = float2HalfFn(Math.exp(sc1[idx]));
+      dataB[idx * 4 + 2] = float2HalfFn(Math.exp(sc2[idx]));
+    }
+  }
+  if (transformB) transformB.unlock();
+}
+
+/**
  * gsplatData에서 인덱스 배열에 해당하는 위치+쿼터니언 원본을 저장한다.
  * positions: [x0,y0,z0, x1,y1,z1, ...]
  * quaternions: [w0,x0,y0,z0, w1,x1,y1,z1, ...]

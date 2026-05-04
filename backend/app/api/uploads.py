@@ -241,8 +241,11 @@ async def complete_upload(
     )
 
 
-def _upload_to_response(upload: Upload) -> UploadResponse:
-    """Upload ORM → UploadResponse (SAM3 파이프라인 파생 플래그 포함)."""
+def _upload_to_response(upload: Upload, has_scene_output: bool = False) -> UploadResponse:
+    """Upload ORM → UploadResponse (SAM3 파이프라인 파생 플래그 포함).
+
+    has_refined: SAM3 정식 경로 (refined_ply_path) 또는 다듬기 저장으로 생성된 SceneOutput 중 하나라도 있으면 true.
+    """
     return UploadResponse(
         id=upload.id,
         module_id=upload.module_id,
@@ -253,7 +256,7 @@ def _upload_to_response(upload: Upload) -> UploadResponse:
         uploaded_at=upload.uploaded_at,
         sam3_status=upload.sam3_status.value if upload.sam3_status else None,
         sam3_prompt=upload.sam3_prompt,
-        has_refined=bool(upload.refined_ply_path),
+        has_refined=bool(upload.refined_ply_path) or has_scene_output,
         has_doors_json=bool(upload.door_corners_json_path),
         has_alignment=bool(upload.alignment_transform),
     )
@@ -270,7 +273,19 @@ async def list_uploads(
         .where(Upload.user_id == user.id)
         .order_by(Upload.uploaded_at.desc())
     )
-    return [_upload_to_response(u) for u in result.scalars().all()]
+    uploads = result.scalars().all()
+    if not uploads:
+        return []
+    # 다듬기 저장 (SceneOutput 생성) 여부를 한 번에 조회 — has_refined 보강용.
+    upload_ids = [u.id for u in uploads]
+    scene_rows = await db.execute(
+        select(Task.upload_id)
+        .join(SceneOutput, SceneOutput.task_id == Task.id)
+        .where(Task.upload_id.in_(upload_ids), SceneOutput.user_id == user.id)
+        .distinct()
+    )
+    has_scene = {row[0] for row in scene_rows.all()}
+    return [_upload_to_response(u, has_scene_output=(u.id in has_scene)) for u in uploads]
 
 
 @router.get("/{upload_id}", response_model=UploadResponse)
@@ -291,7 +306,14 @@ async def get_upload(
             detail="업로드를 찾을 수 없습니다.",
         )
 
-    return _upload_to_response(upload)
+    scene_check = await db.execute(
+        select(SceneOutput.id)
+        .join(Task, SceneOutput.task_id == Task.id)
+        .where(Task.upload_id == upload_id, SceneOutput.user_id == user.id)
+        .limit(1)
+    )
+    has_scene = scene_check.scalar_one_or_none() is not None
+    return _upload_to_response(upload, has_scene_output=has_scene)
 
 
 VIEWABLE_EXTENSIONS = {".ply", ".splat", ".sog"}
@@ -322,14 +344,12 @@ async def get_upload_presigned_url(
 
     minio = get_minio_service()
 
-    # refined 버전 요청 시:
+    # 정제된 PLY 후보 — variant=refined 우선시 + variant=None 일 때 원본 부재 시 fallback 으로도 사용.
     #   1순위: upload.refined_ply_path (SAM3 파이프라인 정식 경로)
     #   2순위: 가장 최근 SceneOutput.ply_path (레거시 호환)
-    if variant == "refined":
+    async def _find_refined_url() -> str | None:
         if upload.refined_ply_path and minio.object_exists(upload.refined_ply_path):
-            url = minio.get_presigned_download_url(upload.refined_ply_path)
-            return {"url": url, "filename": upload.original_filename, "variant": "refined"}
-
+            return minio.get_presigned_download_url(upload.refined_ply_path)
         scene_result = await db.execute(
             select(SceneOutput)
             .join(Task, SceneOutput.task_id == Task.id)
@@ -339,11 +359,28 @@ async def get_upload_presigned_url(
         )
         scene = scene_result.scalar_one_or_none()
         if scene and minio.object_exists(scene.ply_path):
-            url = minio.get_presigned_download_url(scene.ply_path)
-            return {"url": url, "filename": upload.original_filename, "variant": "refined"}
+            return minio.get_presigned_download_url(scene.ply_path)
+        return None
 
-    url = minio.get_presigned_download_url(upload.minio_path)
-    return {"url": url, "filename": upload.original_filename, "variant": "original"}
+    if variant == "refined":
+        refined_url = await _find_refined_url()
+        if refined_url is not None:
+            return {"url": refined_url, "filename": upload.original_filename, "variant": "refined"}
+
+    # variant=None 또는 fallback. 원본이 MinIO 에 실제 존재할 때만 original 을 서빙;
+    # 그렇지 않으면 (예: register-local 로 placeholder 만 잡힌 케이스) refined 로 자동 fallback.
+    if minio.object_exists(upload.minio_path):
+        url = minio.get_presigned_download_url(upload.minio_path)
+        return {"url": url, "filename": upload.original_filename, "variant": "original"}
+
+    refined_url = await _find_refined_url()
+    if refined_url is not None:
+        return {"url": refined_url, "filename": upload.original_filename, "variant": "refined"}
+
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail="이 업로드에 사용할 수 있는 PLY 파일이 없습니다 (원본 미업로드, 정제 결과 없음).",
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
