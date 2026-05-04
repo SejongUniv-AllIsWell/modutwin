@@ -3,6 +3,8 @@ const API_BASE = process.env.NEXT_PUBLIC_API_URL || '/api';
 class ApiClient {
   private accessToken: string | null = null;
   private refreshToken: string | null = null;
+  // 동시 요청들이 같은 refresh를 공유하도록 in-flight Promise를 보관 (single-flight)
+  private refreshInFlight: Promise<boolean> | null = null;
 
   constructor() {
     if (typeof window !== 'undefined') {
@@ -29,6 +31,10 @@ class ApiClient {
     return this.accessToken;
   }
 
+  isAuthenticated() {
+    return !!this.accessToken;
+  }
+
   async exchangeAuthCode(code: string): Promise<boolean> {
     try {
       const res = await fetch(`${API_BASE}/auth/exchange`, {
@@ -45,25 +51,44 @@ class ApiClient {
     }
   }
 
+  /** WebSocket 핸드셰이크용 1회용 ticket 발급. */
+  async getWsTicket(): Promise<string | null> {
+    try {
+      const data = await this.fetch<{ ticket: string; expires_in: number }>(
+        '/auth/ws-ticket',
+        { method: 'POST' },
+      );
+      return data?.ticket ?? null;
+    } catch {
+      return null;
+    }
+  }
+
   private async refreshAccessToken(): Promise<boolean> {
     if (!this.refreshToken) return false;
-    try {
-      const res = await fetch(`${API_BASE}/auth/refresh`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ refresh_token: this.refreshToken }),
-      });
-      if (!res.ok) return false;
-      const data = await res.json();
-      this.accessToken = data.access_token;
-      localStorage.setItem('access_token', data.access_token);
-      // WS도 새 토큰으로 재연결
-      const { wsClient } = await import('@/lib/ws');
-      wsClient.connect(data.access_token);
-      return true;
-    } catch {
-      return false;
-    }
+    // 이미 진행 중인 refresh가 있으면 그 결과를 공유한다 (single-flight).
+    if (this.refreshInFlight) return this.refreshInFlight;
+
+    this.refreshInFlight = (async () => {
+      try {
+        const res = await fetch(`${API_BASE}/auth/refresh`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ refresh_token: this.refreshToken }),
+        });
+        if (!res.ok) return false;
+        const data = await res.json();
+        this.accessToken = data.access_token;
+        localStorage.setItem('access_token', data.access_token);
+        return true;
+      } catch {
+        return false;
+      } finally {
+        this.refreshInFlight = null;
+      }
+    })();
+
+    return this.refreshInFlight;
   }
 
   async fetch<T = any>(path: string, options: RequestInit = {}): Promise<T> {

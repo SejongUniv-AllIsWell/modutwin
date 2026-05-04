@@ -29,7 +29,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       api.get<User>('/auth/me')
         .then((u) => {
           setUser(u);
-          wsClient.connect(token);
+          wsClient.connect();
         })
         .catch(() => {
           api.clearTokens();
