@@ -1557,9 +1557,13 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   }, [options]);
 
   // 문 설정 완료 시점에 호출됨 — refined PLY + mesh.json + tex_*.png 일괄 업로드 + SceneOutput 등록.
-  // 반환값: PLY 에 베이크된 회전값. 호출자가 doors corners 등 다른 좌표를 같은 프레임으로 정렬할 때 사용.
+  // 반환값:
+  //   rotX/rotZ/wallAngleRad — PLY 에 베이크된 회전값. 호출자가 doors corners 등 다른 좌표를
+  //     같은 프레임으로 정렬할 때 사용.
+  //   plyKey — refined PLY 의 MinIO object key. SAM3 dispatch 호출 (`/uploads/{id}/sam3/start`) 의
+  //     refined_ply_key 인자로 전달됨.
   const commitRefinedToServer = useCallback(async (activeUploadId: string): Promise<{
-    rotX: number; rotZ: number; wallAngleRad: number;
+    rotX: number; rotZ: number; wallAngleRad: number; plyKey: string;
   }> => {
     setSaving(true);
     setSamProgressOpen(true);
@@ -1739,8 +1743,8 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       console.log(`[Save] SceneOutput 생성됨 — scene_id=${saveResp.scene_id}, ply_path=${plyUrl.key}`);
 
       // commit 완료 — 호출자(문 설정 완료) 가 다음 단계 (정합) 진입을 처리함.
-      // 호출자가 doors corners 등을 같은 프레임으로 변환할 수 있도록 베이크된 회전값 반환.
-      return { rotX, rotZ, wallAngleRad };
+      // 호출자가 doors corners 등을 같은 프레임으로 변환할 수 있도록 베이크된 회전값 + plyKey 반환.
+      return { rotX, rotZ, wallAngleRad, plyKey: plyUrl.key };
     } catch (e: any) {
       alert(`서버 저장 실패: ${e.message || e}`);
       throw e;

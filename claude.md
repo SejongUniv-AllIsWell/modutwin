@@ -193,8 +193,9 @@ localX = cross(localY, localZ)     # right
 1. **가우시안 경계 clipping** — `lib/gs/clipping.ts` 1차 구현 완료 (단순 shrink: scale 을 `f = |sd| / 3σ_extent` 로 곱, 6평면 중 가장 제약 큰 f 적용).
    - **남은 작업**: 효과 검증 + 사용자 슬라이더 노출 정리. 시점 회전 시 결 artifact 가 충분히 완화되는지 실측.
 2. **문 경계 SAGS-style decomposition** — https://github.com/XuHu0529/SAGS 참고.
-   - 분할 구현 완료: `lib/gs/doorTrim.ts` 의 `decomposeBoundaryGaussians` + `lib/gs/doorDecompose.ts` (SAGS 방식 별도) — boundary 위치 기준 비대칭 분할 (door-side / wall-side sub).
-   - **남은 작업**: 도어 회전 애니메이션 (`useDoorAnimation`) 과 wire-up. 도어 그룹 = (도어 영역 안 원본 + door-side sub 들 in additional splat) 가 함께 변환되도록 연결. 회전 시 sub-gaussian 들이 자기 영역 안에서만 움직여 boundary tail artifact 제거.
+   - 분할 구현 완료: `lib/gs/doorTrim.ts` 의 `decomposeBoundaryGaussians` — boundary 위치 기준 비대칭 분할 (door-side / wall-side sub).
+   - 도어 회전 wire-up 완료: `DoorAlignModal::applyDoorRotation` 가 도어 entity (doorOrigScene + door-side subs in additional splat) 와 도어 mesh 를 같은 변환으로 회전. boundary tail artifact 제거 동작.
+   - **남은 작업**: 추후 basemap 도어와 묶어 단일 도어 객체로 머지하는 단계 (정합 후 통합).
 3. **창문 segmentation + 투명 텍스처** — 텍스처 베이크 시:
    - 창문 영역 자동 segmentation (SAM3 등 활용 검토).
    - 해당 영역 텍스처 알파를 0 으로 → 창문 너머 보이게 (또는 별도 처리).

@@ -29,7 +29,7 @@ interface Props {
   ensureUploadId?: () => Promise<string>;
   /** 도어 설정 영속화 직전 호출 — refined PLY + mesh.json + tex_*.png 일괄 업로드.
    *  반환: PLY 에 베이크된 회전값 (raw → A'+Y). doors corners 도 같은 프레임으로 변환해야 일관 유지. */
-  onCommitRefined?: (uploadId: string) => Promise<{ rotX: number; rotZ: number; wallAngleRad: number }>;
+  onCommitRefined?: (uploadId: string) => Promise<{ rotX: number; rotZ: number; wallAngleRad: number; plyKey: string }>;
   /** 다듬기 단계의 현재 keep mask (flatten/floater/brush 모두 반영). 문 추출이 cachedScene 에 적용해
    *  외부 가우시안이 부활하는 문제 방지. 없으면 무필터로 동작. */
   getCurrentKeepMask?: () => Uint8Array | null;
