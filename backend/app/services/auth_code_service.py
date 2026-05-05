@@ -2,7 +2,7 @@
 
 OAuth 콜백에서 발급한 JWT를 URL에 직접 싣는 대신,
 짧은 수명의 1회용 코드를 발급해 Redis에 토큰을 잠시 저장하고,
-프론트엔드가 POST /api/auth/exchange 로 코드 ↔ 토큰 교환을 수행한다.
+프론트엔드가 POST /api/auth/exchange 로 코드를 제출해 세션 쿠키를 설정한다.
 """
 
 import json

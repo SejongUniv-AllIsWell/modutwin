@@ -110,6 +110,12 @@ class MinioService:
         except Exception:
             return False
 
+    def stat_object(self, key: str):
+        return self.client.stat_object(self.bucket, key)
+
+    def get_object_size(self, key: str) -> int:
+        return int(self.stat_object(key).size)
+
     def get_object_bytes(self, key: str) -> bytes:
         """오브젝트의 바이트를 직접 읽어옴 (작은 메타데이터 파일용)."""
         resp = self.client.get_object(self.bucket, key)

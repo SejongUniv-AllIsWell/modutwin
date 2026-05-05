@@ -9,9 +9,6 @@
 """
 
 import json
-import os
-import re
-import time
 from typing import Optional
 from uuid import UUID
 
@@ -22,8 +19,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.security import get_current_user
+from app.core.storage_keys import is_key_under_prefix, normalize_minio_key
 from app.models import User, Upload, Task, SceneOutput, TaskType, TaskStatus
 from app.services.minio_service import get_minio_service
+from app.services.storage_paths import (
+    build_refined_object_key,
+    mesh_meta_key,
+    refined_prefix,
+    session_dir_from_scene_key,
+    session_file_key,
+)
 
 router = APIRouter(prefix="/refine", tags=["refine"])
 
@@ -60,16 +65,14 @@ async def refined_upload_url(
     if not upload:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="업로드를 찾을 수 없습니다.")
 
-    # path traversal 방지
-    safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", body.filename) or "refined.ply"
-    base_dir = os.path.dirname(upload.minio_path)
-    if body.session_id:
-        safe_session = re.sub(r"[^A-Za-z0-9._-]", "_", body.session_id)[:64]
-        if not safe_session:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="유효하지 않은 session_id")
-        key = f"{base_dir}/refined/{safe_session}/{safe_name}"
-    else:
-        key = f"{base_dir}/refined/{int(time.time() * 1000)}_{safe_name}"
+    try:
+        key = build_refined_object_key(
+            upload_minio_path=upload.minio_path,
+            filename=body.filename,
+            session_id=body.session_id,
+        )
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="유효하지 않은 session_id")
 
     minio = get_minio_service()
     return RefinedUploadUrlResponse(
@@ -109,9 +112,21 @@ async def save_refined(
     if not upload:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="업로드를 찾을 수 없습니다.")
 
+    try:
+        source_key = normalize_minio_key(body.source_key)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="유효하지 않은 source_key 입니다.")
+
+    upload_refined_prefix = refined_prefix(upload.minio_path)
+    if not is_key_under_prefix(source_key, upload_refined_prefix):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="source_key 는 업로드의 refined 경로 하위여야 합니다.",
+        )
+
     # 정제 파일 존재 확인
     minio = get_minio_service()
-    if not minio.object_exists(body.source_key):
+    if not minio.object_exists(source_key):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="정제 파일을 찾을 수 없습니다.")
 
     # Task 생성 (정제 완료 상태)
@@ -131,8 +146,8 @@ async def save_refined(
         task_id=task.id,
         user_id=user.id,
         module_id=upload.module_id,
-        ply_path=body.source_key,
-        sog_path=body.source_key,   # PLY도 뷰어에서 로드 가능
+        ply_path=source_key,
+        sog_path=source_key,   # PLY도 뷰어에서 로드 가능
         is_aligned=False,
     )
     db.add(scene)
@@ -177,20 +192,20 @@ async def get_refined_bundle(
     ply_url = minio.get_presigned_download_url(scene.ply_path)
 
     # 같은 디렉토리에서 mesh.json 찾기 (있으면 텍스처 URL 도 같이)
-    session_dir = os.path.dirname(scene.ply_path)
-    mesh_meta_key = f"{session_dir}/mesh.json"
+    session_dir = session_dir_from_scene_key(scene.ply_path)
+    mesh_meta_object_key = mesh_meta_key(session_dir)
     mesh_meta_url: Optional[str] = None
     textures: dict[str, str] = {}
-    if minio.object_exists(mesh_meta_key):
-        mesh_meta_url = minio.get_presigned_download_url(mesh_meta_key)
+    if minio.object_exists(mesh_meta_object_key):
+        mesh_meta_url = minio.get_presigned_download_url(mesh_meta_object_key)
         try:
-            content = minio.get_object_bytes(mesh_meta_key)
+            content = minio.get_object_bytes(mesh_meta_object_key)
             meta = json.loads(content.decode("utf-8"))
             for surface in meta.get("surfaces", []):
                 tex_filename = surface.get("textureFilename")
                 surface_id = surface.get("surfaceId")
                 if tex_filename and surface_id:
-                    tex_key = f"{session_dir}/{tex_filename}"
+                    tex_key = session_file_key(session_dir, tex_filename)
                     if minio.object_exists(tex_key):
                         textures[surface_id] = minio.get_presigned_download_url(tex_key)
         except Exception as e:

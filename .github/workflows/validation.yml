@@ -1,0 +1,116 @@
+name: validation
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      POSTGRES_PASSWORD: postgres-test-password
+      REDIS_PASSWORD: redis-test-password
+      RABBITMQ_DEFAULT_PASS: rabbitmq-test-password
+      MINIO_SECRET_KEY: minio-test-secret
+      JWT_SECRET_KEY: jwt-test-secret
+      GOOGLE_CLIENT_ID: test-client-id.apps.googleusercontent.com
+      GOOGLE_CLIENT_SECRET: test-google-client-secret
+      PUBLIC_BASE_URL: http://localhost
+      DEV_MODE: "true"
+      ENABLE_SAM3_DISPATCH: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: backend/requirements.txt
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -r requirements.txt
+      - run: python -m compileall app tests
+      - run: python -m pytest -q
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    env:
+      NEXT_PUBLIC_API_URL: /api
+      NEXT_PUBLIC_KAKAO_REST_API_KEY: ""
+      NEXT_PUBLIC_KAKAO_MAP_KEY: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  compose-config:
+    runs-on: ubuntu-latest
+    env:
+      POSTGRES_USER: root
+      POSTGRES_PASSWORD: changeme
+      POSTGRES_DB: 3dgs_platform
+      PC_HOST_IP: 127.0.0.1
+      REDIS_PASSWORD: changeme
+      RABBITMQ_DEFAULT_USER: root
+      RABBITMQ_DEFAULT_PASS: changeme
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: changeme123
+      MINIO_BUCKET: 3dgs-platform
+      MINIO_PUBLIC_ENDPOINT: localhost:9000
+      MINIO_PUBLIC_SECURE: "false"
+      JWT_SECRET_KEY: generate-with-openssl-rand-hex-32
+      JWT_ALGORITHM: HS256
+      GOOGLE_CLIENT_ID: test-client-id.apps.googleusercontent.com
+      GOOGLE_CLIENT_SECRET: test-google-client-secret
+      PUBLIC_BASE_URL: http://localhost
+      DEV_MODE: "true"
+      ENABLE_SAM3_DISPATCH: "false"
+      NEXT_PUBLIC_API_URL: /api
+      NEXT_PUBLIC_KAKAO_REST_API_KEY: ""
+      NEXT_PUBLIC_KAKAO_MAP_KEY: ""
+      FLOWER_USER: admin
+      FLOWER_PASSWORD: changeme
+    steps:
+      - uses: actions/checkout@v4
+      - name: Write compose env file
+        run: |
+          cat > .env <<'EOF'
+          POSTGRES_USER=root
+          POSTGRES_PASSWORD=changeme
+          POSTGRES_DB=3dgs_platform
+          PC_HOST_IP=127.0.0.1
+          REDIS_PASSWORD=changeme
+          RABBITMQ_DEFAULT_USER=root
+          RABBITMQ_DEFAULT_PASS=changeme
+          MINIO_ACCESS_KEY=minioadmin
+          MINIO_SECRET_KEY=changeme123
+          MINIO_BUCKET=3dgs-platform
+          MINIO_PUBLIC_ENDPOINT=localhost:9000
+          MINIO_PUBLIC_SECURE=false
+          JWT_SECRET_KEY=generate-with-openssl-rand-hex-32
+          JWT_ALGORITHM=HS256
+          GOOGLE_CLIENT_ID=test-client-id.apps.googleusercontent.com
+          GOOGLE_CLIENT_SECRET=test-google-client-secret
+          PUBLIC_BASE_URL=http://localhost
+          DEV_MODE=true
+          ENABLE_SAM3_DISPATCH=false
+          NEXT_PUBLIC_API_URL=/api
+          NEXT_PUBLIC_KAKAO_REST_API_KEY=
+          NEXT_PUBLIC_KAKAO_MAP_KEY=
+          FLOWER_USER=admin
+          FLOWER_PASSWORD=changeme
+          EOF
+      - run: docker compose -f docker-compose.yml config
+      - run: docker compose -f docker-compose.yml -f docker-compose.local.yml config

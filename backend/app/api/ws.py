@@ -1,7 +1,7 @@
 """WebSocket 엔드포인트.
 
 설계 원칙:
-- 핸드셰이크 인증은 1회용 ticket(`?ticket=<ticket>`)으로만. access token을 URL에 싣지 않는다.
+- 핸드셰이크 인증은 1회용 ticket을 `Sec-WebSocket-Protocol`로만 전달한다.
 - WS 수명은 access token 수명과 무관하다. 한 번 인증되면 물리적으로 끊길 때까지 유지.
 - 같은 user_id가 여러 connection을 가질 수 있다(멀티 탭). 알림은 모든 connection에 fanout.
 - 서버 측 keepalive ping을 주기적으로 보내 dead connection을 빠르게 감지(half-open NAT 등).
@@ -13,12 +13,14 @@ Close codes:
 """
 
 import asyncio
+import base64
+import binascii
 import json
 import logging
 import uuid
 from typing import Dict, Set
 
-from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from app.services.ws_ticket_service import consume_ws_ticket
 
@@ -27,6 +29,8 @@ router = APIRouter()
 
 # 서버 → 클라 keepalive 주기. 무료 Cloudflare WS idle timeout(~100s)·각종 NAT 만료 보다 넉넉히 짧게.
 SERVER_PING_INTERVAL_SECONDS = 25
+WS_TICKET_SUBPROTOCOL = "ticket"
+WS_TICKET_PROTOCOL_PREFIX = "ticket."
 
 
 class ConnectionManager:
@@ -72,6 +76,53 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
+def _parse_ws_subprotocols(websocket: WebSocket) -> list[str]:
+    raw = websocket.headers.get("sec-websocket-protocol", "")
+    if not raw:
+        return []
+    return [token.strip() for token in raw.split(",") if token.strip()]
+
+
+def _decode_ticket_protocol(token: str) -> str | None:
+    if not token.startswith(WS_TICKET_PROTOCOL_PREFIX):
+        return None
+    encoded = token[len(WS_TICKET_PROTOCOL_PREFIX) :]
+    if not encoded:
+        return None
+
+    padded = encoded + "=" * (-len(encoded) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError, ValueError):
+        return None
+
+    return decoded or None
+
+
+def _extract_ticket_and_accept_protocol(websocket: WebSocket) -> tuple[str | None, str | None]:
+    subprotocols = _parse_ws_subprotocols(websocket)
+    if not subprotocols:
+        return None, None
+
+    if WS_TICKET_SUBPROTOCOL in subprotocols:
+        marker_index = subprotocols.index(WS_TICKET_SUBPROTOCOL)
+        # 권장 패턴: ["ticket", "ticket.<base64url(ticket)>"]
+        for candidate in subprotocols[marker_index + 1 :]:
+            ticket = _decode_ticket_protocol(candidate)
+            if ticket:
+                return ticket, WS_TICKET_SUBPROTOCOL
+        # ticket marker는 있었지만 payload가 없거나 손상된 경우.
+        # 그래도 marker를 선택해 브라우저가 연결을 성립시킨 뒤 4401 close code를 전달받게 한다.
+        return None, WS_TICKET_SUBPROTOCOL
+
+    # 호환 패턴: 단일 "ticket.<base64url(ticket)>"
+    for token in subprotocols:
+        ticket = _decode_ticket_protocol(token)
+        if ticket:
+            return ticket, token
+    return None, None
+
+
 async def _server_keepalive(ws: WebSocket) -> None:
     """주기적으로 ping을 보내 dead connection을 감지한다.
 
@@ -90,13 +141,10 @@ async def _server_keepalive(ws: WebSocket) -> None:
 
 
 @router.websocket("/ws")
-async def websocket_endpoint(
-    websocket: WebSocket,
-    ticket: str = Query(default=""),
-):
+async def websocket_endpoint(websocket: WebSocket):
     """WebSocket 엔드포인트.
 
-    연결: WS /api/ws?ticket=<one_time_ticket>
+    연결: WS /api/ws + Sec-WebSocket-Protocol(ticket 전달)
 
     수신 메시지:
         {"type": "ping"} → {"type": "pong"}
@@ -106,18 +154,19 @@ async def websocket_endpoint(
         {"type": "ping"} (서버 keepalive)
         {"type": "progress" | "task_complete" | "task_failed" | "notification", ...}
     """
-    payload = await consume_ws_ticket(ticket)
+    ticket, accept_protocol = _extract_ticket_and_accept_protocol(websocket)
+    payload = await consume_ws_ticket(ticket or "")
     if payload is None:
         # accept() 전에 close()하면 핸드셰이크가 4xx로 거절된다(브라우저는 close code를 못 본다).
         # accept 후 close하면 클라가 close code를 받을 수 있어 재시도 정책을 분기할 수 있다.
-        await websocket.accept()
+        await websocket.accept(subprotocol=accept_protocol)
         await websocket.close(code=4401, reason="invalid or expired ticket")
         return
 
     user_id = payload["user_id"]
     conn_id = uuid.uuid4().hex[:8]
 
-    await websocket.accept()
+    await websocket.accept(subprotocol=accept_protocol)
     await manager.add(user_id, websocket)
     logger.info("ws connect: user=%s conn=%s", user_id, conn_id)
 
