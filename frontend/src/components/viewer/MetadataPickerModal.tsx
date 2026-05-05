@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { api } from '@/lib/api';
-import { Building, Floor, Module } from '@/types';
+import { Building, BuildingMetadataOptions, MetadataFloorOption, Module } from '@/types';
 
 export interface MetadataResult {
   building_id: string;
@@ -36,36 +36,8 @@ interface Props {
   onClose: () => void;
 }
 
-function parseFloorToInt(value: string): number | null {
-  const v = value.trim().toUpperCase();
-  if (/^B(\d+)$/.test(v)) {
-    const n = parseInt(v.slice(1), 10);
-    return n > 0 ? -n : null;
-  }
-  if (/^\d+$/.test(v)) {
-    const n = parseInt(v, 10);
-    return n > 0 ? n : null;
-  }
-  return null;
-}
-
-function normalizeFloorInput(value: string): string {
-  const v = value.trim();
-  const negMatch = v.match(/^-(\d+)층?$/);
-  if (negMatch) {
-    const n = parseInt(negMatch[1], 10);
-    return n > 0 ? `B${n}` : '';
-  }
-  const bMatch = v.toUpperCase().match(/^B(\d+)$/);
-  if (bMatch) {
-    const n = parseInt(bMatch[1], 10);
-    return n > 0 ? `B${n}` : '';
-  }
-  if (/^\d+$/.test(v)) {
-    const n = parseInt(v, 10);
-    return n > 0 ? String(n) : '';
-  }
-  return '';
+function formatFloor(n: number): string {
+  return n < 0 ? `B${Math.abs(n)}` : `${n}층`;
 }
 
 export default function MetadataPickerModal({
@@ -80,16 +52,15 @@ export default function MetadataPickerModal({
 
   const [buildings, setBuildings] = useState<Building[]>([]);
   const [selectedBuildingName, setSelectedBuildingName] = useState(initial?.building_name ?? '');
+  const [selectedBuildingId, setSelectedBuildingId] = useState<string | null>(null);
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<KakaoPlace[]>([]);
   const [searchLoading, setSearchLoading] = useState(false);
 
-  const [floorNumber, setFloorNumber] = useState(
-    initial?.floor_number !== undefined
-      ? (initial.floor_number < 0 ? `B${Math.abs(initial.floor_number)}` : String(initial.floor_number))
-      : ''
-  );
+  const [metadataOptions, setMetadataOptions] = useState<BuildingMetadataOptions | null>(null);
+  const [optionsLoading, setOptionsLoading] = useState(false);
+  const [selectedFloorId, setSelectedFloorId] = useState('');
   const [moduleName, setModuleName] = useState(initial?.module_name ?? '');
   const [samPrompt, setSamPrompt] = useState(initial?.sam_prompt ?? 'white wooden door');
 
@@ -139,20 +110,74 @@ export default function MetadataPickerModal({
     return () => { clearTimeout(t); setSearchLoading(false); };
   }, [searchQuery]);
 
-  const findOrCreateBuilding = async (name: string): Promise<{ id: string; name: string }> => {
-    const existing = buildings.find(b => b.name === name);
-    if (existing) return { id: existing.id, name: existing.name };
-    const b = await api.post<Building>('/buildings', { name });
-    setBuildings(prev => [...prev, b]);
-    return { id: b.id, name: b.name };
-  };
+  useEffect(() => {
+    if (!selectedBuildingName || selectedBuildingId) return;
+    const existing = buildings.find(b => b.name === selectedBuildingName);
+    if (existing) setSelectedBuildingId(existing.id);
+  }, [buildings, selectedBuildingId, selectedBuildingName]);
 
-  const findOrCreateFloor = async (buildingId: string, floorNum: number): Promise<string> => {
-    const list = await api.get<Floor[]>(`/buildings/${buildingId}/floors`);
-    const existing = list.find(f => f.floor_number === floorNum);
-    if (existing) return existing.id;
-    const f = await api.post<Floor>(`/buildings/${buildingId}/floors`, { floor_number: floorNum });
-    return f.id;
+  useEffect(() => {
+    if (!selectedBuildingId) {
+      setMetadataOptions(null);
+      setSelectedFloorId('');
+      setModuleName('');
+      setOptionsLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    setOptionsLoading(true);
+    api.get<BuildingMetadataOptions>(`/buildings/${selectedBuildingId}/metadata-options`)
+      .then(data => {
+        if (cancelled) return;
+        setMetadataOptions(data);
+        setSelectedFloorId(prev => {
+          if (prev && data.floors.some(f => f.id === prev)) return prev;
+          const initialFloor = data.floors.find(f => f.floor_number === initial?.floor_number);
+          return initialFloor?.id ?? data.floors[0]?.id ?? '';
+        });
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setMetadataOptions(null);
+          setSelectedFloorId('');
+          setModuleName('');
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setOptionsLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [initial?.floor_number, selectedBuildingId]);
+
+  const selectedFloor: MetadataFloorOption | null =
+    metadataOptions?.floors.find(f => f.id === selectedFloorId) ?? null;
+
+  useEffect(() => {
+    if (!selectedFloor) {
+      setModuleName('');
+      return;
+    }
+    setModuleName(prev => {
+      if (prev && selectedFloor.modules.some(m => m.name === prev)) return prev;
+      const initialModule = selectedFloor.modules.find(m => m.name === initial?.module_name);
+      return initialModule?.name ?? selectedFloor.modules[0]?.name ?? '';
+    });
+  }, [initial?.module_name, selectedFloor]);
+
+  const selectBuilding = (name: string, id?: string | null) => {
+    const existing = id ? null : buildings.find(b => b.name === name);
+    setSelectedBuildingName(name);
+    setSelectedBuildingId(id ?? existing?.id ?? null);
+    setMetadataOptions(null);
+    setSelectedFloorId('');
+    setModuleName('');
+    setSearchOpen(false);
+    setSearchQuery('');
+    setSearchResults([]);
   };
 
   const findOrCreateModule = async (floorId: string, name: string): Promise<string> => {
@@ -165,21 +190,18 @@ export default function MetadataPickerModal({
 
   const handleConfirm = async () => {
     setError(null);
-    const floorInt = parseFloorToInt(floorNumber);
-    if (!selectedBuildingName || floorInt === null || !moduleName.trim()) {
-      setError('건물, 층(양의 정수 또는 B1·B2), 모듈을 모두 입력하세요.');
+    if (!selectedBuildingId || !selectedBuildingName || !selectedFloor || !moduleName.trim()) {
+      setError('관리자가 등록한 건물, 층, 모듈을 모두 선택하세요.');
       return;
     }
     setSubmitting(true);
     try {
-      const building = await findOrCreateBuilding(selectedBuildingName);
-      const floorId = await findOrCreateFloor(building.id, floorInt);
-      const moduleId = await findOrCreateModule(floorId, moduleName.trim());
+      const moduleId = await findOrCreateModule(selectedFloor.id, moduleName.trim());
       await onConfirm({
-        building_id: building.id,
-        building_name: building.name,
-        floor_id: floorId,
-        floor_number: floorInt,
+        building_id: selectedBuildingId,
+        building_name: selectedBuildingName,
+        floor_id: selectedFloor.id,
+        floor_number: selectedFloor.floor_number,
         module_id: moduleId,
         module_name: moduleName.trim(),
         sam_prompt: showSamPrompt ? samPrompt.trim() : undefined,
@@ -234,11 +256,7 @@ export default function MetadataPickerModal({
                       <button
                         key={b.id}
                         type="button"
-                        onClick={() => {
-                          setSelectedBuildingName(b.name);
-                          setSearchOpen(false);
-                          setSearchQuery('');
-                        }}
+                        onClick={() => selectBuilding(b.name, b.id)}
                         className="w-full text-left px-3 py-2 hover:bg-gray-700 transition-colors text-white text-sm"
                       >
                         {b.name}
@@ -254,12 +272,7 @@ export default function MetadataPickerModal({
                   <button
                     key={place.id}
                     type="button"
-                    onClick={() => {
-                      setSelectedBuildingName(place.place_name);
-                      setSearchOpen(false);
-                      setSearchQuery('');
-                      setSearchResults([]);
-                    }}
+                    onClick={() => selectBuilding(place.place_name)}
                     className="w-full text-left px-3 py-2 hover:bg-gray-700 transition-colors border-t border-gray-700 first:border-t-0"
                   >
                     <div className="text-white text-sm font-medium">{place.place_name}</div>
@@ -275,26 +288,35 @@ export default function MetadataPickerModal({
         <div className="flex gap-3">
           <div className="flex-1">
             <label className="block text-sm text-gray-400 mb-1">층</label>
-            <input
-              type="text"
-              value={floorNumber}
-              onChange={e => setFloorNumber(e.target.value)}
-              onBlur={e => setFloorNumber(normalizeFloorInput(e.target.value))}
-              placeholder="1, 2 또는 B1, B2"
-              disabled={submitting}
+            <select
+              value={selectedFloorId}
+              onChange={e => setSelectedFloorId(e.target.value)}
+              disabled={submitting || optionsLoading || !selectedBuildingId || !metadataOptions?.floors.length}
               className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white text-sm focus:outline-none focus:border-blue-500 disabled:opacity-40"
-            />
+            >
+              <option value="">{optionsLoading ? '불러오는 중...' : '층 선택'}</option>
+              {metadataOptions?.floors.map(floor => (
+                <option key={floor.id} value={floor.id}>
+                  {formatFloor(floor.floor_number)}
+                </option>
+              ))}
+            </select>
           </div>
           <div className="flex-1">
             <label className="block text-sm text-gray-400 mb-1">모듈</label>
-            <input
-              type="text"
+            <select
               value={moduleName}
               onChange={e => setModuleName(e.target.value)}
-              placeholder="모듈 이름"
-              disabled={submitting}
+              disabled={submitting || optionsLoading || !selectedFloor || selectedFloor.modules.length === 0}
               className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white text-sm focus:outline-none focus:border-blue-500 disabled:opacity-40"
-            />
+            >
+              <option value="">{selectedFloor ? '모듈 선택' : '층 선택 필요'}</option>
+              {selectedFloor?.modules.map(module => (
+                <option key={module.id} value={module.name}>
+                  {module.name}
+                </option>
+              ))}
+            </select>
           </div>
         </div>
 

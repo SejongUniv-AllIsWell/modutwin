@@ -45,6 +45,24 @@ export interface ActiveBasemapResponse {
   filename: string;
 }
 
+export interface MetadataModuleOption {
+  id: string;
+  name: string;
+}
+
+export interface MetadataFloorOption {
+  id: string;
+  building_id: string;
+  floor_number: number;
+  modules: MetadataModuleOption[];
+}
+
+export interface BuildingMetadataOptions {
+  id: string;
+  name: string;
+  floors: MetadataFloorOption[];
+}
+
 // ── Upload ──
 
 export interface UploadInitRequest {
