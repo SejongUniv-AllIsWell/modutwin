@@ -1,6 +1,11 @@
 from celery import Celery
 
 from app.core.config import get_settings
+from app.services.sam3_service import (
+    SAM3_QUEUE_NAME,
+    SAM3_TASK_NAME,
+    build_sam3_task_args,
+)
 
 settings = get_settings()
 
@@ -55,12 +60,19 @@ def dispatch_sam3_door_detection_task(
     않았다면 메시지는 큐에 쌓인다 (worker 측 별도 작업).
     """
     result = celery_app.send_task(
-        "tasks.sam3.run_door_detection",
-        args=[
-            upload_id, user_id, refined_ply_key, prompt,
-            building_id, floor_id, floor_number, module_id, module_name,
-        ],
-        queue="sam3",
+        SAM3_TASK_NAME,
+        args=build_sam3_task_args(
+            upload_id=upload_id,
+            user_id=user_id,
+            refined_ply_key=refined_ply_key,
+            prompt=prompt,
+            building_id=building_id,
+            floor_id=floor_id,
+            floor_number=floor_number,
+            module_id=module_id,
+            module_name=module_name,
+        ),
+        queue=SAM3_QUEUE_NAME,
     )
     return result.id
 
@@ -86,5 +98,4 @@ def dispatch_alignment_task(
         queue="alignment",
     )
     return result.id
-
 

@@ -1,12 +1,20 @@
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlencode, urlparse
+import logging
+from urllib.parse import urlencode
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import RedirectResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.auth_cookies import (
+    clear_auth_cookies,
+    get_refresh_token_from_cookie,
+    set_access_cookie,
+    set_auth_cookies,
+    validate_csrf_for_cookie_auth,
+)
 from app.core.config import get_settings
 from app.core.database import get_db
 from app.core.security import (
@@ -17,48 +25,73 @@ from app.core.security import (
 )
 from app.models import User, Session, UserRole
 from app.schemas.auth import (
-    TokenResponse,
-    RefreshRequest,
-    AccessTokenResponse,
+    SessionResponse,
     UserResponse,
     LoginUrlResponse,
     AuthCodeExchangeRequest,
     WsTicketResponse,
 )
 from app.services.auth_code_service import issue_auth_code, consume_auth_code
+from app.services.google_oauth_service import (
+    GoogleIdTokenValidationError,
+    verify_google_id_token,
+)
+from app.services.oauth_state_service import issue_oauth_state, consume_oauth_state
 from app.services.ws_ticket_service import issue_ws_ticket, WS_TICKET_TTL_SECONDS
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 settings = get_settings()
+logger = logging.getLogger(__name__)
 
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo"
 
 
-def _resolve_frontend_base(request: Request) -> str:
-    """프론트엔드 오리진 결정: PUBLIC_BASE_URL → Referer 헤더 → 상대 경로."""
+def _public_base_url() -> str:
     if settings.PUBLIC_BASE_URL:
-        return settings.PUBLIC_BASE_URL
-    referer = request.headers.get("Referer", "")
-    if referer:
-        parsed = urlparse(referer)
-        if parsed.scheme and parsed.netloc:
-            return f"{parsed.scheme}://{parsed.netloc}"
+        return settings.PUBLIC_BASE_URL.rstrip("/")
     return ""
 
 
-async def _redirect_with_auth_code(
-    request: Request, access_token: str, refresh_token: str
-) -> RedirectResponse:
+def _frontend_redirect_url(path: str) -> str:
+    frontend_base = _public_base_url()
+    if frontend_base:
+        return f"{frontend_base}{path}"
+    return path
+
+
+def _resolve_oauth_callback_url(request: Request) -> str:
+    """OAuth callback URL 결정. 운영(non-DEV)은 PUBLIC_BASE_URL 필수."""
+    public_base = _public_base_url()
+    if public_base:
+        return f"{public_base}/api/auth/callback"
+
+    if settings.DEV_MODE:
+        proto = request.headers.get("X-Forwarded-Proto", "http")
+        host = request.headers.get("Host", request.base_url.hostname)
+        return f"{proto}://{host}/api/auth/callback"
+
+    raise HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail="운영 OAuth에는 PUBLIC_BASE_URL 설정이 필요합니다.",
+    )
+
+
+def _login_error_redirect(error: str) -> RedirectResponse:
+    query = urlencode({"error": error})
+    return RedirectResponse(url=_frontend_redirect_url(f"/login?{query}"))
+
+
+async def _redirect_with_auth_code(access_token: str, refresh_token: str) -> RedirectResponse:
     """JWT를 Redis에 저장하고 1회용 코드를 쿼리로 전달하는 리다이렉트 생성."""
     code = await issue_auth_code(
         access_token=access_token,
         refresh_token=refresh_token,
         expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
     )
-    frontend_base = _resolve_frontend_base(request)
-    return RedirectResponse(url=f"{frontend_base}/login/callback?code={code}")
+    query = urlencode({"code": code})
+    return RedirectResponse(url=_frontend_redirect_url(f"/login/callback?{query}"))
 
 
 @router.get("/dev-login")
@@ -100,7 +133,7 @@ async def dev_login(request: Request, db: AsyncSession = Depends(get_db)):
     db.add(session)
     await db.commit()
 
-    return await _redirect_with_auth_code(request, access_token, refresh_token)
+    return await _redirect_with_auth_code(access_token, refresh_token)
 
 
 @router.get("/login", response_model=LoginUrlResponse)
@@ -111,12 +144,8 @@ async def login(request: Request):
         host = request.headers.get("Host", request.base_url.hostname)
         return LoginUrlResponse(url=f"{proto}://{host}/api/auth/dev-login")
 
-    if settings.PUBLIC_BASE_URL:
-        callback_url = f"{settings.PUBLIC_BASE_URL}/api/auth/callback"
-    else:
-        proto = request.headers.get("X-Forwarded-Proto", "http")
-        host = request.headers.get("Host", request.base_url.hostname)
-        callback_url = f"{proto}://{host}/api/auth/callback"
+    callback_url = _resolve_oauth_callback_url(request)
+    oauth_state = await issue_oauth_state(callback_url)
 
     params = {
         "client_id": settings.GOOGLE_CLIENT_ID,
@@ -124,6 +153,10 @@ async def login(request: Request):
         "response_type": "code",
         "scope": "openid email profile",
         "prompt": "select_account",
+        "state": oauth_state["state"],
+        "code_challenge": oauth_state["code_challenge"],
+        "code_challenge_method": "S256",
+        "nonce": oauth_state["nonce"],
     }
     url = f"{GOOGLE_AUTH_URL}?{urlencode(params)}"
     return LoginUrlResponse(url=url)
@@ -131,22 +164,31 @@ async def login(request: Request):
 
 @router.get("/callback")
 async def callback(
-    request: Request,
     db: AsyncSession = Depends(get_db),
     code: str | None = None,
+    state: str | None = None,
     error: str | None = None,
 ):
     """Google 인증 코드로 사용자 정보 취득 → JWT 발급"""
     # Google이 access_denied 등 에러를 보낸 경우 로그인 페이지로 리다이렉트
     if error or not code:
-        frontend_base = _resolve_frontend_base(request)
-        return RedirectResponse(url=f"{frontend_base}/login?error={error or 'unknown'}")
-    if settings.PUBLIC_BASE_URL:
-        callback_url = f"{settings.PUBLIC_BASE_URL}/api/auth/callback"
-    else:
-        proto = request.headers.get("X-Forwarded-Proto", "http")
-        host = request.headers.get("Host", request.base_url.hostname)
-        callback_url = f"{proto}://{host}/api/auth/callback"
+        return _login_error_redirect(error or "unknown")
+
+    if not settings.DEV_MODE and not _public_base_url():
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="운영 OAuth에는 PUBLIC_BASE_URL 설정이 필요합니다.",
+        )
+
+    oauth_state = await consume_oauth_state(state)
+    if oauth_state is None:
+        return _login_error_redirect("invalid_state")
+
+    callback_url = oauth_state.get("redirect_uri")
+    code_verifier = oauth_state.get("code_verifier")
+    nonce = oauth_state.get("nonce")
+    if not callback_url or not code_verifier or not nonce:
+        return _login_error_redirect("invalid_state")
 
     # 1. 인증 코드 → Google Access Token 교환
     async with httpx.AsyncClient() as client:
@@ -158,6 +200,7 @@ async def callback(
                 "client_secret": settings.GOOGLE_CLIENT_SECRET,
                 "redirect_uri": callback_url,
                 "grant_type": "authorization_code",
+                "code_verifier": code_verifier,
             },
         )
 
@@ -169,25 +212,43 @@ async def callback(
 
     google_tokens = token_resp.json()
     google_access_token = google_tokens.get("access_token")
+    google_id_token = google_tokens.get("id_token")
 
-    # 2. Google Access Token → 사용자 정보 취득
-    async with httpx.AsyncClient() as client:
-        userinfo_resp = await client.get(
-            GOOGLE_USERINFO_URL,
-            headers={"Authorization": f"Bearer {google_access_token}"},
+    try:
+        id_token_claims = await verify_google_id_token(
+            id_token=google_id_token,
+            audience=settings.GOOGLE_CLIENT_ID,
+            expected_nonce=nonce,
         )
+    except GoogleIdTokenValidationError as exc:
+        logger.warning("Google ID token validation failed: %s", exc)
+        return _login_error_redirect("invalid_id_token")
 
-    if userinfo_resp.status_code != 200:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Google 사용자 정보 취득에 실패했습니다.",
-        )
+    google_id = id_token_claims["sub"]
+    email = id_token_claims.get("email")
+    if not email:
+        return _login_error_redirect("invalid_id_token")
 
-    google_user = userinfo_resp.json()
-    google_id = google_user["id"]
-    email = google_user["email"]
-    name = google_user.get("name", email)
-    avatar_url = google_user.get("picture")
+    name = id_token_claims.get("name")
+    avatar_url = id_token_claims.get("picture")
+
+    # ID token에 없는 프로필 정보만 userinfo에서 보강한다(식별자/이메일은 신뢰하지 않음).
+    if google_access_token and (not name or not avatar_url):
+        async with httpx.AsyncClient() as client:
+            userinfo_resp = await client.get(
+                GOOGLE_USERINFO_URL,
+                headers={"Authorization": f"Bearer {google_access_token}"},
+            )
+
+        if userinfo_resp.status_code == 200:
+            google_user = userinfo_resp.json()
+            if not name:
+                name = google_user.get("name")
+            if not avatar_url:
+                avatar_url = google_user.get("picture")
+
+    if not name:
+        name = email
 
     # 3. DB에 사용자 저장/갱신
     result = await db.execute(select(User).where(User.google_id == google_id))
@@ -220,16 +281,27 @@ async def callback(
     db.add(session)
     await db.commit()
 
-    return await _redirect_with_auth_code(request, access_token, refresh_token)
+    return await _redirect_with_auth_code(access_token, refresh_token)
 
 
-@router.post("/refresh", response_model=AccessTokenResponse)
+@router.post("/refresh", response_model=SessionResponse)
 async def refresh(
-    body: RefreshRequest,
+    request: Request,
+    response: Response,
     db: AsyncSession = Depends(get_db),
 ):
     """Refresh Token → 새 Access Token 발급"""
-    token_hash = hash_token(body.refresh_token)
+    refresh_token = get_refresh_token_from_cookie(request)
+
+    if not refresh_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="유효하지 않은 Refresh Token입니다.",
+        )
+
+    validate_csrf_for_cookie_auth(request)
+
+    token_hash = hash_token(refresh_token)
 
     result = await db.execute(
         select(Session).where(
@@ -264,43 +336,47 @@ async def refresh(
         )
 
     access_token = create_access_token(str(user.id), user.role.value)
+    set_access_cookie(response, access_token, settings)
 
-    return AccessTokenResponse(
-        access_token=access_token,
+    return SessionResponse(
         expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
     )
 
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
 async def logout(
-    body: RefreshRequest,
-    user: User = Depends(get_current_user),
+    request: Request,
+    response: Response,
     db: AsyncSession = Depends(get_db),
 ):
     """Refresh Token 무효화 (로그아웃)"""
-    token_hash = hash_token(body.refresh_token)
+    refresh_token = get_refresh_token_from_cookie(request)
 
-    result = await db.execute(
-        select(Session).where(
-            Session.refresh_token_hash == token_hash,
-            Session.user_id == user.id,
+    if refresh_token:
+        validate_csrf_for_cookie_auth(request)
+        token_hash = hash_token(refresh_token)
+        result = await db.execute(
+            select(Session).where(
+                Session.refresh_token_hash == token_hash,
+                Session.is_revoked == False,
+            )
         )
-    )
-    session = result.scalar_one_or_none()
+        session = result.scalar_one_or_none()
 
-    if session:
-        session.is_revoked = True
-        await db.commit()
+        if session:
+            session.is_revoked = True
+            await db.commit()
 
+    clear_auth_cookies(response, settings)
     return None
 
 
-@router.post("/exchange", response_model=TokenResponse)
-async def exchange(body: AuthCodeExchangeRequest):
-    """1회용 auth code → access/refresh 토큰 교환.
+@router.post("/exchange", response_model=SessionResponse)
+async def exchange(body: AuthCodeExchangeRequest, response: Response):
+    """1회용 auth code → 세션 쿠키 설정.
 
     OAuth 콜백이 URL에 토큰을 직접 싣지 않도록, 짧은 수명(60s)의 1회용 코드를
-    Redis에 저장하고 프론트엔드가 이 엔드포인트로 코드를 제출해 토큰을 수령한다.
+    Redis에 저장하고 프론트엔드가 이 엔드포인트로 코드를 제출해 쿠키 세션을 완성한다.
     """
     payload = await consume_auth_code(body.code)
     if payload is None:
@@ -309,9 +385,8 @@ async def exchange(body: AuthCodeExchangeRequest):
             detail="유효하지 않거나 만료된 인증 코드입니다.",
         )
 
-    return TokenResponse(
-        access_token=payload["access_token"],
-        refresh_token=payload["refresh_token"],
+    set_auth_cookies(response, payload["access_token"], payload["refresh_token"], settings)
+    return SessionResponse(
         expires_in=payload["expires_in"],
     )
 

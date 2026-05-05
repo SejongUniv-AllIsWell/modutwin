@@ -9,13 +9,6 @@ export interface User {
   created_at: string;
 }
 
-export interface TokenResponse {
-  access_token: string;
-  refresh_token: string;
-  token_type: string;
-  expires_in: number;
-}
-
 // ── Building / Floor / Module ──
 
 export interface Building {

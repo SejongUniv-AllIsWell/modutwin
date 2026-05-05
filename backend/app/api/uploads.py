@@ -1,7 +1,6 @@
 import json
 import math
 import os
-import re
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -10,8 +9,10 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.core.database import get_db
 from app.core.security import get_current_user
+from app.core.storage_keys import is_key_under_prefix, normalize_minio_key
 from app.models import (
     User, UserRole, Upload, Task, Module, Floor, Building, SceneOutput,
     UploadStatus, TaskType, TaskStatus, PlyTarget, Sam3Status,
@@ -29,22 +30,19 @@ from app.services.celery_service import (
     dispatch_training_task,
     dispatch_sam3_door_detection_task,
 )
+from app.services.sam3_service import (
+    SAM3_DISABLED_DETAIL,
+    mark_sam3_disabled,
+    mark_sam3_dispatch_pending,
+)
+from app.services.storage_paths import doors_json_key, module_base_path, refined_prefix
 
 router = APIRouter(prefix="/uploads", tags=["uploads"])
+settings = get_settings()
 
 # 사용자당 업로드 제한 (개수 / 총 용량)
 MAX_UPLOADS_PER_USER = 100
 MAX_STORAGE_PER_USER = 200 * 1024 * 1024 * 1024  # 200 GB
-
-
-def _module_folder(module_id: str, module_name: str) -> str:
-    return f"{module_id}_{module_name}"
-
-
-def _module_base_path(building_id: str, floor_id: str, module_id: str, module_name: str) -> str:
-    return f"buildings/{building_id}/{floor_id}/modules/{_module_folder(module_id, module_name)}"
-
-
 @router.post("/init", response_model=UploadInitResponse)
 async def init_upload(
     body: UploadInitRequest,
@@ -103,7 +101,7 @@ async def init_upload(
     # MinIO 오브젝트 키 생성 — UUID 기반 (원본 파일명은 DB에만 저장)
     ext = os.path.splitext(body.filename)[1].lower()
     unique_name = f"{uuid4()}{ext}"
-    base_path = _module_base_path(
+    base_path = module_base_path(
         str(body.building_id), str(body.floor_id),
         str(body.module_id), module.name,
     )
@@ -174,6 +172,45 @@ async def complete_upload(
             detail=f"MinIO 업로드 완료 실패: {str(e)}",
         )
 
+    # 완성된 객체의 실제 크기를 MinIO stat으로 검증한다.
+    try:
+        actual_size = minio.get_object_size(upload.minio_path)
+    except Exception as e:
+        upload.status = UploadStatus.failed
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"업로드 파일 검증 실패: {str(e)}",
+        )
+
+    max_size = max(1, int(settings.UPLOAD_MAX_FILE_SIZE_BYTES))
+    tolerance = max(0, int(settings.UPLOAD_SIZE_TOLERANCE_BYTES))
+    declared_size = int(upload.file_size or 0)
+
+    if actual_size <= 0:
+        upload.status = UploadStatus.failed
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="업로드 파일 크기가 0이어서 완료할 수 없습니다.",
+        )
+    if actual_size > max_size:
+        upload.status = UploadStatus.failed
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="업로드 파일이 허용된 최대 크기를 초과했습니다.",
+        )
+    if declared_size > 0 and actual_size > declared_size + tolerance:
+        upload.status = UploadStatus.failed
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="업로드 파일의 실제 크기가 선언된 크기 허용 오차를 초과했습니다.",
+        )
+
+    # quota 계산 일관성을 위해 실제 저장 크기로 보정.
+    upload.file_size = actual_size
     upload.status = UploadStatus.processing
 
     # 학습 없이 바로 완료 처리할 케이스
@@ -463,7 +500,7 @@ async def register_local_upload(
     # placeholder MinIO 경로 — 실제 객체는 없지만 base_dir 가 모듈 폴더 안에 있어야
     # refined PLY / mesh / doors.json 의 키 계산이 일관됨.
     ext = os.path.splitext(body.filename)[1].lower() or ".ply"
-    base_path = _module_base_path(
+    base_path = module_base_path(
         str(body.building_id), str(body.floor_id),
         str(body.module_id), module.name,
     )
@@ -496,13 +533,6 @@ class Sam3StartResponse(BaseModel):
     upload_id: UUID
     sam3_status: str
     celery_task_id: str | None
-
-
-def _doors_json_minio_key(upload: Upload) -> str:
-    base_dir = os.path.dirname(upload.minio_path)
-    return f"{base_dir}/refined/doors.json"
-
-
 @router.post("/{upload_id}/sam3/start", response_model=Sam3StartResponse)
 async def start_sam3(
     upload_id: UUID,
@@ -518,18 +548,31 @@ async def start_sam3(
     if not upload:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="업로드를 찾을 수 없습니다.")
 
+    try:
+        refined_key = normalize_minio_key(body.refined_ply_key)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="유효하지 않은 refined_ply_key 입니다.")
+
+    upload_refined_prefix = refined_prefix(upload.minio_path)
+    if not is_key_under_prefix(refined_key, upload_refined_prefix):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="refined_ply_key 는 업로드의 refined 경로 하위여야 합니다.",
+        )
+
     minio = get_minio_service()
-    if not minio.object_exists(body.refined_ply_key):
+    if not minio.object_exists(refined_key):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="refined PLY 가 MinIO 에 없습니다.")
 
-    # refined PLY 가 사용자/업로드 본인 디렉토리 아래에 있는지 약식 확인 (path traversal 방지).
-    base_dir = os.path.dirname(upload.minio_path)
-    if not body.refined_ply_key.startswith(base_dir + "/"):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="refined_ply_key 가 업로드 디렉토리 밖입니다.")
+    if not settings.ENABLE_SAM3:
+        mark_sam3_disabled(upload=upload, refined_key=refined_key, prompt=body.prompt)
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=SAM3_DISABLED_DETAIL,
+        )
 
-    upload.refined_ply_path = body.refined_ply_key
-    upload.sam3_prompt = (body.prompt or "").strip() or None
-    upload.sam3_status = Sam3Status.pending
+    mark_sam3_dispatch_pending(upload=upload, refined_key=refined_key, prompt=body.prompt)
 
     # 모듈/계층 정보 (SAM3 task 페이로드용)
     mod_q = await db.execute(
@@ -543,7 +586,7 @@ async def start_sam3(
         celery_task_id = dispatch_sam3_door_detection_task(
             upload_id=str(upload.id),
             user_id=str(user.id),
-            refined_ply_key=body.refined_ply_key,
+            refined_ply_key=refined_key,
             prompt=upload.sam3_prompt or "",
             building_id=str(floor.building_id),
             floor_id=str(floor.id),
@@ -681,7 +724,7 @@ async def put_doors(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="업로드를 찾을 수 없습니다.")
 
     minio = get_minio_service()
-    key = upload.door_corners_json_path or _doors_json_minio_key(upload)
+    key = upload.door_corners_json_path or doors_json_key(upload.minio_path)
     payload = json.dumps({"doors": [d.model_dump() for d in body.doors]}).encode("utf-8")
 
     # MinIO put_object 직접 호출 (작은 메타파일이라 단일 PUT)

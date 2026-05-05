@@ -2,7 +2,7 @@
 
 import { createContext, useContext, useEffect, useState, ReactNode } from 'react';
 import { User } from '@/types';
-import { api } from '@/lib/api';
+import { api, ApiError } from '@/lib/api';
 import { wsClient } from '@/lib/ws';
 
 interface AuthContextType {
@@ -24,20 +24,30 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const token = api.getAccessToken();
-    if (token) {
-      api.get<User>('/auth/me')
-        .then((u) => {
-          setUser(u);
-          wsClient.connect();
-        })
-        .catch(() => {
-          api.clearTokens();
-        })
-        .finally(() => setLoading(false));
-    } else {
-      setLoading(false);
-    }
+    let mounted = true;
+
+    api.get<User>('/auth/me')
+      .then((u) => {
+        if (!mounted) return;
+        setUser(u);
+        wsClient.connect();
+      })
+      .catch((error: unknown) => {
+        if (error instanceof ApiError && error.status === 401) {
+          api.clearSessionState();
+        }
+        if (!mounted) return;
+        setUser(null);
+        wsClient.disconnect();
+      })
+      .finally(() => {
+        if (!mounted) return;
+        setLoading(false);
+      });
+
+    return () => {
+      mounted = false;
+    };
   }, []);
 
   const login = async () => {
@@ -50,13 +60,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   };
 
   const logout = async () => {
-    const refreshToken = localStorage.getItem('refresh_token');
-    if (refreshToken) {
-      try {
-        await api.post('/auth/logout', { refresh_token: refreshToken });
-      } catch {}
-    }
-    api.clearTokens();
+    try {
+      await api.post('/auth/logout');
+    } catch {}
+    api.clearSessionState();
     wsClient.disconnect();
     setUser(null);
     window.location.href = '/';
