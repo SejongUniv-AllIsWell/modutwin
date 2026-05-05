@@ -14,6 +14,7 @@ from app.models import (
     Basemap, BasemapStatus, Task, Upload,
 )
 from app.services.minio_service import get_minio_service
+from app.services.metadata_options import validate_floor_number as validate_floor_number_value
 
 router = APIRouter(tags=["buildings"])
 
@@ -49,6 +50,11 @@ class BuildingResponse(BaseModel):
 
 class FloorCreate(BaseModel):
     floor_number: int
+
+    @field_validator("floor_number")
+    @classmethod
+    def validate_floor_number(cls, v: int) -> int:
+        return validate_floor_number_value(v)
 
 
 class FloorResponse(BaseModel):
@@ -91,6 +97,24 @@ class VisibilityRequest(BaseModel):
 class AlignmentTransformRequest(BaseModel):
     """정합 결과 transform — splat entity의 local position/rotation/scale 등."""
     transform: dict
+
+
+class MetadataModuleOption(BaseModel):
+    id: UUID
+    name: str
+
+
+class MetadataFloorOption(BaseModel):
+    id: UUID
+    building_id: UUID
+    floor_number: int
+    modules: list[MetadataModuleOption]
+
+
+class BuildingMetadataOptionsResponse(BaseModel):
+    id: UUID
+    name: str
+    floors: list[MetadataFloorOption]
 
 
 # ── Building endpoints ──
@@ -153,6 +177,76 @@ async def get_building(
     if not building:
         raise HTTPException(status_code=404, detail="건물을 찾을 수 없습니다.")
     return building
+
+
+@router.get("/buildings/{building_id}/metadata-options", response_model=BuildingMetadataOptionsResponse)
+async def get_building_metadata_options(
+    building_id: UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Viewer 메타데이터 선택용: 관리자가 지정한 층과 모듈명 목록.
+
+    floors 는 건물 공용 테이블을 사용하고, module 선택지는 admin 계정이 만든
+    module 이름만 노출한다. 일반 사용자가 저장할 때는 선택한 이름으로 본인
+    소유 module 을 별도로 생성/재사용한다.
+    """
+    building_stmt = select(Building).where(Building.id == building_id)
+    if user.role != UserRole.admin:
+        building_stmt = building_stmt.where(Building.is_visible == True)
+    building_result = await db.execute(building_stmt)
+    building = building_result.scalar_one_or_none()
+    if not building:
+        raise HTTPException(status_code=404, detail="건물을 찾을 수 없습니다.")
+
+    floor_stmt = select(Floor).where(
+        Floor.building_id == building_id,
+        Floor.floor_number != 0,
+    )
+    if user.role != UserRole.admin:
+        floor_stmt = floor_stmt.where(Floor.is_visible == True)
+    floor_stmt = floor_stmt.order_by(Floor.floor_number.desc())
+    floor_result = await db.execute(floor_stmt)
+    floors = floor_result.scalars().all()
+    if not floors:
+        return BuildingMetadataOptionsResponse(id=building.id, name=building.name, floors=[])
+
+    floor_ids = [f.id for f in floors]
+    module_result = await db.execute(
+        select(Module.id, Module.floor_id, Module.name)
+        .join(User, Module.user_id == User.id)
+        .where(
+            Module.floor_id.in_(floor_ids),
+            Module.is_visible == True,
+            User.role == UserRole.admin,
+        )
+        .order_by(Module.floor_id, Module.name)
+    )
+
+    modules_by_floor: dict[UUID, list[MetadataModuleOption]] = {f.id: [] for f in floors}
+    seen_by_floor: dict[UUID, set[str]] = {f.id: set() for f in floors}
+    for module_id, floor_id, module_name in module_result.all():
+        seen = seen_by_floor.setdefault(floor_id, set())
+        if module_name in seen:
+            continue
+        seen.add(module_name)
+        modules_by_floor.setdefault(floor_id, []).append(
+            MetadataModuleOption(id=module_id, name=module_name)
+        )
+
+    return BuildingMetadataOptionsResponse(
+        id=building.id,
+        name=building.name,
+        floors=[
+            MetadataFloorOption(
+                id=floor.id,
+                building_id=floor.building_id,
+                floor_number=floor.floor_number,
+                modules=modules_by_floor.get(floor.id, []),
+            )
+            for floor in floors
+        ],
+    )
 
 
 # ── Explore: cross-user 다층 평면도 트리 ──
