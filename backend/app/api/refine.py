@@ -203,3 +203,4 @@ async def get_refined_bundle(
         textures=textures,
         scene_id=scene.id,
     )
+

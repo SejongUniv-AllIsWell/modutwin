@@ -614,8 +614,25 @@ async def get_sam3_status(
 # ── doors.json: SAM3 결과 + 사용자 보정 ─────────────────────────────────────
 
 class DoorEntry(BaseModel):
+    """doors.json 의 한 문 엔트리.
+
+    corners 외 나머지 메타 (회전축/회전각/회전방향/벽 surfaceId/두께/분할 옵션 등) 는
+    문 설정 단계에서 사용자가 확정한 값. 정합·재진입·basemap 매칭 시 모두 활용되므로
+    스키마에 명시해 라운드트립 시 손실되지 않게 한다.
+    """
     id: str
     corners: list[list[float]]  # 4 × [x, y, z]
+    hingeEdge: int | None = None
+    swing: int | None = None
+    angleDeg: float | None = None
+    wallSurfaceId: str | None = None
+    doorThickness: float | None = None
+    boundarySplitEnabled: bool | None = None
+    safetyMargin: float | None = None
+    # basemap 등록 시 admin 이 각 문에 입력하는 호수 (예: "302호").
+    # 정합 단계에서 모듈의 호수 (Module.name) 와 매칭해 basemap 의 어느 문에 정합할지 결정.
+    # 모듈측 doors.json 에서는 보통 비어있음 (모듈은 단일 호라 호수 = Module.name 으로 자명).
+    unitName: str | None = None
 
 
 class DoorsJson(BaseModel):
@@ -647,7 +664,7 @@ async def get_doors(
         raw = minio.get_object_bytes(upload.door_corners_json_path)
         parsed = json.loads(raw.decode("utf-8"))
         doors = parsed.get("doors", []) if isinstance(parsed, dict) else []
-        # 가벼운 검증
+        # 가벼운 검증 — corners 형식만 강제하고 메타 필드는 그대로 패스스루.
         clean: list[DoorEntry] = []
         for d in doors:
             if not isinstance(d, dict): continue
@@ -659,7 +676,19 @@ async def get_doors(
                 for c in corners
             )
             if not ok: continue
-            clean.append(DoorEntry(id=str(d.get("id") or f"door_{len(clean)+1}"), corners=corners))
+            entry = DoorEntry(
+                id=str(d.get("id") or f"door_{len(clean)+1}"),
+                corners=corners,
+                hingeEdge=d.get("hingeEdge") if isinstance(d.get("hingeEdge"), int) else None,
+                swing=d.get("swing") if isinstance(d.get("swing"), int) else None,
+                angleDeg=d.get("angleDeg") if isinstance(d.get("angleDeg"), (int, float)) else None,
+                wallSurfaceId=d.get("wallSurfaceId") if isinstance(d.get("wallSurfaceId"), str) else None,
+                doorThickness=d.get("doorThickness") if isinstance(d.get("doorThickness"), (int, float)) else None,
+                boundarySplitEnabled=d.get("boundarySplitEnabled") if isinstance(d.get("boundarySplitEnabled"), bool) else None,
+                safetyMargin=d.get("safetyMargin") if isinstance(d.get("safetyMargin"), (int, float)) else None,
+                unitName=d.get("unitName") if isinstance(d.get("unitName"), str) else None,
+            )
+            clean.append(entry)
         return DoorsJson(doors=clean)
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"doors.json 파싱 실패: {e}")
@@ -682,7 +711,10 @@ async def put_doors(
 
     minio = get_minio_service()
     key = upload.door_corners_json_path or _doors_json_minio_key(upload)
-    payload = json.dumps({"doors": [d.model_dump() for d in body.doors]}).encode("utf-8")
+    # exclude_none — 미입력 필드는 JSON 에 안 넣어 가독성 유지.
+    payload = json.dumps(
+        {"doors": [d.model_dump(exclude_none=True) for d in body.doors]}
+    ).encode("utf-8")
 
     # MinIO put_object 직접 호출 (작은 메타파일이라 단일 PUT)
     from io import BytesIO

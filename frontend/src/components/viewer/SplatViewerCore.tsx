@@ -40,6 +40,15 @@ export interface SplatViewerCoreRef {
   drawLine: (a: [number, number, number], b: [number, number, number], color: [number, number, number, number], depthTest?: boolean) => void;
   /** 메인 splat 엔티티 visibility 토글 */
   setMainVisible: (visible: boolean) => void;
+  /** 정합 모드: 모듈 entity 들 (splat + wall mesh + door mesh + module 추가 splat) 을
+   *  공통 부모 alignmentGroup 아래로 이동. basemap 으로 표시된 추가 splat 은 제외.
+   *  반환: alignmentGroup entity (transform 적용 대상). 이미 진입 상태면 기존 group 반환.
+   *  같은 entity 가 두 번 reparent 되어도 안전 (idempotent). */
+  enterAlignmentMode: () => any | null;
+  /** 정합 모드 종료. children 을 다시 app.root 로 이동, alignmentGroup destroy. */
+  exitAlignmentMode: () => void;
+  /** 현재 alignmentGroup entity. 진입 안 했으면 null. */
+  getAlignmentGroup: () => any | null;
 }
 
 interface SplatViewerCoreProps {
@@ -88,6 +97,8 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
     const canvasRef = useRef<HTMLCanvasElement | null>(null);
     const splatDataRef = useRef<SplatData | null>(null);
     const splatEntityRef = useRef<any>(null);
+    // 정합 모드용 공통 부모 entity. enterAlignmentMode 가 생성, exitAlignmentMode 가 정리.
+    const alignmentGroupRef = useRef<any>(null);
     const syncOrbitFromFlyRef = useRef<() => void>(() => {});
     const float2HalfRef = useRef<(v: number) => number>((v) => v);
     const updateCallbacksRef = useRef<Set<(dt: number) => void>>(new Set());
@@ -129,6 +140,51 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
         const ent = splatEntityRef.current;
         if (ent) ent.enabled = visible;
       },
+      enterAlignmentMode: () => {
+        const app = appRef.current;
+        const pc = pcRef.current;
+        if (!app || !pc) return null;
+        let group = alignmentGroupRef.current;
+        if (!group) {
+          group = new pc.Entity('alignmentGroup');
+          app.root.addChild(group);
+          alignmentGroupRef.current = group;
+        }
+        // app.root 의 children 중 module-side entity 를 group 아래로 이동.
+        // 판별 규칙:
+        //   name === 'splat'                       → 본체
+        //   name.startsWith('wallMesh_')           → 6 면 벽 메시
+        //   name.startsWith('doorMesh_')           → 도어 메시
+        //   name.startsWith('add_splat_') && tag 'basemap' 미부여 → 도어 sub-splat 등 module-side
+        // basemap (tag 'basemap') 은 제외.
+        const moveCandidates: any[] = app.root.children.slice();
+        for (const c of moveCandidates) {
+          if (c === group) continue;
+          if (c === cameraEntityRef.current) continue;
+          const name: string = c.name ?? '';
+          const isModuleSplat = name === 'splat';
+          const isWall = name.startsWith('wallMesh_');
+          const isDoor = name.startsWith('doorMesh_');
+          const isAddSplat = name.startsWith('add_splat_');
+          const isBasemap = isAddSplat && c.tags?.has?.('basemap');
+          const include = isModuleSplat || isWall || isDoor || (isAddSplat && !isBasemap);
+          if (!include) continue;
+          group.addChild(c);
+        }
+        return group;
+      },
+      exitAlignmentMode: () => {
+        const app = appRef.current;
+        const group = alignmentGroupRef.current;
+        if (!app || !group) return;
+        // children 을 app.root 로 되돌림 (group 의 transform 은 적용된 채로 유지될 수 있어
+        // 호출자가 반드시 정합 결과 저장 또는 reset 후 호출해야 함).
+        const children = group.children.slice();
+        for (const c of children) app.root.addChild(c);
+        try { group.destroy(); } catch {}
+        alignmentGroupRef.current = null;
+      },
+      getAlignmentGroup: () => alignmentGroupRef.current,
     }));
 
     // ── Shift 키 상태 추적 (이동속도 표시에 반영) ──

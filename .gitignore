@@ -56,7 +56,8 @@ htmlcov/
 logs/
 
 # Data & model artifacts
-data/
+data/*
+!data/.gitkeep
 *.ply
 *.sog
 *.pt
