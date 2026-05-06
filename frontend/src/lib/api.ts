@@ -1,51 +1,75 @@
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || '/api';
+const UNSAFE_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
+export class ApiError extends Error {
+  status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+  }
+}
 
 class ApiClient {
-  private accessToken: string | null = null;
-  private refreshToken: string | null = null;
   // 동시 요청들이 같은 refresh를 공유하도록 in-flight Promise를 보관 (single-flight)
   private refreshInFlight: Promise<boolean> | null = null;
 
-  constructor() {
-    if (typeof window !== 'undefined') {
-      this.accessToken = localStorage.getItem('access_token');
-      this.refreshToken = localStorage.getItem('refresh_token');
+  private getCookie(name: string): string | null {
+    if (typeof document === 'undefined') return null;
+    const encodedName = encodeURIComponent(name);
+    const cookies = document.cookie ? document.cookie.split('; ') : [];
+    for (const cookie of cookies) {
+      if (!cookie.startsWith(`${encodedName}=`)) continue;
+      return decodeURIComponent(cookie.slice(encodedName.length + 1));
     }
+    return null;
   }
 
-  setTokens(accessToken: string, refreshToken: string) {
-    this.accessToken = accessToken;
-    this.refreshToken = refreshToken;
-    localStorage.setItem('access_token', accessToken);
-    localStorage.setItem('refresh_token', refreshToken);
+  private isUnsafeMethod(method?: string): boolean {
+    const normalizedMethod = (method ?? 'GET').toUpperCase();
+    return UNSAFE_METHODS.has(normalizedMethod);
   }
 
-  clearTokens() {
-    this.accessToken = null;
-    this.refreshToken = null;
+  private buildHeaders(options: RequestInit = {}): Headers {
+    const headers = new Headers(options.headers);
+    const method = (options.method ?? 'GET').toUpperCase();
+    const hasStringBody = typeof options.body === 'string';
+
+    if (hasStringBody && !headers.has('Content-Type')) {
+      headers.set('Content-Type', 'application/json');
+    }
+
+    if (this.isUnsafeMethod(method)) {
+      const csrfToken = this.getCookie('csrf_token');
+      if (csrfToken) {
+        headers.set('X-CSRF-Token', csrfToken);
+      }
+    }
+
+    return headers;
+  }
+
+  clearSessionState() {
+    if (typeof window === 'undefined') return;
     localStorage.removeItem('access_token');
     localStorage.removeItem('refresh_token');
   }
 
-  getAccessToken() {
-    return this.accessToken;
-  }
-
-  isAuthenticated() {
-    return !!this.accessToken;
-  }
-
   async exchangeAuthCode(code: string): Promise<boolean> {
+    const body = JSON.stringify({ code });
     try {
       const res = await fetch(`${API_BASE}/auth/exchange`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ code }),
+        headers: this.buildHeaders({
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body,
+        }),
+        body,
+        credentials: 'include',
       });
-      if (!res.ok) return false;
-      const data = await res.json();
-      this.setTokens(data.access_token, data.refresh_token);
-      return true;
+      return res.ok;
     } catch {
       return false;
     }
@@ -65,7 +89,6 @@ class ApiClient {
   }
 
   private async refreshAccessToken(): Promise<boolean> {
-    if (!this.refreshToken) return false;
     // 이미 진행 중인 refresh가 있으면 그 결과를 공유한다 (single-flight).
     if (this.refreshInFlight) return this.refreshInFlight;
 
@@ -73,14 +96,10 @@ class ApiClient {
       try {
         const res = await fetch(`${API_BASE}/auth/refresh`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ refresh_token: this.refreshToken }),
+          headers: this.buildHeaders({ method: 'POST' }),
+          credentials: 'include',
         });
-        if (!res.ok) return false;
-        const data = await res.json();
-        this.accessToken = data.access_token;
-        localStorage.setItem('access_token', data.access_token);
-        return true;
+        return res.ok;
       } catch {
         return false;
       } finally {
@@ -92,35 +111,34 @@ class ApiClient {
   }
 
   async fetch<T = any>(path: string, options: RequestInit = {}): Promise<T> {
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-      ...(options.headers as Record<string, string> || {}),
+    const method = (options.method ?? 'GET').toUpperCase();
+    const requestOptions: RequestInit = {
+      ...options,
+      method,
+      headers: this.buildHeaders({ ...options, method }),
+      credentials: 'include',
     };
+    let res = await fetch(`${API_BASE}${path}`, requestOptions);
 
-    if (this.accessToken) {
-      headers['Authorization'] = `Bearer ${this.accessToken}`;
-    }
-
-    let res = await fetch(`${API_BASE}${path}`, { ...options, headers });
-
-    // 401이면 토큰 갱신 시도
-    if (res.status === 401 && this.refreshToken) {
+    // 401이면 세션 갱신 시도 (refresh 엔드포인트 자체에서는 재시도 금지)
+    if (res.status === 401 && path !== '/auth/refresh') {
       const refreshed = await this.refreshAccessToken();
       if (refreshed) {
-        headers['Authorization'] = `Bearer ${this.accessToken}`;
-        res = await fetch(`${API_BASE}${path}`, { ...options, headers });
+        const retryOptions: RequestInit = {
+          ...options,
+          method,
+          headers: this.buildHeaders({ ...options, method }),
+          credentials: 'include',
+        };
+        res = await fetch(`${API_BASE}${path}`, retryOptions);
       } else {
-        this.clearTokens();
-        if (typeof window !== 'undefined') {
-          window.location.href = '/';
-        }
-        throw new Error('인증이 만료되었습니다.');
+        this.clearSessionState();
       }
     }
 
     if (!res.ok) {
       const error = await res.json().catch(() => ({ detail: res.statusText }));
-      throw new Error(error.detail || '요청에 실패했습니다.');
+      throw new ApiError(error.detail || '요청에 실패했습니다.', res.status);
     }
 
     if (res.status === 204) return null as T;

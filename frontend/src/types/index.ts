@@ -9,13 +9,6 @@ export interface User {
   created_at: string;
 }
 
-export interface TokenResponse {
-  access_token: string;
-  refresh_token: string;
-  token_type: string;
-  expires_in: number;
-}
-
 // ── Building / Floor / Module ──
 
 export interface Building {
@@ -51,6 +44,24 @@ export interface ActiveBasemapResponse {
   url: string;
   filename: string;
   source_upload_id: string | null;
+}
+
+export interface MetadataModuleOption {
+  id: string;
+  name: string;
+}
+
+export interface MetadataFloorOption {
+  id: string;
+  building_id: string;
+  floor_number: number;
+  modules: MetadataModuleOption[];
+}
+
+export interface BuildingMetadataOptions {
+  id: string;
+  name: string;
+  floors: MetadataFloorOption[];
 }
 
 // ── Upload ──

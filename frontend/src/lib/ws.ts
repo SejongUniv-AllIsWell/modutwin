@@ -16,6 +16,8 @@ const MAX_RECONNECT_ATTEMPTS = 0; // 0 = 무한, 단 backoff로 빈도 자체가
 
 const HEARTBEAT_INTERVAL_MS = 25_000;        // 클라 → 서버 ping
 const HEARTBEAT_TIMEOUT_MS = 60_000;         // 이 시간 내 서버로부터 메시지 없으면 dead 판정
+const WS_TICKET_SUBPROTOCOL = 'ticket';
+const WS_TICKET_PROTOCOL_PREFIX = 'ticket.';
 
 class WebSocketClient {
   private ws: WebSocket | null = null;
@@ -118,10 +120,15 @@ class WebSocketClient {
     }
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/api/ws?ticket=${encodeURIComponent(ticket)}`;
+    const wsUrl = `${protocol}//${window.location.host}/api/ws`;
+    const ticketProtocol = this.encodeTicketSubprotocol(ticket);
+    if (!ticketProtocol) {
+      this.scheduleReconnect();
+      return;
+    }
     let ws: WebSocket;
     try {
-      ws = new WebSocket(wsUrl);
+      ws = new WebSocket(wsUrl, [WS_TICKET_SUBPROTOCOL, ticketProtocol]);
     } catch {
       this.scheduleReconnect();
       return;
@@ -233,6 +240,22 @@ class WebSocketClient {
   private clearHeartbeat() {
     if (this.heartbeatTimer) { clearInterval(this.heartbeatTimer); this.heartbeatTimer = null; }
     if (this.watchdogTimer) { clearTimeout(this.watchdogTimer); this.watchdogTimer = null; }
+  }
+
+  private encodeTicketSubprotocol(ticket: string): string | null {
+    if (!ticket) return null;
+    try {
+      const bytes = new TextEncoder().encode(ticket);
+      let binary = '';
+      for (let i = 0; i < bytes.length; i++) {
+        binary += String.fromCharCode(bytes[i]);
+      }
+      const base64url = btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+      if (!base64url) return null;
+      return `${WS_TICKET_PROTOCOL_PREFIX}${base64url}`;
+    } catch {
+      return null;
+    }
   }
 }
 

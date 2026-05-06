@@ -10,7 +10,7 @@ export default function Navbar() {
     <nav className="fixed top-0 left-0 right-0 z-50 bg-gray-900 border-b border-gray-800" style={{ minWidth: '500px' }}>
       <div className="px-10 flex items-center justify-between h-14">
         <Link href="/" className="text-white font-bold text-lg whitespace-nowrap">
-          3DGS Platform
+          ModuTwin
         </Link>
 
         <div className="flex items-center gap-4">

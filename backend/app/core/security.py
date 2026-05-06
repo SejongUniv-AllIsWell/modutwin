@@ -3,18 +3,17 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import Depends, HTTPException, status
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi import Depends, HTTPException, Request, status
 from jose import JWTError, jwt
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.auth_cookies import get_access_token_from_cookie, validate_csrf_for_cookie_auth
 from app.core.config import get_settings
 from app.core.database import get_db
 from app.models import User, Session, UserRole
 
 settings = get_settings()
-security_scheme = HTTPBearer(auto_error=False)
 
 
 def create_access_token(user_id: str, role: str) -> str:
@@ -46,22 +45,24 @@ def decode_access_token(token: str) -> dict:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="유효하지 않거나 만료된 토큰입니다.",
-            headers={"WWW-Authenticate": "Bearer"},
         )
 
 
 async def get_current_user(
-    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security_scheme),
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> User:
-    if credentials is None:
+    token = get_access_token_from_cookie(request)
+
+    if token is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="인증이 필요합니다.",
-            headers={"WWW-Authenticate": "Bearer"},
         )
 
-    payload = decode_access_token(credentials.credentials)
+    validate_csrf_for_cookie_auth(request)
+
+    payload = decode_access_token(token)
     user_id = payload.get("sub")
     if user_id is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="유효하지 않은 토큰입니다.")
@@ -75,13 +76,14 @@ async def get_current_user(
 
 
 async def get_current_user_optional(
-    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security_scheme),
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> Optional[User]:
-    if credentials is None:
+    if get_access_token_from_cookie(request) is None:
         return None
+
     try:
-        return await get_current_user(credentials, db)
+        return await get_current_user(request=request, db=db)
     except HTTPException:
         return None
 

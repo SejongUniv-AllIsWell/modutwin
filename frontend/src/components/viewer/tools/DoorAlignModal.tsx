@@ -8,7 +8,18 @@ import { surfacePlanesFromRoom, type SurfacePlane } from '@/lib/gs/planes';
 import { useAdditionalGsplats } from './useAdditionalGsplats';
 import type { GaussianScene } from '@/lib/ply/types';
 import type { BoundarySubUpdate } from '@/lib/gs/doorTrim';
-import { api } from '@/lib/api';
+import {
+  clearDoorsOnServer,
+  emptyPicked,
+  fetchDoorsFromServer,
+  persistDoorsToServer,
+  PRIMARY_DOOR_ID,
+  type PersistOpts,
+  type PickedCorner,
+  type Vec3,
+} from './doorAlignDoors';
+import { loadBasemapJson, loadBasemapUrl, saveBasemapJson, saveBasemapUrl } from './doorAlignPersistence';
+import { easeInOutCubic, parseBasemapCorners, rotationMatrixToQuat } from './doorAlignMath';
 
 interface Props {
   coreRef: React.RefObject<SplatViewerCoreRef>;
@@ -42,13 +53,6 @@ interface Props {
   getCurrentBakedRotation?: () => { rotX: number; rotZ: number; wallAngleRad: number };
 }
 
-type Vec3 = [number, number, number];
-
-interface PickedCorner {
-  pos: Vec3;        // raw splat frame
-  surfaceId: string; // 어느 면(벽/천장/바닥)에 떨어졌는지
-}
-
 // 픽 / 영속화 / 다운스트림 기하 (Kabsch 등) 는 시계방향 (TL → TR → BR → BL) 인덱스 순서를 가정.
 // 이 배열 인덱스가 곧 picked[] 의 인덱스이며 절대 바꾸지 말 것.
 const CORNERS = [
@@ -61,213 +65,6 @@ const CORNERS = [
 // UI 표시용 순서 — 자연스러운 2x2 배치 (왼쪽아래, 오른쪽아래 가 시각 위치 그대로 가도록).
 // [TL, TR, BL, BR] = [0, 1, 3, 2]
 const DISPLAY_ORDER = [0, 1, 3, 2] as const;
-
-// doors.json 은 서버 (`uploads/{id}/refined/doors.json`) 에 저장된다. 통째 덮어쓰기 —
-// 이력 보존 안 함. 본 모달은 단일 문(door_1)만 다루지만 SAM3 결과로 여러 문이 들어와있을 수
-// 있으므로 door_1 (또는 첫 번째 항목) 만 추출해서 편집.
-
-const PRIMARY_DOOR_ID = 'door_1';
-
-// 서버 doors.json 스키마 — corners 외에 힌지/회전 메타 + 추출 분류 파라미터도 함께 저장.
-// 후속 뷰어가 basemap 위에서 사용자 상호작용 (문 열기) 할 때 어느 변/방향/각도로 열어야 하는지,
-// 그리고 동일 분류 결과 재현 (decompose 입력) 위해 사용.
-//   hingeEdge: 0..3 (P0→P1=0, P1→P2=1, P2→P3=2, P3→P0=3). null = 미설정.
-//   swing: 1 (방 안쪽) | -1 (방 바깥쪽).
-//   angleDeg: 열림 각도 (도).
-//   wallSurfaceId: 'w1a' | 'w1b' | 'w2a' | 'w2b' | 'ceiling' | 'floor'. 어느 면 도어인지.
-//   doorThickness: 슬랩 깊이 (m, 방 안쪽 단방향).
-//   boundarySplitEnabled: 경계 분할 ON/OFF.
-//   safetyMargin: 분할 안전 마진.
-interface DoorMeta {
-  id: string;
-  corners: number[][];
-  hingeEdge?: number | null;
-  swing?: 1 | -1;
-  angleDeg?: number;
-  wallSurfaceId?: string;
-  doorThickness?: number;
-  boundarySplitEnabled?: boolean;
-  safetyMargin?: number;
-}
-interface DoorsJson { doors: DoorMeta[] }
-
-function emptyPicked(): Array<PickedCorner | null> {
-  return [null, null, null, null];
-}
-
-interface FetchedDoor {
-  picked: Array<PickedCorner | null>;
-  hingeEdge: number | null;
-  swing: 1 | -1;
-  angleDeg: number;
-  wallSurfaceId: string | null;
-  doorThickness: number | null;
-  boundarySplitEnabled: boolean | null;
-  safetyMargin: number | null;
-}
-
-async function fetchDoorsFromServer(uploadId: string): Promise<FetchedDoor> {
-  const empty: FetchedDoor = {
-    picked: emptyPicked(), hingeEdge: null, swing: 1, angleDeg: 75,
-    wallSurfaceId: null, doorThickness: null, boundarySplitEnabled: null, safetyMargin: null,
-  };
-  try {
-    const data = await api.get<DoorsJson>(`/uploads/${uploadId}/doors`);
-    if (!data.doors || data.doors.length === 0) return empty;
-    const target = data.doors.find(d => d.id === PRIMARY_DOOR_ID) ?? data.doors[0];
-    if (!target?.corners || target.corners.length !== 4) return empty;
-    const surfaceId = typeof target.wallSurfaceId === 'string' ? target.wallSurfaceId : '';
-    return {
-      picked: target.corners.map(c => ({ pos: [c[0], c[1], c[2]] as Vec3, surfaceId })),
-      hingeEdge: typeof target.hingeEdge === 'number' ? target.hingeEdge : null,
-      swing: target.swing === -1 ? -1 : 1,
-      angleDeg: typeof target.angleDeg === 'number' ? target.angleDeg : 75,
-      wallSurfaceId: surfaceId || null,
-      doorThickness: typeof target.doorThickness === 'number' ? target.doorThickness : null,
-      boundarySplitEnabled: typeof target.boundarySplitEnabled === 'boolean' ? target.boundarySplitEnabled : null,
-      safetyMargin: typeof target.safetyMargin === 'number' ? target.safetyMargin : null,
-    };
-  } catch (e: any) {
-    return empty;
-  }
-}
-
-interface PersistOpts {
-  hingeEdge?: number | null;
-  swing?: 1 | -1;
-  angleDeg?: number;
-  wallSurfaceId?: string;
-  doorThickness?: number;
-  boundarySplitEnabled?: boolean;
-  safetyMargin?: number;
-}
-async function persistDoorsToServer(
-  uploadId: string,
-  corners: Array<PickedCorner | null>,
-  opts: PersistOpts = {},
-) {
-  const allFilled = corners.every(c => c !== null);
-  if (!allFilled) return;
-  const door: DoorMeta = {
-    id: PRIMARY_DOOR_ID,
-    corners: corners.map(c => [c!.pos[0], c!.pos[1], c!.pos[2]]),
-  };
-  if (opts.hingeEdge !== undefined) door.hingeEdge = opts.hingeEdge;
-  if (opts.swing !== undefined) door.swing = opts.swing;
-  if (opts.angleDeg !== undefined) door.angleDeg = opts.angleDeg;
-  if (opts.wallSurfaceId !== undefined) door.wallSurfaceId = opts.wallSurfaceId;
-  if (opts.doorThickness !== undefined) door.doorThickness = opts.doorThickness;
-  if (opts.boundarySplitEnabled !== undefined) door.boundarySplitEnabled = opts.boundarySplitEnabled;
-  if (opts.safetyMargin !== undefined) door.safetyMargin = opts.safetyMargin;
-  try {
-    const existing = await api.get<DoorsJson>(`/uploads/${uploadId}/doors`).catch(() => ({ doors: [] }));
-    // 기존 door_1 의 메타는 새 opts 가 없으면 유지 — partial update.
-    const prev = (existing.doors ?? []).find(d => d.id === PRIMARY_DOOR_ID);
-    if (prev) {
-      if (door.hingeEdge === undefined && prev.hingeEdge !== undefined) door.hingeEdge = prev.hingeEdge;
-      if (door.swing === undefined && prev.swing !== undefined) door.swing = prev.swing;
-      if (door.angleDeg === undefined && prev.angleDeg !== undefined) door.angleDeg = prev.angleDeg;
-      if (door.wallSurfaceId === undefined && prev.wallSurfaceId !== undefined) door.wallSurfaceId = prev.wallSurfaceId;
-      if (door.doorThickness === undefined && prev.doorThickness !== undefined) door.doorThickness = prev.doorThickness;
-      if (door.boundarySplitEnabled === undefined && prev.boundarySplitEnabled !== undefined) door.boundarySplitEnabled = prev.boundarySplitEnabled;
-      if (door.safetyMargin === undefined && prev.safetyMargin !== undefined) door.safetyMargin = prev.safetyMargin;
-    }
-    const others = (existing.doors ?? []).filter(d => d.id !== PRIMARY_DOOR_ID);
-    await api.put(`/uploads/${uploadId}/doors`, { doors: [door, ...others] });
-  } catch (e: any) {
-    console.warn('[doors] persist 실패', e);
-  }
-}
-
-async function clearDoorsOnServer(uploadId: string) {
-  // door_1 만 제거 (다른 문은 유지).
-  try {
-    const existing = await api.get<DoorsJson>(`/uploads/${uploadId}/doors`).catch(() => ({ doors: [] }));
-    const others = (existing.doors ?? []).filter(d => d.id !== PRIMARY_DOOR_ID);
-    await api.put(`/uploads/${uploadId}/doors`, { doors: others });
-  } catch (e: any) {
-    console.warn('[doors] clear 실패', e);
-  }
-}
-
-const BASEMAP_KEY_PREFIX = 'basemap_corners_v1_';
-
-function loadBasemapJson(uploadId: string): string {
-  try {
-    const raw = localStorage.getItem(BASEMAP_KEY_PREFIX + uploadId);
-    return raw ?? '';
-  } catch { return ''; }
-}
-function saveBasemapJson(uploadId: string, json: string) {
-  try { localStorage.setItem(BASEMAP_KEY_PREFIX + uploadId, json); }
-  catch { /* ignore */ }
-}
-
-const BASEMAP_URL_KEY_PREFIX = 'basemap_ply_url_v1_';
-function loadBasemapUrl(uploadId: string): string {
-  try { return localStorage.getItem(BASEMAP_URL_KEY_PREFIX + uploadId) ?? ''; }
-  catch { return ''; }
-}
-function saveBasemapUrl(uploadId: string, url: string) {
-  try { localStorage.setItem(BASEMAP_URL_KEY_PREFIX + uploadId, url); }
-  catch { /* ignore */ }
-}
-
-/** 3x3 회전행렬 (row-major) → quaternion [w, x, y, z] */
-function rotationMatrixToQuat(R: ArrayLike<number>): [number, number, number, number] {
-  const m00 = R[0], m01 = R[1], m02 = R[2];
-  const m10 = R[3], m11 = R[4], m12 = R[5];
-  const m20 = R[6], m21 = R[7], m22 = R[8];
-  const tr = m00 + m11 + m22;
-  let w: number, x: number, y: number, z: number;
-  if (tr > 0) {
-    const s = Math.sqrt(tr + 1) * 2;
-    w = 0.25 * s;
-    x = (m21 - m12) / s;
-    y = (m02 - m20) / s;
-    z = (m10 - m01) / s;
-  } else if (m00 > m11 && m00 > m22) {
-    const s = Math.sqrt(1 + m00 - m11 - m22) * 2;
-    w = (m21 - m12) / s;
-    x = 0.25 * s;
-    y = (m01 + m10) / s;
-    z = (m02 + m20) / s;
-  } else if (m11 > m22) {
-    const s = Math.sqrt(1 + m11 - m00 - m22) * 2;
-    w = (m02 - m20) / s;
-    x = (m01 + m10) / s;
-    y = 0.25 * s;
-    z = (m12 + m21) / s;
-  } else {
-    const s = Math.sqrt(1 + m22 - m00 - m11) * 2;
-    w = (m10 - m01) / s;
-    x = (m02 + m20) / s;
-    y = (m12 + m21) / s;
-    z = 0.25 * s;
-  }
-  return [w, x, y, z];
-}
-
-function easeInOutCubic(t: number): number {
-  return t < 0.5 ? 4*t*t*t : 1 - Math.pow(-2*t + 2, 3) / 2;
-}
-
-/** "[[x,y,z],[x,y,z],[x,y,z],[x,y,z]]" 형태 JSON 파싱 */
-function parseBasemapCorners(text: string): Vec3[] | null {
-  if (!text.trim()) return null;
-  try {
-    const parsed = JSON.parse(text);
-    if (!Array.isArray(parsed) || parsed.length !== 4) return null;
-    const out: Vec3[] = [];
-    for (const c of parsed) {
-      if (!Array.isArray(c) || c.length !== 3) return null;
-      const x = Number(c[0]), y = Number(c[1]), z = Number(c[2]);
-      if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return null;
-      out.push([x, y, z]);
-    }
-    return out;
-  } catch { return null; }
-}
 
 /**
  * 문 설정 + 정합 단일 모달.

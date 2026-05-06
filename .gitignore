@@ -1,59 +1,37 @@
-# development 
-.claude/
-*.sql
-nginx/nginx.conf
-claude.md
-docs/
-
-# data
-*.mp4
-*.wav
-*.ply
-*.sog
-
-# Dependencies
-node_modules/
-__pycache__/
-*.pyc
-*.pyo
-*.egg-info/
-.eggs/
-dist/
-build/
-
-# Environment
+# Local secrets
 .env
 .env.local
 .env.*.local
-*.env
 
-# Python virtual environments
-venv/
-.venv/
-env/
+# Local tool state
+.claude/
 
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-.DS_Store
+# Dependencies
+node_modules/
+frontend/node_modules/
 
-# Next.js
+# Build output and caches
+.next/
 frontend/.next/
-frontend/out/
-frontend/tsconfig.tsbuildinfo
-frontend/next-env.d.ts
+dist/
+build/
+coverage/
+*.tsbuildinfo
 
-# Testing
-.coverage
-htmlcov/
+# Python caches and virtualenvs
+__pycache__/
+*.py[cod]
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
 
 # Logs
 *.log
-logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
 # Data & model artifacts
 data/*
@@ -76,7 +54,8 @@ tmp/
 temp/
 *.tmp
 
-# OS
+# OS / editor files
+.DS_Store
 Thumbs.db
-
-mlx_sam3/
+.vscode/
+.idea/

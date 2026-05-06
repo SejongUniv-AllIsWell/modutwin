@@ -50,6 +50,14 @@ class Settings(BaseSettings):
     # Dev mode (OAuth bypass)
     DEV_MODE: bool = False
 
+    # Upload integrity / quota
+    UPLOAD_MAX_FILE_SIZE_BYTES: int = 20 * 1024 * 1024 * 1024
+    UPLOAD_SIZE_TOLERANCE_BYTES: int = 1024 * 1024
+
+    # Feature flags
+    ENABLE_SAM3: bool = False
+    ENABLE_SAM3_DISPATCH: bool | None = None
+
     @model_validator(mode="after")
     def assemble_urls(self) -> "Settings":
         if not self.DATABASE_URL:
@@ -64,6 +72,8 @@ class Settings(BaseSettings):
                 f"amqp://{self.RABBITMQ_DEFAULT_USER}:{self.RABBITMQ_DEFAULT_PASS}"
                 f"@{self.RABBITMQ_HOST}:5672//"
             )
+        if self.ENABLE_SAM3_DISPATCH is not None:
+            self.ENABLE_SAM3 = self.ENABLE_SAM3_DISPATCH
         return self
 
     class Config:

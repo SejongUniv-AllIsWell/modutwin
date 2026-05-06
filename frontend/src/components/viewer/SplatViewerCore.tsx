@@ -4,6 +4,12 @@ import {
   useEffect, useRef, useState, useCallback,
   forwardRef, useImperativeHandle,
 } from 'react';
+import {
+  _half2Float,
+  calcForwardVec,
+  getLookDir,
+  getRightDir,
+} from './tools/cameraMath';
 
 // ── 외부 노출 타입 ──
 
@@ -59,21 +65,6 @@ interface SplatViewerCoreProps {
 }
 
 type CameraMode = 'fly' | 'orbit';
-
-const DEG2RAD = Math.PI / 180;
-
-// half2Float 구현 (PlayCanvas에 없음)
-function _half2Float(h: number): number {
-  const s = (h >> 15) & 0x1;
-  const e = (h >> 10) & 0x1f;
-  const m = h & 0x3ff;
-  if (e === 0) {
-    if (m === 0) return s ? -0 : 0;
-    return (s ? -1 : 1) * Math.pow(2, -14) * (m / 1024);
-  }
-  if (e === 31) return m ? NaN : (s ? -Infinity : Infinity);
-  return (s ? -1 : 1) * Math.pow(2, e - 15) * (1 + m / 1024);
-}
 
 const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
   ({ sogUrl, onSplatLoaded, children }, ref) => {
@@ -257,20 +248,6 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
           let orbitRadius = 3;
           const orbitTarget = new pc.Vec3(0, 0, 0);
 
-          const calcForwardVec = (a: number, e: number) => {
-            const ex = e * DEG2RAD, ey = a * DEG2RAD;
-            const s1 = Math.sin(-ex), c1 = Math.cos(-ex), s2 = Math.sin(-ey), c2 = Math.cos(-ey);
-            return new pc.Vec3(-c1 * s2, s1, c1 * c2);
-          };
-          const getLookDir = (a: number, e: number) => {
-            const f = calcForwardVec(a, e);
-            return new pc.Vec3(-f.x, -f.y, -f.z);
-          };
-          const getRightDir = (a: number) => {
-            const ey = a * DEG2RAD;
-            return new pc.Vec3(Math.cos(ey), 0, -Math.sin(ey));
-          };
-
           const syncCamera = () => {
             if (cameraModeRef.current === 'orbit') {
               const fwd = calcForwardVec(azim, elev);
@@ -286,12 +263,12 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
           syncCamera();
 
           syncOrbitFromFlyRef.current = () => {
-            const lookDir = getLookDir(azim, elev);
-            orbitRadius = 3;
-            orbitTarget.set(
-              camPos.x + lookDir.x * orbitRadius,
-              camPos.y + lookDir.y * orbitRadius,
-              camPos.z + lookDir.z * orbitRadius,
+              const lookDir = getLookDir(azim, elev);
+              orbitRadius = 3;
+              orbitTarget.set(
+                camPos.x + lookDir.x * orbitRadius,
+                camPos.y + lookDir.y * orbitRadius,
+                camPos.z + lookDir.z * orbitRadius,
             );
           };
 

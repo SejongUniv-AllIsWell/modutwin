@@ -2,18 +2,22 @@ from uuid import UUID
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from typing import Optional
-from sqlalchemy import select, func
+from sqlalchemy import select, func, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.security import get_current_user, require_admin
 from app.models import (
-    User, Basemap, BasemapStatus, Floor, Building, Module, Upload,
+    User, UserRole, Basemap, BasemapStatus, Floor, Building, Module, Upload,
     SceneOutput, Task,
 )
 from app.services.minio_service import get_minio_service
+from app.services.metadata_options import (
+    parse_module_name_input,
+    validate_floor_number as validate_floor_number_value,
+)
 
 router = APIRouter(prefix="/admin/basemaps", tags=["basemaps"])
 
@@ -148,6 +152,9 @@ async def get_basemap_doors(
 class BasemapResponse(BaseModel):
     id: UUID
     floor_id: UUID
+    floor_number: int
+    building_id: UUID
+    building_name: str
     version: int
     status: str
     is_active: bool
@@ -177,6 +184,132 @@ class BasemapRegisterRequest(BaseModel):
     upload_id: UUID
 
 
+class BasemapMetadataModuleResponse(BaseModel):
+    id: UUID
+    name: str
+
+
+class BasemapMetadataFloorResponse(BaseModel):
+    id: UUID
+    building_id: UUID
+    floor_number: int
+    modules: list[BasemapMetadataModuleResponse]
+
+
+class BasemapMetadataResponse(BaseModel):
+    basemap_id: UUID
+    building_id: UUID
+    building_name: str
+    floors: list[BasemapMetadataFloorResponse]
+
+
+class BasemapFloorCreateRequest(BaseModel):
+    floor_number: int
+
+    @field_validator("floor_number")
+    @classmethod
+    def validate_floor_number(cls, v: int) -> int:
+        return validate_floor_number_value(v)
+
+
+class BasemapModuleCreateRequest(BaseModel):
+    floor_id: UUID
+    module_input: str
+
+
+def _basemap_response(basemap: Basemap, floor: Floor, building: Building) -> BasemapResponse:
+    return BasemapResponse(
+        id=basemap.id,
+        floor_id=basemap.floor_id,
+        floor_number=floor.floor_number,
+        building_id=building.id,
+        building_name=building.name,
+        version=basemap.version,
+        status=basemap.status.value if hasattr(basemap.status, "value") else str(basemap.status),
+        is_active=basemap.is_active,
+        created_at=basemap.created_at,
+        approved_at=basemap.approved_at,
+    )
+
+
+async def _get_basemap_with_building(
+    db: AsyncSession,
+    basemap_id: UUID,
+) -> tuple[Basemap, Floor, Building]:
+    result = await db.execute(
+        select(Basemap, Floor, Building)
+        .join(Floor, Basemap.floor_id == Floor.id)
+        .join(Building, Floor.building_id == Building.id)
+        .where(Basemap.id == basemap_id)
+    )
+    row = result.one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Basemap을 찾을 수 없습니다.")
+    return row
+
+
+async def _metadata_response_for_building(
+    db: AsyncSession,
+    basemap_id: UUID,
+    building: Building,
+) -> BasemapMetadataResponse:
+    floor_result = await db.execute(
+        select(Floor)
+        .where(
+            Floor.building_id == building.id,
+            Floor.floor_number != 0,
+            Floor.is_visible == True,
+        )
+        .order_by(Floor.floor_number.desc())
+    )
+    floors = floor_result.scalars().all()
+    if not floors:
+        return BasemapMetadataResponse(
+            basemap_id=basemap_id,
+            building_id=building.id,
+            building_name=building.name,
+            floors=[],
+        )
+
+    floor_ids = [floor.id for floor in floors]
+    module_result = await db.execute(
+        select(Module.id, Module.floor_id, Module.name)
+        .join(User, Module.user_id == User.id)
+        .where(
+            Module.floor_id.in_(floor_ids),
+            Module.is_visible == True,
+            User.role == UserRole.admin,
+        )
+        .order_by(Module.floor_id, Module.name)
+    )
+
+    modules_by_floor: dict[UUID, list[BasemapMetadataModuleResponse]] = {f.id: [] for f in floors}
+    seen_by_floor: dict[UUID, set[str]] = {f.id: set() for f in floors}
+    for module_id, floor_id, module_name in module_result.all():
+        seen = seen_by_floor.setdefault(floor_id, set())
+        if module_name in seen:
+            continue
+        seen.add(module_name)
+        modules_by_floor.setdefault(floor_id, []).append(
+            BasemapMetadataModuleResponse(id=module_id, name=module_name)
+        )
+
+    return BasemapMetadataResponse(
+        basemap_id=basemap_id,
+        building_id=building.id,
+        building_name=building.name,
+        floors=[
+            BasemapMetadataFloorResponse(
+                id=floor.id,
+                building_id=floor.building_id,
+                floor_number=floor.floor_number,
+                modules=modules_by_floor.get(floor.id, []),
+            )
+            for floor in floors
+        ],
+    )
+
+
 @router.get("", response_model=list[BasemapResponse])
 async def list_basemaps(
     admin: User = Depends(require_admin),
@@ -184,9 +317,15 @@ async def list_basemaps(
 ):
     """basemap 목록 조회 (관리자)"""
     result = await db.execute(
-        select(Basemap).order_by(Basemap.floor_id, Basemap.version.desc())
+        select(Basemap, Floor, Building)
+        .join(Floor, Basemap.floor_id == Floor.id)
+        .join(Building, Floor.building_id == Building.id)
+        .order_by(Building.name, Floor.floor_number.desc(), Basemap.version.desc())
     )
-    return result.scalars().all()
+    return [
+        _basemap_response(basemap, floor, building)
+        for basemap, floor, building in result.all()
+    ]
 
 
 @router.get("/candidates", response_model=list[BasemapCandidateResponse])
@@ -281,17 +420,18 @@ async def register_basemap_from_upload(
     Upload.minio_path 는 placeholder 라 MinIO 에 실물이 없을 수 있으므로,
     가장 최근 SceneOutput.ply_path (실제 다듬기 결과)를 basemap 으로 사용한다.
     """
-    # 업로드 + 모듈 + 층 조회
+    # 업로드 + 모듈 + 층 + 건물 조회
     result = await db.execute(
-        select(Upload, Module, Floor)
+        select(Upload, Module, Floor, Building)
         .join(Module, Upload.module_id == Module.id)
         .join(Floor, Module.floor_id == Floor.id)
+        .join(Building, Floor.building_id == Building.id)
         .where(Upload.id == body.upload_id)
     )
     row = result.one_or_none()
     if row is None:
         raise HTTPException(status_code=404, detail="업로드를 찾을 수 없습니다.")
-    upload, module, floor = row
+    upload, module, floor, building = row
 
     # 가장 최근 다듬기 결과 조회 — basemap 의 실제 PLY 경로
     scene_result = await db.execute(
@@ -346,7 +486,172 @@ async def register_basemap_from_upload(
     db.add(basemap)
     await db.commit()
     await db.refresh(basemap)
-    return basemap
+    return _basemap_response(basemap, floor, building)
+
+
+@router.get("/{basemap_id}/metadata", response_model=BasemapMetadataResponse)
+async def get_basemap_metadata(
+    basemap_id: UUID,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """등록된 Basemap 이 속한 건물의 관리자 지정 층/모듈 목록."""
+    _, _, building = await _get_basemap_with_building(db, basemap_id)
+    return await _metadata_response_for_building(db, basemap_id, building)
+
+
+@router.post("/{basemap_id}/metadata/floors", response_model=BasemapMetadataResponse)
+async def add_basemap_metadata_floor(
+    basemap_id: UUID,
+    body: BasemapFloorCreateRequest,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Basemap 의 건물에 관리자 지정 층을 추가한다."""
+    _, _, building = await _get_basemap_with_building(db, basemap_id)
+
+    existing = await db.execute(
+        select(Floor).where(
+            Floor.building_id == building.id,
+            Floor.floor_number == body.floor_number,
+        )
+    )
+    floor = existing.scalar_one_or_none()
+    if floor is None:
+        db.add(Floor(building_id=building.id, floor_number=body.floor_number))
+        await db.commit()
+    elif not floor.is_visible:
+        floor.is_visible = True
+        await db.commit()
+
+    return await _metadata_response_for_building(db, basemap_id, building)
+
+
+@router.post("/{basemap_id}/metadata/modules", response_model=BasemapMetadataResponse)
+async def add_basemap_metadata_modules(
+    basemap_id: UUID,
+    body: BasemapModuleCreateRequest,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Basemap 의 건물에 속한 층에 관리자 지정 모듈명을 추가한다.
+
+    module_input 이 `N~M` 형태이면 N부터 M까지 문자열 모듈명으로 확장한다.
+    """
+    _, _, building = await _get_basemap_with_building(db, basemap_id)
+
+    floor_result = await db.execute(
+        select(Floor).where(
+            Floor.id == body.floor_id,
+            Floor.building_id == building.id,
+        )
+    )
+    floor = floor_result.scalar_one_or_none()
+    if floor is None:
+        raise HTTPException(status_code=404, detail="Basemap 건물에 속한 층을 찾을 수 없습니다.")
+
+    try:
+        module_names = parse_module_name_input(body.module_input)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    visible_admin_result = await db.execute(
+        select(Module.name)
+        .join(User, Module.user_id == User.id)
+        .where(
+            Module.floor_id == floor.id,
+            Module.name.in_(module_names),
+            User.role == UserRole.admin,
+            Module.is_visible == True,
+        )
+    )
+    visible_admin_names = {name for (name,) in visible_admin_result.all()}
+
+    admin_owned_result = await db.execute(
+        select(Module).where(
+            Module.floor_id == floor.id,
+            Module.user_id == admin.id,
+            Module.name.in_(module_names),
+        )
+    )
+    admin_owned_by_name = {module.name: module for module in admin_owned_result.scalars().all()}
+
+    for module_name in module_names:
+        if module_name in visible_admin_names:
+            continue
+        existing_admin_module = admin_owned_by_name.get(module_name)
+        if existing_admin_module is not None:
+            existing_admin_module.is_visible = True
+            continue
+        db.add(Module(floor_id=floor.id, user_id=admin.id, name=module_name))
+
+    await db.commit()
+    return await _metadata_response_for_building(db, basemap_id, building)
+
+
+@router.delete("/{basemap_id}/metadata/floors/{floor_id}", response_model=BasemapMetadataResponse)
+async def delete_basemap_metadata_floor(
+    basemap_id: UUID,
+    floor_id: UUID,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Basemap 건물의 층 선택지를 숨기고 관리자 모듈 선택지도 함께 숨긴다."""
+    _, _, building = await _get_basemap_with_building(db, basemap_id)
+
+    floor_result = await db.execute(
+        select(Floor).where(
+            Floor.id == floor_id,
+            Floor.building_id == building.id,
+        )
+    )
+    floor = floor_result.scalar_one_or_none()
+    if floor is None:
+        raise HTTPException(status_code=404, detail="Basemap 건물에 속한 층을 찾을 수 없습니다.")
+
+    floor.is_visible = False
+    await db.execute(
+        sa_update(Module)
+        .where(
+            Module.floor_id == floor.id,
+            Module.user_id.in_(
+                select(User.id).where(User.role == UserRole.admin)
+            ),
+        )
+        .values(is_visible=False)
+    )
+    await db.commit()
+    return await _metadata_response_for_building(db, basemap_id, building)
+
+
+@router.delete("/{basemap_id}/metadata/modules/{module_id}", response_model=BasemapMetadataResponse)
+async def delete_basemap_metadata_module(
+    basemap_id: UUID,
+    module_id: UUID,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """관리자가 만든 모듈 선택지를 숨긴다."""
+    _, _, building = await _get_basemap_with_building(db, basemap_id)
+
+    module_result = await db.execute(
+        select(Module, Floor, User)
+        .join(Floor, Module.floor_id == Floor.id)
+        .join(User, Module.user_id == User.id)
+        .where(
+            Module.id == module_id,
+            Floor.building_id == building.id,
+            User.role == UserRole.admin,
+        )
+    )
+    row = module_result.one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Basemap 건물에 속한 관리자 모듈을 찾을 수 없습니다.")
+
+    module, _, _ = row
+    module.is_visible = False
+    await db.commit()
+    return await _metadata_response_for_building(db, basemap_id, building)
 
 
 @router.put("/{basemap_id}/approve")

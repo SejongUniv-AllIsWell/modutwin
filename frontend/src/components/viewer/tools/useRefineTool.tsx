@@ -6,180 +6,58 @@ import { useDepthNormal } from './useDepthNormal';
 import { surfacePlanesFromRoom, signedDistance } from '@/lib/gs/planes';
 import { loadRefineState, saveRefineState, clearRefineState } from '@/lib/refine/persistence';
 import type { GaussianScene } from '@/lib/ply/types';
-
-const UNDO_STACK_LIMIT = 3;
+import {
+  AXIS_COLORS,
+  AXIS_COLORS_DIM,
+  RING_PICK_PX,
+  RING_SEGMENTS,
+  WORLD_AXES,
+  add3,
+  computeCellCodes,
+  cross3,
+  dot3,
+  findKeepCell,
+  isClosed,
+  normalize3,
+  pcaNormal,
+  planeCorners,
+  rotateVec,
+  scale3,
+  tangentBasis,
+  type Color4,
+  type Plane,
+  type Vec3,
+} from './refineMath';
+import {
+  ALL_SURFACES,
+  CF_SURFACES,
+  SELECT_SUB_MODES,
+  UNDO_STACK_LIMIT,
+  WALL_SURFACES,
+  isSelectMode,
+  type OpRecord,
+  type PaintMode,
+  type RefineMode,
+  type RefineToolOptions,
+  type SelectSubMode,
+  type Surface,
+  type ToolMode,
+} from './refineTypes';
+import {
+  buildRotatedPositions as buildRotatedPositionsForRotation,
+  buildRotatedScene as buildRotatedSceneForRotation,
+} from './refineSceneTransforms';
 
 const CeilingFloorModal = lazy(() => import('./CeilingFloorModal'));
 const WallModal = lazy(() => import('./WallModal'));
 
-// ── Types ──
-
-type Vec3 = [number, number, number];
-type Color4 = [number, number, number, number];
-
-interface Plane {
-  normal: Vec3;
-  d: number;
-  center: Vec3;
-}
-
-type ToolMode = 'none' | 'translate' | 'rotate';
-type RefineMode = 'plane' | 'brush' | 'bbox' | 'rect' | 'transparent';
-type PaintMode = 'union' | 'intersect' | 'diff';
-type SelectSubMode = 'brush' | 'bbox' | 'rect';
-const SELECT_SUB_MODES: ReadonlyArray<SelectSubMode> = ['brush', 'bbox', 'rect'];
-const isSelectMode = (m: RefineMode): m is SelectSubMode => (SELECT_SUB_MODES as readonly string[]).includes(m);
-
-// ── Vector utilities ──
-
-function dot3(a: Vec3, b: Vec3): number {
-  return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-}
-function normalize3(v: Vec3): Vec3 {
-  const len = Math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
-  if (len < 1e-8) return [0, 1, 0];
-  return [v[0] / len, v[1] / len, v[2] / len];
-}
-function cross3(a: Vec3, b: Vec3): Vec3 {
-  return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
-}
-function add3(a: Vec3, b: Vec3): Vec3 { return [a[0] + b[0], a[1] + b[1], a[2] + b[2]]; }
-function scale3(v: Vec3, s: number): Vec3 { return [v[0] * s, v[1] * s, v[2] * s]; }
-function tangentBasis(n: Vec3): [Vec3, Vec3] {
-  const up: Vec3 = Math.abs(n[1]) < 0.9 ? [0, 1, 0] : [1, 0, 0];
-  const t1 = normalize3(cross3(n, up));
-  const t2 = cross3(n, t1);
-  return [t1, t2];
-}
-function rotateVec(v: Vec3, axis: Vec3, angle: number): Vec3 {
-  const c = Math.cos(angle), s = Math.sin(angle);
-  const d = dot3(v, axis);
-  const cr = cross3(axis, v);
-  return [v[0]*c+cr[0]*s+axis[0]*d*(1-c), v[1]*c+cr[1]*s+axis[1]*d*(1-c), v[2]*c+cr[2]*s+axis[2]*d*(1-c)];
-}
-function planeCorners(center: Vec3, normal: Vec3, size: number): Vec3[] {
-  const [t1, t2] = tangentBasis(normal);
-  return [
-    add3(add3(center, scale3(t1, -size)), scale3(t2, -size)),
-    add3(add3(center, scale3(t1, size)), scale3(t2, -size)),
-    add3(add3(center, scale3(t1, size)), scale3(t2, size)),
-    add3(add3(center, scale3(t1, -size)), scale3(t2, size)),
-  ];
-}
-
-// ── PCA normal computation ──
-
-function symmetricEigen3x3(mat: number[][]): { values: number[]; vectors: number[][] } {
-  const a = mat.map(r => [...r]);
-  const v = [[1,0,0],[0,1,0],[0,0,1]];
-  for (let iter = 0; iter < 30; iter++) {
-    let maxVal = 0, p = 0, q = 1;
-    for (let i = 0; i < 3; i++) for (let j = i+1; j < 3; j++) {
-      if (Math.abs(a[i][j]) > maxVal) { maxVal = Math.abs(a[i][j]); p = i; q = j; }
-    }
-    if (maxVal < 1e-12) break;
-    const apq = a[p][q];
-    const diff = a[p][p] - a[q][q];
-    let t: number;
-    if (Math.abs(diff) < 1e-12) t = apq > 0 ? 1 : -1;
-    else { const phi = diff / (2 * apq); t = 1 / (Math.abs(phi) + Math.sqrt(phi*phi+1)); if (phi < 0) t = -t; }
-    const c = 1 / Math.sqrt(t*t+1), s = t*c, tau = s/(1+c);
-    a[p][p] -= t * apq; a[q][q] += t * apq; a[p][q] = 0; a[q][p] = 0;
-    for (let r = 0; r < 3; r++) {
-      if (r === p || r === q) continue;
-      const arp = a[r][p], arq = a[r][q];
-      a[r][p] = a[p][r] = arp - s*(arq + tau*arp);
-      a[r][q] = a[q][r] = arq + s*(arp - tau*arq);
-    }
-    for (let r = 0; r < 3; r++) {
-      const vrp = v[r][p], vrq = v[r][q];
-      v[r][p] = vrp - s*(vrq + tau*vrp);
-      v[r][q] = vrq + s*(vrp - tau*vrq);
-    }
-  }
-  return { values: [a[0][0], a[1][1], a[2][2]], vectors: v };
-}
-
-function pcaNormal(positions: Vec3[]): Vec3 {
-  const n = positions.length;
-  const mean: Vec3 = [0, 0, 0];
-  for (const p of positions) { mean[0] += p[0]; mean[1] += p[1]; mean[2] += p[2]; }
-  mean[0] /= n; mean[1] /= n; mean[2] /= n;
-  const cov = [[0,0,0],[0,0,0],[0,0,0]];
-  for (const p of positions) {
-    const d = [p[0]-mean[0], p[1]-mean[1], p[2]-mean[2]];
-    for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) cov[i][j] += d[i]*d[j];
-  }
-  const { values, vectors } = symmetricEigen3x3(cov);
-  const minIdx = values[0] <= values[1] && values[0] <= values[2] ? 0 : values[1] <= values[2] ? 1 : 2;
-  return normalize3([vectors[0][minIdx], vectors[1][minIdx], vectors[2][minIdx]]);
-}
-
-// ── Space partitioning ──
-
-function computeCellCodes(posX: Float32Array, posY: Float32Array, posZ: Float32Array, n: number, planes: Plane[]): Uint32Array {
-  const codes = new Uint32Array(n);
-  for (let i = 0; i < n; i++) {
-    let code = 0;
-    for (let p = 0; p < planes.length; p++) {
-      const { normal, d } = planes[p];
-      if (normal[0]*posX[i]+normal[1]*posY[i]+normal[2]*posZ[i] > d) code |= (1 << p);
-    }
-    codes[i] = code;
-  }
-  return codes;
-}
-function findKeepCell(codes: Uint32Array): number {
-  const counts = new Map<number, number>();
-  for (let i = 0; i < codes.length; i++) counts.set(codes[i], (counts.get(codes[i]) ?? 0) + 1);
-  let best = 0, bestC = 0;
-  counts.forEach((c, k) => { if (c > bestC) { bestC = c; best = k; } });
-  return best;
-}
-function isClosed(keepCell: number, numPlanes: number): boolean { return numPlanes >= 4 && keepCell === 0; }
-
-// ── Gizmo constants ──
-
-const WORLD_AXES: Vec3[] = [[1,0,0],[0,1,0],[0,0,1]];
-const AXIS_COLORS: Color4[] = [[1,0.3,0.3,1],[0.3,1,0.3,1],[0.4,0.6,1,1]];
-const AXIS_COLORS_DIM: Color4[] = [[0.5,0.15,0.15,0.5],[0.15,0.5,0.15,0.5],[0.2,0.3,0.5,0.5]];
-const RING_SEGMENTS = 48;
-const RING_PICK_PX = 18;
-
 // ── Hook ──
 
-interface SaveMetadata {
-  building_id: string;
-  floor_id: string;
-  module_id: string;
-  building_name?: string;
-  floor_number?: number;
-  module_name?: string;
-  /** SAM3 프롬프트 팝업의 자유 텍스트 (현재는 메타데이터 모달 외부에서 별도 수집). */
-  sam_prompt?: string;
-  /** 로컬 파일에서 시작했을 때 register-local 로 새로 생성된 upload_id. */
-  upload_id?: string;
-}
-
-interface RefineToolOptions {
-  uploadId?: string;
-  // 다듬기가 베이스로 삼는 원본 PLY URL — ensureOriginalScene 에서 fetch&parse.
-  currentUrl?: string;
-  // resetAll 에서 새 URL로 SplatViewerCore in-place reload.
-  reloadWithUrl?: (url: string) => void;
-  // 사용자에게 보여주는 파일명 (이미 'refined_' prefix 가 붙어있을 수도 있음 — 이중 prefix 방지용으로 strip).
-  // 저장 시 MinIO key 의 파일명에 사용: `refined_<원본>.ply`.
-  originalFilename?: string;
-  // 저장 성공 후 postSaveModal '예' 선택 시 호출. UnifiedSplatEditor 내부에서 mode='align' 으로 전환.
-  // 미지정이면 '예' 버튼은 모달만 닫고 아무 일도 안 함.
-  onSwitchToAlign?: () => void;
-  // 저장 클릭 시 호출 — 외부에서 메타데이터 입력 모달을 띄우고 결과 반환.
-  // 항상 호출되며, 받은 building/floor/module 로 새 upload 를 등록한 뒤 PLY+sidecar 를 그 위에 PUT.
-  // reject 되면 저장 흐름 취소.
-  onRequestMetadata?: () => Promise<SaveMetadata>;
-}
-
 export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, options?: RefineToolOptions) {
+  const active = options?.active ?? true;
+  const activeRef = useRef(active);
+  activeRef.current = active;
+
   // ── Shared state ──
   const [splatLoaded, setSplatLoaded] = useState(false);
   const [totalCount, setTotalCount] = useState(0);
@@ -230,10 +108,6 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   const selectedSurfacesRef = useRef<Set<string>>(new Set());
 
   // ── Surface selection for flatten/remove ──
-  const ALL_SURFACES = ['ceiling', 'floor', 'w1a', 'w1b', 'w2a', 'w2b'] as const;
-  type Surface = typeof ALL_SURFACES[number];
-  const CF_SURFACES: Surface[] = ['ceiling', 'floor'];
-  const WALL_SURFACES: Surface[] = ['w1a', 'w1b', 'w2a', 'w2b'];
   const [selectedSurfaces, setSelectedSurfaces] = useState<Set<Surface>>(new Set());
   const [flattening, setFlattening] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -347,12 +221,6 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   // 옵션 A: 막 생성 후 CF 모달의 회전 슬라이더 lock
 
   // 통합 undo 히스토리 (시간순 단일 스택)
-  type OpRecord =
-    | { type: 'rotation'; prevRotation: { rotX: number; rotZ: number } }
-    | { type: 'flatten'; prevMask: Uint8Array | null; prevActive: boolean }
-    | { type: 'floater'; prevMask: Uint8Array | null; prevActive: boolean }
-    | { type: 'clipping'; prevSnapshot: Array<{ idx: number; s0: number; s1: number; s2: number }>; prevActive: boolean }
-    | { type: 'wallMesh'; prevEntities: any[]; prevActive: boolean };
   const opHistoryRef = useRef<OpRecord[]>([]);
   const [undoDepth, setUndoDepth] = useState(0);
 
@@ -450,39 +318,12 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   // ── 회전된 source scene 빌드 (A → A' = pendingRotation · A) ──
   // 주의: posX/Y/Z + rot_0..3 만 새 배열, 나머지는 reference 공유 (메모리 절약)
   const buildRotatedScene = useCallback(async (origin: GaussianScene): Promise<GaussianScene> => {
-    const { rotX, rotZ } = pendingRotationRef.current;
-    if (rotX === 0 && rotZ === 0) return origin;
-    const { rotateScene } = await import('@/lib/gs');
-    const cloned: GaussianScene = {
-      numSplats: origin.numSplats,
-      propertyOrder: [...origin.propertyOrder],
-      attrs: new Map(origin.attrs),
-    };
-    for (const p of ['x', 'y', 'z', 'rot_0', 'rot_1', 'rot_2', 'rot_3']) {
-      const arr = origin.attrs.get(p);
-      if (arr) cloned.attrs.set(p, new Float32Array(arr));
-    }
-    rotateScene(cloned, rotX, rotZ);
-    return cloned;
+    return buildRotatedSceneForRotation(origin, pendingRotationRef.current);
   }, []);
 
   // ── splatData 위치 배열을 pendingRotation으로 회전한 사본 (in-place 마스킹용) ──
   const buildRotatedPositions = useCallback((px: Float32Array, py: Float32Array, pz: Float32Array): { x: Float32Array; y: Float32Array; z: Float32Array } => {
-    const { rotX, rotZ } = pendingRotationRef.current;
-    if (rotX === 0 && rotZ === 0) return { x: px, y: py, z: pz };
-    const n = px.length;
-    const cx = Math.cos(rotX), sx = Math.sin(rotX);
-    const cz = Math.cos(rotZ), sz = Math.sin(rotZ);
-    const rx = new Float32Array(n);
-    const ry = new Float32Array(n);
-    const rz = new Float32Array(n);
-    for (let i = 0; i < n; i++) {
-      const x = px[i], y = py[i], z = pz[i];
-      rx[i] = cz * x - sz * cx * y + sz * sx * z;
-      ry[i] = sz * x + cz * cx * y - cz * sx * z;
-      rz[i] = sx * y + cx * z;
-    }
-    return { x: rx, y: ry, z: rz };
+    return buildRotatedPositionsForRotation(px, py, pz, pendingRotationRef.current);
   }, []);
 
 
@@ -1242,6 +1083,20 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   useEffect(() => { wallAngleRef.current = wallAngle; }, [wallAngle]);
   useEffect(() => { wallDistancesRef.current = wallDistances; }, [wallDistances]);
   useEffect(() => { wallModeRef.current = wallMode; }, [wallMode]);
+
+  useEffect(() => {
+    activeRef.current = active;
+    if (active) return;
+
+    dragRef.current = null;
+    hoveredAxisRef.current = -1;
+    normalDisplayRef.current = null;
+    pickingNormalRef.current = false;
+    setPickingNormal(false);
+    if (brushCursorRef.current) brushCursorRef.current.style.display = 'none';
+    if (rectPreviewRef.current) rectPreviewRef.current.style.display = 'none';
+    if (transRectPreviewRef.current) transRectPreviewRef.current.style.display = 'none';
+  }, [active]);
 
   // URL 변경 시 stale splatDataRef를 즉시 비워 destroyed 텍스처 참조를 막는다
   // (reloadWithUrl 후 SplatViewerCore는 unmount → 새 PLY 로드 전까지 ref가 무효)
@@ -2303,6 +2158,21 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     // 가우시안 선택용 rect 모드의 드래그 시작 좌표
     let rectStartScreen: { x: number; y: number } | null = null;
 
+    const clearTransientInteraction = () => {
+      painting = false;
+      transPainting = false;
+      bboxDragAxis = -1;
+      transRectStartScreen = null;
+      rectStartScreen = null;
+      dragRef.current = null;
+      hoveredAxisRef.current = -1;
+      strokeBaseSelRef.current = null;
+      strokeMaskRef.current = null;
+      if (brushCursorRef.current) brushCursorRef.current.style.display = 'none';
+      if (rectPreviewRef.current) rectPreviewRef.current.style.display = 'none';
+      if (transRectPreviewRef.current) transRectPreviewRef.current.style.display = 'none';
+    };
+
     // ── BBox face pick ──
     const pickBboxFace = (mouseX: number, mouseY: number): {axis:number;isMax:boolean}|null => {
       const cam = cameraEntity.camera; const pc = pcRef.current; if (!cam||!pc) return null;
@@ -2328,6 +2198,10 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
 
     // ── Keyboard ──
     const onKeyDown = (e: KeyboardEvent) => {
+      if (!activeRef.current) {
+        clearTransientInteraction();
+        return;
+      }
       const mode = refineModeRef.current;
       if (mode === 'plane' && selectedPlaneRef.current >= 0) {
         if (e.code === 'KeyT') { setToolMode('translate'); toolModeRef.current = 'translate'; }
@@ -2338,12 +2212,20 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       }
     };
     const onKeyUp = (e: KeyboardEvent) => {
+      if (!activeRef.current) {
+        clearTransientInteraction();
+        return;
+      }
       if (e.code === 'KeyT' && toolModeRef.current === 'translate') { setToolMode('none'); toolModeRef.current = 'none'; dragRef.current = null; }
       else if (e.code === 'KeyR' && toolModeRef.current === 'rotate') { setToolMode('none'); toolModeRef.current = 'none'; hoveredAxisRef.current = -1; dragRef.current = null; }
     };
 
     // ── Mouse ──
     const onMouseDown = (e: MouseEvent) => {
+      if (!activeRef.current) {
+        clearTransientInteraction();
+        return;
+      }
       if (e.button !== 0) return;
       const pc = pcRef.current; if (!pc) return;
       const rect = canvas.getBoundingClientRect();
@@ -2516,6 +2398,10 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     };
 
     const onMouseMove = (e: MouseEvent) => {
+      if (!activeRef.current) {
+        clearTransientInteraction();
+        return;
+      }
       const mode = refineModeRef.current;
 
       // ── PLANE: rotation ring hover + drag ──
@@ -2632,6 +2518,10 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     };
 
     const onMouseUp = (e: MouseEvent) => {
+      if (!activeRef.current) {
+        clearTransientInteraction();
+        return;
+      }
       if (e.button !== 0) return;
       // 직사각형 커밋: 화면 시작점 ↔ 현재점 사이 영역 안의 모든 wall 텍셀 alpha=0
       if (refineModeRef.current === 'transparent' && transShapeRef.current === 'rect' && transRectStartScreen) {
@@ -2655,6 +2545,10 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       dragRef.current = null; painting = false; transPainting = false; bboxDragAxis = -1;
     };
     const onMouseLeave = () => {
+      if (!activeRef.current) {
+        clearTransientInteraction();
+        return;
+      }
       if (brushCursorRef.current) brushCursorRef.current.style.display = 'none';
       // rect preview 는 mouseup 까지 표시 (캔버스 밖 드래그 허용 → 표시는 유지)
     };
@@ -2665,6 +2559,8 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
 
     // ── Visualization loop ──
     const unsubUpdate = core.onUpdate(() => {
+      if (!activeRef.current) return;
+
       const mode = refineModeRef.current;
 
       // ── Plane visualization ──
@@ -2761,7 +2657,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   }, [coreRef, recomputePlanes, refreshSelection, syncPlanes, pickAxis, pushHistory, applyBboxSel, deleteSelected]);
 
   // Auto recompute for planes
-  useEffect(() => { if (splatLoaded && refineModeRef.current === 'plane') recomputePlanes(); }, [planes, splatLoaded, recomputePlanes]);
+  useEffect(() => { if (active && splatLoaded && refineModeRef.current === 'plane') recomputePlanes(); }, [active, planes, splatLoaded, recomputePlanes]);
 
   // ── UI ──
   // overlay: brush cursor / rect previews / modals — 캔버스 위 레이어에 둠

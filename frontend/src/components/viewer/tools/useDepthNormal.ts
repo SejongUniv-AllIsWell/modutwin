@@ -9,18 +9,10 @@ let pipelinePromise: Promise<any> | null = null;
 async function getDepthPipeline() {
   if (!pipelinePromise) {
     pipelinePromise = (async () => {
-      const cdnUrl = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3';
-      const mod = await (Function('url', 'return import(url)') as (url: string) => Promise<any>)(cdnUrl);
-      const { pipeline } = mod;
-      try {
-        return await pipeline('depth-estimation', 'onnx-community/depth-anything-v2-small', {
-          device: 'webgpu',
-        });
-      } catch {
-        return await pipeline('depth-estimation', 'onnx-community/depth-anything-v2-small', {
-          device: 'wasm',
-        });
-      }
+      // Runtime CDN imports execute code outside the locked dependency graph and
+      // are difficult to cover with CSP. Keep depth normals disabled until the
+      // model runtime is bundled through a Next-compatible browser package.
+      return null;
     })();
   }
   return pipelinePromise;
@@ -140,11 +132,13 @@ export function useDepthNormal() {
     loadingRef.current = true;
 
     try {
+      const pipe = await getDepthPipeline();
+      if (!pipe) return null;
+
       const blob = await new Promise<Blob>((resolve, reject) => {
         canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('Canvas capture failed'))), 'image/png');
       });
 
-      const pipe = await getDepthPipeline();
       const url = URL.createObjectURL(blob);
       const result = await pipe(url);
       URL.revokeObjectURL(url);

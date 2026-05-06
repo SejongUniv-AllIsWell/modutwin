@@ -8,6 +8,7 @@ import MetadataPickerModal, { MetadataResult } from './MetadataPickerModal';
 import { useRefineTool } from './tools/useRefineTool';
 import { useRefinedMeshLoader } from './tools/useRefinedMeshLoader';
 import { useAdditionalGsplats, AdditionalGsplatSource } from './tools/useAdditionalGsplats';
+import { destroyMainDerivedMeshes, splitSceneFilesByExtension } from './tools/sourceManager';
 import { api } from '@/lib/api';
 import { ActiveBasemapResponse } from '@/types';
 
@@ -16,8 +17,6 @@ const Sam3PromptModal = lazy(() => import('./tools/Sam3PromptModal'));
 const AlignPanel = lazy(() => import('./tools/AlignPanel'));
 
 export type EditorMode = 'refine' | 'door' | 'align' | null;
-
-const SCENE_3D_EXTS = ['ply', 'splat', 'sog'];
 
 interface Props {
   /** 서버 진입 시 (대시보드에서 업로드 클릭 → /viewer?upload_id=X). */
@@ -259,6 +258,7 @@ export default function UnifiedSplatEditor({
   }, [requestMetadata]);
 
   const refine = useRefineTool(coreRef, {
+    active: mode === 'refine',
     uploadId,
     currentUrl: currentUrl ?? undefined,
     reloadWithUrl,
@@ -284,10 +284,11 @@ export default function UnifiedSplatEditor({
     onRequestMetadata: requestSaveMetadata,
   });
 
-  // 정제된 wall mesh + 텍스처 자동 로드 (저장된 mesh.json + tex_*.png). uploadId 있으면 모든 모드에서.
-  // 다듬기 모드에서 다시 들어왔을 때도 이전에 베이크해 저장한 wall mesh 가 보이도록 함.
-  // 단 문 설정 완료 직후엔 메모리에 이미 punch 된 텍스처가 있으므로 서버 fetch 를 건너뛴다.
-  useRefinedMeshLoader(coreRef, uploadId, Boolean(uploadId) && !meshIsFreshInMemory);
+  // 정제된 wall mesh + 텍스처 자동 로드 (저장된 mesh.json + tex_*.png).
+  // 비활성 조건 두 가지:
+  //   - door 단계: register-local 로 uploadId 가 먼저 생기고 refined save 가 뒤따라 /refine/refined-bundle 이 404 를 낼 수 있음.
+  //   - meshIsFreshInMemory: 문 설정 완료 직후 정합 진입 시 메모리에 이미 punch 된 텍스처 + 메시가 있어 서버 fetch 가 덮어쓰면 안 됨.
+  useRefinedMeshLoader(coreRef, uploadId, Boolean(uploadId) && mode !== 'door' && !meshIsFreshInMemory);
 
   const handleSplatLoaded = useCallback((data: SplatData) => {
     refine.onSplatLoaded(data);
@@ -297,13 +298,7 @@ export default function UnifiedSplatEditor({
   // - 메인이 아직 없으면: 첫 파일을 메인으로, 나머지는 추가 레이어
   // - 메인이 이미 있으면: 모두 추가 레이어 (덮어쓰지 않음)
   const handlePickFiles = useCallback((files: File[]) => {
-    const valid: File[] = [];
-    const rejected: string[] = [];
-    for (const f of files) {
-      const ext = f.name.split('.').pop()?.toLowerCase();
-      if (ext && SCENE_3D_EXTS.includes(ext)) valid.push(f);
-      else rejected.push(f.name);
-    }
+    const { valid, rejected } = splitSceneFilesByExtension(files);
     if (rejected.length > 0) {
       alert(`지원하지 않는 파일은 무시됨 (.ply / .splat / .sog 만 지원):\n${rejected.join('\n')}`);
     }
@@ -346,21 +341,7 @@ export default function UnifiedSplatEditor({
     // 다듬기 단계에서 만든 막 (wallMesh) + 정합 단계에서 만든 도어 mesh 모두 메인 surface 기준이라
     // 메인이 사라지면 함께 사라져야 함.
     const app = coreRef.current?.getApp();
-    if (app?.root) {
-      const toDestroy: any[] = [];
-      const collect = (root: any) => {
-        for (const c of [...(root.children || [])]) {
-          const name = (c as any).name as string | undefined;
-          if (name?.startsWith('wallMesh_') || name?.startsWith('doorMesh_')) {
-            toDestroy.push(c);
-          } else {
-            collect(c);
-          }
-        }
-      };
-      collect(app.root);
-      for (const e of toDestroy) { try { e.destroy(); } catch {} }
-    }
+    destroyMainDerivedMeshes(app?.root);
 
     if (localObjectUrlRef.current) {
       URL.revokeObjectURL(localObjectUrlRef.current);
