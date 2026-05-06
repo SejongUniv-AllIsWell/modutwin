@@ -33,7 +33,28 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
-# OS/editor files
+# Data & model artifacts
+data/*
+!data/.gitkeep
+*.ply
+*.sog
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Docker
+docker-compose.override.yml
+
+# MinIO local data
+minio_data/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# OS / editor files
 .DS_Store
 Thumbs.db
 .vscode/

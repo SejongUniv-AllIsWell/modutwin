@@ -14,6 +14,8 @@ import { ActiveBasemapResponse } from '@/types';
 
 const DoorAlignModal = lazy(() => import('./tools/DoorAlignModal'));
 const Sam3PromptModal = lazy(() => import('./tools/Sam3PromptModal'));
+const AlignPanel = lazy(() => import('./tools/AlignPanel'));
+
 export type EditorMode = 'refine' | 'door' | 'align' | null;
 
 interface Props {
@@ -48,6 +50,10 @@ export default function UnifiedSplatEditor({
 
   // ── 현재 작업 메타데이터 (문 설정 완료 시 register-local 결과 또는 정합 진입 시 채워짐) ──
   const [metadata, setMetadata] = useState<MetadataResult | null>(null);
+  // metadata state 의 closure 캡처 stale 회피용 ref. handleMetadataConfirm 가 setMetadata 직후
+  // onSetupSaveDone 콜백에서 fetchBasemapAndMatchDoor(meta) 등을 호출하는 흐름에서 필요.
+  const metadataRef = useRef<MetadataResult | null>(null);
+  useEffect(() => { metadataRef.current = metadata; }, [metadata]);
 
   // ── 모드 ──
   const [mode, setMode] = useState<EditorMode>(initialMode);
@@ -69,6 +75,17 @@ export default function UnifiedSplatEditor({
   // 완료 버튼으로 다음 단계로 넘어간 이전 단계는 되돌릴 수 없음 (변경 시 후속 단계 의존성이 깨지므로).
   // 다듬기 완료 → 'upload' + 'refine' 잠금. 문 설정 완료 → 'door' 추가 잠금.
   const [lockedStages, setLockedStages] = useState<Set<'upload' | 'refine' | 'door'>>(() => new Set());
+
+  // 문 설정 완료 직후 정합 단계 진입 시점 — 메모리에 이미 wall mesh / 도어 entity 가 살아있어서
+  // 서버에서 mesh.json + tex 를 다시 받아오는 useRefinedMeshLoader 가 동작하면 punch 가 풀림.
+  // 이 플래그가 true 인 동안 loader 를 비활성. 페이지 reload (새 세션) 시 false 로 초기화.
+  const [meshIsFreshInMemory, setMeshIsFreshInMemory] = useState(false);
+
+  // 정합 단계 자동 매칭에 쓸 basemap 의 4 코너 (모듈 호수와 매칭된 문). null 이면 매칭 실패 상태.
+  const [basemapDoorCorners, setBasemapDoorCorners] = useState<Array<[number, number, number]> | null>(null);
+  const [basemapMatchError, setBasemapMatchError] = useState<string | null>(null);
+  // 모듈측 (현재 작업 중인 모듈) 의 1차 도어 (door_1) 4 코너. 백엔드 doors.json 에서 가져옴 (A'+Y 프레임).
+  const [moduleDoorCorners, setModuleDoorCorners] = useState<Array<[number, number, number]> | null>(null);
 
   const reloadWithUrl = useCallback((newUrl: string) => {
     setCurrentUrl(newUrl);
@@ -98,6 +115,8 @@ export default function UnifiedSplatEditor({
 
   const handleMetadataConfirm = useCallback(async (result: MetadataResult) => {
     let enriched: MetadataResult & { upload_id?: string } = result;
+    // ref 즉시 갱신 — onSetupSaveDone 콜백이 setState 사이클 기다리지 않고 사용 가능.
+    metadataRef.current = result;
     // 로컬 파일에서 문 설정 완료 또는 정합 진입 시 → register-local 로 upload 등록.
     // (정합 모달은 uploadId 가 있어야 doors.json 로드/저장 가능. save/align 둘 다 등록 필요.)
     if (!uploadId && (metadataModal?.purpose === 'save' || metadataModal?.purpose === 'align')) {
@@ -129,6 +148,13 @@ export default function UnifiedSplatEditor({
   }, [metadataModal, uploadId, displayName]);
 
   const handleMetadataClose = useCallback(() => {
+    // 정합 단계 진입용 모달은 dismiss 시 작업이 저장되지 않으므로 경고. save 용도는 그냥 닫음.
+    if (metadataModal?.purpose === 'align') {
+      const ok = window.confirm(
+        '모듈 정보를 입력하지 않으면 지금까지 작업한 내용이 저장되지 않습니다. 정말 나가시겠습니까?',
+      );
+      if (!ok) return;
+    }
     metadataModal?.saveReject?.();
     setMetadataModal(null);
   }, [metadataModal]);
@@ -161,37 +187,69 @@ export default function UnifiedSplatEditor({
       setMode(null);
       return;
     }
-    if (next === 'align') {
-      // 정합 진입 시 metadata 보장 (force=true 면 메타데이터 이미 있다고 가정 — 문 설정 완료 경로).
-      let meta = metadata;
-      if (!opts.force && (!meta || !uploadId)) {
-        try {
-          meta = await requestMetadata('align');
-        } catch {
-          return; // 사용자 취소
-        }
-      }
-      // basemap 자동 fetch — meta 있을 때만.
-      if (meta?.floor_id) {
-        try {
-          const bm = await api.get<ActiveBasemapResponse>(`/basemaps/active?floor_id=${meta.floor_id}`);
-          const alreadyHas = additional.items.some(
-            it => it.source === 'basemap' && it.url === bm.url,
-          );
-          if (!alreadyHas) {
-            const resp = await fetch(bm.url);
-            if (!resp.ok) throw new Error(`basemap 다운로드 실패: ${resp.status}`);
-            const blob = await resp.blob();
-            const blobUrl = URL.createObjectURL(blob);
-            additional.add(blobUrl, { name: `basemap v${bm.version} (${bm.filename})`, source: 'basemap' }).ready.catch(() => {});
-          }
-        } catch (e: any) {
-          alert(`basemap 가져오기 실패: ${e?.message || e}`);
-        }
-      }
-    }
     setMode(next);
-  }, [mode, metadata, uploadId, requestMetadata, additional, lockedStages]);
+  }, [mode, lockedStages]);
+
+  // 모듈 측 (자기 자신) 의 첫 도어 (door_1) 4 코너 가져옴. 백그라운드 저장 후엔 서버 doors.json 에 있음.
+  // 백그라운드 저장 직후엔 아직 없을 수 있으니 retry. 정합 단계 진입 직후 호출.
+  const fetchModuleDoorCorners = useCallback(async (id: string) => {
+    setModuleDoorCorners(null);
+    for (let attempt = 0; attempt < 10; attempt++) {
+      try {
+        const doors = await api.get<{ doors: Array<{ id: string; corners: number[][] }> }>(`/uploads/${id}/doors`);
+        const primary = doors.doors.find(d => d.id === 'door_1') ?? doors.doors[0];
+        if (primary && Array.isArray(primary.corners) && primary.corners.length === 4) {
+          setModuleDoorCorners(primary.corners.map(c => [c[0], c[1], c[2]]) as Array<[number, number, number]>);
+          return;
+        }
+      } catch { /* ignore — retry */ }
+      await new Promise(r => setTimeout(r, 500));
+    }
+    console.warn('[align] 모듈 도어 코너 fetch 실패 (10회 재시도 모두 실패)');
+  }, []);
+
+  // basemap fetch + 호수 문 자동 매칭. 모듈 정보 확정 후 정합 진입 시 호출.
+  // 매칭 실패 시 basemapMatchError 설정 → 정합 버튼 비활성.
+  const fetchBasemapAndMatchDoor = useCallback(async (meta: MetadataResult) => {
+    setBasemapDoorCorners(null);
+    setBasemapMatchError(null);
+    try {
+      const bm = await api.get<ActiveBasemapResponse>(`/basemaps/active?floor_id=${meta.floor_id}`);
+      // basemap PLY 를 layer 로 추가 (이미 있으면 스킵)
+      const alreadyHas = additional.items.some(
+        it => it.source === 'basemap' && it.url === bm.url,
+      );
+      if (!alreadyHas) {
+        const resp = await fetch(bm.url);
+        if (resp.ok) {
+          const blob = await resp.blob();
+          const blobUrl = URL.createObjectURL(blob);
+          additional.add(blobUrl, { name: `basemap v${bm.version} (${bm.filename})`, source: 'basemap' }).ready.catch(() => {});
+        }
+      }
+
+      // basemap 의 doors.json 가져와 호수 매칭.
+      if (!bm.source_upload_id) {
+        setBasemapMatchError('basemap 에 source upload 정보가 없습니다 (basemap 등록을 다시 확인하세요).');
+        return;
+      }
+      const doors = await api.get<{ doors: Array<{ id: string; corners: number[][]; unitName?: string | null }> }>(
+        `/basemaps/${bm.basemap_id}/doors`,
+      );
+      const target = doors.doors.find(d => d.unitName === meta.module_name);
+      if (!target) {
+        setBasemapMatchError(`basemap 에 "${meta.module_name}" 호수의 문 정보가 없습니다. (basemap 등록 시 호수 입력 확인)`);
+        return;
+      }
+      if (!Array.isArray(target.corners) || target.corners.length !== 4) {
+        setBasemapMatchError('basemap 의 매칭된 문 corners 형식이 올바르지 않습니다.');
+        return;
+      }
+      setBasemapDoorCorners(target.corners.map(c => [c[0], c[1], c[2]]) as Array<[number, number, number]>);
+    } catch (e: any) {
+      setBasemapMatchError(`basemap 가져오기 실패: ${e?.message || e}`);
+    }
+  }, [additional]);
 
   // ── Refine tool ──
   // 다듬기 완료 시 호출 — 서버 업로드면 skip, 로컬 파일은 모달 (register-local 이 유효 UUID 요구).
@@ -227,9 +285,10 @@ export default function UnifiedSplatEditor({
   });
 
   // 정제된 wall mesh + 텍스처 자동 로드 (저장된 mesh.json + tex_*.png).
-  // door 단계에서는 register-local 로 uploadId 가 먼저 생기고 refined save 가 뒤따르므로
-  // loader 를 켜면 /refine/refined-bundle 이 save 완료 전에 404 를 낸다. align 진입 후 로드한다.
-  useRefinedMeshLoader(coreRef, uploadId, Boolean(uploadId) && mode !== 'door');
+  // 비활성 조건 두 가지:
+  //   - door 단계: register-local 로 uploadId 가 먼저 생기고 refined save 가 뒤따라 /refine/refined-bundle 이 404 를 낼 수 있음.
+  //   - meshIsFreshInMemory: 문 설정 완료 직후 정합 진입 시 메모리에 이미 punch 된 텍스처 + 메시가 있어 서버 fetch 가 덮어쓰면 안 됨.
+  useRefinedMeshLoader(coreRef, uploadId, Boolean(uploadId) && mode !== 'door' && !meshIsFreshInMemory);
 
   const handleSplatLoaded = useCallback((data: SplatData) => {
     refine.onSplatLoaded(data);
@@ -474,15 +533,15 @@ export default function UnifiedSplatEditor({
               autoExtracting={autoExtracting}
               onManualPickStart={() => setAutoExtracting(false)}
               ensureUploadId={async () => {
-                // 로컬 파일에서 문 설정 완료 시 호출. 메타데이터 모달 → register-local → 새 uploadId 반환.
-                if (uploadId) return uploadId;
+                // SPEC: 모든 케이스에서 모듈 정보 모달 강제. uploadId 가 이미 있어도 모달이 뜸 (확인 받음).
+                // 모달 dismiss → reject → DoorAlignModal 이 작업 유지 (화면 안 넘어감).
                 let meta: MetadataResult & { upload_id?: string };
                 try {
-                  meta = await requestMetadata('save');
+                  meta = await requestMetadata('align');
                 } catch {
                   throw new Error('cancelled');
                 }
-                const newId = meta.upload_id;
+                const newId = meta.upload_id ?? uploadId;
                 if (!newId) throw new Error('register failed');
                 return newId;
               }}
@@ -491,14 +550,28 @@ export default function UnifiedSplatEditor({
                 return await refine.commitRefinedToServer(id);
               }}
               getCurrentKeepMask={() => refine.getCurrentKeepMask?.() ?? null}
-              onSetupSaveDone={async () => {
-                // 문 설정 완료 (모든 영속화 끝) → 'door' 단계 추가 잠금 → 정합 진입.
+              getBakeRgba={(sid) => refine.getBakeRgba?.(sid) ?? null}
+              getCurrentBakedRotation={() => refine.getCurrentBakedRotation?.() ?? { rotX: 0, rotZ: 0, wallAngleRad: 0 }}
+              onSetupSaveDone={async (activeUploadId: string) => {
+                // 문 설정 완료 (메모리 직주입 + 백그라운드 저장 + 정합 진입).
+                // - 메모리에 이미 모든 자산 (PLY, wall mesh, doors) 이 있으니 서버 fetch 안 한다.
+                // - useRefinedMeshLoader 우회 + alignmentGroup 으로 reparent.
+                setMeshIsFreshInMemory(true);
                 setLockedStages(s => {
                   const n = new Set(s);
                   n.add('door');
                   return n;
                 });
+                // 정합 모드 entity 재구성 — splat + wall mesh + door mesh + module-side 추가 splat 을 한 부모 아래.
+                coreRef.current?.enterAlignmentMode?.();
                 await handleToggleMode('align', { force: true });
+                // basemap fetch + 호수 매칭 + 모듈 도어 코너 fetch (백그라운드 저장 끝나면 서버 doors.json 에 있음).
+                const meta = metadataRef.current;
+                if (meta) {
+                  void fetchBasemapAndMatchDoor(meta);
+                }
+                // 백그라운드 PLY 업로드 → doors.json PUT 이 끝나야 fetch 가 성공. retry 로 처리.
+                void fetchModuleDoorCorners(activeUploadId);
               }}
             />
           </Suspense>
@@ -540,27 +613,31 @@ export default function UnifiedSplatEditor({
             />
           </Suspense>
         )}
-        {/* 정합 단계 — DoorAlignModal align view 항상 표시 (basemap PLY/4 코너/정합 시작/확정 저장). */}
-        {mode === 'align' && currentUrl && uploadId && (
-          <Suspense fallback={null}>
-            <DoorAlignModal
-              coreRef={coreRef}
-              uploadId={uploadId}
-              currentUrl={currentUrl}
-              onDone={(u) => { reloadWithUrl(u); }}
-              onClose={() => {}}
-              view="align"
-            />
-          </Suspense>
-        )}
-        {/* 정합 완료 — 모든 단계의 마지막. mode='align' + metadata 있을 때만 표시. */}
-        {mode === 'align' && currentUrl && uploadId && metadata && (
-          <div className="bg-black/70 backdrop-blur-sm border border-white/10 rounded-lg shadow-lg p-3 select-none w-72">
-            <button onClick={handleSaveAlignmentTransform}
-              className="w-full px-3 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded cursor-pointer text-xs font-bold">
-              정합 완료
-            </button>
-          </div>
+        {/* 정합 단계 — 새 AlignPanel (basemap 자동 매칭 + 슝 애니메이션 + 수동 핸들 + 4×4 저장). */}
+        {mode === 'align' && (
+          <>
+            {/* 진단용: 어느 조건이 막고 있는지 표시 */}
+            {(!currentUrl || !uploadId || !metadata) && (
+              <div className="bg-amber-900/80 border border-amber-600 rounded p-3 text-amber-100 text-xs space-y-1">
+                <div className="font-bold">정합 패널 미표시 — 누락 조건:</div>
+                {!currentUrl && <div>• currentUrl 없음 (파일 미로드)</div>}
+                {!uploadId && <div>• uploadId 없음 (모듈 정보 모달 미완료)</div>}
+                {!metadata && <div>• metadata 없음 (모듈 정보 모달 미완료)</div>}
+              </div>
+            )}
+            {currentUrl && uploadId && metadata && (
+              <Suspense fallback={<div className="text-xs text-gray-400 p-3">패널 로딩...</div>}>
+                <AlignPanel
+                  coreRef={coreRef}
+                  uploadId={uploadId}
+                  metadata={metadata}
+                  basemapDoorCorners={basemapDoorCorners}
+                  basemapMatchError={basemapMatchError}
+                  moduleDoorCorners={moduleDoorCorners}
+                />
+              </Suspense>
+            )}
+          </>
         )}
       </div>
 

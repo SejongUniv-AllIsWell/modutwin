@@ -43,6 +43,7 @@ export interface ActiveBasemapResponse {
   version: number;
   url: string;
   filename: string;
+  source_upload_id: string | null;
 }
 
 export interface MetadataModuleOption {

@@ -14,6 +14,7 @@ import {
   fetchDoorsFromServer,
   persistDoorsToServer,
   PRIMARY_DOOR_ID,
+  type PersistOpts,
   type PickedCorner,
   type Vec3,
 } from './doorAlignDoors';
@@ -33,8 +34,9 @@ interface Props {
   /** 사용자가 "문 수동 지정" 을 누르면 호출 — 부모가 autoExtracting 을 false 로 내릴 수 있게. */
   onManualPickStart?: () => void;
   /** "문 설정 완료" 가 성공한 후 호출 — 부모가 메타데이터 모달 띄우거나 정합으로 진입할 수 있게.
-   *  반환된 promise 가 resolve 되어야 모달이 닫힘 (취소 시 reject 로 닫힘 방지). */
-  onSetupSaveDone?: () => Promise<void> | void;
+   *  반환된 promise 가 resolve 되어야 모달이 닫힘 (취소 시 reject 로 닫힘 방지).
+   *  uploadId 인자는 ensureUploadId 가 확정한 값. 부모는 이 값으로 doors fetch 등에 사용. */
+  onSetupSaveDone?: (uploadId: string) => Promise<void> | void;
   /** "문 설정 완료" 누른 직후 호출 — uploadId 가 없으면 부모가 모달 + register-local 처리하고 새 uploadId 반환. */
   ensureUploadId?: () => Promise<string>;
   /** 도어 설정 영속화 직전 호출 — refined PLY + mesh.json + tex_*.png 일괄 업로드.
@@ -43,6 +45,12 @@ interface Props {
   /** 다듬기 단계의 현재 keep mask (flatten/floater/brush 모두 반영). 문 추출이 cachedScene 에 적용해
    *  외부 가우시안이 부활하는 문제 방지. 없으면 무필터로 동작. */
   getCurrentKeepMask?: () => Uint8Array | null;
+  /** 면별 베이크 텍스처의 CPU 캐시 RGBA 접근. 문 영역 alpha-punch 가 GPU colorTexture 뿐 아니라
+   *  서버에 직렬화되는 CPU rgba 에도 반영되도록 — 재진입/다음 세션에서도 punch 유지. */
+  getBakeRgba?: (surfaceId: string) => { rgba: Uint8ClampedArray; width: number; height: number } | null;
+  /** 다듬기 단계의 정렬 회전값 (pendingRotation + wallAngle) 동기 조회. 메모리 직주입 흐름에서
+   *  서버 업로드 await 없이 즉시 doors corners 변환에 사용. */
+  getCurrentBakedRotation?: () => { rotX: number; rotZ: number; wallAngleRad: number };
 }
 
 // 픽 / 영속화 / 다운스트림 기하 (Kabsch 등) 는 시계방향 (TL → TR → BR → BL) 인덱스 순서를 가정.
@@ -71,7 +79,7 @@ const DISPLAY_ORDER = [0, 1, 3, 2] as const;
  *   - 'align' — 정합 단계: basemap 4꼭짓점 픽 + Kabsch + applyAndSave 로 aligned.ply 업로드.
  */
 export default function DoorAlignModal({
-  coreRef, uploadId, currentUrl, onDone, onClose, view = 'setup', autoExtracting = false, onManualPickStart, onSetupSaveDone, ensureUploadId, onCommitRefined, getCurrentKeepMask,
+  coreRef, uploadId, currentUrl, onDone, onClose, view = 'setup', autoExtracting = false, onManualPickStart, onSetupSaveDone, ensureUploadId, onCommitRefined, getCurrentKeepMask, getBakeRgba, getCurrentBakedRotation,
 }: Props) {
   const [picked, setPicked] = useState<Array<PickedCorner | null>>(() => emptyPicked());
 
@@ -1017,6 +1025,9 @@ export default function DoorAlignModal({
 
   // 자동 저장 제거 — 모든 서버 저장은 문 설정 완료 버튼에서 일괄 처리.
   const [doorRotated, setDoorRotated] = useState(false);
+  // 문 열기를 한 번이라도 적용했는지 — 회전축/각도/방향이 사용자에 의해 확정됐다는 신호.
+  // 문 닫기 (resetDoorRotation) 로는 false 로 안 돌림 — 한 번 확정했으면 닫혀 있어도 완료 가능.
+  const [rotationApplied, setRotationApplied] = useState(false);
 
   // 서버에서 코너 복원 → 자동 문 추출 (1회). 사용자가 다시 들어와도 회전 즉시 가능.
   // 수동 픽 (사용자가 4점 직접 클릭) 시에는 발동 안 함 — 명시적 "문 추출" 버튼 클릭만 받음.
@@ -1192,6 +1203,7 @@ export default function DoorAlignModal({
       setDoorRefineError(null);
       setDoorRefineStats(null);
       setDoorRotated(false);
+      setRotationApplied(false);
       // 회전축 선택도 초기화 — 다시 문 추출 후 새로 고를 수 있도록.
       setHingeEdge(null);
       setEdgePickArmed(false);
@@ -1203,6 +1215,7 @@ export default function DoorAlignModal({
       setDoorRefineError(null);
       setDoorRefineStats(null);
       setDoorRotated(false);
+      setRotationApplied(false);
       setHingeEdge(null);
       setEdgePickArmed(false);
       hoveredEdgeRef.current = null;
@@ -1547,6 +1560,17 @@ export default function DoorAlignModal({
           console.log(`[DoorRefine] wall mesh hole: ${touched} pixels`);
         }
         wallMeshTex.unlock();
+
+        // CPU rgba 캐시 (lastBakesRef) 에도 동일 punch — 서버 PNG 로 직렬화될 때 punch 가 보존되도록.
+        // wallEntName 형식: 'wallMesh_<surfaceId>'. surfaceId 추출.
+        const surfaceId = wallEntName.startsWith('wallMesh_') ? wallEntName.slice('wallMesh_'.length) : wallEntName;
+        const bake = getBakeRgba?.(surfaceId);
+        if (bake) {
+          const touchedCpu = punchAlphaZeroInDoorRegion(bake.rgba, bake.width, bake.height, wallCorners, wallUvs, cornersA);
+          console.log(`[DoorRefine] wall mesh hole (CPU rgba): ${touchedCpu} pixels (surfaceId=${surfaceId})`);
+        } else {
+          console.warn(`[DoorRefine] CPU rgba 캐시 없음 — surfaceId=${surfaceId} (서버 PNG 에 punch 미반영 가능)`);
+        }
       }
 
       doorMeshEntityRef.current = pendingDoorMeshEnt;
@@ -1921,6 +1945,7 @@ export default function DoorAlignModal({
       cA: cAvec3,
     };
     setDoorRotated(true);
+    setRotationApplied(true);
     setDoorRefineError(null);
     console.log(`[DoorRotate] hinge ${hingeIndices[0]}→${hingeIndices[1]}, ${doorAngleDeg}° ${doorSwing === 1 ? '안쪽' : '바깥쪽'} (insideSign=${insideSign}, from=${(doorCurrentAngleRef.current * 180 / Math.PI).toFixed(1)}° → ${(angleRad * 180 / Math.PI).toFixed(1)}°)`);
   }, [hingeIndices, doorAngleDeg, doorSwing, picked, planes, allPicked]);
@@ -2087,6 +2112,7 @@ export default function DoorAlignModal({
                 setEdgePickArmed(false);
                 hoveredEdgeRef.current = null;
                 setDoorRotated(false);
+                setRotationApplied(false);
               }
               setPicked(emptyPicked());
 
@@ -2294,33 +2320,28 @@ export default function DoorAlignModal({
               if (!allPicked) return;
               setSaveDoorBusy(true);
               try {
-                // 1) uploadId 보장 (로컬 파일이면 모달 + register-local).
-                let activeUploadId = uploadId;
-                if (!activeUploadId && ensureUploadId) {
+                // 1) 모듈 정보 모달 + uploadId 확정 — 모든 케이스에서 강제. 모달 dismiss 시 작업 유지.
+                let activeUploadId: string | null = null;
+                if (ensureUploadId) {
                   try { activeUploadId = await ensureUploadId(); }
                   catch { setSaveDoorBusy(false); return; }
+                } else {
+                  activeUploadId = uploadId || null;
                 }
                 if (!activeUploadId) { setSaveDoorBusy(false); return; }
-                // 2) refined PLY + mesh.json + tex_*.png 일괄 업로드. 베이크된 회전값 받아옴.
-                let baked: { rotX: number; rotZ: number; wallAngleRad: number } | null = null;
-                if (onCommitRefined) {
-                  try { baked = await onCommitRefined(activeUploadId); }
-                  catch { setSaveDoorBusy(false); return; }
-                }
-                // 3) 도어 설정 (corners + 회전 메타) 저장.
-                // SPEC: refined PLY 가 A'+Y 프레임 (pendingRotation rotX/rotZ + wallAngle Y) 으로 베이크됐으므로
-                //   picked 코너 (raw 프레임) 도 같은 변환을 적용해 doors.json 에 저장 → 재진입 시 PLY/mesh/doors 일관.
-                const r = baked ?? { rotX: 0, rotZ: 0, wallAngleRad: 0 };
+
+                // 2) 베이크 회전값을 동기 조회 (서버 업로드 await 없이 즉시).
+                //    SPEC: refined PLY 가 A'+Y 프레임 (pendingRotation rotX/rotZ + wallAngle Y) 으로 베이크되므로
+                //    picked 코너 (raw) 도 같은 변환 적용해 doors.json 에 저장.
+                const r = getCurrentBakedRotation?.() ?? { rotX: 0, rotZ: 0, wallAngleRad: 0 };
                 const cx = Math.cos(r.rotX), sx = Math.sin(r.rotX);
                 const cz = Math.cos(r.rotZ), sz = Math.sin(r.rotZ);
                 const cy2 = Math.cos(r.wallAngleRad), sy2 = Math.sin(r.wallAngleRad);
-                // raw → A' (rotateScene: R = Rz · Rx).
                 const rotXZ = (v: [number, number, number]): [number, number, number] => [
                   cz * v[0] - sz * cx * v[1] + sz * sx * v[2],
                   sz * v[0] + cz * cx * v[1] - cz * sx * v[2],
                   sx * v[1] + cx * v[2],
                 ];
-                // A' → A'+Y (rotateSceneY: Ry).
                 const rotYy = (v: [number, number, number]): [number, number, number] => [
                   cy2 * v[0] + sy2 * v[2],
                   v[1],
@@ -2331,7 +2352,7 @@ export default function DoorAlignModal({
                   surfaceId: p.surfaceId,
                 });
                 const pickedTransformed = picked.map(p => p ? rotateForSave(p) : null);
-                await persistDoorsToServer(activeUploadId, pickedTransformed, {
+                const doorOpts: PersistOpts = {
                   hingeEdge,
                   swing: doorSwing,
                   angleDeg: doorAngleDeg,
@@ -2339,18 +2360,27 @@ export default function DoorAlignModal({
                   doorThickness,
                   boundarySplitEnabled,
                   safetyMargin: DOOR_SAFETY_MARGIN,
-                });
-                setSaveDoorToast('저장됨 ✓');
-                // 저장 성공 → 부모 콜백 (모듈 정보 입력 → 정합 진입). 콜백이 거부되면 (사용자가 모달 취소) 닫지 않음.
+                };
+
+                // 3) 화면 즉시 정합 단계로 전환 — 메모리 자산 그대로 사용.
                 if (onSetupSaveDone) {
-                  try {
-                    await onSetupSaveDone();
-                  } catch {
-                    return;
-                  }
-                } else {
-                  setTimeout(() => { onClose(); }, 300);
+                  try { await onSetupSaveDone(activeUploadId); }
+                  catch { setSaveDoorBusy(false); return; }
                 }
+                setSaveDoorToast('정합 단계로 이동 ✓');
+
+                // 4) 백그라운드 저장 — PLY/mesh/tex 업로드 + doors.json 업로드. 사용자 대기 X.
+                const idForBg = activeUploadId;
+                void (async () => {
+                  try {
+                    if (onCommitRefined) {
+                      await onCommitRefined(idForBg);
+                    }
+                    await persistDoorsToServer(idForBg, pickedTransformed, doorOpts);
+                  } catch (e: any) {
+                    console.warn('[Setup] 백그라운드 저장 실패:', e);
+                  }
+                })();
               } catch (e: any) {
                 setSaveDoorToast(`실패: ${e?.message ?? e}`);
               } finally {
@@ -2358,8 +2388,14 @@ export default function DoorAlignModal({
                 setTimeout(() => setSaveDoorToast(null), 2000);
               }
             }}
-            disabled={!allPicked || saveDoorBusy || autoExtracting}
-            title={autoExtracting ? '자동 문 추출 진행 중...' : (!allPicked ? '4 꼭짓점을 모두 찍은 후 저장' : '도어 설정 (corners, hinge, 회전, doorThickness 등) 즉시 영속화')}
+            disabled={!allPicked || hingeEdge === null || !rotationApplied || saveDoorBusy || autoExtracting}
+            title={
+              autoExtracting ? '자동 문 추출 진행 중...' :
+              !allPicked ? '4 꼭짓점을 모두 찍은 후 저장' :
+              hingeEdge === null ? '회전축을 먼저 선택하세요' :
+              !rotationApplied ? '문 열기를 한 번 눌러 회전각/회전 방향을 확정하세요' :
+              '도어 설정 (corners, hinge, 회전각, 회전방향, doorThickness 등) 즉시 영속화'
+            }
             className="w-full px-3 py-1.5 rounded cursor-pointer text-xs font-bold bg-green-700 hover:bg-green-600 text-white disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed"
           >
             {saveDoorBusy ? '저장 중...' : (saveDoorToast ?? '문 설정 완료')}
@@ -2368,85 +2404,8 @@ export default function DoorAlignModal({
 
         </>}
 
-        {/* ── basemap PLY URL + 4코너 + 정합 ── align view 에서만 표시. autoExtracting 시 잠금. */}
-        {view === 'align' && <div className={`border-t border-gray-700 pt-2 space-y-1.5 ${autoExtracting ? 'opacity-40 pointer-events-none' : ''}`}>
-          <div className="text-[11px] font-bold text-gray-200">basemap (정합 대상)</div>
-
-          {/* PLY URL */}
-          <div className="space-y-1">
-            <div className="flex items-center justify-between">
-              <span className="text-[10px] text-gray-500">PLY URL (presigned)</span>
-              <span className="text-[10px]">
-                {(() => {
-                  const item = additional.items.find(it => it.id === basemapIdRef.current);
-                  if (!item) return basemapUrl.trim() ? <span className="text-yellow-500">URL 무효</span> : <span className="text-gray-600">미입력</span>;
-                  if (item.error) return <span className="text-red-400">로드 실패</span>;
-                  if (!item.loaded) return <span className="text-yellow-400">로딩 중...</span>;
-                  return <span className="text-green-400">로드 완료</span>;
-                })()}
-              </span>
-            </div>
-            <input
-              type="text"
-              value={basemapUrl}
-              onChange={e => { setBasemapUrl(e.target.value); saveBasemapUrl(uploadId, e.target.value); }}
-              placeholder="https://..."
-              spellCheck={false}
-              className="w-full bg-gray-800 border border-gray-600 rounded px-1.5 py-1 text-[10px] font-mono"
-            />
-          </div>
-
-          {/* 4 코너 JSON */}
-          <div className="space-y-1">
-            <div className="flex items-center justify-between">
-              <span className="text-[10px] text-gray-500">4 코너 (시계방향, basemap raw frame)</span>
-              <span className="text-[10px]">
-                {basemapCorners ? <span className="text-green-400">유효</span> : <span className="text-gray-600">미입력 / 무효</span>}
-              </span>
-            </div>
-            <textarea
-              value={basemapJson}
-              onChange={e => { setBasemapJson(e.target.value); saveBasemapJson(uploadId, e.target.value); }}
-              placeholder='[[0,0,0],[1,0,0],[1,-2,0],[0,-2,0]]'
-              spellCheck={false}
-              className="w-full h-14 bg-gray-800 border border-gray-600 rounded px-1.5 py-1 text-[10px] font-mono resize-y"
-            />
-          </div>
-
-          {rmsd !== null && (
-            <div className="text-[11px]">
-              RMSD: <span className={`font-mono font-bold ${rmsd < 0.02 ? 'text-green-400' : rmsd < 0.1 ? 'text-yellow-400' : 'text-red-400'}`}>
-                {rmsd.toFixed(4)}
-              </span> m
-            </div>
-          )}
-
-          <div className="flex gap-1.5">
-            <button
-              onClick={resetPosition}
-              disabled={!aligned}
-              className="flex-1 px-3 py-1.5 bg-gray-700 hover:bg-gray-600 disabled:bg-gray-800 disabled:text-gray-600 rounded cursor-pointer text-xs"
-              title="모듈을 원위치(raw)로 되돌림"
-            >
-              원위치
-            </button>
-            <button
-              onClick={startAlignment}
-              disabled={!allPicked || !basemapCorners}
-              className="flex-1 px-3 py-1.5 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 rounded cursor-pointer text-xs font-bold"
-            >
-              정합 시작
-            </button>
-          </div>
-
-          <button
-            onClick={applyAndSave}
-            disabled={running || !allPicked || !basemapCorners}
-            className="w-full px-3 py-1.5 bg-purple-600 hover:bg-purple-500 disabled:bg-gray-700 disabled:text-gray-500 rounded cursor-pointer text-xs font-bold"
-          >
-            {running ? '처리 중...' : '확정 저장 (PLY에 적용 후 업로드)'}
-          </button>
-        </div>}
+        {/* 정합 단계 UI 는 새 AlignPanel (UnifiedSplatEditor 측) 으로 이전됨.
+            DoorAlignModal 은 'setup' view 만 사용. (구 view='align' UI 는 제거됨.) */}
       </div>
     </div>
   );

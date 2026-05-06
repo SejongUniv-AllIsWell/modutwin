@@ -32,6 +32,9 @@ class ActiveBasemapResponse(BaseModel):
     version: int
     url: str
     filename: str
+    # basemap 의 원본 upload — 클라이언트가 basemap 의 doors.json 을 가져와
+    # 모듈 정합 시 호수 매칭 (basemap door 의 wallSurfaceId/모듈명 → 정합 대상 4점) 에 사용.
+    source_upload_id: UUID | None = None
 
 
 @public_router.get("/active", response_model=ActiveBasemapResponse)
@@ -77,6 +80,17 @@ async def get_active_basemap(
     url = minio.get_presigned_download_url(basemap.minio_path)
     filename = basemap.minio_path.rsplit("/", 1)[-1]
 
+    # basemap.minio_path 는 SceneOutput.ply_path 와 동일 경로로 등록됨 (register_basemap_from_upload).
+    # 그 SceneOutput → Task → Upload 로 거슬러 source upload_id 를 찾는다.
+    src_q = await db.execute(
+        select(Task.upload_id)
+        .join(SceneOutput, SceneOutput.task_id == Task.id)
+        .where(SceneOutput.ply_path == basemap.minio_path)
+        .order_by(SceneOutput.created_at.desc())
+        .limit(1)
+    )
+    source_upload_id = src_q.scalar_one_or_none()
+
     return ActiveBasemapResponse(
         basemap_id=basemap.id,
         floor_id=basemap.floor_id,
@@ -84,7 +98,55 @@ async def get_active_basemap(
         version=basemap.version,
         url=url,
         filename=filename,
+        source_upload_id=source_upload_id,
     )
+
+
+@public_router.get("/{basemap_id}/doors")
+async def get_basemap_doors(
+    basemap_id: UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """basemap 의 doors.json 반환 — 정합 단계에서 모듈을 매칭할 대상 문 정보.
+
+    `/uploads/{id}/doors` 와 동일 형식 ({doors: [...]}) 이지만 ownership 체크 없음 —
+    basemap 은 admin 이 등록 후 모든 사용자가 읽을 수 있다.
+    """
+    bm_result = await db.execute(select(Basemap).where(Basemap.id == basemap_id))
+    basemap = bm_result.scalar_one_or_none()
+    if basemap is None:
+        raise HTTPException(status_code=404, detail="basemap 을 찾을 수 없습니다.")
+
+    # source upload 찾기 (active endpoint 와 동일 경로)
+    src_q = await db.execute(
+        select(Task.upload_id)
+        .join(SceneOutput, SceneOutput.task_id == Task.id)
+        .where(SceneOutput.ply_path == basemap.minio_path)
+        .order_by(SceneOutput.created_at.desc())
+        .limit(1)
+    )
+    source_upload_id = src_q.scalar_one_or_none()
+    if source_upload_id is None:
+        return {"doors": []}
+
+    up_q = await db.execute(select(Upload).where(Upload.id == source_upload_id))
+    upload = up_q.scalar_one_or_none()
+    if upload is None or not upload.door_corners_json_path:
+        return {"doors": []}
+
+    minio = get_minio_service()
+    if not minio.object_exists(upload.door_corners_json_path):
+        return {"doors": []}
+
+    import json as _json
+    try:
+        raw = minio.get_object_bytes(upload.door_corners_json_path)
+        parsed = _json.loads(raw.decode("utf-8"))
+        doors = parsed.get("doors", []) if isinstance(parsed, dict) else []
+        return {"doors": doors}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"doors.json 파싱 실패: {e}")
 
 
 class BasemapResponse(BaseModel):

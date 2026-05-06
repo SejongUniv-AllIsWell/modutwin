@@ -134,6 +134,9 @@ export function useAdditionalGsplats(
         }
         ent.addComponent('gsplat', { asset });
         ent.enabled = visible;
+        // 정합 모드 reparent 시 module-side 와 basemap 을 구분하기 위한 태그.
+        // SplatViewerCore.enterAlignmentMode 가 'basemap' 태그가 없는 추가 splat 만 alignmentGroup 으로 옮긴다.
+        try { ent.tags.add(`source:${source}`); if (source === 'basemap') ent.tags.add('basemap'); } catch {}
         app.root.addChild(ent);
         entityMapRef.current.set(id, ent);
         setItems(prev => prev.map(it => it.id === id ? { ...it, loaded: true, error: null } : it));

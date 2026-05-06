@@ -2786,20 +2786,33 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
                 className="px-2 py-1 bg-gray-700 hover:bg-gray-600 disabled:bg-gray-800 disabled:opacity-50 text-gray-200 rounded cursor-pointer disabled:cursor-not-allowed text-[11px]">
                 전체 선택/해제
               </button>
-              <button
-                onClick={() => setFlattenPreviewActive(v => !v)}
-                className={`px-2 py-1 rounded cursor-pointer text-[10px] font-bold ${flattenPreviewActive ? 'bg-red-600 hover:bg-red-500 text-white' : 'bg-gray-700 hover:bg-gray-600 text-gray-300'}`}>
-                {flattenPreviewActive ? '삭제될 가우시안 숨기기' : '삭제될 가우시안 확인'}
-              </button>
-              <button onClick={() => applyFlatten()}
-                disabled={flattening || (!flattenActive && selectedSurfaces.size === 0)}
-                className={`w-full px-2 py-1.5 rounded cursor-pointer text-xs font-bold disabled:bg-gray-600 disabled:text-gray-400 ${
-                  flattenActive
-                    ? 'bg-amber-600 hover:bg-amber-500 text-white'
-                    : 'bg-red-600 hover:bg-red-500 text-white'
-                }`}>
-                {flattening ? '처리 중...' : (flattenActive ? '외부 가우시안 복원' : '외부 가우시안 제거')}
-              </button>
+              {(() => {
+                const notAllConfirmed = cfMode !== 'confirmed' || wallMode !== 'confirmed';
+                const previewDisabled = !flattenPreviewActive && notAllConfirmed;
+                const applyDisabled = flattening || (!flattenActive && (notAllConfirmed || selectedSurfaces.size === 0));
+                const gateTitle = notAllConfirmed ? '천장/바닥과 벽면을 모두 설정하세요.' : '';
+                return (
+                  <>
+                    <button
+                      onClick={() => setFlattenPreviewActive(v => !v)}
+                      disabled={previewDisabled}
+                      title={previewDisabled ? gateTitle : ''}
+                      className={`px-2 py-1 rounded text-[10px] font-bold disabled:bg-gray-800 disabled:text-gray-500 disabled:cursor-not-allowed ${flattenPreviewActive ? 'bg-red-600 hover:bg-red-500 text-white cursor-pointer' : 'bg-gray-700 hover:bg-gray-600 text-gray-300 cursor-pointer'}`}>
+                      {flattenPreviewActive ? '삭제될 가우시안 숨기기' : '삭제될 가우시안 확인'}
+                    </button>
+                    <button onClick={() => applyFlatten()}
+                      disabled={applyDisabled}
+                      title={!flattenActive && notAllConfirmed ? gateTitle : ''}
+                      className={`w-full px-2 py-1.5 rounded cursor-pointer text-xs font-bold disabled:bg-gray-600 disabled:text-gray-400 disabled:cursor-not-allowed ${
+                        flattenActive
+                          ? 'bg-amber-600 hover:bg-amber-500 text-white'
+                          : 'bg-red-600 hover:bg-red-500 text-white'
+                      }`}>
+                      {flattening ? '처리 중...' : (flattenActive ? '외부 가우시안 복원' : '외부 가우시안 제거')}
+                    </button>
+                  </>
+                );
+              })()}
 
               {/* 막 생성하기 — 외부 가우시안 제거 활성 후 사용 가능 (의존성: flatten 적용 후 막 생성 의미). */}
               <div className={`border-t border-gray-700 pt-2 mt-1 space-y-1.5 ${flattenActive ? '' : 'opacity-50 pointer-events-none'}`}>
@@ -3210,5 +3223,22 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     return keep;
   }, [coreRef]);
 
-  return { overlay, panel, modals, onSplatLoaded, planes, saveRefined, commitRefinedToServer, getCurrentKeepMask };
+  // 문 설정 단계의 alpha-punch 가 lastBakesRef CPU rgba 까지 반영되도록 외부에서 접근 가능하게 노출.
+  // (DoorAlignModal 이 GPU colorTexture 만 punch 하는 한, 같은 punch 를 여기서도 호출해 서버 PNG 와 일관 유지.)
+  const getBakeRgba = useCallback((surfaceId: string): { rgba: Uint8ClampedArray; width: number; height: number } | null => {
+    const b = lastBakesRef.current.get(surfaceId);
+    if (!b) return null;
+    return { rgba: b.rgba, width: b.width, height: b.height };
+  }, []);
+
+  // commitRefinedToServer 가 서버 업로드 완료 후 반환하던 베이크 회전값을, 업로드 기다리지 않고
+  // 동기적으로 얻어와서 doors corners 변환 등에 즉시 사용할 수 있게 한다.
+  // (메모리 직주입 후 백그라운드 저장으로 흐름이 바뀌어 await 가 부담스러워졌기 때문.)
+  const getCurrentBakedRotation = useCallback((): { rotX: number; rotZ: number; wallAngleRad: number } => {
+    const { rotX, rotZ } = pendingRotationRef.current;
+    const wallAngleDeg = wallAngleRef.current ?? 0;
+    return { rotX, rotZ, wallAngleRad: (wallAngleDeg * Math.PI) / 180 };
+  }, []);
+
+  return { overlay, panel, modals, onSplatLoaded, planes, saveRefined, commitRefinedToServer, getCurrentKeepMask, getBakeRgba, getCurrentBakedRotation };
 }

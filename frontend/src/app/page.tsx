@@ -27,9 +27,9 @@ export default function Home() {
         <source src="/tmp.mp4" type="video/mp4" />
       </video>
       <div className="relative z-10 flex flex-col items-center px-4">
-      <h1 className="text-5xl font-bold mb-4 text-center">3DGS Digital Twin</h1>
+      <h1 className="text-5xl font-bold mb-4 text-center">ModuTwin</h1>
       <p className="text-gray-400 text-lg mb-8 text-center max-w-xl">
-        건물 내부를 3D Gaussian Splatting으로 디지털 트윈화하는 플랫폼
+        3DGS기반 실내 디지털 트윈 구축 플랫폼
       </p>
 
       <div className="flex gap-4">
