@@ -53,28 +53,28 @@ def dispatch_sam3_door_detection_task(
     module_id: str,
     module_name: str,
 ) -> str:
-    """SAM3 문 꼭짓점 자동 검출 태스크 발행 → celery_task_id 반환.
+    """SAM3 문 꼭짓점 자동 검출 발행 → task_id 반환.
 
-    GPU worker 가 refined PLY 를 다운로드해 SAM3 로 문을 검출하고
-    `doors.json` 을 minIO 에 저장한다. 워커가 아직 task 핸들러를 구현하지
-    않았다면 메시지는 큐에 쌓인다 (worker 측 별도 작업).
+    원래 설계는 GPU worker 가 Celery 큐(SAM3_QUEUE_NAME)에서 가져가 refined PLY 를
+    다운로드해 SAM3 로 문을 검출하고 `doors.json` 을 MinIO 에 저장하는 흐름.
+    이 프로젝트의 GPU worker 는 스코프 밖이라 미구현 → docker-compose.gpu.yml 의
+    door-ml HTTP 컨테이너로 동등한 처리를 위임한다.
+
+    호출자(start_sam3) 는 task_id 와 sam3_status='running' 만 신경 쓰므로
+    인터페이스(반환값 형식)는 동일하게 유지.
+
+    upload_id, refined_ply_key, prompt 외 인자(building_id 등)는 원래 Celery 워커가
+    페이로드 라우팅에 썼던 것 — door-ml 은 PLY 와 prompt 만 받으므로 미사용.
     """
-    result = celery_app.send_task(
-        SAM3_TASK_NAME,
-        args=build_sam3_task_args(
-            upload_id=upload_id,
-            user_id=user_id,
-            refined_ply_key=refined_ply_key,
-            prompt=prompt,
-            building_id=building_id,
-            floor_id=floor_id,
-            floor_number=floor_number,
-            module_id=module_id,
-            module_name=module_name,
-        ),
-        queue=SAM3_QUEUE_NAME,
+    # 지연 import — door-ml 통합 모듈은 sqlalchemy session/minio 를 끌어와서
+    # circular import 방지를 위해 함수 내부에서 import.
+    from app.services.sam3_door_ml import dispatch_via_door_ml
+
+    return dispatch_via_door_ml(
+        upload_id=upload_id,
+        refined_ply_key=refined_ply_key,
+        prompt=prompt,
     )
-    return result.id
 
 
 def dispatch_alignment_task(

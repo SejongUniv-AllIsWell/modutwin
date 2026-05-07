@@ -1,0 +1,29 @@
+fastapi
+uvicorn[standard]
+python-multipart
+huggingface_hub
+# setuptools 81+ 은 pkg_resources 제거 → sam3 import 실패. torch 도 <82 요구.
+setuptools<81
+# ML 의존성
+torch
+torchvision
+gsplat
+sam3 @ git+https://github.com/facebookresearch/sam3.git
+# Meta SAM3 누락 의존 — sam3 setup.py가 안 깔아주는 패키지들
+einops
+psutil
+av
+matplotlib
+pycocotools
+hydra-core
+omegaconf
+iopath
+# 그 외 파이프라인 의존
+scipy
+scikit-learn
+opencv-python-headless
+Pillow
+plyfile
+tqdm
+# numpy<2 — sam3 가 numpy<2 요구. requirements 마지막에 둬서 다른 패키지의 numpy 2.x 끌어들임 방지.
+numpy<2

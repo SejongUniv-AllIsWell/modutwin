@@ -5,7 +5,6 @@
 #
 # 사전 조건:
 #   - NVIDIA Container Toolkit 설치
-#   - .env 파일에 PC_HOST_IP, HF_TOKEN 설정
 #   - .env 파일에 HF_TOKEN 설정
 #     HF_TOKEN: facebook/sam3 gated model 접근 토큰
 #     (https://huggingface.co/facebook/sam3 에서 access request 후 발급)
@@ -62,9 +61,4 @@ services:
     restart: unless-stopped
 
 volumes:
-  hf_cache:                                # SAM3 체크포인트 영구 캐시
-
-networks:
-  3dgs-net:
-    external: true
   hf_cache:   # SAM3 체크포인트 영구 캐시 (컨테이너 재시작 시 재다운로드 방지)

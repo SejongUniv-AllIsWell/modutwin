@@ -58,6 +58,10 @@ class Settings(BaseSettings):
     ENABLE_SAM3: bool = False
     ENABLE_SAM3_DISPATCH: bool | None = None
 
+    # door-ml SAM3 inference 서비스 (docker-compose.gpu.yml 의 door-ml 컨테이너).
+    # Celery 워커 대신 in-cluster HTTP 로 SAM3 를 실행할 때 사용.
+    DOOR_ML_URL: str = "http://door-ml:8000"
+
     @model_validator(mode="after")
     def assemble_urls(self) -> "Settings":
         if not self.DATABASE_URL:
