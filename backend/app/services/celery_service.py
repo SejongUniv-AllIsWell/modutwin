@@ -91,20 +91,6 @@ def dispatch_colmap_task(
     return result.id
 
 
-def dispatch_gs_training_from_colmap_task(
-    upload_id: str,
-    user_id: str,
-    zip_minio_key: str,
-    bounds: dict,
-) -> str:
-    """COLMAP 결과 + bounding box → GS 학습 태스크 발행 → celery_task_id 반환"""
-    result = celery_app.send_task(
-        "tasks.training.run_gs_training_from_colmap",
-        args=[upload_id, user_id, zip_minio_key, bounds],
-        queue="training",
-    )
-    return result.id
-
 
 def dispatch_alignment_task(
     upload_id: str,

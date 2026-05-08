@@ -74,22 +74,16 @@ def run_colmap_preprocessing(self, upload_id: str, user_id: str, minio_input_key
                 upload_file(local_bin, remote_key)
                 logger.info(f"[Task {task_id}] 업로드: {remote_key}")
 
-        # colmap_result.json 업로드 (뷰어용)
-        result_json = os.path.join(colmap_workspace, "colmap_result.json")
-        if os.path.isfile(result_json):
-            remote_json_key = f"{result_base}/colmap_result.json"
-            upload_file(result_json, remote_json_key, content_type="application/json")
-            logger.info(f"[Task {task_id}] 결과 JSON 업로드: {remote_json_key}")
-        else:
-            raise RuntimeError("colmap_result.json이 생성되지 않았습니다.")
-
         update_progress(task_id, 100, "완료")
-        logger.info(f"[Task {task_id}] COLMAP 전처리 완료")
+        logger.info(f"[Task {task_id}] COLMAP 전처리 완료 → GS 학습 자동 시작")
+
+        # GS 학습 태스크 자동 체이닝 (바운딩박스 없이 전체 범위 학습)
+        from tasks.training import run_gs_training_from_colmap
+        run_gs_training_from_colmap.delay(upload_id, user_id, minio_input_key, {})
 
         return {
             "status": "completed",
             "upload_id": upload_id,
-            "result_key": f"{result_base}/colmap_result.json",
         }
 
     except Exception as e:
