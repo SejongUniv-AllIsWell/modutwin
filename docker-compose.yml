@@ -142,6 +142,27 @@ services:
       - 3dgs-net
     restart: unless-stopped
 
+  colmap-worker:
+    build: ./worker
+    container_name: 3dgs-colmap-worker
+    environment:
+      - RABBITMQ_URL=amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@rabbitmq:5672//
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY}
+      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
+      - MINIO_BUCKET=${MINIO_BUCKET:-3dgs-platform}
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      minio:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    networks:
+      - 3dgs-net
+    restart: unless-stopped
+
   flower:
     image: mher/flower
     container_name: 3dgs-flower

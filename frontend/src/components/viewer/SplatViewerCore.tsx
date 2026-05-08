@@ -57,11 +57,19 @@ export interface SplatViewerCoreRef {
   getAlignmentGroup: () => any | null;
 }
 
+export interface SplatEntry {
+  id: string;
+  url: string;
+  visible: boolean;
+}
+
 interface SplatViewerCoreProps {
   /** 없으면 빈 viewer만 표시 (카메라/기즈모만 활성). */
   sogUrl?: string | null;
   onSplatLoaded?: (data: SplatData) => void;
   children?: React.ReactNode;
+  /** multi-viewer: 복수 splat 목록 (현재 미구현, 타입 호환용) */
+  splats?: SplatEntry[];
 }
 
 type CameraMode = 'fly' | 'orbit';

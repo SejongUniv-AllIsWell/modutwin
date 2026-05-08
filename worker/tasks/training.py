@@ -182,3 +182,98 @@ def run_3dgs_training(self, upload_id: str, user_id: str, minio_input_key: str,
         if os.path.exists(work_dir):
             shutil.rmtree(work_dir, ignore_errors=True)
         clear_progress(task_id)
+
+
+@app.task(
+    name="tasks.training.run_gs_training_from_colmap",
+    bind=True,
+    max_retries=1,
+    default_retry_delay=60,
+)
+def run_gs_training_from_colmap(self, upload_id: str, user_id: str, zip_minio_key: str, bounds: dict):
+    """COLMAP 전처리 결과 + bounding box → GS 학습 태스크.
+
+    파이프라인:
+      1. MinIO에서 원본 zip 다운로드 → 이미지 추출
+      2. MinIO에서 sparse/0/*.bin 다운로드 (COLMAP 재실행 없음)
+      3. GsplatModule(bounds) → PLY 생성
+      4. MinIO에 PLY 저장
+
+    결과:
+      users/{user_id}/gsplat/{upload_id}/output.ply
+    """
+    task_id  = self.request.id
+    work_dir = tempfile.mkdtemp(prefix=f"gs_{upload_id}_")
+    result_base = f"users/{user_id}/gsplat/{upload_id}"
+
+    logger.info(f"[Task {task_id}] GS 학습 시작: upload_id={upload_id}, bounds={bounds}")
+
+    try:
+        from pipeline.ffmpeg_module import FFmpegModule
+        from pipeline.gsplat_module import GsplatModule
+        from pipeline.sog_converter import SogConverterModule
+    except ImportError as e:
+        update_progress(task_id, -1, f"파이프라인 모듈 로드 실패: {e}")
+        raise RuntimeError(str(e))
+
+    try:
+        # 1. zip 다운로드 → 이미지 추출
+        update_progress(task_id, 5, "이미지 추출")
+        ext = os.path.splitext(zip_minio_key)[1].lower()
+        local_zip = os.path.join(work_dir, f"input{ext}")
+        download_file(zip_minio_key, local_zip)
+
+        ffmpeg = FFmpegModule(fps=2)
+        image_dir = ffmpeg.run(local_zip)
+        logger.info(f"[Task {task_id}] 이미지 추출 완료: {image_dir}")
+
+        # 2. pre-computed sparse/0/*.bin 다운로드
+        update_progress(task_id, 20, "COLMAP 결과 다운로드")
+        sparse0_dir = os.path.join(work_dir, "sparse", "0")
+        os.makedirs(sparse0_dir, exist_ok=True)
+
+        colmap_base = f"users/{user_id}/colmap/{upload_id}/sparse/0"
+        for fname in ["cameras.bin", "images.bin", "points3D.bin"]:
+            download_file(f"{colmap_base}/{fname}", os.path.join(sparse0_dir, fname))
+            logger.info(f"[Task {task_id}] 다운로드: {fname}")
+
+        # images/ 폴더를 work_dir 하위로 이동
+        images_link = os.path.join(work_dir, "images")
+        if os.path.isdir(image_dir) and not os.path.exists(images_link):
+            os.rename(image_dir, images_link)
+
+        # 3. GS 학습
+        update_progress(task_id, 30, "GS 학습 중")
+        gsplat = GsplatModule(bounds=bounds)
+        ply_path = gsplat.run(work_dir)
+        logger.info(f"[Task {task_id}] 학습 완료: {ply_path}")
+
+        # 4. SOG 변환 (optional, 실패해도 PLY는 저장)
+        sog_path = None
+        try:
+            sog = SogConverterModule()
+            sog_path = sog.run(ply_path)
+        except Exception as e:
+            logger.warning(f"[Task {task_id}] SOG 변환 실패 (무시): {e}")
+
+        # 5. MinIO 업로드
+        update_progress(task_id, 90, "업로드")
+        ply_key = f"{result_base}/output.ply"
+        upload_file(ply_path, ply_key)
+        logger.info(f"[Task {task_id}] PLY 업로드: {ply_key}")
+
+        if sog_path and os.path.isfile(sog_path):
+            sog_key = f"{result_base}/output.sog"
+            upload_file(sog_path, sog_key)
+
+        update_progress(task_id, 100, "완료")
+        return {"status": "completed", "upload_id": upload_id, "ply_key": ply_key}
+
+    except Exception as e:
+        logger.error(f"[Task {task_id}] 실패: {e}")
+        update_progress(task_id, -1, f"실패: {str(e)[:200]}")
+        raise
+
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        clear_progress(task_id)

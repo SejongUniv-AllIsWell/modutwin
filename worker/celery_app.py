@@ -18,4 +18,6 @@ app.config_from_object({
     'task_default_queue': 'training',
 })
 
-app.autodiscover_tasks(['tasks'])
+import tasks.colmap   # noqa: F401
+import tasks.training  # noqa: F401
+import tasks.alignment # noqa: F401

@@ -14,6 +14,10 @@ function isScene3DFile(filename: string): boolean {
   return SCENE_3D_EXTENSIONS.includes(fileExt(filename));
 }
 
+function isZipFile(file: File): boolean {
+  return fileExt(file.name) === '.zip';
+}
+
 // 브라우저가 file.type을 빈 문자열로 반환할 때 확장자 기반 보완
 const EXT_TO_MIME: Record<string, string> = {
   mp4: 'video/mp4', mov: 'video/quicktime', avi: 'video/x-msvideo',
@@ -22,6 +26,7 @@ const EXT_TO_MIME: Record<string, string> = {
   gif: 'image/gif', bmp: 'image/bmp', webp: 'image/webp',
   ply: 'application/octet-stream', splat: 'application/octet-stream',
   sog: 'application/octet-stream',
+  zip: 'application/zip',
 };
 
 function resolveContentType(file: File): string {
@@ -35,7 +40,7 @@ function isVideoFile(file: File): boolean {
 }
 
 function isAcceptedFile(file: File): boolean {
-  return isVideoFile(file) || isScene3DFile(file.name);
+  return isVideoFile(file) || isScene3DFile(file.name) || isZipFile(file);
 }
 
 // "1","2" → 1,2 / "B1","B2" → -1,-2 / invalid → null
@@ -196,7 +201,7 @@ export default function MultipartUploader() {
     const dropped = e.dataTransfer.files?.[0];
     if (!dropped) return;
     if (!isAcceptedFile(dropped)) {
-      setMessage('영상 또는 .ply/.splat/.sog 파일만 업로드할 수 있습니다.');
+      setMessage('영상, .ply/.splat/.sog, 또는 사진 묶음(.zip) 파일만 업로드할 수 있습니다.');
       setUploadStatus('error');
       return;
     }
@@ -215,7 +220,7 @@ export default function MultipartUploader() {
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0] || null;
     if (f && !isAcceptedFile(f)) {
-      setMessage('영상 또는 .ply/.splat/.sog 파일만 업로드할 수 있습니다.');
+      setMessage('영상, .ply/.splat/.sog, 또는 사진 묶음(.zip) 파일만 업로드할 수 있습니다.');
       setUploadStatus('error');
       if (fileRef.current) fileRef.current.value = '';
       return;
@@ -242,9 +247,11 @@ export default function MultipartUploader() {
       const floorId = await findOrCreateFloor(buildingId, floorInt);
       const moduleId = await findOrCreateModule(floorId, moduleName.trim());
 
-      // 파일 분기: 영상 → 학습 파이프라인, ply/splat/sog → refined 폴더
-      let plyTarget: 'gsplat' | 'alignment' | 'refined' | undefined;
-      if (isScene3DFile(file.name)) {
+      // 파일 분기: zip → COLMAP, ply/splat/sog → refined, 영상 → 학습 파이프라인
+      let plyTarget: 'gsplat' | 'alignment' | 'refined' | 'colmap' | undefined;
+      if (isZipFile(file)) {
+        plyTarget = 'colmap';
+      } else if (isScene3DFile(file.name)) {
         plyTarget = 'refined';
       } else {
         plyTarget = undefined; // 영상 — 기본 학습 흐름
@@ -316,18 +323,24 @@ export default function MultipartUploader() {
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
           </svg>
           {file ? (
-            <p className="text-sm text-blue-400 font-medium px-4 text-center truncate max-w-full">{file.name}</p>
+            <div className="text-center px-4">
+              <p className="text-sm text-blue-400 font-medium truncate max-w-full">{file.name}</p>
+              {isZipFile(file) && (
+                <p className="text-xs text-emerald-400 mt-1">COLMAP 사진 묶음 — SfM 전처리 실행됩니다</p>
+              )}
+            </div>
           ) : (
             <>
               <p className="text-sm text-gray-300">파일을 끌어다 놓거나 클릭하여 선택</p>
               <p className="text-xs text-gray-500 mt-1">video / .ply / .splat / .sog</p>
+              <p className="text-xs text-emerald-600 mt-0.5">또는 사진 묶음 .zip (COLMAP)</p>
             </>
           )}
         </div>
         <input
           ref={fileRef}
           type="file"
-          accept="video/*,.ply,.splat,.sog"
+          accept="video/*,.ply,.splat,.sog,.zip"
           onChange={handleFileChange}
           className="hidden"
           disabled={uploading}

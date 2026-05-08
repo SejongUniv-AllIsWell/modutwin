@@ -31,6 +31,7 @@ class PlyTarget(str, PyEnum):
     gsplat = "gsplat"
     alignment = "alignment"
     refined = "refined"
+    colmap = "colmap"
 
 
 class TaskType(str, PyEnum):
@@ -38,6 +39,7 @@ class TaskType(str, PyEnum):
     door_alignment = "door_alignment"
     basemap_realign = "basemap_realign"
     sam3_door_detection = "sam3_door_detection"
+    colmap_preprocessing = "colmap_preprocessing"
 
 
 class Sam3Status(str, PyEnum):

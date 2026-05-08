@@ -73,7 +73,7 @@ export interface UploadInitRequest {
   building_id: string;
   floor_id: string;
   module_id: string;
-  ply_target?: 'gsplat' | 'alignment' | 'refined';
+  ply_target?: 'gsplat' | 'alignment' | 'refined' | 'colmap';
 }
 
 export interface UploadInitResponse {

@@ -29,6 +29,7 @@ from app.services.minio_service import get_minio_service, PART_SIZE
 from app.services.celery_service import (
     dispatch_training_task,
     dispatch_sam3_door_detection_task,
+    dispatch_colmap_task,
 )
 from app.services.sam3_service import (
     SAM3_DISABLED_DETAIL,
@@ -213,19 +214,18 @@ async def complete_upload(
     upload.file_size = actual_size
     upload.status = UploadStatus.processing
 
-    # 학습 없이 바로 완료 처리할 케이스
-    #  - PLY + alignment 타겟 (정합용 ply)
-    #  - PLY + refined 타겟 (다듬기 결과 ply)
-    #  - .splat / .sog (이미 학습 완료된 산출물)
     ext = os.path.splitext(upload.original_filename)[1].lower()
     is_ply = ext == ".ply"
     is_scene_artifact = ext in {".splat", ".sog"}
+    is_colmap_input = upload.ply_target == PlyTarget.colmap
+
     skip_training = (
         (is_ply and upload.ply_target in (PlyTarget.alignment, PlyTarget.refined))
         or is_scene_artifact
+        or is_colmap_input  # COLMAP은 별도 태스크로 처리
     )
 
-    if skip_training:
+    if skip_training and not is_colmap_input:
         upload.status = UploadStatus.completed
 
     # 모듈 + 계층 정보 조회
@@ -238,9 +238,24 @@ async def complete_upload(
     floor_result = await db.execute(select(Floor).where(Floor.id == module.floor_id))
     floor = floor_result.scalar_one()
 
-    # PLY + alignment 타겟이면 별도 처리 없이 완료
     celery_task_id = None
-    if not skip_training:
+
+    if is_colmap_input:
+        # COLMAP 전처리 태스크 발행
+        upload.status = UploadStatus.processing
+        celery_task_id = dispatch_colmap_task(
+            upload_id=str(upload.id),
+            user_id=str(user.id),
+            minio_input_key=upload.minio_path,
+        )
+        task = Task(
+            upload_id=upload.id,
+            user_id=user.id,
+            task_type=TaskType.colmap_preprocessing,
+            celery_task_id=celery_task_id,
+            status=TaskStatus.pending,
+        )
+    elif not skip_training:
         celery_task_id = dispatch_training_task(
             upload_id=str(upload.id),
             user_id=str(user.id),
@@ -251,19 +266,28 @@ async def complete_upload(
             module_name=module.name,
             ply_target=upload.ply_target.value if upload.ply_target else "gsplat",
         )
+        task = Task(
+            upload_id=upload.id,
+            user_id=user.id,
+            task_type=TaskType.training_3dgs,
+            celery_task_id=celery_task_id,
+            status=TaskStatus.pending,
+        )
+    else:
+        task = Task(
+            upload_id=upload.id,
+            user_id=user.id,
+            task_type=TaskType.training_3dgs,
+            celery_task_id=None,
+            status=TaskStatus.completed,
+        )
 
-    task = Task(
-        upload_id=upload.id,
-        user_id=user.id,
-        task_type=TaskType.training_3dgs,
-        celery_task_id=celery_task_id,
-        status=TaskStatus.completed if skip_training else TaskStatus.pending,
-    )
     db.add(task)
-
     await db.commit()
 
-    if skip_training:
+    if is_colmap_input:
+        msg = "업로드 완료. COLMAP 전처리가 시작됩니다."
+    elif skip_training:
         if is_scene_artifact or upload.ply_target == PlyTarget.refined:
             msg = "업로드 완료. refined 폴더에 저장되었습니다."
         else:
@@ -271,9 +295,10 @@ async def complete_upload(
     else:
         msg = "업로드 완료. 3DGS 학습이 시작됩니다."
 
+    final_status = "processing" if (is_colmap_input or not skip_training) else "completed"
     return UploadCompleteResponse(
         upload_id=upload.id,
-        status="processing" if not skip_training else "completed",
+        status=final_status,
         message=msg,
     )
 

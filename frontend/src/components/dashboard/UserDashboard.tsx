@@ -147,6 +147,9 @@ export default function UserDashboard({ showHeader = true }: Props) {
                   const sam = u.sam3_status ?? null;
                   const canAlign = sam === 'done' || sam === 'failed' || u.has_refined;
                   const stage = progressStage(u);
+                  const isColmap = u.ply_target === 'colmap';
+                  const colmapDone = isColmap && u.status === 'completed';
+                  const colmapProcessing = isColmap && u.status === 'processing';
                   return (
                     <tr key={u.id} className="border-b border-gray-800/50">
                       <td className="py-3 pr-4">
@@ -163,13 +166,27 @@ export default function UserDashboard({ showHeader = true }: Props) {
                           <span className="text-gray-300">{u.original_filename}</span>
                         )}
                       </td>
-                      <td className={`py-3 pr-4 ${STAGE_COLOR[stage]}`}>{STAGE_LABEL[stage]}</td>
+                      <td className={`py-3 pr-4 ${isColmap ? 'text-emerald-400' : STAGE_COLOR[stage]}`}>
+                        {isColmap
+                          ? (colmapDone ? 'COLMAP 완료' : colmapProcessing ? 'COLMAP 처리 중' : 'COLMAP 대기')
+                          : STAGE_LABEL[stage]}
+                      </td>
                       <td className={`py-3 pr-4 ${sam ? SAM3_COLOR[sam] : 'text-gray-600'}`}>
-                        {sam ? SAM3_LABEL[sam] : '—'}
+                        {isColmap ? '—' : (sam ? SAM3_LABEL[sam] : '—')}
                       </td>
                       <td className="py-3 pr-4 text-gray-500">{new Date(u.uploaded_at).toLocaleDateString('ko-KR')}</td>
                       <td className="py-3 pr-4 text-right">
-                        {canAlign ? (
+                        {isColmap ? (
+                          <Link
+                            href={`/colmap-viewer?upload_id=${u.id}`}
+                            className={`inline-block px-3 py-1 rounded text-white text-xs font-bold
+                              ${colmapDone
+                                ? 'bg-emerald-600 hover:bg-emerald-500'
+                                : 'bg-gray-700 hover:bg-gray-600'}`}
+                          >
+                            {colmapDone ? 'COLMAP 결과 보기' : '처리 중...'}
+                          </Link>
+                        ) : canAlign ? (
                           <Link
                             href={`/viewer?upload_id=${u.id}&mode=align`}
                             className="inline-block px-3 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold"
