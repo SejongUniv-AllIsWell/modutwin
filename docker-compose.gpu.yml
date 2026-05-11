@@ -41,13 +41,15 @@ services:
   worker:
     build: ./worker
     container_name: 3dgs-worker
+    networks:
+      - 3dgs-net
     volumes:
       - ./core:/app/core:ro
       - ./utilities:/app/utilities:ro
     environment:
-      - RABBITMQ_URL=amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@${PC_HOST_IP}:5672//
-      - REDIS_URL=redis://:${REDIS_PASSWORD}@${PC_HOST_IP}:6379/0
-      - MINIO_ENDPOINT=${PC_HOST_IP}:9000
+      - RABBITMQ_URL=amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@rabbitmq:5672//
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+      - MINIO_ENDPOINT=minio:9000
       - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY}
       - MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
       - MINIO_BUCKET=${MINIO_BUCKET}
