@@ -11,12 +11,28 @@ import { useAdditionalGsplats, AdditionalGsplatSource } from './tools/useAdditio
 import { destroyMainDerivedMeshes, splitSceneFilesByExtension } from './tools/sourceManager';
 import { api } from '@/lib/api';
 import { ActiveBasemapResponse } from '@/types';
+import { useRouter } from 'next/navigation';
+import { copyRefineState } from '@/lib/refine/persistence';
 
 const DoorAlignModal = lazy(() => import('./tools/DoorAlignModal'));
 const Sam3PromptModal = lazy(() => import('./tools/Sam3PromptModal'));
 const AlignPanel = lazy(() => import('./tools/AlignPanel'));
 
 export type EditorMode = 'refine' | 'door' | 'align' | null;
+export type RegistrationPurpose = 'basemap' | 'module';
+export interface RegistrationContext {
+  purpose: RegistrationPurpose;
+  building_id?: string;
+  building_name: string;
+  floor_id?: string;
+  floor_number: number;
+  module_name?: string;
+  kakao_place_id?: string;
+  address_name?: string;
+  road_address_name?: string;
+  latitude?: number;
+  longitude?: number;
+}
 
 interface Props {
   /** 서버 진입 시 (대시보드에서 업로드 클릭 → /viewer?upload_id=X). */
@@ -24,6 +40,16 @@ interface Props {
   initialUploadId?: string;
   initialDisplayName?: string;
   initialMode?: EditorMode;
+  initialRegistrationContext?: RegistrationContext | null;
+}
+
+interface EnsureRegistrationContextResponse {
+  building_id: string;
+  building_name: string;
+  floor_id: string;
+  floor_number: number;
+  module_id: string | null;
+  module_name: string | null;
 }
 
 export default function UnifiedSplatEditor({
@@ -31,8 +57,12 @@ export default function UnifiedSplatEditor({
   initialUploadId,
   initialDisplayName,
   initialMode = null,
+  initialRegistrationContext = null,
 }: Props) {
+  const router = useRouter();
   const coreRef = useRef<SplatViewerCoreRef>(null);
+  const isBasemapPurpose = initialRegistrationContext?.purpose === 'basemap';
+  const isModulePurpose = initialRegistrationContext?.purpose === 'module';
 
   // ── 메인 splat 상태 ──
   // currentUrl만 바뀌어도 SplatViewerCore가 entity만 in-place 교체하므로 reloadKey 같은
@@ -80,6 +110,7 @@ export default function UnifiedSplatEditor({
   // 서버에서 mesh.json + tex 를 다시 받아오는 useRefinedMeshLoader 가 동작하면 punch 가 풀림.
   // 이 플래그가 true 인 동안 loader 를 비활성. 페이지 reload (새 세션) 시 false 로 초기화.
   const [meshIsFreshInMemory, setMeshIsFreshInMemory] = useState(false);
+  const [basemapDone, setBasemapDone] = useState(false);
 
   // 정합 단계 자동 매칭에 쓸 basemap 의 4 코너 (모듈 호수와 매칭된 문). null 이면 매칭 실패 상태.
   const [basemapDoorCorners, setBasemapDoorCorners] = useState<Array<[number, number, number]> | null>(null);
@@ -121,17 +152,26 @@ export default function UnifiedSplatEditor({
     // (정합 모달은 uploadId 가 있어야 doors.json 로드/저장 가능. save/align 둘 다 등록 필요.)
     if (!uploadId && (metadataModal?.purpose === 'save' || metadataModal?.purpose === 'align')) {
       try {
+        const regPath = isBasemapPurpose ? '/uploads/register-local-basemap' : '/uploads/register-local';
+        const regBody = isBasemapPurpose ? {
+          filename: displayName ?? 'local.ply',
+          building_id: result.building_id,
+          floor_id: result.floor_id,
+          file_size: localFileSizeRef.current || 0,
+          content_type: 'application/octet-stream',
+        } : {
+          filename: displayName ?? 'local.ply',
+          building_id: result.building_id,
+          floor_id: result.floor_id,
+          module_id: result.module_id,
+          file_size: localFileSizeRef.current || 0,
+          content_type: 'application/octet-stream',
+        };
         const reg = await api.post<{ upload_id: string; minio_path: string }>(
-          '/uploads/register-local',
-          {
-            filename: displayName ?? 'local.ply',
-            building_id: result.building_id,
-            floor_id: result.floor_id,
-            module_id: result.module_id,
-            file_size: localFileSizeRef.current || 0,
-            content_type: 'application/octet-stream',
-          },
+          regPath,
+          regBody,
         );
+        copyRefineState('', reg.upload_id);
         setUploadId(reg.upload_id);
         setSource('server');
         enriched = { ...result, upload_id: reg.upload_id };
@@ -145,7 +185,7 @@ export default function UnifiedSplatEditor({
     setMetadata(result);
     metadataModal?.saveResolve?.(enriched);
     setMetadataModal(null);
-  }, [metadataModal, uploadId, displayName]);
+  }, [metadataModal, uploadId, displayName, isBasemapPurpose]);
 
   const handleMetadataClose = useCallback(() => {
     // 정합 단계 진입용 모달은 dismiss 시 작업이 저장되지 않으므로 경고. save 용도는 그냥 닫음.
@@ -238,7 +278,7 @@ export default function UnifiedSplatEditor({
       );
       const target = doors.doors.find(d => d.unitName === meta.module_name);
       if (!target) {
-        setBasemapMatchError(`basemap 에 "${meta.module_name}" 호수의 문 정보가 없습니다. (basemap 등록 시 호수 입력 확인)`);
+        setBasemapMatchError(`basemap 에 "${meta.module_name}" 이름의 문 정보가 없습니다. (basemap 등록 시작 시 저장 이름 확인)`);
         return;
       }
       if (!Array.isArray(target.corners) || target.corners.length !== 4) {
@@ -259,6 +299,7 @@ export default function UnifiedSplatEditor({
 
   const refine = useRefineTool(coreRef, {
     active: mode === 'refine',
+    basemapMode: isBasemapPurpose,
     uploadId,
     currentUrl: currentUrl ?? undefined,
     reloadWithUrl,
@@ -275,7 +316,7 @@ export default function UnifiedSplatEditor({
             n.add('refine');
             return n;
           });
-          setSam3PromptOpen(true);
+          if (!isBasemapPurpose) setSam3PromptOpen(true);
           return 'door';
         }
         return prev;
@@ -466,6 +507,28 @@ export default function UnifiedSplatEditor({
   const handleCollapsePanel = useCallback(() => setPanelHidden(true), []);
   const handleExpandPanel = useCallback(() => setPanelHidden(false), []);
 
+  const ensureRegistrationContext = useCallback(async (moduleName?: string | null) => {
+    const fixed = initialRegistrationContext;
+    if (!fixed) throw new Error('missing registration context');
+    const resolvedModuleName = moduleName === undefined ? fixed.module_name : moduleName ?? undefined;
+    const payload = {
+      building_id: fixed.building_id,
+      floor_id: fixed.floor_id,
+      building_name: fixed.building_name,
+      floor_number: fixed.floor_number,
+      module_name: resolvedModuleName,
+      kakao_place_id: fixed.kakao_place_id,
+      address_name: fixed.address_name,
+      road_address_name: fixed.road_address_name,
+      latitude: fixed.latitude,
+      longitude: fixed.longitude,
+    };
+    return await api.post<EnsureRegistrationContextResponse>(
+      '/buildings/ensure-registration-context',
+      payload,
+    );
+  }, [initialRegistrationContext]);
+
   const alignPanel = mode === 'align' && currentUrl && !uploadId ? (
     <div className="bg-black/70 backdrop-blur-sm border border-white/10 text-gray-300 text-xs rounded-lg shadow-lg p-3 select-none w-72">
       <div className="text-[11px] text-amber-300 bg-amber-900/30 border border-amber-700 rounded px-2 py-1.5 leading-tight">
@@ -527,20 +590,83 @@ export default function UnifiedSplatEditor({
               coreRef={coreRef}
               uploadId={uploadId ?? ''}
               currentUrl={currentUrl}
-              onDone={(u) => { void handleToggleMode('align'); reloadWithUrl(u); }}
-              onClose={() => { void handleToggleMode('align'); }}
+              onDone={(u) => { if (!isBasemapPurpose) { void handleToggleMode('align'); reloadWithUrl(u); } }}
+              onClose={() => { if (!isBasemapPurpose) { void handleToggleMode('align'); } }}
               view="setup"
               autoExtracting={autoExtracting}
+              basemapMode={isBasemapPurpose}
+              basemapUnitName={isBasemapPurpose ? initialRegistrationContext?.module_name : undefined}
               onManualPickStart={() => setAutoExtracting(false)}
               ensureUploadId={async () => {
-                // SPEC: 모든 케이스에서 모듈 정보 모달 강제. uploadId 가 이미 있어도 모달이 뜸 (확인 받음).
-                // 모달 dismiss → reject → DoorAlignModal 이 작업 유지 (화면 안 넘어감).
-                let meta: MetadataResult & { upload_id?: string };
-                try {
-                  meta = await requestMetadata('align');
-                } catch {
-                  throw new Error('cancelled');
+                // 등록 진입 시 받은 컨텍스트가 있으면 모달 없이 확정하고, 레거시 진입만 모달로 보완한다.
+                if (isBasemapPurpose) {
+                  const ensured = await ensureRegistrationContext(null);
+                  const result: MetadataResult = {
+                    building_id: ensured.building_id,
+                    building_name: ensured.building_name,
+                    floor_id: ensured.floor_id,
+                    floor_number: ensured.floor_number,
+                    module_id: 'basemap',
+                    module_name: 'basemap',
+                  };
+                  metadataRef.current = result;
+                  setMetadata(result);
+                  let newId = uploadId;
+                  if (!newId) {
+                    const reg = await api.post<{ upload_id: string; minio_path: string }>(
+                      '/uploads/register-local-basemap',
+                      {
+                        filename: displayName ?? 'local.ply',
+                        building_id: ensured.building_id,
+                        floor_id: ensured.floor_id,
+                        file_size: localFileSizeRef.current || 0,
+                        content_type: 'application/octet-stream',
+                      },
+                    );
+                    copyRefineState('', reg.upload_id);
+                    newId = reg.upload_id;
+                    setUploadId(reg.upload_id);
+                    setSource('server');
+                  }
+                  if (!newId) throw new Error('register failed');
+                  return newId;
                 }
+                if (isModulePurpose && initialRegistrationContext?.module_name?.trim()) {
+                  const ensured = await ensureRegistrationContext(initialRegistrationContext.module_name);
+                  const result: MetadataResult = {
+                    building_id: ensured.building_id,
+                    building_name: ensured.building_name,
+                    floor_id: ensured.floor_id,
+                    floor_number: ensured.floor_number,
+                    module_id: ensured.module_id ?? '',
+                    module_name: ensured.module_name ?? initialRegistrationContext.module_name.trim(),
+                  };
+                  if (!result.module_id) throw new Error('module registration failed');
+                  metadataRef.current = result;
+                  setMetadata(result);
+                  let newId = uploadId;
+                  if (!newId) {
+                    const reg = await api.post<{ upload_id: string; minio_path: string }>(
+                      '/uploads/register-local',
+                      {
+                        filename: displayName ?? 'local.ply',
+                        building_id: ensured.building_id,
+                        floor_id: ensured.floor_id,
+                        module_id: result.module_id,
+                        file_size: localFileSizeRef.current || 0,
+                        content_type: 'application/octet-stream',
+                      },
+                    );
+                    copyRefineState('', reg.upload_id);
+                    newId = reg.upload_id;
+                    setUploadId(reg.upload_id);
+                    setSource('server');
+                  }
+                  if (!newId) throw new Error('register failed');
+                  return newId;
+                }
+                let meta: MetadataResult & { upload_id?: string };
+                try { meta = await requestMetadata('align'); } catch { throw new Error('cancelled'); }
                 const newId = meta.upload_id ?? uploadId;
                 if (!newId) throw new Error('register failed');
                 return newId;
@@ -563,21 +689,30 @@ export default function UnifiedSplatEditor({
                   return n;
                 });
                 // 정합 모드 entity 재구성 — splat + wall mesh + door mesh + module-side 추가 splat 을 한 부모 아래.
-                coreRef.current?.enterAlignmentMode?.();
-                await handleToggleMode('align', { force: true });
+                if (!isBasemapPurpose) {
+                  coreRef.current?.enterAlignmentMode?.();
+                  await handleToggleMode('align', { force: true });
+                }
                 // basemap fetch + 호수 매칭 + 모듈 도어 코너 fetch (백그라운드 저장 끝나면 서버 doors.json 에 있음).
                 const meta = metadataRef.current;
-                if (meta) {
+                if (meta && !isBasemapPurpose) {
                   void fetchBasemapAndMatchDoor(meta);
                 }
                 // 백그라운드 PLY 업로드 → doors.json PUT 이 끝나야 fetch 가 성공. retry 로 처리.
-                void fetchModuleDoorCorners(activeUploadId);
+                if (!isBasemapPurpose) {
+                  void fetchModuleDoorCorners(activeUploadId);
+                } else {
+                  await refine.commitRefinedToServer(activeUploadId);
+                  await api.post('/basemaps/register', { upload_id: activeUploadId });
+                  setBasemapDone(true);
+                  setTimeout(() => router.push('/dashboard'), 1400);
+                }
               }}
             />
           </Suspense>
         )}
         {/* 다듬기 완료 직후 — SAM3 프롬프트 팝업. */}
-        {mode === 'door' && sam3PromptOpen && (
+        {mode === 'door' && sam3PromptOpen && !isBasemapPurpose && (
           <Suspense fallback={null}>
             <Sam3PromptModal
               onStartAuto={(prompt) => {
@@ -614,7 +749,7 @@ export default function UnifiedSplatEditor({
           </Suspense>
         )}
         {/* 정합 단계 — 새 AlignPanel (basemap 자동 매칭 + 슝 애니메이션 + 수동 핸들 + 4×4 저장). */}
-        {mode === 'align' && (
+        {mode === 'align' && !isBasemapPurpose && (
           <>
             {/* 진단용: 어느 조건이 막고 있는지 표시 */}
             {(!currentUrl || !uploadId || !metadata) && (
@@ -668,12 +803,29 @@ export default function UnifiedSplatEditor({
           title="모듈 정보 입력"
           description="저장할 건물 / 층 / 모듈을 지정하세요. 완료를 누르면 정합 단계로 넘어갑니다."
           showSamPrompt={false}
+          fixedContext={isModulePurpose && initialRegistrationContext ? {
+            building_id: initialRegistrationContext.building_id,
+            building_name: initialRegistrationContext.building_name,
+            floor_id: initialRegistrationContext.floor_id,
+            floor_number: initialRegistrationContext.floor_number,
+            module_name: initialRegistrationContext.module_name,
+            kakao_place_id: initialRegistrationContext.kakao_place_id,
+            address_name: initialRegistrationContext.address_name,
+            road_address_name: initialRegistrationContext.road_address_name,
+            latitude: initialRegistrationContext.latitude,
+            longitude: initialRegistrationContext.longitude,
+          } : null}
           initial={metadata
             ? { building_name: metadata.building_name, floor_number: metadata.floor_number, module_name: metadata.module_name }
             : undefined}
           onConfirm={handleMetadataConfirm}
           onClose={handleMetadataClose}
         />
+      )}
+      {basemapDone && (
+        <div className="absolute inset-0 z-[70] bg-black/70 flex items-center justify-center">
+          <div className="text-center text-white text-xl font-bold">basemap 등록 신청이 완료되었습니다</div>
+        </div>
       )}
     </SplatViewerCore>
   );

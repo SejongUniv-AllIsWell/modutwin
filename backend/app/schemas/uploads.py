@@ -10,12 +10,14 @@ ALLOWED_EXTENSIONS = {
     ".mp4", ".mov", ".avi", ".mkv", ".webm",  # video
     ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp",  # image
     ".ply", ".splat", ".sog",  # 3D scene
+    ".zip",
 }
 # 허용 content-type 화이트리스트
 ALLOWED_CONTENT_TYPES = {
     "video/mp4", "video/quicktime", "video/x-msvideo", "video/x-matroska",
     "video/webm", "image/jpeg", "image/png", "image/gif", "image/bmp",
     "image/webp", "application/octet-stream", "model/x-ply",
+    "application/zip", "application/x-zip-compressed",
 }
 # application/octet-stream 허용 확장자 (표준 MIME 타입이 없는 3D 포맷만 허용)
 OCTET_STREAM_ALLOWED_EXTENSIONS = {".ply", ".splat", ".sog"}

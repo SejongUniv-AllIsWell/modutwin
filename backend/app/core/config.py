@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     # Google OAuth
     GOOGLE_CLIENT_ID: str = ""
     GOOGLE_CLIENT_SECRET: str = ""
+    KAKAO_REST_API_KEY: str = ""
 
     # Public URL (for OAuth redirect behind reverse proxy)
     PUBLIC_BASE_URL: str = ""
@@ -57,6 +58,9 @@ class Settings(BaseSettings):
     # Feature flags
     ENABLE_SAM3: bool = False
     ENABLE_SAM3_DISPATCH: bool | None = None
+
+    # Internal worker callback auth
+    WORKER_CALLBACK_TOKEN: str = ""
 
     @model_validator(mode="after")
     def assemble_urls(self) -> "Settings":

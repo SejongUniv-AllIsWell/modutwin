@@ -80,16 +80,7 @@ async def get_active_basemap(
     url = minio.get_presigned_download_url(basemap.minio_path)
     filename = basemap.minio_path.rsplit("/", 1)[-1]
 
-    # basemap.minio_path 는 SceneOutput.ply_path 와 동일 경로로 등록됨 (register_basemap_from_upload).
-    # 그 SceneOutput → Task → Upload 로 거슬러 source upload_id 를 찾는다.
-    src_q = await db.execute(
-        select(Task.upload_id)
-        .join(SceneOutput, SceneOutput.task_id == Task.id)
-        .where(SceneOutput.ply_path == basemap.minio_path)
-        .order_by(SceneOutput.created_at.desc())
-        .limit(1)
-    )
-    source_upload_id = src_q.scalar_one_or_none()
+    source_upload_id = await _resolve_source_upload_id(db, basemap)
 
     return ActiveBasemapResponse(
         basemap_id=basemap.id,
@@ -118,15 +109,7 @@ async def get_basemap_doors(
     if basemap is None:
         raise HTTPException(status_code=404, detail="basemap 을 찾을 수 없습니다.")
 
-    # source upload 찾기 (active endpoint 와 동일 경로)
-    src_q = await db.execute(
-        select(Task.upload_id)
-        .join(SceneOutput, SceneOutput.task_id == Task.id)
-        .where(SceneOutput.ply_path == basemap.minio_path)
-        .order_by(SceneOutput.created_at.desc())
-        .limit(1)
-    )
-    source_upload_id = src_q.scalar_one_or_none()
+    source_upload_id = await _resolve_source_upload_id(db, basemap)
     if source_upload_id is None:
         return {"doors": []}
 
@@ -156,6 +139,7 @@ class BasemapResponse(BaseModel):
     building_id: UUID
     building_name: str
     version: int
+    source_upload_id: UUID | None = None
     status: str
     is_active: bool
     created_at: datetime
@@ -182,6 +166,13 @@ class BasemapCandidateResponse(BaseModel):
 
 class BasemapRegisterRequest(BaseModel):
     upload_id: UUID
+
+
+class BasemapRegisterResponse(BaseModel):
+    basemap_id: UUID
+    floor_id: UUID
+    version: int
+    status: str
 
 
 class BasemapMetadataModuleResponse(BaseModel):
@@ -225,11 +216,26 @@ def _basemap_response(basemap: Basemap, floor: Floor, building: Building) -> Bas
         building_id=building.id,
         building_name=building.name,
         version=basemap.version,
+        source_upload_id=basemap.source_upload_id,
         status=basemap.status.value if hasattr(basemap.status, "value") else str(basemap.status),
         is_active=basemap.is_active,
         created_at=basemap.created_at,
         approved_at=basemap.approved_at,
     )
+
+
+async def _resolve_source_upload_id(db: AsyncSession, basemap: Basemap) -> UUID | None:
+    if basemap.source_upload_id is not None:
+        return basemap.source_upload_id
+
+    src_q = await db.execute(
+        select(Task.upload_id)
+        .join(SceneOutput, SceneOutput.task_id == Task.id)
+        .where(SceneOutput.ply_path == basemap.minio_path)
+        .order_by(SceneOutput.created_at.desc())
+        .limit(1)
+    )
+    return src_q.scalar_one_or_none()
 
 
 async def _get_basemap_with_building(
@@ -478,6 +484,7 @@ async def register_basemap_from_upload(
 
     basemap = Basemap(
         floor_id=floor.id,
+        source_upload_id=upload.id,
         minio_path=refined_ply_path,
         version=next_version,
         uploaded_by=admin.id,
@@ -487,6 +494,79 @@ async def register_basemap_from_upload(
     await db.commit()
     await db.refresh(basemap)
     return _basemap_response(basemap, floor, building)
+
+
+@public_router.post("/register", response_model=BasemapRegisterResponse, status_code=status.HTTP_201_CREATED)
+async def register_basemap_from_user_upload(
+    body: BasemapRegisterRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Upload, Module, Floor)
+        .join(Module, Upload.module_id == Module.id)
+        .join(Floor, Module.floor_id == Floor.id)
+        .where(Upload.id == body.upload_id, Upload.user_id == user.id)
+    )
+    row = result.one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="업로드를 찾을 수 없습니다.")
+    upload, _, floor = row
+
+    minio = get_minio_service()
+    refined_ply_path: str | None = None
+    if upload.refined_ply_path and minio.object_exists(upload.refined_ply_path):
+        refined_ply_path = upload.refined_ply_path
+    else:
+        scene_result = await db.execute(
+            select(SceneOutput.ply_path)
+            .join(Task, SceneOutput.task_id == Task.id)
+            .where(Task.upload_id == upload.id)
+            .order_by(SceneOutput.created_at.desc())
+            .limit(1)
+        )
+        refined_ply_path = scene_result.scalar_one_or_none()
+
+    if refined_ply_path is None:
+        raise HTTPException(status_code=400, detail="다듬기 결과가 없는 업로드는 basemap 으로 등록할 수 없습니다.")
+    if not minio.object_exists(refined_ply_path):
+        raise HTTPException(status_code=400, detail="다듬기 결과 PLY 가 MinIO 에 존재하지 않습니다.")
+
+    dup = await db.execute(
+        select(Basemap).where(
+            Basemap.minio_path == refined_ply_path,
+            Basemap.status != BasemapStatus.rejected,
+        )
+    )
+    if dup.scalar_one_or_none():
+        raise HTTPException(status_code=400, detail="이미 basemap으로 등록된 파일입니다.")
+
+    latest = await db.execute(
+        select(Basemap)
+        .where(Basemap.floor_id == floor.id)
+        .order_by(Basemap.version.desc())
+        .limit(1)
+    )
+    latest_bm = latest.scalar_one_or_none()
+    next_version = (latest_bm.version + 1) if latest_bm else 1
+
+    basemap = Basemap(
+        floor_id=floor.id,
+        source_upload_id=upload.id,
+        minio_path=refined_ply_path,
+        version=next_version,
+        uploaded_by=user.id,
+        status=BasemapStatus.pending,
+    )
+    db.add(basemap)
+    await db.commit()
+    await db.refresh(basemap)
+    return BasemapRegisterResponse(
+        basemap_id=basemap.id,
+        floor_id=basemap.floor_id,
+        version=basemap.version,
+        status=basemap.status.value if hasattr(basemap.status, "value") else str(basemap.status),
+    )
 
 
 @router.get("/{basemap_id}/metadata", response_model=BasemapMetadataResponse)
@@ -753,6 +833,7 @@ async def activate_basemap(
 
     # 새 basemap 활성화
     new_basemap.is_active = True
+    floor.overview_dirty = True
 
     # 활성 basemap을 공용 경로에 복사 (basemap/basemap.ply)
     # TODO: MinIO copy_object 구현

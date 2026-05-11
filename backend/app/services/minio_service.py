@@ -110,6 +110,36 @@ class MinioService:
         except Exception:
             return False
 
+    def delete_object(self, key: str) -> bool:
+        """MinIO 오브젝트를 best-effort 로 삭제. 삭제됐으면 True."""
+        try:
+            self.client.remove_object(self.bucket, key)
+            return True
+        except Exception:
+            return False
+
+    def delete_prefix(self, prefix: str) -> int:
+        """prefix 하위 오브젝트를 best-effort 로 삭제하고 삭제 시도 성공 수를 반환."""
+        normalized = prefix.strip("/")
+        if not normalized:
+            return 0
+        if not normalized.endswith("/"):
+            normalized = f"{normalized}/"
+
+        deleted = 0
+        try:
+            objects = list(self.client.list_objects(self.bucket, prefix=normalized, recursive=True))
+        except Exception:
+            return 0
+
+        for obj in objects:
+            name = getattr(obj, "object_name", None)
+            if not name:
+                continue
+            if self.delete_object(name):
+                deleted += 1
+        return deleted
+
     def stat_object(self, key: str):
         return self.client.stat_object(self.bucket, key)
 

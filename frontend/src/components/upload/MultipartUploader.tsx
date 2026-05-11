@@ -5,6 +5,7 @@ import { api } from '@/lib/api';
 import { Building, Floor, Module, UploadInitResponse } from '@/types';
 
 const SCENE_3D_EXTENSIONS = ['.ply', '.splat', '.sog'];
+const STORAGE_ZIP_EXTENSIONS = ['.zip'];
 
 function fileExt(filename: string): string {
   return `.${filename.split('.').pop()?.toLowerCase() ?? ''}`;
@@ -14,6 +15,10 @@ function isScene3DFile(filename: string): boolean {
   return SCENE_3D_EXTENSIONS.includes(fileExt(filename));
 }
 
+function isZipFile(filename: string): boolean {
+  return STORAGE_ZIP_EXTENSIONS.includes(fileExt(filename));
+}
+
 // 브라우저가 file.type을 빈 문자열로 반환할 때 확장자 기반 보완
 const EXT_TO_MIME: Record<string, string> = {
   mp4: 'video/mp4', mov: 'video/quicktime', avi: 'video/x-msvideo',
@@ -21,7 +26,7 @@ const EXT_TO_MIME: Record<string, string> = {
   jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png',
   gif: 'image/gif', bmp: 'image/bmp', webp: 'image/webp',
   ply: 'application/octet-stream', splat: 'application/octet-stream',
-  sog: 'application/octet-stream',
+  sog: 'application/octet-stream', zip: 'application/zip',
 };
 
 function resolveContentType(file: File): string {
@@ -34,8 +39,12 @@ function isVideoFile(file: File): boolean {
   return resolveContentType(file).startsWith('video/');
 }
 
+function isImageFile(file: File): boolean {
+  return resolveContentType(file).startsWith('image/');
+}
+
 function isAcceptedFile(file: File): boolean {
-  return isVideoFile(file) || isScene3DFile(file.name);
+  return isVideoFile(file) || isImageFile(file) || isScene3DFile(file.name) || isZipFile(file.name);
 }
 
 // "1","2" → 1,2 / "B1","B2" → -1,-2 / invalid → null
@@ -82,7 +91,11 @@ interface KakaoPlace {
   id: string;
 }
 
-export default function MultipartUploader() {
+export default function MultipartUploader({
+  fixedContext = null,
+}: {
+  fixedContext?: { building_id: string; building_name: string; floor_id: string; floor_number: number } | null;
+}) {
   const fileRef = useRef<HTMLInputElement>(null);
   const buildingDropdownRef = useRef<HTMLDivElement>(null);
 
@@ -107,8 +120,13 @@ export default function MultipartUploader() {
 
   // Load buildings on mount
   useEffect(() => {
+    if (fixedContext) {
+      setSelectedBuildingName(fixedContext.building_name);
+      setFloorNumber(fixedContext.floor_number < 0 ? `B${Math.abs(fixedContext.floor_number)}` : `${fixedContext.floor_number}`);
+      return;
+    }
     api.get<Building[]>('/buildings').then(setBuildings).catch(() => {});
-  }, []);
+  }, [fixedContext]);
 
   // Close dropdown on outside click
   useEffect(() => {
@@ -131,18 +149,12 @@ export default function MultipartUploader() {
       return;
     }
 
-    const KAKAO_KEY = process.env.NEXT_PUBLIC_KAKAO_REST_API_KEY;
-    if (!KAKAO_KEY) return;
-
     setBuildingSearchLoading(true);
     const timer = setTimeout(async () => {
       try {
-        const res = await fetch(
-          `https://dapi.kakao.com/v2/local/search/keyword.json?query=${encodeURIComponent(query)}&size=10`,
-          { headers: { Authorization: `KakaoAK ${KAKAO_KEY}` } }
+        const data = await api.get<{ documents: KakaoPlace[] }>(
+          `/kakao/search/keyword?query=${encodeURIComponent(query)}&size=10`
         );
-        if (!res.ok) return;
-        const data = await res.json();
         setBuildingSearchResults(data.documents || []);
       } catch {
         setBuildingSearchResults([]);
@@ -196,7 +208,7 @@ export default function MultipartUploader() {
     const dropped = e.dataTransfer.files?.[0];
     if (!dropped) return;
     if (!isAcceptedFile(dropped)) {
-      setMessage('영상 또는 .ply/.splat/.sog 파일만 업로드할 수 있습니다.');
+      setMessage('이미지, 영상 또는 .ply/.splat/.sog/.zip 파일만 업로드할 수 있습니다.');
       setUploadStatus('error');
       return;
     }
@@ -215,7 +227,7 @@ export default function MultipartUploader() {
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0] || null;
     if (f && !isAcceptedFile(f)) {
-      setMessage('영상 또는 .ply/.splat/.sog 파일만 업로드할 수 있습니다.');
+      setMessage('이미지, 영상 또는 .ply/.splat/.sog/.zip 파일만 업로드할 수 있습니다.');
       setUploadStatus('error');
       if (fileRef.current) fileRef.current.value = '';
       return;
@@ -238,16 +250,16 @@ export default function MultipartUploader() {
     setMessage('');
 
     try {
-      const buildingId = await findOrCreateBuilding(selectedBuildingName);
-      const floorId = await findOrCreateFloor(buildingId, floorInt);
+      const buildingId = fixedContext?.building_id ?? await findOrCreateBuilding(selectedBuildingName);
+      const floorId = fixedContext?.floor_id ?? await findOrCreateFloor(buildingId, floorInt);
       const moduleId = await findOrCreateModule(floorId, moduleName.trim());
 
-      // 파일 분기: 영상 → 학습 파이프라인, ply/splat/sog → refined 폴더
+      // 파일 분기: ply/splat/sog → refined 폴더, image/video/zip → 기본 업로드
       let plyTarget: 'gsplat' | 'alignment' | 'refined' | undefined;
-      if (isScene3DFile(file.name)) {
+      if (isScene3DFile(file.name) && !isZipFile(file.name)) {
         plyTarget = 'refined';
       } else {
-        plyTarget = undefined; // 영상 — 기본 학습 흐름
+        plyTarget = undefined;
       }
 
       // 1. 업로드 초기화
@@ -320,14 +332,14 @@ export default function MultipartUploader() {
           ) : (
             <>
               <p className="text-sm text-gray-300">파일을 끌어다 놓거나 클릭하여 선택</p>
-              <p className="text-xs text-gray-500 mt-1">video / .ply / .splat / .sog</p>
+              <p className="text-xs text-gray-500 mt-1">image / video / .ply / .splat / .sog / .zip</p>
             </>
           )}
         </div>
         <input
           ref={fileRef}
           type="file"
-          accept="video/*,.ply,.splat,.sog"
+          accept="image/*,video/*,.ply,.splat,.sog,.zip,.jpg,.jpeg,.png,.gif,.bmp,.webp"
           onChange={handleFileChange}
           className="hidden"
           disabled={uploading}
@@ -336,7 +348,7 @@ export default function MultipartUploader() {
 
 
       {/* 건물 선택 */}
-      <div ref={buildingDropdownRef} className="relative">
+      {!fixedContext && <div ref={buildingDropdownRef} className="relative">
         <label className="block text-sm text-gray-400 mb-1">건물</label>
         <button
           type="button"
@@ -383,7 +395,7 @@ export default function MultipartUploader() {
             </div>
           </div>
         )}
-      </div>
+      </div>}
 
       {/* 층 / 모듈 */}
       <div className="flex gap-3">
@@ -395,7 +407,7 @@ export default function MultipartUploader() {
             onChange={e => setFloorNumber(e.target.value)}
             onBlur={e => setFloorNumber(normalizeFloorInput(e.target.value))}
             placeholder="1, 2 또는 B1, B2"
-            disabled={uploading}
+            disabled={uploading || !!fixedContext}
             className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white text-sm focus:outline-none focus:border-blue-500 disabled:opacity-40"
           />
         </div>

@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
+import { api } from '@/lib/api';
 
 interface Building {
   name: string;
@@ -12,6 +13,12 @@ interface Building {
 interface BuildingMapProps {
   buildings: Building[];
   onBuildingSelect?: (building: Building) => void;
+}
+
+interface KakaoPlaceResult {
+  place_name: string;
+  x: string;
+  y: string;
 }
 
 declare global {
@@ -85,20 +92,23 @@ export default function BuildingMap({ buildings, onBuildingSelect }: BuildingMap
   };
 
   const handleSearch = () => {
-    if (!searchQuery || !window.kakao?.maps) return;
+    const query = searchQuery.trim();
+    if (!query || !window.kakao?.maps) return;
 
-    const ps = new window.kakao.maps.services.Places();
-    ps.keywordSearch(searchQuery, (data: any[], status: any) => {
-      if (status === window.kakao.maps.services.Status.OK && data.length > 0) {
-        const place = data[0];
+    api.get<{ documents?: KakaoPlaceResult[] }>(`/kakao/search/keyword?${new URLSearchParams({ query, size: '1' }).toString()}`)
+      .then((response) => {
+        const place = response?.documents?.[0];
+        if (!place) return;
         onBuildingSelect?.({
           name: place.place_name,
           lat: parseFloat(place.y),
           lng: parseFloat(place.x),
           floors: [],
         });
-      }
-    });
+      })
+      .catch(() => {
+        // 검색 실패 시 무시
+      });
   };
 
   return (

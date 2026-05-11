@@ -15,21 +15,6 @@ interface Basemap {
   created_at: string;
 }
 
-interface BasemapCandidate {
-  upload_id: string;
-  original_filename: string;
-  file_size: number;
-  uploaded_at: string;
-  uploaded_by_name: string;
-  module_id: string;
-  module_name: string;
-  floor_id: string;
-  floor_number: number;
-  building_id: string;
-  building_name: string;
-  already_registered: boolean;
-}
-
 interface BasemapMetadataModule {
   id: string;
   name: string;
@@ -84,17 +69,8 @@ function sortFloorsDesc<T extends { floor_number: number }>(floors: T[]): T[] {
   return [...floors].sort((a, b) => b.floor_number - a.floor_number);
 }
 
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
-  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
-}
-
 export default function BasemapManager() {
   const [basemaps, setBasemaps] = useState<Basemap[]>([]);
-  const [candidates, setCandidates] = useState<BasemapCandidate[]>([]);
-  const [registering, setRegistering] = useState<string | null>(null);
   const [openBasemapId, setOpenBasemapId] = useState<string | null>(null);
   const [metadata, setMetadata] = useState<BasemapMetadata | null>(null);
   const [metadataLoading, setMetadataLoading] = useState(false);
@@ -110,12 +86,8 @@ export default function BasemapManager() {
 
   const loadAll = async () => {
     try {
-      const [bms, cands] = await Promise.all([
-        api.get<Basemap[]>('/admin/basemaps'),
-        api.get<BasemapCandidate[]>('/admin/basemaps/candidates'),
-      ]);
+      const bms = await api.get<Basemap[]>('/admin/basemaps');
       setBasemaps(bms);
-      setCandidates(cands);
     } catch (e: any) {
       showMessage(e.message || '로딩 실패', 'err');
     }
@@ -144,19 +116,6 @@ export default function BasemapManager() {
       loadAll();
     } catch (e: any) {
       showMessage(e.message || '취소 실패', 'err');
-    }
-  };
-
-  const handleRegister = async (uploadId: string) => {
-    setRegistering(uploadId);
-    try {
-      await api.post('/admin/basemaps/register', { upload_id: uploadId });
-      showMessage('basemap으로 등록되었습니다. 승인 후 활성화하세요.', 'ok');
-      loadAll();
-    } catch (e: any) {
-      showMessage(e.message || '등록 실패', 'err');
-    } finally {
-      setRegistering(null);
     }
   };
 
@@ -283,51 +242,10 @@ export default function BasemapManager() {
         </p>
       )}
 
-      {/* 후보 — 업로드된 PLY 파일들 */}
-      <div className="mb-6">
-        <h3 className="text-sm font-semibold text-gray-300 mb-3">
-          업로드된 PLY 파일 ({candidates.length})
-        </h3>
-        {candidates.length === 0 ? (
-          <p className="text-gray-500 text-sm">업로드된 PLY 파일이 없습니다.</p>
-        ) : (
-          <div className="space-y-2">
-            {candidates.map(c => (
-              <div key={c.upload_id} className="bg-gray-950 border border-gray-800 rounded-lg p-3">
-                <div className="flex justify-between items-start gap-3">
-                  <div className="min-w-0 flex-1">
-                    <div className="text-sm text-gray-200 font-medium truncate">{c.original_filename}</div>
-                    <div className="text-xs text-gray-500 mt-1 flex flex-wrap gap-x-3 gap-y-1">
-                      <span>{c.building_name} / {formatFloor(c.floor_number)} / {c.module_name}</span>
-                      <span>{formatBytes(c.file_size)}</span>
-                      <span>{c.uploaded_by_name}</span>
-                      <span>{new Date(c.uploaded_at).toLocaleString('ko-KR')}</span>
-                    </div>
-                  </div>
-                  <div className="flex-shrink-0">
-                    {c.already_registered ? (
-                      <span className="text-xs bg-gray-800 text-gray-400 px-2 py-1 rounded">등록됨</span>
-                    ) : (
-                      <button
-                        onClick={() => handleRegister(c.upload_id)}
-                        disabled={registering === c.upload_id}
-                        className="text-xs bg-blue-600 hover:bg-blue-700 disabled:bg-gray-700 text-white px-3 py-1 rounded"
-                      >
-                        {registering === c.upload_id ? '등록 중...' : 'basemap으로 등록'}
-                      </button>
-                    )}
-                  </div>
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-
       {/* 등록된 basemap 목록 */}
       <div>
         <h3 className="text-sm font-semibold text-gray-300 mb-3">
-          등록된 Basemap ({basemaps.length})
+          Basemap 신청/등록 목록 ({basemaps.length})
         </h3>
         {basemaps.length === 0 ? (
           <p className="text-gray-500 text-sm">등록된 basemap이 없습니다.</p>

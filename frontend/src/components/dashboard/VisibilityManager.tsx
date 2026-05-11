@@ -12,6 +12,11 @@ interface BuildingWithFloors extends Building {
   floors: FloorWithModules[];
 }
 
+type DeleteTarget =
+  | { scope: 'building'; id: string; label: string; noun: '건물' }
+  | { scope: 'floor'; id: string; label: string; noun: '층' }
+  | { scope: 'module'; id: string; label: string; noun: '모듈' };
+
 function formatFloor(n: number): string {
   return n < 0 ? `B${-n}` : `${n}층`;
 }
@@ -23,6 +28,7 @@ export default function VisibilityManager() {
   const [loading, setLoading] = useState(true);
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [message, setMessage] = useState<{ text: string; kind: 'ok' | 'err' } | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null);
 
   useEffect(() => {
     loadAll();
@@ -177,6 +183,77 @@ export default function VisibilityManager() {
     }
   };
 
+  const confirmBuilding = async (buildingId: string) => {
+    const key = `confirm:building:${buildingId}`;
+    setBusyKey(key);
+    try {
+      await api.put(`/admin/buildings/${buildingId}/confirm`);
+      showMessage('건물 확정 완료', 'ok');
+      await loadAll();
+    } catch (e: any) {
+      showMessage(e.message || '건물 확정 실패', 'err');
+    } finally {
+      setBusyKey(null);
+    }
+  };
+
+  const confirmFloor = async (floorId: string) => {
+    const key = `confirm:floor:${floorId}`;
+    setBusyKey(key);
+    try {
+      await api.put(`/admin/floors/${floorId}/confirm`);
+      showMessage('층 확정 완료', 'ok');
+      await loadAll();
+    } catch (e: any) {
+      showMessage(e.message || '층 확정 실패', 'err');
+    } finally {
+      setBusyKey(null);
+    }
+  };
+
+  const confirmModule = async (moduleId: string) => {
+    const key = `confirm:mod:${moduleId}`;
+    setBusyKey(key);
+    try {
+      await api.put(`/admin/modules/${moduleId}/confirm`);
+      showMessage('모듈 확정 완료', 'ok');
+      await loadAll();
+    } catch (e: any) {
+      showMessage(e.message || '모듈 확정 실패', 'err');
+    } finally {
+      setBusyKey(null);
+    }
+  };
+
+  const deleteEndpoint = (target: DeleteTarget) => {
+    if (target.scope === 'building') return `/admin/buildings/${target.id}`;
+    if (target.scope === 'floor') return `/admin/floors/${target.id}`;
+    return `/admin/modules/${target.id}`;
+  };
+
+  const deleteWarningText = (target: DeleteTarget) => {
+    if (target.scope === 'building') return '삭제 시 해당 건물의 모든 데이터가 삭제됩니다.';
+    if (target.scope === 'floor') return '삭제 시 해당 층의 모든 데이터가 삭제됩니다.';
+    return '삭제 시 해당 모듈의 모든 데이터가 삭제됩니다.';
+  };
+
+  const handleDelete = async () => {
+    if (!deleteTarget) return;
+    const target = deleteTarget;
+    const key = `delete:${target.scope}:${target.id}`;
+    setBusyKey(key);
+    try {
+      await api.delete(deleteEndpoint(target));
+      setDeleteTarget(null);
+      showMessage(`${target.noun} 삭제 완료`, 'ok');
+      await loadAll();
+    } catch (e: any) {
+      showMessage(e.message || `${target.noun} 삭제 실패`, 'err');
+    } finally {
+      setBusyKey(null);
+    }
+  };
+
   const visBadge = (visible: boolean) => (
     <span
       className={`text-xs px-2 py-0.5 rounded ${
@@ -196,6 +273,19 @@ export default function VisibilityManager() {
       }`}
     >
       {busy ? '...' : visible ? '숨기기' : '표시'}
+    </button>
+  );
+
+  const deleteBtn = (target: DeleteTarget) => (
+    <button
+      type="button"
+      onClick={() => setDeleteTarget(target)}
+      disabled={busyKey === `delete:${target.scope}:${target.id}`}
+      className="w-7 h-7 rounded border border-red-900/60 text-red-400 hover:bg-red-950/60 hover:text-red-200 disabled:opacity-50 shrink-0"
+      aria-label={`${target.label} 삭제`}
+      title={`${target.label} 삭제`}
+    >
+      X
     </button>
   );
 
@@ -230,6 +320,7 @@ export default function VisibilityManager() {
           {buildings.map((b) => {
             const isOpen = openBuildings.has(b.id);
             const buildingBusy = busyKey === `building:${b.id}`;
+            const buildingConfirmBusy = busyKey === `confirm:building:${b.id}`;
             const sortedFloors = [...b.floors].sort((a, c) => c.floor_number - a.floor_number);
             const moduleCount = b.floors.reduce((s, f) => s + f.modules.length, 0);
             return (
@@ -260,7 +351,19 @@ export default function VisibilityManager() {
                       {b.floors.length}개 층 · {moduleCount}개 모듈
                     </span>
                   </button>
-                  {toggleBtn(b.is_visible, buildingBusy, () => toggleBuildingVisibility(b))}
+                  <div className="flex items-center gap-2">
+                    {!b.is_confirmed && (
+                      <button
+                        onClick={() => confirmBuilding(b.id)}
+                        disabled={buildingConfirmBusy}
+                        className="text-xs px-3 py-1 rounded text-white bg-emerald-600 hover:bg-emerald-700 disabled:bg-gray-700"
+                      >
+                        {buildingConfirmBusy ? '...' : '확정'}
+                      </button>
+                    )}
+                    {toggleBtn(b.is_visible, buildingBusy, () => toggleBuildingVisibility(b))}
+                    {deleteBtn({ scope: 'building', id: b.id, label: b.name, noun: '건물' })}
+                  </div>
                 </div>
 
                 {isOpen && (
@@ -270,6 +373,7 @@ export default function VisibilityManager() {
                     ) : (
                       sortedFloors.map((f) => {
                         const floorBusy = busyKey === `floor:${f.id}`;
+                        const floorConfirmBusy = busyKey === `confirm:floor:${f.id}`;
                         const floorOpen = openFloors.has(f.id);
                         return (
                           <div
@@ -299,15 +403,26 @@ export default function VisibilityManager() {
                                   {f.modules.length}개 모듈
                                 </span>
                               </button>
-                              {toggleBtn(f.is_visible, floorBusy, () =>
-                                toggleFloorVisibility(b, f),
-                              )}
+                              <div className="flex items-center gap-2">
+                                {!f.is_confirmed && (
+                                  <button
+                                    onClick={() => confirmFloor(f.id)}
+                                    disabled={floorConfirmBusy}
+                                    className="text-xs px-3 py-1 rounded text-white bg-emerald-600 hover:bg-emerald-700 disabled:bg-gray-700"
+                                  >
+                                    {floorConfirmBusy ? '...' : '확정'}
+                                  </button>
+                                )}
+                                {toggleBtn(f.is_visible, floorBusy, () => toggleFloorVisibility(b, f))}
+                                {deleteBtn({ scope: 'floor', id: f.id, label: `${b.name} ${formatFloor(f.floor_number)}`, noun: '층' })}
+                              </div>
                             </div>
 
                             {floorOpen && f.modules.length > 0 && (
                               <div className="px-3 pb-2 space-y-1">
                                 {f.modules.map((m) => {
                                   const modBusy = busyKey === `mod:${m.id}`;
+                                  const modConfirmBusy = busyKey === `confirm:mod:${m.id}`;
                                   return (
                                     <div
                                       key={m.id}
@@ -319,9 +434,19 @@ export default function VisibilityManager() {
                                         <span className="text-gray-300 truncate">{m.name}</span>
                                         {visBadge(m.is_visible)}
                                       </div>
-                                      {toggleBtn(m.is_visible, modBusy, () =>
-                                        toggleModuleVisibility(m),
-                                      )}
+                                      <div className="flex items-center gap-2">
+                                        {!m.is_confirmed && (
+                                          <button
+                                            onClick={() => confirmModule(m.id)}
+                                            disabled={modConfirmBusy}
+                                            className="text-xs px-3 py-1 rounded text-white bg-emerald-600 hover:bg-emerald-700 disabled:bg-gray-700"
+                                          >
+                                            {modConfirmBusy ? '...' : '확정'}
+                                          </button>
+                                        )}
+                                        {toggleBtn(m.is_visible, modBusy, () => toggleModuleVisibility(m))}
+                                        {deleteBtn({ scope: 'module', id: m.id, label: m.name, noun: '모듈' })}
+                                      </div>
                                     </div>
                                   );
                                 })}
@@ -340,6 +465,37 @@ export default function VisibilityManager() {
               </div>
             );
           })}
+        </div>
+      )}
+      {deleteTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4">
+          <div className="w-full max-w-md rounded-lg border border-gray-700 bg-gray-900 p-5 shadow-xl">
+            <h3 className="text-base font-semibold text-white">삭제 확인</h3>
+            <p className="mt-3 text-sm text-red-300">
+              {deleteWarningText(deleteTarget)}
+            </p>
+            <p className="mt-2 text-sm text-gray-300 truncate">
+              대상: {deleteTarget.label}
+            </p>
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={handleDelete}
+                disabled={busyKey === `delete:${deleteTarget.scope}:${deleteTarget.id}`}
+                className="rounded bg-red-600 px-4 py-2 text-sm font-semibold text-white hover:bg-red-700 disabled:bg-gray-700 disabled:text-gray-400"
+              >
+                {busyKey === `delete:${deleteTarget.scope}:${deleteTarget.id}` ? '삭제 중...' : '삭제'}
+              </button>
+              <button
+                type="button"
+                onClick={() => setDeleteTarget(null)}
+                disabled={busyKey === `delete:${deleteTarget.scope}:${deleteTarget.id}`}
+                className="rounded bg-gray-700 px-4 py-2 text-sm text-gray-200 hover:bg-gray-600 disabled:opacity-50"
+              >
+                취소
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </section>
