@@ -1,25 +1,25 @@
 import os
-import json
+import re
+import shutil
 import logging
+import subprocess
 import tempfile
-import numpy as np
 
 from pipeline.base import PipelineModule, PipelineError
 
 logger = logging.getLogger(__name__)
 
-# 포인트 수가 너무 많으면 뷰어 JSON이 커지므로 최대 개수 제한
-MAX_POINTS = 200_000
+COLMAP_BIN = os.environ.get("COLMAP_BIN", "colmap")
 
 
 class ColmapModule(PipelineModule):
-    """COLMAP SfM 실행 모듈.
+    """COLMAP SfM + undistortion 모듈 (CLI 방식).
 
     입력: 이미지 디렉토리
-    출력: colmap_workspace 디렉토리
-        ├── sparse/0/{cameras,images,points3D}.bin
-        ├── database.db
-        └── colmap_result.json   ← 뷰어용 파싱 결과
+    출력: undistorted 디렉토리
+        ├── images/       ← undistorted 이미지
+        └── sparse/
+            └── 0/        ← cameras.bin, images.bin, points3D.bin
     """
 
     @property
@@ -34,139 +34,135 @@ class ColmapModule(PipelineModule):
             if os.path.splitext(f)[1].lower() in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
         ]
         if len(images) < 3:
-            raise PipelineError(self.name, f"COLMAP에는 최소 3장 이상의 이미지가 필요합니다. (현재 {len(images)}장)")
+            raise PipelineError(self.name, f"최소 3장 이상의 이미지가 필요합니다. (현재 {len(images)}장)")
+        self._total_images = len(images)
         return True
+
+    def _run_cmd(self, cmd: list, step: str) -> str:
+        logger.info(f"[{self.name}] {step}: {' '.join(cmd)}")
+        try:
+            result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+            return result.stdout + result.stderr
+        except subprocess.CalledProcessError as e:
+            raise PipelineError(self.name, f"{step} 실패:\n{(e.stderr or '')[-500:]}")
+        except FileNotFoundError:
+            raise PipelineError(self.name, f"colmap 바이너리를 찾을 수 없습니다: {COLMAP_BIN}")
+
+    def _get_registered_images(self, folder_path: str) -> int:
+        """colmap model_analyzer로 registered images 수 반환."""
+        try:
+            result = subprocess.run(
+                [COLMAP_BIN, "model_analyzer", "--path", folder_path],
+                check=True, capture_output=True, text=True,
+            )
+            output = result.stdout + result.stderr
+            match = re.search(r"Registered images:\s*(\d+)", output)
+            return int(match.group(1)) if match else 0
+        except Exception:
+            return 0
 
     def run(self, input_path: str) -> str:
         self.validate_input(input_path)
-
-        try:
-            import pycolmap
-        except ImportError:
-            raise PipelineError(self.name, "pycolmap이 설치되어 있지 않습니다. requirements.txt를 확인하세요.")
+        total_images = self._total_images
 
         work_dir = os.path.join(tempfile.gettempdir(), f"colmap_{os.getpid()}")
         os.makedirs(work_dir, exist_ok=True)
 
         database_path = os.path.join(work_dir, "database.db")
-        sparse_dir = os.path.join(work_dir, "sparse")
+        sparse_dir    = os.path.join(work_dir, "sparse")
+        undistorted_dir = os.path.join(work_dir, "undistorted")
         os.makedirs(sparse_dir, exist_ok=True)
 
+        # 1. Feature extraction
         logger.info(f"[{self.name}] Feature extraction 시작: {input_path}")
-        try:
-            pycolmap.extract_features(database_path, input_path)
-        except Exception as e:
-            raise PipelineError(self.name, f"Feature extraction 실패: {e}")
+        self._run_cmd([
+            COLMAP_BIN, "feature_extractor",
+            "--database_path", database_path,
+            "--image_path",    input_path,
+            "--ImageReader.single_camera", "1",
+            "--ImageReader.camera_model",  "OPENCV",
+        ], "feature_extractor")
 
+        # 2. Exhaustive matching
         logger.info(f"[{self.name}] Feature matching 시작")
-        try:
-            pycolmap.match_exhaustive(database_path)
-        except Exception as e:
-            raise PipelineError(self.name, f"Feature matching 실패: {e}")
+        self._run_cmd([
+            COLMAP_BIN, "exhaustive_matcher",
+            "--database_path", database_path,
+        ], "exhaustive_matcher")
 
+        # 3. Mapper
         logger.info(f"[{self.name}] Incremental mapping 시작")
-        try:
-            maps = pycolmap.incremental_mapping(database_path, input_path, sparse_dir)
-        except Exception as e:
-            raise PipelineError(self.name, f"Sparse reconstruction 실패: {e}")
+        self._run_cmd([
+            COLMAP_BIN, "mapper",
+            "--database_path", database_path,
+            "--image_path",    input_path,
+            "--output_path",   sparse_dir,
+        ], "mapper")
 
-        if not maps:
-            raise PipelineError(self.name, "Reconstruction 결과가 없습니다. 이미지 수가 부족하거나 특징점을 찾지 못했습니다.")
+        # 4. 생성된 subfolder 목록 수집
+        subfolders = sorted([
+            d for d in os.listdir(sparse_dir)
+            if os.path.isdir(os.path.join(sparse_dir, d))
+        ])
+        if not subfolders:
+            raise PipelineError(self.name, "Mapper 결과가 없습니다. 이미지가 부족하거나 특징점을 찾지 못했습니다.")
 
-        # 가장 큰 reconstruction 선택
-        best_map = max(maps.values(), key=lambda m: len(m.images))
-        sparse0_dir = os.path.join(sparse_dir, "0")
-        os.makedirs(sparse0_dir, exist_ok=True)
-        best_map.write(sparse0_dir)
+        # 5. 각 subfolder model_analyzer 실행 → registered images 수집
+        stats = []  # [(original_folder_name, registered_images)]
+        for folder in subfolders:
+            folder_path = os.path.join(sparse_dir, folder)
+            reg = self._get_registered_images(folder_path)
+            stats.append((folder, reg))
+            logger.info(f"[{self.name}] sparse/{folder}: registered images = {reg}")
 
-        logger.info(
-            f"[{self.name}] Reconstruction 완료: "
-            f"{len(best_map.images)} 카메라, {len(best_map.points3D)} 포인트"
-        )
+        # 6. registered images 내림차순 정렬 → 임시 이름으로 rename 후 최종 rename
+        stats.sort(key=lambda x: x[1], reverse=True)
 
-        result_json_path = os.path.join(work_dir, "colmap_result.json")
-        self._export_result_json(best_map, result_json_path)
+        for i, (folder, _) in enumerate(stats):
+            os.rename(
+                os.path.join(sparse_dir, folder),
+                os.path.join(sparse_dir, f"{i}_tmp"),
+            )
+        for i in range(len(stats)):
+            os.rename(
+                os.path.join(sparse_dir, f"{i}_tmp"),
+                os.path.join(sparse_dir, str(i)),
+            )
 
-        return work_dir
+        # 7. 정렬 결과 로그
+        logger.info(f"[{self.name}] === Reconstruction 결과 (registered images 내림차순) ===")
+        for i, (orig, reg) in enumerate(stats):
+            logger.info(f"[{self.name}]   sparse/{i} ← 원래 '{orig}': {reg}장 등록")
 
-    def _export_result_json(self, reconstruction, output_path: str) -> None:
-        """Reconstruction 객체를 뷰어용 JSON으로 변환."""
-        points = []
-        point3d_items = list(reconstruction.points3D.items())
+        # 8. 품질 검증: 0번 폴더 registered images >= 총 이미지 수의 절반
+        best_reg = stats[0][1]
+        threshold = total_images / 2
+        if best_reg < threshold:
+            raise PipelineError(
+                self.name,
+                f"COLMAP failed: 최적 reconstruction {best_reg}장 등록 "
+                f"< 총 이미지 절반 ({int(threshold)}/{total_images})",
+            )
+        logger.info(f"[{self.name}] COLMAP success: {best_reg}/{total_images}장 등록")
 
-        # 너무 많으면 균등 샘플링
-        if len(point3d_items) > MAX_POINTS:
-            step = len(point3d_items) // MAX_POINTS
-            point3d_items = point3d_items[::step]
+        # 9. Image undistortion
+        logger.info(f"[{self.name}] Image undistortion 시작")
+        os.makedirs(undistorted_dir, exist_ok=True)
+        self._run_cmd([
+            COLMAP_BIN, "image_undistorter",
+            "--image_path", input_path,
+            "--input_path", os.path.join(sparse_dir, "0"),
+            "--output_path", undistorted_dir,
+        ], "image_undistorter")
 
-        for _, pt in point3d_items:
-            xyz = pt.xyz.tolist()
-            color = [int(c) for c in pt.color[:3]]
-            points.append(xyz + color)  # [x, y, z, r, g, b]
+        # undistorted/sparse/ 파일을 undistorted/sparse/0/ 로 이동 (gsplat 호환)
+        undist_sparse    = os.path.join(undistorted_dir, "sparse")
+        undist_sparse_0  = os.path.join(undist_sparse, "0")
+        os.makedirs(undist_sparse_0, exist_ok=True)
+        for fname in os.listdir(undist_sparse):
+            src = os.path.join(undist_sparse, fname)
+            if os.path.isfile(src):
+                shutil.move(src, os.path.join(undist_sparse_0, fname))
 
-        cameras = []
-        for _, image in reconstruction.images.items():
-            cam = reconstruction.cameras[image.camera_id]
-
-            R = image.cam_from_world.rotation.matrix()   # world-to-cam, 3x3
-            t = image.cam_from_world.translation          # 3-vector in cam space
-            # camera center in world: -R^T @ t
-            position = (-R.T @ t).tolist()
-
-            fx, fy, cx, cy = self._parse_intrinsics(cam)
-
-            cameras.append({
-                "name": image.name,
-                "position": position,
-                "R": R.tolist(),     # world-to-cam (viewer에서 역변환해 frustum 계산)
-                "fx": fx,
-                "fy": fy,
-                "cx": cx,
-                "cy": cy,
-                "width": cam.width,
-                "height": cam.height,
-            })
-
-        result = {
-            "num_points": len(points),
-            "num_cameras": len(cameras),
-            "points": points,
-            "cameras": cameras,
-        }
-
-        with open(output_path, "w") as f:
-            json.dump(result, f, separators=(",", ":"))
-
-        size_mb = os.path.getsize(output_path) / (1024 * 1024)
-        logger.info(f"[{self.name}] colmap_result.json 생성: {len(points)}pt, {len(cameras)}cam, {size_mb:.1f}MB")
-
-    @staticmethod
-    def _parse_intrinsics(camera) -> tuple[float, float, float, float]:
-        """카메라 모델별 fx, fy, cx, cy 추출."""
-        try:
-            import pycolmap
-            model = camera.model
-            params = camera.params
-
-            # pycolmap CameraModelId 비교
-            model_name = str(model)
-
-            if "SIMPLE_PINHOLE" in model_name:
-                return params[0], params[0], params[1], params[2]
-            elif "PINHOLE" in model_name:
-                return params[0], params[1], params[2], params[3]
-            elif "SIMPLE_RADIAL" in model_name:
-                return params[0], params[0], params[1], params[2]
-            elif "RADIAL" in model_name:
-                return params[0], params[0], params[1], params[2]
-            elif "OPENCV" in model_name:
-                return params[0], params[1], params[2], params[3]
-            else:
-                # fallback: 첫 번째 파라미터를 focal length로 가정
-                f = params[0]
-                cx = camera.width / 2.0
-                cy = camera.height / 2.0
-                return f, f, cx, cy
-        except Exception:
-            f = max(camera.width, camera.height) * 1.2
-            return f, f, camera.width / 2.0, camera.height / 2.0
+        logger.info(f"[{self.name}] 완료: {undistorted_dir}")
+        return undistorted_dir

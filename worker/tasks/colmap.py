@@ -62,7 +62,7 @@ def run_colmap_preprocessing(self, upload_id: str, user_id: str, minio_input_key
         runner = PipelineRunner(modules)
         colmap_workspace = runner.run(local_input, _progress)
 
-        # 3. 결과를 MinIO에 업로드
+        # 3. 결과를 MinIO에 업로드 (undistorted/sparse/0/*.bin + undistorted/images/)
         update_progress(task_id, 88, "결과 업로드")
 
         # sparse/0/*.bin 업로드
@@ -73,6 +73,16 @@ def run_colmap_preprocessing(self, upload_id: str, user_id: str, minio_input_key
                 remote_key = f"{result_base}/sparse/0/{fname}"
                 upload_file(local_bin, remote_key)
                 logger.info(f"[Task {task_id}] 업로드: {remote_key}")
+
+        # undistorted images 업로드
+        undist_images = os.path.join(colmap_workspace, "images")
+        if os.path.isdir(undist_images):
+            for fname in os.listdir(undist_images):
+                local_img = os.path.join(undist_images, fname)
+                if os.path.isfile(local_img):
+                    remote_key = f"{result_base}/images/{fname}"
+                    upload_file(local_img, remote_key)
+            logger.info(f"[Task {task_id}] undistorted images 업로드 완료")
 
         update_progress(task_id, 100, "완료")
         logger.info(f"[Task {task_id}] COLMAP 전처리 완료 → GS 학습 자동 시작")
