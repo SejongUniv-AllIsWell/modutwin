@@ -5,10 +5,20 @@
 #   - nginx: HTTP only (no SSL, no HTTPS redirect)
 #   - nginx: uses nginx.local.conf directly
 #   - MinIO presigned URLs go directly to localhost:9000 (not through nginx)
+#   - 불필요한 호스트 포트 바인딩 제거 (postgres/rabbitmq/redis: 컨테이너 내부 통신만 사용)
 
 services:
   nginx:
     volumes:
       - ./nginx/nginx.local.conf:/etc/nginx/nginx.conf:ro
-    ports:
+    ports: !override
       - "80:80"
+
+  postgres:
+    ports: !override []
+
+  rabbitmq:
+    ports: !override []
+
+  redis:
+    ports: !override []

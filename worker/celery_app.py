@@ -18,4 +18,4 @@ app.config_from_object({
     'task_default_queue': 'training',
 })
 
-app.autodiscover_tasks(['tasks'])
+app.conf.imports = ('tasks.training', 'tasks.alignment')

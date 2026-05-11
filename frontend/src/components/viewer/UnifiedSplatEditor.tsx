@@ -70,6 +70,11 @@ export default function UnifiedSplatEditor({
   const [sam3PromptOpen, setSam3PromptOpen] = useState(false);
   const [autoExtracting, setAutoExtracting] = useState(false);
   const [, setSam3Prompt] = useState('');
+  // SAM3 자동 추출 완료 시 doors.json 에서 가져온 4 corner. DoorAlignModal 에 prefill 로 전달.
+  const [autoExtractedCorners, setAutoExtractedCorners] = useState<Array<[number, number, number]> | null>(null);
+  // /sam3/start 응답을 받아 backend 가 sam3_status='running' 으로 commit 한 시점 이후에만 폴링을
+  // 시작하기 위한 가드. 이전 dispatch 의 stale 'done' 을 새 시도의 결과로 오인하는 race 차단.
+  const [sam3DispatchSent, setSam3DispatchSent] = useState(false);
 
   // ── 단방향 진행 잠금 ──
   // 완료 버튼으로 다음 단계로 넘어간 이전 단계는 되돌릴 수 없음 (변경 시 후속 단계 의존성이 깨지므로).
@@ -159,6 +164,49 @@ export default function UnifiedSplatEditor({
     setMetadataModal(null);
   }, [metadataModal]);
 
+  // ── SAM3 자동 추출 진행 폴링 ──
+  // 다듬기 완료 직후 dispatch 한 SAM3 작업 상태(`/uploads/{id}/sam3`)를 2.5s 주기로 조회.
+  // status='done' 이면 doors.json 가져와 4 corner 를 DoorAlignModal 에 prefill 후 autoExtracting=false.
+  // status='failed' 면 autoExtracting=false (사용자가 수동 picking 으로 진행).
+  // sam3DispatchSent: /sam3/start 응답을 받은 이후에만 폴링. 이전 시도의 stale 'done' 을 새 시도의
+  // 결과로 오인해 로딩 표시가 즉시 사라지는 race 방지.
+  useEffect(() => {
+    if (!autoExtracting || !uploadId || !sam3DispatchSent) return;
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const s = await api.get<{ sam3_status?: string | null }>(`/uploads/${uploadId}/sam3`);
+        if (cancelled) return;
+        if (s.sam3_status === 'done') {
+          try {
+            const doors = await api.get<{ doors: Array<{ id: string; corners: number[][] }> }>(`/uploads/${uploadId}/doors`);
+            if (cancelled) return;
+            const target = doors.doors.find(d => d.id === 'door_1') ?? doors.doors[0];
+            if (target?.corners?.length === 4) {
+              setAutoExtractedCorners(target.corners.map(c => [c[0], c[1], c[2]]) as Array<[number, number, number]>);
+            }
+          } catch (e) {
+            console.warn('[Sam3] doors.json fetch 실패', e);
+          }
+          setAutoExtracting(false);
+          return;
+        }
+        if (s.sam3_status === 'failed') {
+          console.warn('[Sam3] 자동 추출 실패 — 수동 모드로 전환');
+          setAutoExtracting(false);
+          return;
+        }
+      } catch (e) {
+        // 네트워크 일시 오류 — 다음 tick 재시도.
+      }
+      if (!cancelled) {
+        timer = window.setTimeout(tick, 2500);
+      }
+    };
+    let timer = window.setTimeout(tick, 1500);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [autoExtracting, uploadId, sam3DispatchSent]);
+
   // ── 페이지 이탈 경고 — 다듬기/문 설정 단계에선 저장되지 않은 변경사항이 있으므로 닫기/새로고침 시 경고. ──
   useEffect(() => {
     if (mode !== 'refine' && mode !== 'door') return;
@@ -188,7 +236,28 @@ export default function UnifiedSplatEditor({
       return;
     }
     setMode(next);
-  }, [mode, lockedStages]);
+    // 다듬기 단계를 건너뛰고 바로 문 설정으로 진입하는 경우 — SAM3 자동 추출 프롬프트 자동 오픈.
+    // (정상 흐름인 다듬기 완료 → onSwitchToAlign 경로와 별개로, 문 코너 검출만 빠르게 테스트할 수 있도록.)
+    if (next === 'door' && mode !== 'refine') {
+      setLockedStages(s => {
+        const n = new Set(s);
+        n.add('upload');
+        n.add('refine');
+        return n;
+      });
+      // 로컬 파일이라 uploadId 가 아직 없으면 먼저 모듈 정보 모달 → register-local 으로 uploadId 확보.
+      // 그래야 SAM3 dispatch (`/uploads/{id}/sam3/start`) 가 동작.
+      if (!uploadId) {
+        requestMetadata('save').then(() => {
+          setSam3PromptOpen(true);
+        }).catch(e => {
+          console.warn('[skip-refine] register-local 실패 — 모달 미오픈', e);
+        });
+      } else {
+        setSam3PromptOpen(true);
+      }
+    }
+  }, [mode, lockedStages, uploadId, requestMetadata]);
 
   // 모듈 측 (자기 자신) 의 첫 도어 (door_1) 4 코너 가져옴. 백그라운드 저장 후엔 서버 doors.json 에 있음.
   // 백그라운드 저장 직후엔 아직 없을 수 있으니 retry. 정합 단계 진입 직후 호출.
@@ -275,7 +344,17 @@ export default function UnifiedSplatEditor({
             n.add('refine');
             return n;
           });
-          setSam3PromptOpen(true);
+          // 로컬 파일이라 uploadId 가 아직 없으면 → 모듈 정보 모달 → register-local 으로
+          // uploadId 확보 후에야 SAM3 자동 추출 dispatch 가 동작. 모달 처리 후 SAM3 프롬프트 오픈.
+          if (!uploadId) {
+            requestMetadata('save').then(() => {
+              setSam3PromptOpen(true);
+            }).catch(e => {
+              console.warn('[refine→door] register-local 실패 — SAM3 모달 미오픈', e);
+            });
+          } else {
+            setSam3PromptOpen(true);
+          }
           return 'door';
         }
         return prev;
@@ -531,7 +610,8 @@ export default function UnifiedSplatEditor({
               onClose={() => { void handleToggleMode('align'); }}
               view="setup"
               autoExtracting={autoExtracting}
-              onManualPickStart={() => setAutoExtracting(false)}
+              autoExtractedCorners={autoExtractedCorners}
+              onManualPickStart={() => { setAutoExtracting(false); setSam3DispatchSent(false); setAutoExtractedCorners(null); }}
               ensureUploadId={async () => {
                 // SPEC: 모든 케이스에서 모듈 정보 모달 강제. uploadId 가 이미 있어도 모달이 뜸 (확인 받음).
                 // 모달 dismiss → reject → DoorAlignModal 이 작업 유지 (화면 안 넘어감).
@@ -584,6 +664,8 @@ export default function UnifiedSplatEditor({
                 setSam3Prompt(prompt);
                 setSam3PromptOpen(false);
                 setAutoExtracting(true);
+                setSam3DispatchSent(false);
+                setAutoExtractedCorners(null);
                 // 백그라운드: refined PLY 업로드 → SAM3 dispatch.
                 // 로컬 파일(아직 register-local 안 한 경우) 이면 자동 추출 시작이 불가능하므로
                 // 그 경우 dispatch는 건너뛰고 사용자는 수동 지정으로 진행 (autoExtracting 은 UI 라벨만).
@@ -593,11 +675,17 @@ export default function UnifiedSplatEditor({
                     return;
                   }
                   try {
-                    const { plyKey } = await refine.commitRefinedToServer(uploadId);
+                    const { plyKey, rotX, rotZ, wallAngleRad } = await refine.commitRefinedToServer(uploadId);
+                    // SAM3 검출은 백엔드가 원본 PLY (upload.minio_path) 로 수행 — 다듬기 후 PLY 는
+                    // 벽이 분리돼 SAM3 가 문을 못 봐 본질적 검출 불가능. refined_ply_key 는 doors.json
+                    // 저장 위치 도출용. bake_rotation 은 원본 좌표계 corner → refined 좌표계 변환에 사용.
                     await api.post(`/uploads/${uploadId}/sam3/start`, {
                       refined_ply_key: plyKey,
                       prompt,
+                      bake_rotation: { rotX, rotZ, wallAngleRad },
                     });
+                    // backend 가 sam3_status='running' 으로 commit 한 시점 이후 폴링 안전.
+                    setSam3DispatchSent(true);
                   } catch (e) {
                     console.warn('[Sam3] dispatch 실패 — 사용자가 수동 지정으로 진행 가능', e);
                     // dispatch 실패 시에도 autoExtracting 은 그대로 둠: DoorAlignModal 의 setup view 가
@@ -608,6 +696,7 @@ export default function UnifiedSplatEditor({
               onSkipToManual={() => {
                 setSam3PromptOpen(false);
                 setAutoExtracting(false);
+                setSam3DispatchSent(false);
               }}
               onClose={() => setSam3PromptOpen(false)}
             />
