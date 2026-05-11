@@ -54,6 +54,9 @@ interface Props {
   /** 다듬기 단계의 정렬 회전값 (pendingRotation + wallAngle) 동기 조회. 메모리 직주입 흐름에서
    *  서버 업로드 await 없이 즉시 doors corners 변환에 사용. */
   getCurrentBakedRotation?: () => { rotX: number; rotZ: number; wallAngleRad: number };
+  /** 백엔드가 실제로 서빙한 PLY variant — 'original' = raw frame, 'refined' = A'+Y baked frame.
+   *  SAM3 자동추출 prefill 의 좌표 frame 분기에 사용 (아래 useEffect 주석 참조). */
+  servedVariant?: 'original' | 'refined' | null;
 }
 
 // 픽 / 영속화 / 다운스트림 기하 (Kabsch 등) 는 시계방향 (TL → TR → BR → BL) 인덱스 순서를 가정.
@@ -82,29 +85,39 @@ const DISPLAY_ORDER = [0, 1, 3, 2] as const;
  *   - 'align' — 정합 단계: basemap 4꼭짓점 픽 + Kabsch + applyAndSave 로 aligned.ply 업로드.
  */
 export default function DoorAlignModal({
-  coreRef, uploadId, currentUrl, onDone, onClose, view = 'setup', autoExtracting = false, autoExtractedCorners = null, onManualPickStart, onSetupSaveDone, ensureUploadId, onCommitRefined, getCurrentKeepMask, getBakeRgba, getCurrentBakedRotation,
+  coreRef, uploadId, currentUrl, onDone, onClose, view = 'setup', autoExtracting = false, autoExtractedCorners = null, servedVariant = null, onManualPickStart, onSetupSaveDone, ensureUploadId, onCommitRefined, getCurrentKeepMask, getBakeRgba, getCurrentBakedRotation,
 }: Props) {
   const [picked, setPicked] = useState<Array<PickedCorner | null>>(() => emptyPicked());
 
   // SAM3 자동 추출 완료 시 부모가 넘겨준 4 코너로 picked 초기 채움.
-  // doors.json contract = A'+Y frame (회전 베이크된 PLY 와 동일 frame). picked.pos contract = raw frame
-  // (raycastToPlanes 가 splatEntity 역변환으로 산출). 다듬기 직후 세션은 메모리 PLY 가 아직 raw 이고
-  // splatEntity 가 시각화 회전을 적용 중 → A'+Y → raw 역변환 필요.
-  // 재진입 세션은 베이크된 PLY 가 새 raw 로 로드되고 getCurrentBakedRotation 이 0 을 반환 → 항등 변환.
+  //
+  // doors.json contract = A'+Y frame (refined PLY 좌표계). picked.pos contract = splatEntity local
+  // (raycastToPlanes 가 splatEntity 역변환으로 산출) = 메모리 splatData 좌표.
+  //
+  // 메모리 splatData 좌표는 백엔드가 서빙한 PLY variant 에 따라:
+  //   'original' → raw frame (다듬기 직후 + 재진입 시 백엔드가 원본 서빙):
+  //                A'+Y → raw 역변환 (ayToRaw) 필요. getCurrentBakedRotation 의 ref 값 사용.
+  //   'refined'  → A'+Y baked frame (백엔드 fallback 으로 refined PLY 가 서빙된 경우, e.g. register-local):
+  //                항등 변환 — corner 가 이미 메모리 frame 과 동일.
+  // servedVariant 가 명시되지 않은 경우 보수적으로 'original' 가정 (기존 ayToRaw 동작).
+  //
   // 사용자가 이미 직접 픽한 코너가 있으면 덮어쓰지 않음. surfaceId 는 빈 문자열 — 후속 회전/저장 단계가
   // raycast 로 보정.
   useEffect(() => {
     if (!autoExtractedCorners || autoExtractedCorners.length !== 4) return;
     const r = getCurrentBakedRotation?.() ?? { rotX: 0, rotZ: 0, wallAngleRad: 0 };
+    const isRefined = servedVariant === 'refined';
     setPicked(prev => {
       const allEmpty = prev.every(p => p === null);
       if (!allEmpty) return prev;
       return autoExtractedCorners.map(c => ({
-        pos: ayToRaw([c[0], c[1], c[2]] as Vec3, r),
+        pos: isRefined
+          ? ([c[0], c[1], c[2]] as Vec3)
+          : ayToRaw([c[0], c[1], c[2]] as Vec3, r),
         surfaceId: '',
       }));
     });
-  }, [autoExtractedCorners, getCurrentBakedRotation]);
+  }, [autoExtractedCorners, getCurrentBakedRotation, servedVariant]);
 
   // 문 경계 (4 변 노란선 + 힌지 cylinder) 표시 토글. true 면 그리고, false 면 둘 다 숨김.
   const [boundaryVisible, setBoundaryVisible] = useState(true);

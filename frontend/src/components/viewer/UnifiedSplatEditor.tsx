@@ -24,6 +24,9 @@ interface Props {
   initialUploadId?: string;
   initialDisplayName?: string;
   initialMode?: EditorMode;
+  /** 백엔드가 실제로 서빙한 PLY variant — 'original' = raw frame, 'refined' = A'+Y baked frame.
+   *  SAM3 자동추출 prefill 의 좌표 frame 분기에 사용. */
+  initialServedVariant?: 'original' | 'refined' | null;
 }
 
 export default function UnifiedSplatEditor({
@@ -31,6 +34,7 @@ export default function UnifiedSplatEditor({
   initialUploadId,
   initialDisplayName,
   initialMode = null,
+  initialServedVariant = null,
 }: Props) {
   const coreRef = useRef<SplatViewerCoreRef>(null);
 
@@ -42,6 +46,11 @@ export default function UnifiedSplatEditor({
   const [displayName, setDisplayName] = useState<string | null>(initialDisplayName ?? null);
   const [source, setSource] = useState<'local' | 'server'>(initialUploadId ? 'server' : 'local');
   const [mainVisible, setMainVisible] = useState(true);
+  // 서빙된 PLY variant — DoorAlignModal SAM3 prefill 의 좌표 frame 분기에 사용.
+  //   'original' = 메모리 PLY 가 raw frame (다듬기 회전 미적용) → ayToRaw 변환 필요.
+  //   'refined'  = 메모리 PLY 가 A'+Y baked (회전 베이크됨) → 항등 변환.
+  // 로컬 파일 진입은 항상 raw (사용자 머신의 원본) 이므로 'original'.
+  const [servedVariant, setServedVariant] = useState<'original' | 'refined' | null>(initialServedVariant ?? (initialUploadId ? null : 'original'));
 
   // 로컬 파일 → Object URL 추적 (revoke 위해)
   const localObjectUrlRef = useRef<string | null>(null);
@@ -96,13 +105,14 @@ export default function UnifiedSplatEditor({
     setCurrentUrl(newUrl);
   }, []);
 
-  // 서버 진입 — initialSogUrl 변화 시 동기화
+  // 서버 진입 — initialSogUrl 변화 시 동기화 (servedVariant 도 함께)
   const lastInitialUrlRef = useRef(initialSogUrl);
   useEffect(() => {
     if (lastInitialUrlRef.current === initialSogUrl) return;
     lastInitialUrlRef.current = initialSogUrl ?? null;
     if (initialSogUrl) {
       setCurrentUrl(initialSogUrl);
+      setServedVariant(initialServedVariant ?? 'original');
     }
   }, [initialSogUrl]);
 
@@ -332,6 +342,7 @@ export default function UnifiedSplatEditor({
     currentUrl: currentUrl ?? undefined,
     reloadWithUrl,
     originalFilename: displayName ?? undefined,
+    servedVariant,
     // 다듬기 완료 → 문 설정 단계 + SAM3 프롬프트 팝업 자동 오픈.
     // 단 이미 'door' 또는 'align' 이면 transition 안 함 (saveRefined 가 재호출된 경우).
     onSwitchToAlign: () => {
@@ -611,6 +622,7 @@ export default function UnifiedSplatEditor({
               view="setup"
               autoExtracting={autoExtracting}
               autoExtractedCorners={autoExtractedCorners}
+              servedVariant={servedVariant}
               onManualPickStart={() => { setAutoExtracting(false); setSam3DispatchSent(false); setAutoExtractedCorners(null); }}
               ensureUploadId={async () => {
                 // SPEC: 모든 케이스에서 모듈 정보 모달 강제. uploadId 가 이미 있어도 모달이 뜸 (확인 받음).

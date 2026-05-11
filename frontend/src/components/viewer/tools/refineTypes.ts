@@ -39,6 +39,10 @@ export interface RefineToolOptions {
   // 항상 호출되며, 받은 building/floor/module 로 새 upload 를 등록한 뒤 PLY+sidecar 를 그 위에 PUT.
   // reject 되면 저장 흐름 취소.
   onRequestMetadata?: () => Promise<SaveMetadata>;
+  // 백엔드가 서빙한 PLY variant. 'refined' 면 메모리 PLY 좌표가 이미 A'+Y baked 이므로
+  // applyEntityRotation 이 추가 회전을 적용하면 회전 누적이 되어 mesh 와 frame 어긋남.
+  // 이 값을 보고 분기해 누적 차단.
+  servedVariant?: 'original' | 'refined' | null;
 }
 
 export const ALL_SURFACES = ['ceiling', 'floor', 'w1a', 'w1b', 'w2a', 'w2b'] as const;

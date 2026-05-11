@@ -404,6 +404,17 @@ async def get_upload_presigned_url(
         if refined_url is not None:
             return {"url": refined_url, "filename": upload.original_filename, "variant": "refined"}
 
+    # variant=original 명시 — 다듬기 reset 처럼 "원본부터 다시" 의도. refined fallback 안 함.
+    # 원본 부재 시 404 → 프론트엔드가 "원본 PLY 없음" 안내. register-local 케이스가 여기 해당.
+    if variant == "original":
+        if minio.object_exists(upload.minio_path):
+            url = minio.get_presigned_download_url(upload.minio_path)
+            return {"url": url, "filename": upload.original_filename, "variant": "original"}
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="원본 PLY 가 서버에 없습니다 (로컬 파일로 시작한 세션은 원본이 보존되지 않습니다).",
+        )
+
     # variant=None 또는 fallback. 원본이 MinIO 에 실제 존재할 때만 original 을 서빙;
     # 그렇지 않으면 (예: register-local 로 placeholder 만 잡힌 케이스) refined 로 자동 fallback.
     if minio.object_exists(upload.minio_path):

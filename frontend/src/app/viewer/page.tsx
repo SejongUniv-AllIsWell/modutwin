@@ -23,6 +23,9 @@ function ViewerContent() {
 
   const [fileUrl, setFileUrl] = useState<string | null>(null);
   const [filename, setFilename] = useState<string | undefined>();
+  // 백엔드가 실제로 서빙한 variant — 메모리 PLY 가 raw 인지 회전 베이크된 refined 인지 구분.
+  // SAM3 자동추출 prefill 변환이 좌표 frame 분기에 사용 (DoorAlignModal).
+  const [servedVariant, setServedVariant] = useState<'original' | 'refined' | null>(null);
   const [resolving, setResolving] = useState(!!uploadId);
   const [resolveError, setResolveError] = useState<string | null>(null);
 
@@ -34,15 +37,19 @@ function ViewerContent() {
     }
     setResolving(true);
     setResolveError(null);
-    const variant = initialMode === 'align' ? 'refined' : '';
-    const qs = variant ? `?variant=${variant}` : '';
+    // 항상 refined 우선 요청 — 다듬기 산출물이 있으면 그 frame (A'+Y baked) 로 로드해
+    // mesh.json / wallMesh / doors.json 등 다른 영속 자산과 frame 일관. refined 가 없으면
+    // backend 가 자동으로 original 로 fallback (presigned-url 라우트 참조).
+    const variant = 'refined';
+    const qs = `?variant=${variant}`;
     api.get<{ url: string; filename: string; variant?: string }>(`/uploads/${uploadId}/presigned-url${qs}`)
       .then(data => {
         setFileUrl(data.url);
         const name = data.filename ?? '';
         // 백엔드가 실제로 서빙한 variant 가 요청 variant 와 다를 수 있음 (원본 부재 → refined fallback).
-        const servedVariant = data.variant ?? '';
-        const labelVariant = servedVariant === 'refined' ? 'refined' : '';
+        const served = data.variant ?? '';
+        setServedVariant(served === 'refined' ? 'refined' : 'original');
+        const labelVariant = served === 'refined' ? 'refined' : '';
         if (labelVariant && name && !name.includes(labelVariant)) {
           const dotIdx = name.lastIndexOf('.');
           const base = dotIdx >= 0 ? name.slice(0, dotIdx) : name;
@@ -88,6 +95,7 @@ function ViewerContent() {
         initialUploadId={uploadId}
         initialDisplayName={filename}
         initialMode={initialMode}
+        initialServedVariant={servedVariant}
       />
     </div>
   );

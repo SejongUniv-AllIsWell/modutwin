@@ -239,6 +239,15 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     const data = splatDataRef.current;
     const pc = coreRef.current?.getPC();
     if (!data?.splatEntity || !pc) return;
+
+    // 메모리 PLY 가 이미 A'+Y baked (servedVariant='refined') 인 경우 추가 회전을 적용하면 누적되어
+    // mesh entity (Z-180 만 적용, corners 는 A'+Y) 와 frame 이 어긋남. Z-180 만 적용해 mesh 와 일치.
+    // (PR #12 가정 "재진입 시 raw_already_rotated → entity 추가 회전 없음" 을 실제 코드로 강제.)
+    if (options?.servedVariant === 'refined') {
+      data.splatEntity.setLocalEulerAngles(0, 0, 180);
+      return;
+    }
+
     const { rotX, rotZ } = pendingRotationRef.current;
 
     // pendingRotation이 0이면 SplatViewerCore의 초기 설정과 정확히 동일한 API 사용 (회귀 방지)
@@ -256,7 +265,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     const qPending = new pc.Quat(); qPending.mul2(qz, qx);
     const qTotal = new pc.Quat(); qTotal.mul2(qBase, qPending);
     data.splatEntity.setLocalRotation(qTotal);
-  }, []);
+  }, [options?.servedVariant, coreRef]);
 
   // ── flatten 마스크를 colorTexture에 페인트 ──
   // origColorData(브러시 삭제 누적)를 베이스로, 마스크된 곳만 alpha=0.
@@ -1698,14 +1707,21 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     setDirty(false);
     setSaved(false);
     if (options?.uploadId) clearRefineState(options.uploadId);
-    // 9) 추가 안전장치: 원본 PLY로 강제 reload — in-place 정리에서 놓친 부분이 있어도 깨끗한 상태 보장
+    // 9) 추가 안전장치: 원본 PLY로 강제 reload — in-place 정리에서 놓친 부분이 있어도 깨끗한 상태 보장.
+    // variant=original 명시 — page.tsx 의 default 가 'refined' 우선으로 바뀌었으므로 reset 의도(원본
+    // 부터 다시) 를 강제하려면 명시 필요. register-local 처럼 원본이 서버에 없는 케이스는 404.
     if (options?.uploadId && options?.reloadWithUrl) {
       try {
         const { api } = await import('@/lib/api');
-        const res = await api.get<{ url: string }>(`/uploads/${options.uploadId}/presigned-url`);
+        const res = await api.get<{ url: string }>(`/uploads/${options.uploadId}/presigned-url?variant=original`);
         options.reloadWithUrl(res.url);
-      } catch (e) {
-        console.error('원본 PLY reload 실패', e);
+      } catch (e: any) {
+        const msg = e?.message ?? '';
+        if (msg.includes('404') || msg.includes('NOT_FOUND')) {
+          alert('원본 PLY 가 서버에 없어 다듬기를 처음부터 다시 시작할 수 없습니다. (로컬 파일로 시작한 세션은 원본이 보존되지 않습니다.)');
+        } else {
+          console.error('원본 PLY reload 실패', e);
+        }
       }
     }
   }, [options, applyEntityRotation]);
