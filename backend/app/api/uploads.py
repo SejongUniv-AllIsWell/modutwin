@@ -595,9 +595,16 @@ async def register_local_basemap_upload(
 
 # refined PLY: 클라이언트가 /refine/refined-upload-url 로 단일 PUT 업로드 한 후,
 # 이 엔드포인트를 호출해 canonical refined_ply_path 등록 + SAM3 task 발행.
+class BakeRotation(BaseModel):
+    rotX: float = 0.0
+    rotZ: float = 0.0
+    wallAngleRad: float = 0.0
+
+
 class Sam3StartRequest(BaseModel):
-    refined_ply_key: str   # MinIO key
+    refined_ply_key: str   # MinIO key (refined PLY — doors.json 위치 도출용)
     prompt: str = ""
+    bake_rotation: BakeRotation | None = None  # 다듬기에서 베이크된 회전 — 원본 좌표계 검출 결과를 refined 좌표계로 변환할 때 사용
 
 
 class Sam3StartResponse(BaseModel):
@@ -654,16 +661,24 @@ async def start_sam3(
 
     celery_task_id: str | None = None
     try:
+        # SAM3 검출은 다듬기 전 원본 PLY (upload.minio_path) 로 수행. 다듬기 산출물은
+        # 벽 가우시안이 mesh+texture 로 분리돼 SAM3 가 문을 못 봐 본질적으로 검출 실패.
+        # door-ml 결과(원본 좌표계 corners) 는 백엔드에서 베이크 회전 적용 → refined 좌표계로 변환.
+        bake = body.bake_rotation or BakeRotation()
         celery_task_id = dispatch_sam3_door_detection_task(
             upload_id=str(upload.id),
             user_id=str(user.id),
-            refined_ply_key=refined_key,
+            original_ply_key=upload.minio_path,
             prompt=upload.sam3_prompt or "",
             building_id=str(floor.building_id),
             floor_id=str(floor.id),
             floor_number=floor.floor_number,
             module_id=str(mod.id),
             module_name=mod.name,
+            rot_x=bake.rotX,
+            rot_z=bake.rotZ,
+            wall_angle_rad=bake.wallAngleRad,
+            doors_target_key=refined_key,
         )
         upload.sam3_status = Sam3Status.running
     except Exception as e:
