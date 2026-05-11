@@ -13,6 +13,7 @@ import {
   emptyPicked,
   fetchDoorsFromServer,
   persistDoorsToServer,
+  persistEmptyDoorsToServer,
   PRIMARY_DOOR_ID,
   type PersistOpts,
   type PickedCorner,
@@ -54,6 +55,8 @@ interface Props {
   /** 다듬기 단계의 정렬 회전값 (pendingRotation + wallAngle) 동기 조회. 메모리 직주입 흐름에서
    *  서버 업로드 await 없이 즉시 doors corners 변환에 사용. */
   getCurrentBakedRotation?: () => { rotX: number; rotZ: number; wallAngleRad: number };
+  basemapMode?: boolean;
+  basemapUnitName?: string;
 }
 
 // 픽 / 영속화 / 다운스트림 기하 (Kabsch 등) 는 시계방향 (TL → TR → BR → BL) 인덱스 순서를 가정.
@@ -82,7 +85,7 @@ const DISPLAY_ORDER = [0, 1, 3, 2] as const;
  *   - 'align' — 정합 단계: basemap 4꼭짓점 픽 + Kabsch + applyAndSave 로 aligned.ply 업로드.
  */
 export default function DoorAlignModal({
-  coreRef, uploadId, currentUrl, onDone, onClose, view = 'setup', autoExtracting = false, autoExtractedCorners = null, onManualPickStart, onSetupSaveDone, ensureUploadId, onCommitRefined, getCurrentKeepMask, getBakeRgba, getCurrentBakedRotation,
+  coreRef, uploadId, currentUrl, onDone, onClose, view = 'setup', autoExtracting = false, autoExtractedCorners = null, onManualPickStart, onSetupSaveDone, ensureUploadId, onCommitRefined, getCurrentKeepMask, getBakeRgba, getCurrentBakedRotation, basemapMode = false, basemapUnitName,
 }: Props) {
   const [picked, setPicked] = useState<Array<PickedCorner | null>>(() => emptyPicked());
 
@@ -193,6 +196,7 @@ export default function DoorAlignModal({
       floorY: st.floorY,
     });
   }, [uploadId]);
+  const showRefineGuide = !planes && !(basemapMode && view === 'setup');
 
   // ── ray-plane 교점 (raw 프레임) ──
   // 클릭은 "평면 위의 점" 으로만 떨어진다 (가우시안 위치가 아니라 수학적 평면 교점).
@@ -1005,6 +1009,8 @@ export default function DoorAlignModal({
   // "문 설정 완료" 버튼 피드백.
   const [saveDoorBusy, setSaveDoorBusy] = useState(false);
   const [saveDoorToast, setSaveDoorToast] = useState<string | null>(null);
+  const resolvedBasemapUnitName = basemapUnitName?.trim() ?? '';
+  const [savedDoorCount, setSavedDoorCount] = useState(0);
 
   // 서버 doors.json 으로부터 door_1 로드. surfaceId 는 서버에 없어서 코너 위치 ↔ plane 으로 추정.
   // 힌지/방향/각도도 함께 복원해 사용자가 다시 들어와도 마지막 설정 유지.
@@ -2102,9 +2108,11 @@ export default function DoorAlignModal({
         </div>
       </div>
       <div className="p-3 space-y-2 overflow-y-auto">
-        {!planes ? (
+        {showRefineGuide ? (
           <div className="text-red-400 text-[11px] p-2 bg-red-900/30 border border-red-800 rounded leading-tight">
-            다듬기 단계에서 천장/바닥과 벽면을 먼저 확정한 뒤 정합 단계로 진입하세요.
+            {view === 'setup'
+              ? '다듬기 단계에서 천장/바닥과 벽면을 먼저 확정하세요.'
+              : '다듬기 단계에서 천장/바닥과 벽면을 먼저 확정한 뒤 정합 단계로 진입하세요.'}
           </div>
         ) : null}
 
@@ -2336,11 +2344,22 @@ export default function DoorAlignModal({
             {doorRotated ? '문 닫기' : '문 열기'}
           </button>
 
+          {basemapMode && (
+            <div className="border-t border-gray-700 pt-2 space-y-1.5">
+              <div className="text-[10px] text-gray-400">저장 이름: {resolvedBasemapUnitName || '미지정'}</div>
+              <div className="text-[10px] text-gray-400">저장된 문: {savedDoorCount}개</div>
+            </div>
+          )}
+
           {/* 명시적 "문 설정 완료" — debounce 기다리지 않고 즉시 서버 영속. 나갔다가 다시 들어와도 그대로 복원되며,
               미래 basemap 정합에서 동일 분류 (corners + wallSurfaceId + doorThickness 등) 재현용. */}
           <button
             onClick={async () => {
               if (!allPicked) return;
+              if (basemapMode && !resolvedBasemapUnitName) {
+                setError('등록 시작 시 저장할 이름을 입력하세요.');
+                return;
+              }
               setSaveDoorBusy(true);
               try {
                 // 1) 모듈 정보 모달 + uploadId 확정 — 모든 케이스에서 강제. 모달 dismiss 시 작업 유지.
@@ -2376,6 +2395,8 @@ export default function DoorAlignModal({
                 });
                 const pickedTransformed = picked.map(p => p ? rotateForSave(p) : null);
                 const doorOpts: PersistOpts = {
+                  doorId: basemapMode ? `door_${Date.now()}` : PRIMARY_DOOR_ID,
+                  unitName: basemapMode ? resolvedBasemapUnitName : undefined,
                   hingeEdge,
                   swing: doorSwing,
                   angleDeg: doorAngleDeg,
@@ -2384,6 +2405,19 @@ export default function DoorAlignModal({
                   boundarySplitEnabled,
                   safetyMargin: DOOR_SAFETY_MARGIN,
                 };
+
+                if (basemapMode) {
+                  await persistDoorsToServer(activeUploadId, pickedTransformed, doorOpts);
+                  setSavedDoorCount(c => c + 1);
+                  setPicked(emptyPicked());
+                  setHingeEdge(null);
+                  setEdgePickArmed(false);
+                  setDoorRotated(false);
+                  setRotationApplied(false);
+                  setDoorRefineActive(false);
+                  setSaveDoorToast('문 저장 완료');
+                  return;
+                }
 
                 // 3) 화면 즉시 정합 단계로 전환 — 메모리 자산 그대로 사용.
                 if (onSetupSaveDone) {
@@ -2421,8 +2455,37 @@ export default function DoorAlignModal({
             }
             className="w-full px-3 py-1.5 rounded cursor-pointer text-xs font-bold bg-green-700 hover:bg-green-600 text-white disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed"
           >
-            {saveDoorBusy ? '저장 중...' : (saveDoorToast ?? '문 설정 완료')}
+            {saveDoorBusy ? '저장 중...' : (saveDoorToast ?? (basemapMode ? '문 저장' : '문 설정 완료'))}
           </button>
+          {basemapMode && (
+            <button
+              onClick={async () => {
+                setSaveDoorBusy(true);
+                let activeUploadId: string | null = null;
+                try {
+                  if (ensureUploadId) {
+                    activeUploadId = await ensureUploadId();
+                  } else {
+                    activeUploadId = uploadId || null;
+                  }
+                  if (!activeUploadId || !onSetupSaveDone) return;
+                  if (savedDoorCount === 0) {
+                    await persistEmptyDoorsToServer(activeUploadId);
+                  }
+                  await onSetupSaveDone(activeUploadId);
+                } catch (e: any) {
+                  setSaveDoorToast(`실패: ${e?.message ?? e}`);
+                } finally {
+                  setSaveDoorBusy(false);
+                  setTimeout(() => setSaveDoorToast(null), 2000);
+                }
+              }}
+              disabled={saveDoorBusy}
+              className="w-full px-3 py-1.5 rounded cursor-pointer text-xs font-bold bg-green-700 hover:bg-green-600 text-white disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed"
+            >
+              basemap 등록 완료
+            </button>
+          )}
         </div>
 
         </>}

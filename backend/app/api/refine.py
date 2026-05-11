@@ -14,13 +14,13 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.security import get_current_user
 from app.core.storage_keys import is_key_under_prefix, normalize_minio_key
-from app.models import User, Upload, Task, SceneOutput, TaskType, TaskStatus
+from app.models import User, Upload, Task, SceneOutput, TaskType, TaskStatus, Module, Floor
 from app.services.minio_service import get_minio_service
 from app.services.storage_paths import (
     build_refined_object_key,
@@ -151,6 +151,18 @@ async def save_refined(
         is_aligned=False,
     )
     db.add(scene)
+
+    floor_id_result = await db.execute(
+        select(Module.floor_id).where(Module.id == upload.module_id)
+    )
+    floor_id = floor_id_result.scalar_one_or_none()
+    if floor_id is not None:
+        await db.execute(
+            sa_update(Floor)
+            .where(Floor.id == floor_id)
+            .values(overview_dirty=True)
+        )
+
     await db.commit()
 
     return SaveResponse(scene_id=scene.id, message="정제 결과가 저장되었습니다.")
@@ -218,4 +230,3 @@ async def get_refined_bundle(
         textures=textures,
         scene_id=scene.id,
     )
-

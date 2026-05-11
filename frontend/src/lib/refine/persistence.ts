@@ -59,3 +59,15 @@ export function clearRefineState(uploadId: string): void {
     localStorage.removeItem(storageKey(uploadId));
   } catch { /* ignore */ }
 }
+
+export function copyRefineState(sourceUploadId: string, targetUploadId: string): void {
+  try {
+    const raw = localStorage.getItem(storageKey(sourceUploadId));
+    if (!raw) return;
+    const parsed = JSON.parse(raw) as PersistedRefineState;
+    if (parsed.version !== STATE_VERSION) return;
+    localStorage.setItem(storageKey(targetUploadId), raw);
+  } catch (e) {
+    console.warn('[refine] persist copy failed', e);
+  }
+}

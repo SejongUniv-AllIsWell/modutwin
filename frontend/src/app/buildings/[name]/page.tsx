@@ -1,258 +1,385 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
-import { useRouter, useParams } from 'next/navigation';
+import { useEffect, useMemo, useState } from 'react';
+import { useParams, useRouter, useSearchParams } from 'next/navigation';
 import { api } from '@/lib/api';
-import { Building, Floor, Module, Scene } from '@/types';
 import { useAuth } from '@/lib/auth';
-import dynamic from 'next/dynamic';
+import type { FloorOverviewManifest, FloorOverviewManifestEntry } from '@/types';
 
-const SplatViewer = dynamic(() => import('@/components/viewer/SplatViewer'), { ssr: false });
+const floorLabel = (n: number) => (n >= 0 ? `F${n}` : `B${Math.abs(n)}`);
 
-interface ModuleWithScene extends Module {
-  scene?: Scene;
-}
-
-interface FloorWithModules extends Floor {
-  modules: ModuleWithScene[];
-}
-
-export default function BuildingDetailPage() {
+export default function BuildingOverviewPage() {
   const router = useRouter();
   const params = useParams();
-  // route param is building UUID
+  const searchParams = useSearchParams();
   const buildingId = params.name as string;
-
+  const isPendingBuilding = buildingId === 'pending';
   const { user, loading } = useAuth();
-  const [building, setBuilding] = useState<Building | null>(null);
-  const [floors, setFloors] = useState<FloorWithModules[]>([]);
-  const [selectedScene, setSelectedScene] = useState<Scene | null>(null);
-  const [selectedModule, setSelectedModule] = useState<Module | null>(null);
-  const [sogUrl, setSogUrl] = useState<string | null>(null);
-  const [loadingScene, setLoadingScene] = useState(false);
+
+  const [manifest, setManifest] = useState<FloorOverviewManifest | null>(null);
+  const [hoveredFloorId, setHoveredFloorId] = useState<string | null>(null);
+  const [brokenImageByFloorId, setBrokenImageByFloorId] = useState<Record<string, boolean>>({});
+  const [openFloorMenuId, setOpenFloorMenuId] = useState<string | null>(null);
+  const [addMenuOpen, setAddMenuOpen] = useState(false);
+  const [registerPurpose, setRegisterPurpose] = useState<'basemap' | 'module' | null>(null);
+  const [registerFloor, setRegisterFloor] = useState<FloorOverviewManifestEntry | null>(null);
+  const [floorInputValue, setFloorInputValue] = useState('');
+  const [nameInputValue, setNameInputValue] = useState('');
+  const [floorInputError, setFloorInputError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!loading && !user) router.push('/');
-  }, [user, loading, router]);
-
-  const handleSceneSelect = useCallback(async (scene: Scene, module: Module) => {
-    setSelectedScene(scene);
-    setSelectedModule(module);
-    setLoadingScene(true);
-    setSogUrl(null);
-    try {
-      const data = await api.get<{ url: string }>(`/scenes/${scene.id}/download`);
-      setSogUrl(data.url);
-    } catch {
-      setSogUrl(null);
-    } finally {
-      setLoadingScene(false);
+    if (!loading && !user) {
+      router.push('/');
     }
-  }, []);
+  }, [user, loading, router]);
 
   useEffect(() => {
     if (!buildingId) return;
-
-    // 건물 정보 로드
-    api.get<Building>(`/buildings/${buildingId}`).then(setBuilding).catch(() => {});
-
-    // 층 목록 로드
-    api.get<Floor[]>(`/buildings/${buildingId}/floors`).then(async (floorList) => {
-      const withModules: FloorWithModules[] = await Promise.all(
-        floorList.map(async (floor) => {
-          try {
-            const mods = await api.get<Module[]>(`/floors/${floor.id}/modules`);
-            // 각 모듈의 씬 조회
-            const modulesWithScene: ModuleWithScene[] = await Promise.all(
-              mods.map(async (mod) => {
-                try {
-                  const scenes = await api.get<Scene[]>(`/scenes?module_id=${mod.id}`);
-                  return { ...mod, scene: scenes[0] };
-                } catch {
-                  return { ...mod };
-                }
-              })
-            );
-            return { ...floor, modules: modulesWithScene };
-          } catch {
-            return { ...floor, modules: [] };
-          }
-        })
-      );
-      setFloors(withModules);
-
-      // 첫 번째 씬 자동 선택 + 해당 층 열기
-      for (const floor of withModules) {
-        for (const mod of floor.modules) {
-          if (mod.scene) {
-            setOpenFloors(new Set([floor.id]));
-            handleSceneSelect(mod.scene, mod);
-            return;
-          }
-        }
-      }
-    }).catch(() => {});
-  }, [buildingId, handleSceneSelect]);
-
-  const totalScenes = floors.reduce((sum, f) => sum + f.modules.filter(m => m.scene).length, 0);
-
-  // 지상 내림차순 → 지하 내림차순 정렬
-  const sortedFloors = [...floors].sort((a, b) => b.floor_number - a.floor_number);
-
-  const floorLabel = (n: number) => n >= 0 ? `${n}층` : `B${Math.abs(n)}`;
-
-  const [openFloors, setOpenFloors] = useState<Set<string>>(new Set());
-  const toggleFloor = (id: string) =>
-    setOpenFloors(prev => {
-      const next = new Set(prev);
-      next.has(id) ? next.delete(id) : next.add(id);
-      return next;
+    if (isPendingBuilding) {
+      const pendingName = searchParams.get('building_name')?.trim() || 'Pending Building';
+      setManifest({
+        building_id: 'pending',
+        building_name: pendingName,
+        building_is_confirmed: false,
+        generated_at: new Date().toISOString(),
+        floors: [],
+      });
+      return;
+    }
+    api.get<FloorOverviewManifest>(`/buildings/${buildingId}/floor-overview`).then(setManifest).catch(() => {
+      setManifest(null);
     });
+  }, [buildingId, isPendingBuilding, searchParams]);
+
+  const floors = useMemo(
+    () => [...(manifest?.floors ?? [])].sort((a, b) => b.floor_number - a.floor_number),
+    [manifest]
+  );
+
+  const parseFloorNumber = (raw: string): number | null => {
+    const value = raw.trim();
+    if (!value) return null;
+    const basementMatch = value.match(/^B(\d+)$/i);
+    if (basementMatch) {
+      const n = Number(basementMatch[1]);
+      if (!Number.isInteger(n) || n <= 0) return null;
+      return -n;
+    }
+    const parsed = Number(value);
+    if (!Number.isInteger(parsed) || parsed === 0) return null;
+    return parsed;
+  };
+
+  const ensureFloor = async (floorNumber: number): Promise<{ id?: string; floor_number: number }> => {
+    const existing = floors.find((f) => f.floor_number === floorNumber);
+    if (existing) return { id: existing.floor_id, floor_number: existing.floor_number };
+    return { floor_number: floorNumber };
+  };
+
+  const closeRegisterModal = () => {
+    setRegisterPurpose(null);
+    setRegisterFloor(null);
+    setFloorInputValue('');
+    setNameInputValue('');
+    setFloorInputError(null);
+  };
+
+  const openRegisterModal = (purpose: 'basemap' | 'module', floor?: FloorOverviewManifestEntry) => {
+    setAddMenuOpen(false);
+    setOpenFloorMenuId(null);
+    setRegisterPurpose(purpose);
+    setRegisterFloor(floor ?? null);
+    setFloorInputValue(floor ? floorLabel(floor.floor_number) : '');
+    setNameInputValue('');
+    setFloorInputError(null);
+  };
+
+  const handleRegisterFromPlus = async () => {
+    if (!registerPurpose) return;
+    const floorNumber = registerFloor?.floor_number ?? parseFloorNumber(floorInputValue);
+    if (floorNumber === null) {
+      setFloorInputError('유효한 층 번호를 입력하세요. 예: 1, -1, B1');
+      return;
+    }
+    const registrationName = nameInputValue.trim();
+    if (!registrationName) {
+      setFloorInputError(registerPurpose === 'basemap' ? '저장할 이름을 입력하세요.' : '모듈 이름을 입력하세요.');
+      return;
+    }
+    try {
+      const floor = registerFloor
+        ? { id: registerFloor.floor_id, floor_number: registerFloor.floor_number }
+        : await ensureFloor(floorNumber);
+      const qs = new URLSearchParams({
+        purpose: registerPurpose,
+        building_name: manifest?.building_name ?? 'Building',
+        floor_number: String(floor.floor_number),
+        module_name: registrationName,
+      });
+      if (!isPendingBuilding) qs.set('building_id', buildingId);
+      if (floor.id) qs.set('floor_id', floor.id);
+      if (isPendingBuilding) {
+        const placeId = searchParams.get('place_id');
+        const addressName = searchParams.get('address_name');
+        const roadAddressName = searchParams.get('road_address_name');
+        const lat = searchParams.get('lat');
+        const lng = searchParams.get('lng');
+        if (placeId) qs.set('place_id', placeId);
+        if (addressName) qs.set('address_name', addressName);
+        if (roadAddressName) qs.set('road_address_name', roadAddressName);
+        if (lat) qs.set('lat', lat);
+        if (lng) qs.set('lng', lng);
+      }
+      closeRegisterModal();
+      router.push(`/viewer?${qs.toString()}`);
+    } catch (error: any) {
+      window.alert(error?.message || '뷰어 이동에 실패했습니다.');
+    }
+  };
 
   if (loading) return null;
 
   return (
-    <div className="flex h-[calc(100vh-56px)]">
-      {/* 좌측 패널 */}
-      <div className="w-72 flex flex-col border-r border-gray-800 bg-gray-900 shrink-0">
-        <div className="p-4 border-b border-gray-800">
-          <button
-            onClick={() => router.push('/explore')}
-            className="flex items-center gap-1.5 text-gray-400 hover:text-white text-sm mb-4 transition"
-          >
-            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
-            </svg>
-            목록으로 돌아가기
-          </button>
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-blue-600/20 text-blue-400 flex items-center justify-center shrink-0">
-              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-2 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4" />
-              </svg>
-            </div>
-            <div className="min-w-0">
-              <h1 className="text-base font-semibold text-white leading-tight truncate">
-                {building?.name ?? '...'}
-              </h1>
-              <p className="text-xs text-gray-500 mt-0.5">{totalScenes}개 씬 등록됨</p>
-            </div>
-          </div>
+    <div className="h-[calc(100vh-56px)] bg-gray-950 text-gray-100 flex">
+      <aside className="w-80 border-r border-gray-800 bg-gray-900/70 p-4 flex flex-col shrink-0">
+        <button type="button" onClick={() => router.push('/explore')} className="text-sm text-gray-400 hover:text-white transition self-start">
+          Back to Explore
+        </button>
+        <div className="mt-4">
+          <h1 className="text-base font-semibold truncate">{manifest?.building_name ?? 'Building'}</h1>
+          <p className="mt-1 text-xs text-gray-500">Floors: {floors.length}</p>
+          <p className="mt-1 text-xs text-gray-500">
+            상태: {manifest?.building_is_confirmed ? '확정' : '미확정'}
+          </p>
         </div>
 
-        {/* 층/모듈 목록 */}
-        <div className="flex-1 overflow-y-auto">
-          <div className="px-4 py-2.5 border-b border-gray-800">
-            <p className="text-xs font-medium text-gray-500 uppercase tracking-wider">층 / 모듈 목록</p>
-          </div>
-
-          {floors.length === 0 ? (
-            <div className="flex flex-col items-center justify-center py-16 text-gray-600">
-              <svg className="w-10 h-10 mb-3 opacity-40" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4" />
-              </svg>
-              <p className="text-sm">씬 데이터가 없습니다</p>
-            </div>
-          ) : (
-            <div className="p-2 space-y-1">
-              {sortedFloors.map(floor => {
-                const isOpen = openFloors.has(floor.id);
-                const hasSelected = floor.modules.some(m => m.id === selectedModule?.id);
-                return (
-                  <div key={floor.id}>
-                    <button
-                      onClick={() => toggleFloor(floor.id)}
-                      className={`w-full flex items-center justify-between px-3 py-2 rounded-lg text-sm font-semibold transition ${
-                        hasSelected ? 'text-blue-400' : 'text-gray-400 hover:text-white hover:bg-gray-800'
-                      }`}
-                    >
-                      <span>{floorLabel(floor.floor_number)}</span>
-                      <svg
-                        className={`w-4 h-4 transition-transform ${isOpen ? 'rotate-180' : ''}`}
-                        fill="none" stroke="currentColor" viewBox="0 0 24 24"
+        <div className="mt-4 flex-1 overflow-y-auto space-y-1">
+          {floors.map((floor) => (
+            <div key={floor.floor_id} className="rounded border border-gray-800 bg-gray-950">
+              <div className="px-2 py-1.5 flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => router.push(`/buildings/${buildingId}/floors/${floor.floor_number}`)}
+                  className="flex-1 text-left text-sm text-gray-200 hover:text-white"
+                >
+                  {floorLabel(floor.floor_number)}
+                </button>
+                <div className="relative">
+                  <button
+                    type="button"
+                    onClick={() => setOpenFloorMenuId((prev) => (prev === floor.floor_id ? null : floor.floor_id))}
+                    className="w-7 h-7 flex items-center justify-center rounded hover:bg-gray-800 text-gray-400 hover:text-white"
+                  >
+                    ⋮
+                  </button>
+                  {openFloorMenuId === floor.floor_id && (
+                    <div className="absolute right-0 top-8 z-10 w-28 rounded border border-gray-700 bg-gray-900 shadow-lg p-1">
+                      {!floor.has_active_basemap && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            openRegisterModal('basemap', floor);
+                          }}
+                          className="w-full text-left text-xs px-2 py-1.5 rounded hover:bg-gray-800"
+                        >
+                          basemap 등록
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => {
+                          openRegisterModal('module', floor);
+                        }}
+                        className="w-full text-left text-xs px-2 py-1.5 rounded hover:bg-gray-800"
                       >
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-                      </svg>
-                    </button>
-                    {isOpen && (
-                      <div className="mt-1 mb-1 ml-2 space-y-1">
-                        {floor.modules.map(mod => (
-                          <button
-                            key={mod.id}
-                            onClick={() => mod.scene && handleSceneSelect(mod.scene, mod)}
-                            disabled={!mod.scene}
-                            className={`w-full text-left px-3 py-2.5 rounded-lg text-sm transition ${
-                              selectedModule?.id === mod.id
-                                ? 'bg-blue-600/20 text-blue-300 border border-blue-600/40'
-                                : mod.scene
-                                  ? 'text-gray-300 hover:bg-gray-800 border border-transparent'
-                                  : 'text-gray-600 border border-transparent cursor-default'
-                            }`}
-                          >
-                            <div className="flex items-center justify-between">
-                              <span className="font-medium truncate">{mod.name}</span>
-                              {!mod.scene && (
-                                <span className="text-xs text-gray-600 ml-2 shrink-0">씬 없음</span>
-                              )}
-                            </div>
-                            {mod.scene && (
-                              <p className="text-xs text-gray-500 mt-1">
-                                {new Date(mod.scene.created_at).toLocaleDateString('ko-KR', {
-                                  year: 'numeric', month: 'long', day: 'numeric',
-                                })}
-                              </p>
-                            )}
-                          </button>
-                        ))}
-                        {floor.modules.length === 0 && (
-                          <p className="text-xs text-gray-600 px-3 py-2">모듈 없음</p>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
+                        module 등록
+                      </button>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          ))}
+
+          <div className="space-y-2">
+            <button
+              type="button"
+              disabled={manifest?.building_is_confirmed}
+              onClick={() => setAddMenuOpen((prev) => !prev)}
+              className="w-full rounded border border-gray-700 px-3 py-2 text-sm text-left hover:border-blue-500 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              + 등록
+            </button>
+            {addMenuOpen && !manifest?.building_is_confirmed && (
+              <div className="rounded border border-gray-700 bg-gray-900 p-1 space-y-1">
+                <button
+                  type="button"
+                  onClick={() => {
+                    openRegisterModal('basemap');
+                  }}
+                  className="w-full text-left text-xs px-2 py-1.5 rounded hover:bg-gray-800"
+                >
+                  basemap 등록
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    openRegisterModal('module');
+                  }}
+                  className="w-full text-left text-xs px-2 py-1.5 rounded hover:bg-gray-800"
+                >
+                  module 등록
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      </aside>
+
+      <main className="flex-1 h-full overflow-y-auto px-4 pt-4 pb-8 lg:px-8 lg:pt-6 lg:pb-12 [perspective:1200px] [scrollbar-width:thin] [scrollbar-color:#374151_#11182766] [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-track]:bg-gray-900/40 [&::-webkit-scrollbar-thumb]:bg-gray-700 [&::-webkit-scrollbar-thumb]:rounded-full">
+        <div className="mx-auto max-w-5xl min-h-full pt-1 lg:pt-2 pr-1">
+          {floors.map((floor, idx) => {
+            const hovered = hoveredFloorId === floor.floor_id;
+            const dimmed = hoveredFloorId !== null && !hovered;
+            const fallbackSample = floor.floor_number === 1 ? "/data/1.webp" : floor.floor_number === 2 ? "/data/2.webp" : null;
+            const imageUrl = !brokenImageByFloorId[floor.floor_id] ? floor.topdown_url || fallbackSample : null;
+            return (
+              <FloorSlab
+                key={floor.floor_id}
+                floor={floor}
+                imageUrl={imageUrl}
+                hovered={hovered}
+                dimmed={dimmed}
+                onHover={() => setHoveredFloorId(floor.floor_id)}
+                onLeave={() => setHoveredFloorId(null)}
+                onImageError={() => setBrokenImageByFloorId((prev) => ({ ...prev, [floor.floor_id]: true }))}
+                onClick={() => router.push(`/buildings/${buildingId}/floors/${floor.floor_number}`)}
+              />
+            );
+          })}
+          {floors.length === 0 && (
+            <div className="h-64 border border-gray-800 rounded-md bg-gray-900/70 flex items-center justify-center text-sm text-gray-500">
+              No floor overview manifest found.
             </div>
           )}
         </div>
-      </div>
+      </main>
 
-      {/* 우측: 3D 뷰어 */}
-      <div className="flex-1 relative bg-gray-950">
-        {sogUrl ? (
-          <SplatViewer sogUrl={sogUrl} mode="readonly" />
-        ) : (
-          <div className="flex items-center justify-center h-full text-gray-600">
-            <div className="text-center">
-              {loadingScene ? (
-                <>
-                  <div className="w-10 h-10 border-2 border-blue-500 border-t-transparent rounded-full animate-spin mx-auto mb-4" />
-                  <p className="text-sm text-gray-400">씬 로딩 중...</p>
-                </>
-              ) : (
-                <>
-                  <svg className="w-20 h-20 mx-auto mb-4 opacity-20" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4" />
-                  </svg>
-                  <p className="text-sm">
-                    {totalScenes === 0 ? '이 건물에 등록된 씬이 없습니다' : '왼쪽에서 모듈을 선택하세요'}
-                  </p>
-                </>
-              )}
+      {registerPurpose && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4">
+          <div className="w-full max-w-sm rounded-md border border-gray-700 bg-gray-900 p-4 shadow-xl">
+            <h2 className="text-sm font-semibold">
+              {registerPurpose === 'basemap' ? 'Basemap 등록 정보' : 'Module 등록 정보'}
+            </h2>
+            <p className="mt-1 text-xs text-gray-400">
+              {registerFloor ? `${floorLabel(registerFloor.floor_number)}에 등록합니다.` : '층은 예: 1, -1, B1 형식으로 입력하세요.'}
+            </p>
+            <input
+              type="text"
+              value={floorInputValue}
+              onChange={(e) => {
+                setFloorInputValue(e.target.value);
+                if (floorInputError) setFloorInputError(null);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') handleRegisterFromPlus();
+                if (e.key === 'Escape') closeRegisterModal();
+              }}
+              autoFocus={!registerFloor}
+              disabled={!!registerFloor}
+              className="mt-3 w-full rounded border border-gray-700 bg-gray-950 px-3 py-2 text-sm text-gray-100 outline-none focus:border-blue-500 disabled:opacity-50"
+              placeholder="층 번호"
+            />
+            <input
+              type="text"
+              value={nameInputValue}
+              onChange={(e) => {
+                setNameInputValue(e.target.value);
+                if (floorInputError) setFloorInputError(null);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') handleRegisterFromPlus();
+                if (e.key === 'Escape') closeRegisterModal();
+              }}
+              autoFocus={!!registerFloor}
+              className="mt-2 w-full rounded border border-gray-700 bg-gray-950 px-3 py-2 text-sm text-gray-100 outline-none focus:border-blue-500"
+              placeholder={registerPurpose === 'basemap' ? '저장할 이름' : '모듈 이름'}
+            />
+            {floorInputError && <p className="mt-2 text-xs text-red-400">{floorInputError}</p>}
+            <div className="mt-4 flex items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={closeRegisterModal}
+                className="rounded border border-gray-700 px-3 py-1.5 text-xs hover:bg-gray-800"
+              >
+                취소
+              </button>
+              <button
+                type="button"
+                onClick={handleRegisterFromPlus}
+                className="rounded bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-500"
+              >
+                확인
+              </button>
             </div>
           </div>
-        )}
-
-        {/* 선택된 씬 정보 오버레이 */}
-        {selectedModule && sogUrl && (
-          <div className="absolute top-4 left-4 bg-gray-900/80 backdrop-blur-sm border border-gray-700/50 rounded-xl px-4 py-3 pointer-events-none">
-            <p className="text-xs text-gray-400">{building?.name}</p>
-            <p className="text-sm font-semibold text-white mt-0.5">
-              {floors.find(f => f.modules.some(m => m.id === selectedModule.id))?.floor_number}층 · {selectedModule.name}
-            </p>
-          </div>
-        )}
-      </div>
+        </div>
+      )}
     </div>
+  );
+}
+
+function FloorSlab({
+  floor,
+  imageUrl,
+  hovered,
+  dimmed,
+  onHover,
+  onLeave,
+  onImageError,
+  onClick,
+}: {
+  floor: FloorOverviewManifestEntry;
+  imageUrl: string | null;
+  hovered: boolean;
+  dimmed: boolean;
+  onHover: () => void;
+  onLeave: () => void;
+  onImageError: () => void;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onMouseEnter={onHover}
+      onMouseLeave={onLeave}
+      onClick={onClick}
+    className={`group relative w-full h-28 lg:h-32 overflow-hidden text-left transition duration-200 ${
+        imageUrl ? 'rounded-sm' : 'rounded-md border'
+      } ${
+        hovered
+          ? imageUrl
+            ? 'ring-2 ring-blue-500/80 shadow-lg shadow-blue-900/30'
+            : 'border-blue-500/80 shadow-lg shadow-blue-900/30'
+          : imageUrl
+            ? 'ring-1 ring-white/10'
+            : 'border-gray-800'
+      } ${dimmed ? 'opacity-40' : 'opacity-100'}`}
+    >
+      {imageUrl ? (
+        <img
+          src={imageUrl}
+          alt="floor overview"
+          onError={onImageError}
+          className="h-full w-full object-cover"
+        />
+      ) : (
+        <div className="h-full w-full bg-gradient-to-b from-gray-700 to-gray-900" />
+      )}
+      <div className="pointer-events-none absolute left-2 bottom-2 z-10 text-[11px] font-medium text-white/90 drop-shadow">
+        {floorLabel(floor.floor_number)}
+      </div>
+      {imageUrl && <div className="pointer-events-none absolute inset-x-0 bottom-0 h-12 bg-gradient-to-t from-black/45 to-transparent" />}
+    </button>
   );
 }

@@ -7,6 +7,7 @@ import tempfile
 from celery_app import app
 from minio_helper import download_file, upload_file
 from redis_helper import update_progress, clear_progress
+from callback_client import notify_task_failure, notify_task_success
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,8 @@ def run_door_alignment(self, upload_id: str, user_id: str,
     module_base = _module_base(building_id, floor_id, module_id, module_name)
 
     logger.info(f"[Task {task_id}] 정합 시작: upload_id={upload_id}")
+    processing_completed = False
+    success_callback_failed = False
 
     try:
         # 1. 다운로드
@@ -96,7 +99,7 @@ def run_door_alignment(self, upload_id: str, user_id: str,
 
         update_progress(task_id, 100, "완료")
 
-        return {
+        result = {
             "status": "completed",
             "upload_id": upload_id,
             "ply_key": output_ply_key,
@@ -104,10 +107,23 @@ def run_door_alignment(self, upload_id: str, user_id: str,
             "web_sog_key": web_sog_key,
             "metadata_key": metadata_key,
         }
+        processing_completed = True
+        try:
+            notify_task_success(task_id, result)
+        except Exception as callback_err:
+            success_callback_failed = True
+            logger.error(f"[Task {task_id}] 성공 콜백 전송 실패: {callback_err}")
+            raise
+        return result
 
     except Exception as e:
-        logger.error(f"[Task {task_id}] 정합 실패: {e}")
-        update_progress(task_id, -1, f"실패: {str(e)[:200]}")
+        if not processing_completed and not success_callback_failed:
+            logger.error(f"[Task {task_id}] 정합 실패: {e}")
+            try:
+                notify_task_failure(task_id, upload_id, str(e))
+            except Exception as callback_err:
+                logger.error(f"[Task {task_id}] 실패 콜백 전송 실패: {callback_err}")
+            update_progress(task_id, -1, f"실패: {str(e)[:200]}")
         raise
 
     finally:

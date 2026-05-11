@@ -22,7 +22,6 @@ services:
       context: ./frontend
       args:
         - NEXT_PUBLIC_KAKAO_MAP_KEY=${NEXT_PUBLIC_KAKAO_MAP_KEY}
-        - NEXT_PUBLIC_KAKAO_REST_API_KEY=${NEXT_PUBLIC_KAKAO_REST_API_KEY}
         - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
     container_name: 3dgs-frontend
     expose:
@@ -53,6 +52,35 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    networks:
+      - 3dgs-net
+    restart: unless-stopped
+
+  worker:
+    build: ./worker
+    container_name: 3dgs-worker
+    volumes:
+      - ./core:/app/core:ro
+      - ./utilities:/app/utilities:ro
+    env_file: .env
+    environment:
+      - RABBITMQ_URL=amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@rabbitmq:5672//
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY}
+      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
+      - MINIO_BUCKET=${MINIO_BUCKET}
+      - BACKEND_CALLBACK_URL=http://backend:8000
+      - WORKER_CALLBACK_TOKEN=${WORKER_CALLBACK_TOKEN}
+    depends_on:
+      backend:
+        condition: service_started
       redis:
         condition: service_healthy
       rabbitmq:

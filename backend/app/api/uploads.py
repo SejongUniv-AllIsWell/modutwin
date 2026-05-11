@@ -220,9 +220,11 @@ async def complete_upload(
     ext = os.path.splitext(upload.original_filename)[1].lower()
     is_ply = ext == ".ply"
     is_scene_artifact = ext in {".splat", ".sog"}
+    is_zip = ext == ".zip"
     skip_training = (
         (is_ply and upload.ply_target in (PlyTarget.alignment, PlyTarget.refined))
         or is_scene_artifact
+        or is_zip
     )
 
     if skip_training:
@@ -264,7 +266,9 @@ async def complete_upload(
     await db.commit()
 
     if skip_training:
-        if is_scene_artifact or upload.ply_target == PlyTarget.refined:
+        if is_zip:
+            msg = "업로드 완료. ZIP 파일이 저장되었습니다. COLMAP 처리는 추후 지원됩니다."
+        elif is_scene_artifact or upload.ply_target == PlyTarget.refined:
             msg = "업로드 완료. refined 폴더에 저장되었습니다."
         else:
             msg = "업로드 완료. alignment 폴더에 저장되었습니다."
@@ -440,6 +444,14 @@ class RegisterLocalResponse(BaseModel):
     minio_path: str   # placeholder (refined PLY 의 base_dir 계산에만 사용됨)
 
 
+class RegisterLocalBasemapRequest(BaseModel):
+    filename: str
+    building_id: UUID
+    floor_id: UUID
+    file_size: int = 0
+    content_type: str = "application/octet-stream"
+
+
 @router.post("/register-local", response_model=RegisterLocalResponse)
 async def register_local_upload(
     body: RegisterLocalRequest,
@@ -509,6 +521,65 @@ async def register_local_upload(
     upload = Upload(
         user_id=user.id,
         module_id=body.module_id,
+        original_filename=body.filename,
+        file_size=body.file_size,
+        content_type=body.content_type,
+        minio_path=placeholder_key,
+        ply_target=PlyTarget.alignment,
+        status=UploadStatus.completed,
+    )
+    db.add(upload)
+    await db.commit()
+
+    return RegisterLocalResponse(upload_id=upload.id, minio_path=placeholder_key)
+
+
+@router.post("/register-local-basemap", response_model=RegisterLocalResponse)
+async def register_local_basemap_upload(
+    body: RegisterLocalBasemapRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    floor_result = await db.execute(
+        select(Floor).where(Floor.id == body.floor_id, Floor.building_id == body.building_id)
+    )
+    floor = floor_result.scalar_one_or_none()
+    if floor is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="building_id / floor_id 조합이 유효하지 않습니다.",
+        )
+
+    module_result = await db.execute(
+        select(Module).where(
+            Module.floor_id == body.floor_id,
+            Module.user_id == user.id,
+            Module.name == "__basemap__",
+        )
+    )
+    module = module_result.scalar_one_or_none()
+    if module is None:
+        module = Module(
+            floor_id=body.floor_id,
+            user_id=user.id,
+            name="__basemap__",
+            is_visible=False,
+        )
+        db.add(module)
+        await db.flush()
+    elif module.is_visible:
+        module.is_visible = False
+
+    ext = os.path.splitext(body.filename)[1].lower() or ".ply"
+    base_path = module_base_path(
+        str(body.building_id), str(body.floor_id),
+        str(module.id), module.name,
+    )
+    placeholder_key = f"{base_path}/alignment/{uuid4()}_local{ext}"
+
+    upload = Upload(
+        user_id=user.id,
+        module_id=module.id,
         original_filename=body.filename,
         file_size=body.file_size,
         content_type=body.content_type,

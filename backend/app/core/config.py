@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     # Google OAuth
     GOOGLE_CLIENT_ID: str = ""
     GOOGLE_CLIENT_SECRET: str = ""
+    KAKAO_REST_API_KEY: str = ""
 
     # Public URL (for OAuth redirect behind reverse proxy)
     PUBLIC_BASE_URL: str = ""
@@ -57,6 +58,9 @@ class Settings(BaseSettings):
     # Feature flags
     ENABLE_SAM3: bool = False
     ENABLE_SAM3_DISPATCH: bool | None = None
+
+    # Internal worker callback auth
+    WORKER_CALLBACK_TOKEN: str = ""
 
     # door-ml SAM3 inference 서비스 (docker-compose.gpu.yml 의 door-ml 컨테이너).
     # Celery 워커 대신 in-cluster HTTP 로 SAM3 를 실행할 때 사용.
