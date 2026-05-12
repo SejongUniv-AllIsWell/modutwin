@@ -5,6 +5,13 @@ import { useRouter } from 'next/navigation';
 import { api } from '@/lib/api';
 import { Building, Floor } from '@/types';
 import { useAuth } from '@/lib/auth';
+import {
+  comparePriorityPlaceCandidates,
+  type PriorityCoordinateOverride,
+  scorePriorityPlaceName,
+  sejongUniversityPlacePriority,
+  type PriorityPlaceScore,
+} from '@/lib/map/placePriority';
 
 declare global {
   interface Window {
@@ -73,7 +80,14 @@ interface Coordinate {
   lng: number;
 }
 
+interface KakaoPlaceCandidate extends PriorityPlaceScore {
+  place: KakaoPlaceResult;
+  placeName: string;
+  distance: number;
+}
+
 const KAKAO_SDK_URL = 'https://dapi.kakao.com/v2/maps/sdk.js';
+const DEFAULT_MAP_CENTER = sejongUniversityPlacePriority.center;
 
 const escapeHtml = (value: string) => value
   .replace(/&/g, '&amp;')
@@ -150,12 +164,6 @@ const coord2AddressViaBackend = async (x: number, y: number): Promise<KakaoCoord
   return result.documents ?? [];
 };
 
-const DEFAULT_MAP_CENTER = {
-  lat: 37.5509,
-  lng: 127.0738,
-};
-const ADDRESS_PLACE_SEARCH_RADIUS_METERS = 120;
-
 const coordinateForBuilding = (building: Building): Coordinate | null => {
   const lat = Number(building.latitude);
   const lng = Number(building.longitude);
@@ -221,19 +229,32 @@ export default function ExplorePage() {
 
   const routeBuildingByLookup = useCallback(async (payload: {
     building_name: string;
+    lookup_names?: string[];
     place_id?: string | null;
     address_name?: string | null;
     road_address_name?: string | null;
     lat?: number | null;
     lng?: number | null;
   }) => {
+    const lookupNames = Array.from(new Set([
+      payload.building_name,
+      ...(payload.lookup_names ?? []),
+    ].map((name) => name.trim()).filter(Boolean)));
     const qs = new URLSearchParams();
     if (payload.place_id) qs.set('kakao_place_id', payload.place_id);
-    qs.set('name', payload.building_name);
+    qs.set('name', lookupNames[0] ?? payload.building_name);
     const lookup = await api.get<BuildingLookupResponse>(`/buildings/lookup?${qs.toString()}`);
     if (lookup.building) {
       navigateFromMap(`/buildings/${lookup.building.id}`);
       return;
+    }
+    for (const lookupName of lookupNames.slice(1)) {
+      const aliasQs = new URLSearchParams({ name: lookupName });
+      const aliasLookup = await api.get<BuildingLookupResponse>(`/buildings/lookup?${aliasQs.toString()}`);
+      if (aliasLookup.building) {
+        navigateFromMap(`/buildings/${aliasLookup.building.id}`);
+        return;
+      }
     }
     pushPendingBuilding(payload);
   }, [navigateFromMap, pushPendingBuilding]);
@@ -348,6 +369,62 @@ export default function ExplorePage() {
         return 6371000 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
       };
 
+      const distanceFromCoordinate = (coordinate: Coordinate, latLng: any) => distanceMeters({
+        id: 'coordinate',
+        place_name: '',
+        address_name: '',
+        road_address_name: '',
+        x: String(coordinate.lng),
+        y: String(coordinate.lat),
+      }, latLng);
+
+      const scorePlaceCandidate = (place: KakaoPlaceResult, latLng: any): KakaoPlaceCandidate => {
+        const placeName = place.place_name.trim();
+        return {
+          place,
+          placeName,
+          distance: distanceMeters(place, latLng),
+          ...scorePriorityPlaceName(placeName),
+        };
+      };
+
+      const findCoordinateOverrideAt = (latLng: any): PriorityCoordinateOverride | null => (
+        sejongUniversityPlacePriority.coordinateOverrides
+          ?.map((override) => ({
+            override,
+            distance: distanceFromCoordinate({ lat: override.lat, lng: override.lng }, latLng),
+          }))
+          .filter(({ override, distance }) => (
+            Number.isFinite(distance)
+            && distance <= override.radiusMeters
+          ))
+          .sort((a, b) => a.distance - b.distance)[0]?.override ?? null
+      );
+
+      const findNearestSejongUniversityPlace = async (latLng: any): Promise<KakaoPlaceResult | null> => {
+        const campusDistance = distanceFromCoordinate(DEFAULT_MAP_CENTER, latLng);
+        if (campusDistance > sejongUniversityPlacePriority.campusRadiusMeters) return null;
+
+        const places = await searchKeywordViaBackend({
+          query: sejongUniversityPlacePriority.campusKeyword,
+          x: latLng.getLng(),
+          y: latLng.getLat(),
+          radius: sejongUniversityPlacePriority.placeSearchRadiusMeters,
+          sort: 'distance',
+          size: 15,
+        }).catch((): KakaoPlaceResult[] => []);
+
+        return places
+          .map((place) => scorePlaceCandidate(place, latLng))
+          .filter(({ placeName, distance }) => (
+            placeName.includes(sejongUniversityPlacePriority.campusKeyword)
+            && placeName.length >= 2
+            && Number.isFinite(distance)
+            && distance <= sejongUniversityPlacePriority.placeSearchRadiusMeters
+          ))
+          .sort(comparePriorityPlaceCandidates)[0]?.place ?? null;
+      };
+
       const findNearestPlaceByAddress = async (
         address: KakaoCoord2AddressDocument | null,
         latLng: any,
@@ -358,31 +435,19 @@ export default function ExplorePage() {
           query,
           x: latLng.getLng(),
           y: latLng.getLat(),
-          radius: ADDRESS_PLACE_SEARCH_RADIUS_METERS,
+          radius: sejongUniversityPlacePriority.addressSearchRadiusMeters,
           sort: 'distance',
-          size: 10,
+          size: 15,
         }).catch((): KakaoPlaceResult[] => []);
         return places
-          .map((place) => ({
-            place,
-            distance: distanceMeters(place, latLng),
-          }))
-          .filter(({ place, distance }) => (
-            place.place_name.trim().length >= 2
+          .map((place) => scorePlaceCandidate(place, latLng))
+          .filter(({ placeName, distance }) => (
+            placeName.length >= 2
             && Number.isFinite(distance)
-            && distance <= ADDRESS_PLACE_SEARCH_RADIUS_METERS
+            && distance <= sejongUniversityPlacePriority.addressSearchRadiusMeters
           ))
-          .sort((a, b) => a.distance - b.distance)[0]?.place ?? null;
+          .sort(comparePriorityPlaceCandidates)[0]?.place ?? null;
       };
-
-      const distanceFromCoordinate = (coordinate: Coordinate, latLng: any) => distanceMeters({
-        id: 'registered-building',
-        place_name: '',
-        address_name: '',
-        road_address_name: '',
-        x: String(coordinate.lng),
-        y: String(coordinate.lat),
-      }, latLng);
 
       const findRegisteredBuildingAt = (latLng: any) => buildingsRef.current
         .map((building) => {
@@ -441,15 +506,38 @@ export default function ExplorePage() {
         });
       };
 
+      const createBuildingFromCoordinateOverride = async (override: PriorityCoordinateOverride) => {
+        showSelectedMarker(override.name, override.lat, override.lng);
+        showToast(`선택됨: ${override.name}`);
+        await routeBuildingByLookup({
+          building_name: override.name,
+          lookup_names: override.aliases,
+          address_name: override.address_name ?? null,
+          road_address_name: override.road_address_name ?? null,
+          lat: override.lat,
+          lng: override.lng,
+        });
+      };
+
       clickHandler = async (_mouseEvent: any) => {
         if (disposed) return;
         if (mapClickInFlightRef.current) return;
         mapClickInFlightRef.current = true;
         const latLng = _mouseEvent.latLng;
         try {
+          const coordinateOverride = findCoordinateOverrideAt(latLng);
+          if (coordinateOverride) {
+            await createBuildingFromCoordinateOverride(coordinateOverride);
+            return;
+          }
           const registeredBuilding = findRegisteredBuildingAt(latLng);
           if (registeredBuilding) {
             openRegisteredBuilding(registeredBuilding);
+            return;
+          }
+          const sejongPlace = await findNearestSejongUniversityPlace(latLng);
+          if (sejongPlace) {
+            await createBuildingFromPlace(sejongPlace);
             return;
           }
           const addresses = await coord2Address(latLng);

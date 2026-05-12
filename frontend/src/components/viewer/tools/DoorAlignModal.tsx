@@ -2343,14 +2343,18 @@ export default function DoorAlignModal({
           >
             {doorRotated ? '문 닫기' : '문 열기'}
           </button>
+        </div>
 
-          {basemapMode && (
-            <div className="border-t border-gray-700 pt-2 space-y-1.5">
-              <div className="text-[10px] text-gray-400">저장 이름: {resolvedBasemapUnitName || '미지정'}</div>
-              <div className="text-[10px] text-gray-400">저장된 문: {savedDoorCount}개</div>
-            </div>
-          )}
+        {/* 저장 정보 + 저장 버튼들은 "문 회전" 래퍼 (pointer-events-none) 밖에 둬야 한다.
+            문 저장 후 doorRefineActive=false 로 돌아가도 basemap 등록 완료 가 클릭 가능해야 하기 때문. */}
+        {basemapMode && (
+          <div className="border-t border-gray-700 pt-2 space-y-1.5">
+            <div className="text-[10px] text-gray-400">저장 이름: {resolvedBasemapUnitName || '미지정'}</div>
+            <div className="text-[10px] text-gray-400">저장된 문: {savedDoorCount}개</div>
+          </div>
+        )}
 
+        <div className="space-y-1.5">
           {/* 명시적 "문 설정 완료" — debounce 기다리지 않고 즉시 서버 영속. 나갔다가 다시 들어와도 그대로 복원되며,
               미래 basemap 정합에서 동일 분류 (corners + wallSurfaceId + doorThickness 등) 재현용. */}
           <button
