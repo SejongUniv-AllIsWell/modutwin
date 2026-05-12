@@ -104,6 +104,7 @@ export default function FloorDetailPage() {
   const [manifest, setManifest] = useState<FloorDetailManifest | null>(null);
   const [primaryUrl, setPrimaryUrl] = useState<string | null>(null);
   const [selectedModuleId, setSelectedModuleId] = useState<string | null>(null);
+  const [openModuleMenuId, setOpenModuleMenuId] = useState<string | null>(null);
 
   useEffect(() => {
     if (!loading && !user) {
@@ -130,6 +131,19 @@ export default function FloorDetailPage() {
 
   const moduleRows = useMemo(() => manifest?.modules ?? [], [manifest]);
   const hasBasemap = !!manifest?.basemap?.url;
+
+  const goRegisterModule = (moduleName: string) => {
+    setOpenModuleMenuId(null);
+    const qs = new URLSearchParams({
+      purpose: 'module',
+      building_id: buildingId,
+      building_name: manifest?.building_name ?? 'Building',
+      floor_number: String(manifest?.floor_number ?? floorNumber),
+      module_name: moduleName,
+    });
+    if (manifest?.floor_id) qs.set('floor_id', manifest.floor_id);
+    router.push(`/viewer?${qs.toString()}`);
+  };
   const renderableModules = useMemo(
     () => moduleRows.filter((module) => module.url && module.is_visible !== false),
     [moduleRows],
@@ -161,25 +175,52 @@ export default function FloorDetailPage() {
         <div className="mt-4 text-xs text-gray-500">Modules ({moduleRows.length})</div>
         <div className="mt-2 space-y-2 overflow-y-auto">
           {moduleRows.map((module) => (
-            <button
+            <div
               key={module.id}
-              type="button"
-              disabled={!module.url}
-              onClick={() => {
-                if (!module.url) return;
-                setSelectedModuleId(module.id);
-                if (!hasBasemap) setPrimaryUrl(module.url);
-              }}
-              className={`w-full rounded-md border px-3 py-2 text-left transition ${
+              className={`flex items-center rounded-md border transition ${
                 module.url
                   ? selectedModuleId === module.id
                     ? 'border-blue-500/70 bg-blue-500/10'
                     : 'border-gray-800 hover:border-gray-700 hover:bg-gray-800/60'
-                  : 'border-gray-800 text-gray-500 cursor-not-allowed'
+                  : 'border-gray-800'
               }`}
             >
-              <div className="text-sm font-medium truncate">{module.name}</div>
-            </button>
+              <button
+                type="button"
+                disabled={!module.url}
+                onClick={() => {
+                  if (!module.url) return;
+                  setSelectedModuleId(module.id);
+                  if (!hasBasemap) setPrimaryUrl(module.url);
+                }}
+                className={`flex-1 px-3 py-2 text-left ${
+                  module.url ? '' : 'text-gray-500 cursor-not-allowed'
+                }`}
+              >
+                <div className="text-sm font-medium truncate">{module.name}</div>
+              </button>
+              <div className="relative pr-1">
+                <button
+                  type="button"
+                  onClick={() => setOpenModuleMenuId((prev) => (prev === module.id ? null : module.id))}
+                  className="w-7 h-7 flex items-center justify-center rounded hover:bg-gray-800 text-gray-400 hover:text-white"
+                  aria-label="더보기"
+                >
+                  ⋮
+                </button>
+                {openModuleMenuId === module.id && (
+                  <div className="absolute right-0 top-8 z-10 w-28 rounded border border-gray-700 bg-gray-900 shadow-lg p-1">
+                    <button
+                      type="button"
+                      onClick={() => goRegisterModule(module.name)}
+                      className="w-full text-left text-xs px-2 py-1.5 rounded hover:bg-gray-800"
+                    >
+                      module 등록
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
           ))}
           {moduleRows.length === 0 && <p className="text-sm text-gray-500">No modules available.</p>}
         </div>
