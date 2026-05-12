@@ -26,12 +26,24 @@ const SPREAD_WEIGHT = 0.3;     // score = count × (0.7 + 0.3 · non_empty)
 const PATH_POINT_RADIUS = 5;
 const PATH_POINT_HOVER_RADIUS = 6.5;
 const PATH_POINT_HIT_RADIUS = 14;
+const PATH_DRAG_THRESHOLD_PX = 4;
 
 type PathPoint = { x: number; z: number };
 type PathEdge = { from: number; to: number };
 type PathAction =
   | { type: 'point'; pointIdx: number; edge: PathEdge | null; prevSelected: number }
-  | { type: 'edge'; edge: PathEdge; prevSelected: number };
+  | { type: 'edge'; edge: PathEdge; prevSelected: number }
+  | { type: 'move'; pointIdx: number; prevPos: PathPoint; prevSelected: number };
+
+type PendingDrag = {
+  idx: number;
+  startMx: number;
+  startMy: number;
+  startPos: PathPoint;
+  prevSelected: number;
+  isNew: boolean;
+  dragging: boolean;
+};
 
 // Compute 2 wall peaks for a given angle (top peak in bottom 25% + top 25%)
 // score = count × (0.7 + 0.3 · non_empty_ratio) — 가구 덩어리(한 구석 몰림) 페널티
@@ -279,6 +291,7 @@ export default function WallModal({
   const pathEdgesRef = useRef<PathEdge[]>([]);
   const pathActionsRef = useRef<PathAction[]>([]);
   const selectedPointIdxRef = useRef<number>(-1);
+  const pendingDragRef = useRef<PendingDrag | null>(null);
 
   const selectPathPoint = useCallback((idx: number) => {
     selectedPointIdxRef.current = idx;
@@ -433,28 +446,43 @@ export default function WallModal({
     if (basemapMode) {
       if (e.button !== 0) return;
       e.preventDefault();
+      const rect = e.currentTarget.getBoundingClientRect();
+      const startMx = (e.clientX - rect.left) * (CW / rect.width);
+      const startMy = (e.clientY - rect.top) * (CH / rect.height);
       const { rx, rz } = mouseToRot(e);
       const hit = findPathPointHit(rx, rz);
       const points = pathPointsRef.current;
-      const selected = selectedPointIdxRef.current;
+      const prevSelected = selectedPointIdxRef.current;
 
       if (hit >= 0) {
-        if (selected >= 0 && selected < points.length) {
-          const edge = addPathEdge(selected, hit);
-          if (edge) pathActionsRef.current.push({ type: 'edge', edge, prevSelected: selected });
-        }
+        pendingDragRef.current = {
+          idx: hit,
+          startMx, startMy,
+          startPos: { x: points[hit].x, z: points[hit].z },
+          prevSelected,
+          isNew: false,
+          dragging: false,
+        };
         selectPathPoint(hit);
         return;
       }
 
       const nextIdx = points.length;
-      const fromIdx = selected >= 0 && selected < points.length ? selected : points.length - 1;
+      const fromIdx = prevSelected >= 0 && prevSelected < points.length ? prevSelected : points.length - 1;
       const next = [...points, { x: rx, z: rz }];
       pathPointsRef.current = next;
       setPathPoints(next);
       const edge = fromIdx >= 0 ? addPathEdge(fromIdx, nextIdx) : null;
-      pathActionsRef.current.push({ type: 'point', pointIdx: nextIdx, edge, prevSelected: selected });
+      pathActionsRef.current.push({ type: 'point', pointIdx: nextIdx, edge, prevSelected });
       selectPathPoint(nextIdx);
+      pendingDragRef.current = {
+        idx: nextIdx,
+        startMx, startMy,
+        startPos: { x: rx, z: rz },
+        prevSelected,
+        isNew: true,
+        dragging: false,
+      };
       return;
     }
     const { rx, rz } = mouseToRot(e);
@@ -472,6 +500,24 @@ export default function WallModal({
 
   const handleMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     if (basemapMode) {
+      const pending = pendingDragRef.current;
+      if (pending) {
+        const rect = e.currentTarget.getBoundingClientRect();
+        const mx = (e.clientX - rect.left) * (CW / rect.width);
+        const my = (e.clientY - rect.top) * (CH / rect.height);
+        if (!pending.dragging && Math.hypot(mx - pending.startMx, my - pending.startMy) >= PATH_DRAG_THRESHOLD_PX) {
+          pending.dragging = true;
+        }
+        if (pending.dragging) {
+          const { rx, rz } = mouseToRot(e);
+          const next = pathPointsRef.current.map((p, i) =>
+            i === pending.idx ? { x: rx, z: rz } : p
+          );
+          pathPointsRef.current = next;
+          setPathPoints(next);
+        }
+        return;
+      }
       const { rx, rz } = mouseToRot(e);
       setHoverPointIdx(findPathPointHit(rx, rz));
       return;
@@ -485,7 +531,51 @@ export default function WallModal({
     });
   }, [draggingLine, mouseToRot, basemapMode, findPathPointHit]);
 
-  const handleMouseUp = useCallback(() => setDraggingLine(null), []);
+  const handleMouseUp = useCallback(() => {
+    if (basemapMode) {
+      const pending = pendingDragRef.current;
+      pendingDragRef.current = null;
+      if (!pending) return;
+      if (pending.dragging) {
+        if (!pending.isNew) {
+          pathActionsRef.current.push({
+            type: 'move',
+            pointIdx: pending.idx,
+            prevPos: pending.startPos,
+            prevSelected: pending.prevSelected,
+          });
+        }
+        return;
+      }
+      if (pending.isNew) return; // 새 점 클릭 추가는 mouseDown에서 이미 처리됨
+      const prev = pending.prevSelected;
+      const points = pathPointsRef.current;
+      if (prev >= 0 && prev < points.length && prev !== pending.idx) {
+        const edge = addPathEdge(prev, pending.idx);
+        if (edge) pathActionsRef.current.push({ type: 'edge', edge, prevSelected: prev });
+      }
+      return;
+    }
+    setDraggingLine(null);
+  }, [basemapMode, addPathEdge]);
+
+  const handleMouseLeave = useCallback(() => {
+    if (basemapMode) {
+      const pending = pendingDragRef.current;
+      pendingDragRef.current = null;
+      setHoverPointIdx(-1);
+      if (pending?.dragging && !pending.isNew) {
+        pathActionsRef.current.push({
+          type: 'move',
+          pointIdx: pending.idx,
+          prevPos: pending.startPos,
+          prevSelected: pending.prevSelected,
+        });
+      }
+      return;
+    }
+    setDraggingLine(null);
+  }, [basemapMode]);
 
   const handleContextMenu = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     if (!basemapMode) return;
@@ -506,6 +596,16 @@ export default function WallModal({
         ? action.prevSelected
         : nextPoints.length - 1;
       selectPathPoint(nextSelected);
+      return;
+    }
+
+    if (action.type === 'move') {
+      const nextPoints = pathPointsRef.current.map((p, i) =>
+        i === action.pointIdx ? action.prevPos : p
+      );
+      pathPointsRef.current = nextPoints;
+      setPathPoints(nextPoints);
+      selectPathPoint(action.prevSelected);
       return;
     }
 
@@ -550,7 +650,7 @@ export default function WallModal({
         <div className="text-white font-bold text-sm mb-1">벽면 설정</div>
         <div className="text-gray-400 text-xs mb-3">
           {basemapMode
-            ? '좌클릭으로 점과 선을 추가합니다. 기존 점을 클릭하면 직전에 선택한 점과 연결되고, 우클릭은 마지막 선과 점을 되돌립니다.'
+            ? '좌클릭으로 점과 선을 추가, 기존 점은 드래그로 이동합니다. 점을 클릭하면 직전에 선택한 점과 연결되고, 우클릭은 마지막 조작을 되돌립니다.'
             : <>슬라이더로 회전, 각 선(<span style={{color:'#10b981'}}>벽1</span>/<span style={{color:'#3b82f6'}}>벽2</span>/<span style={{color:'#8b5cf6'}}>벽3</span>/<span style={{color:'#84cc16'}}>벽4</span>)은 드래그해서 평행이동.</>}
         </div>
         <div>
@@ -560,7 +660,7 @@ export default function WallModal({
             onMouseDown={handleMouseDown}
             onMouseMove={handleMouseMove}
             onMouseUp={handleMouseUp}
-            onMouseLeave={handleMouseUp}
+            onMouseLeave={handleMouseLeave}
             onContextMenu={handleContextMenu} />
         </div>
         {!basemapMode && (
