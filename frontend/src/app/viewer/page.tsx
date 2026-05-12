@@ -4,7 +4,7 @@ import { useEffect, useState, Suspense } from 'react';
 import { useSearchParams } from 'next/navigation';
 import { api } from '@/lib/api';
 import dynamic from 'next/dynamic';
-import type { EditorMode } from '@/components/viewer/UnifiedSplatEditor';
+import type { EditorMode, RegistrationContext, RegistrationPurpose } from '@/components/viewer/UnifiedSplatEditor';
 
 const UnifiedSplatEditor = dynamic(
   () => import('@/components/viewer/UnifiedSplatEditor'),
@@ -14,6 +14,25 @@ const UnifiedSplatEditor = dynamic(
 function ViewerContent() {
   const searchParams = useSearchParams();
   const uploadId = searchParams.get('upload_id') ?? undefined;
+  const purposeParam = searchParams.get('purpose');
+  const purpose: RegistrationPurpose | null = purposeParam === 'basemap' || purposeParam === 'module' ? purposeParam : null;
+  const buildingName = searchParams.get('building_name') ?? '';
+  const floorNumber = Number(searchParams.get('floor_number') ?? NaN);
+  const lat = Number(searchParams.get('lat') ?? NaN);
+  const lng = Number(searchParams.get('lng') ?? NaN);
+  const initialRegistrationContext: RegistrationContext | null = purpose && Number.isFinite(floorNumber) ? {
+    purpose,
+    building_id: searchParams.get('building_id') ?? undefined,
+    building_name: buildingName,
+    floor_id: searchParams.get('floor_id') ?? undefined,
+    floor_number: floorNumber,
+    module_name: searchParams.get('module_name') ?? undefined,
+    kakao_place_id: searchParams.get('place_id') ?? undefined,
+    address_name: searchParams.get('address_name') ?? undefined,
+    road_address_name: searchParams.get('road_address_name') ?? undefined,
+    latitude: Number.isFinite(lat) ? lat : undefined,
+    longitude: Number.isFinite(lng) ? lng : undefined,
+  } : null;
   // 초기 모드:
   //  - URL 에 mode 명시 (예: /viewer?upload_id=X&mode=align) 면 그것을 우선
   //  - upload_id 만 있으면 파일이 함께 로드되므로 'refine' (다듬기) 시작
@@ -96,6 +115,7 @@ function ViewerContent() {
         initialDisplayName={filename}
         initialMode={initialMode}
         initialServedVariant={servedVariant}
+        initialRegistrationContext={initialRegistrationContext}
       />
     </div>
   );

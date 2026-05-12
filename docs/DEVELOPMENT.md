@@ -48,7 +48,7 @@ DEV_MODE=false
 ENABLE_SAM3_DISPATCH=false
 
 NEXT_PUBLIC_API_URL=/api
-NEXT_PUBLIC_KAKAO_REST_API_KEY=...
+KAKAO_REST_API_KEY=...
 NEXT_PUBLIC_KAKAO_MAP_KEY=...
 
 GOOGLE_CLIENT_ID=...
@@ -65,7 +65,7 @@ Do not use `DEV_MODE=true` in shared or production-like environments.
 3. Enable Kakao Map.
 4. Add the local domain, for example `http://localhost`, to the JavaScript SDK
    allowed domains.
-5. Copy the REST API key and JavaScript key into `.env`.
+5. Copy the REST API key and JavaScript key into `.env` (`KAKAO_REST_API_KEY`, `NEXT_PUBLIC_KAKAO_MAP_KEY`).
 
 ## Running the Stack
 

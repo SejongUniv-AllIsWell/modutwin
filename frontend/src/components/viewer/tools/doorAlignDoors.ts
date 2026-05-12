@@ -25,6 +25,7 @@ export const PRIMARY_DOOR_ID = 'door_1';
 interface DoorMeta {
   id: string;
   corners: number[][];
+  unitName?: string;
   hingeEdge?: number | null;
   swing?: 1 | -1;
   angleDeg?: number;
@@ -87,6 +88,9 @@ export async function fetchDoorsFromServer(uploadId: string): Promise<FetchedDoo
 }
 
 export interface PersistOpts {
+  doorId?: string;
+  unitName?: string;
+  replaceExistingId?: boolean;
   hingeEdge?: number | null;
   swing?: 1 | -1;
   angleDeg?: number;
@@ -105,9 +109,10 @@ export async function persistDoorsToServer(
   const allFilled = corners.every(c => c !== null);
   if (!allFilled) return;
   const door: DoorMeta = {
-    id: PRIMARY_DOOR_ID,
+    id: opts.doorId || PRIMARY_DOOR_ID,
     corners: corners.map(c => [c!.pos[0], c!.pos[1], c!.pos[2]]),
   };
+  if (opts.unitName !== undefined) door.unitName = opts.unitName;
   if (opts.hingeEdge !== undefined) door.hingeEdge = opts.hingeEdge;
   if (opts.swing !== undefined) door.swing = opts.swing;
   if (opts.angleDeg !== undefined) door.angleDeg = opts.angleDeg;
@@ -118,7 +123,7 @@ export async function persistDoorsToServer(
   try {
     const existing = await api.get<DoorsJson>(`/uploads/${uploadId}/doors`).catch(() => ({ doors: [] }));
     // 기존 door_1 의 메타는 새 opts 가 없으면 유지 — partial update.
-    const prev = (existing.doors ?? []).find(d => d.id === PRIMARY_DOOR_ID);
+    const prev = (existing.doors ?? []).find(d => d.id === door.id);
     if (prev) {
       if (door.hingeEdge === undefined && prev.hingeEdge !== undefined) door.hingeEdge = prev.hingeEdge;
       if (door.swing === undefined && prev.swing !== undefined) door.swing = prev.swing;
@@ -128,11 +133,18 @@ export async function persistDoorsToServer(
       if (door.boundarySplitEnabled === undefined && prev.boundarySplitEnabled !== undefined) door.boundarySplitEnabled = prev.boundarySplitEnabled;
       if (door.safetyMargin === undefined && prev.safetyMargin !== undefined) door.safetyMargin = prev.safetyMargin;
     }
-    const others = (existing.doors ?? []).filter(d => d.id !== PRIMARY_DOOR_ID);
+    const others = opts.replaceExistingId === false
+      ? (existing.doors ?? [])
+      : (existing.doors ?? []).filter(d => d.id !== door.id);
     await api.put(`/uploads/${uploadId}/doors`, { doors: [door, ...others] });
   } catch (e: any) {
     console.warn('[doors] persist 실패', e);
   }
+}
+
+export async function persistEmptyDoorsToServer(uploadId: string) {
+  if (!uploadId.trim()) return;
+  await api.put(`/uploads/${uploadId}/doors`, { doors: [] });
 }
 
 export async function clearDoorsOnServer(uploadId: string) {

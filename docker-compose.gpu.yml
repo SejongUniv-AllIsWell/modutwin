@@ -53,6 +53,8 @@ services:
       - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY}
       - MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
       - MINIO_BUCKET=${MINIO_BUCKET}
+      - BACKEND_CALLBACK_URL=${BACKEND_CALLBACK_URL:-http://backend:8000}
+      - WORKER_CALLBACK_TOKEN=${WORKER_CALLBACK_TOKEN:-}
     deploy:
       resources:
         reservations:

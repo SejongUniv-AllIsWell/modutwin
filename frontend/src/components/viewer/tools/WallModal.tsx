@@ -9,6 +9,7 @@ interface Props {
   numSplats: number;
   ceilingY: number;
   floorY: number;
+  basemapMode?: boolean;
   initialAngle: number | null;
   initialWalls: [number, number, number, number] | null;
   onConfirm: (angleDeg: number, walls: [number, number, number, number]) => void;
@@ -22,6 +23,15 @@ const BINS = 120;
 const SUB_BINS = 20;           // 벽면 방향 sub-bin (spread 측정)
 const NEIGHBOR_HALF = 2;       // ±2 bin 묶어서 측정 (가구 앞 가려진 벽도 살림)
 const SPREAD_WEIGHT = 0.3;     // score = count × (0.7 + 0.3 · non_empty)
+const PATH_POINT_RADIUS = 5;
+const PATH_POINT_HOVER_RADIUS = 6.5;
+const PATH_POINT_HIT_RADIUS = 14;
+
+type PathPoint = { x: number; z: number };
+type PathEdge = { from: number; to: number };
+type PathAction =
+  | { type: 'point'; pointIdx: number; edge: PathEdge | null; prevSelected: number }
+  | { type: 'edge'; edge: PathEdge; prevSelected: number };
 
 // Compute 2 wall peaks for a given angle (top peak in bottom 25% + top 25%)
 // score = count × (0.7 + 0.3 · non_empty_ratio) — 가구 덩어리(한 구석 몰림) 페널티
@@ -80,8 +90,53 @@ function peaksAtAngle(
   };
 }
 
+function normalizeAngle90(deg: number): number {
+  let d = ((deg % 180) + 180) % 180;
+  if (d >= 90) d -= 90;
+  return d;
+}
+
+function wallsFromPath(points: PathPoint[]): { angleDeg: number; walls: [number, number, number, number] } | null {
+  if (points.length < 2) return null;
+  let cx = 0, cz = 0;
+  for (const p of points) { cx += p.x; cz += p.z; }
+  cx /= points.length; cz /= points.length;
+  let sxx = 0, sxz = 0, szz = 0;
+  for (const p of points) {
+    const dx = p.x - cx;
+    const dz = p.z - cz;
+    sxx += dx * dx;
+    sxz += dx * dz;
+    szz += dz * dz;
+  }
+  const trace = sxx + szz;
+  const det = sxx * szz - sxz * sxz;
+  const disc = Math.max(0, trace * trace * 0.25 - det);
+  const l1 = trace * 0.5 + Math.sqrt(disc);
+  let vx = sxz;
+  let vz = l1 - sxx;
+  if (Math.abs(vx) + Math.abs(vz) < 1e-9) { vx = 1; vz = 0; }
+  const vn = Math.hypot(vx, vz) || 1;
+  vx /= vn; vz /= vn;
+  const rawDeg = (Math.atan2(vz, vx) * 180) / Math.PI;
+  const angleDeg = normalizeAngle90(rawDeg);
+  const rad = (angleDeg * Math.PI) / 180;
+  const c = Math.cos(rad), s = Math.sin(rad);
+  let minD1 = Infinity, maxD1 = -Infinity, minD2 = Infinity, maxD2 = -Infinity;
+  for (const p of points) {
+    const d1 = p.x * c + p.z * s;
+    const d2 = -p.x * s + p.z * c;
+    if (d1 < minD1) minD1 = d1;
+    if (d1 > maxD1) maxD1 = d1;
+    if (d2 < minD2) minD2 = d2;
+    if (d2 > maxD2) maxD2 = d2;
+  }
+  return { angleDeg, walls: [minD1, maxD1, minD2, maxD2] };
+}
+
 export default function WallModal({
   posX, posY, posZ, numSplats,
+  basemapMode = false,
   ceilingY, floorY, initialAngle, initialWalls,
   onConfirm, onClose,
 }: Props) {
@@ -216,6 +271,49 @@ export default function WallModal({
   }, [pts, n, angle]);
 
   const [draggingLine, setDraggingLine] = useState<number | null>(null);
+  const [pathPoints, setPathPoints] = useState<PathPoint[]>([]);
+  const [pathEdges, setPathEdges] = useState<PathEdge[]>([]);
+  const [hoverPointIdx, setHoverPointIdx] = useState<number>(-1);
+  const [selectedPointIdx, setSelectedPointIdx] = useState<number>(-1);
+  const pathPointsRef = useRef<PathPoint[]>([]);
+  const pathEdgesRef = useRef<PathEdge[]>([]);
+  const pathActionsRef = useRef<PathAction[]>([]);
+  const selectedPointIdxRef = useRef<number>(-1);
+
+  const selectPathPoint = useCallback((idx: number) => {
+    selectedPointIdxRef.current = idx;
+    setSelectedPointIdx(idx);
+  }, []);
+
+  const addPathEdge = useCallback((from: number, to: number): PathEdge | null => {
+    if (from === to) return null;
+    const prev = pathEdgesRef.current;
+    const exists = prev.some(edge =>
+      (edge.from === from && edge.to === to) || (edge.from === to && edge.to === from)
+    );
+    if (exists) return null;
+    const edge = { from, to };
+    const next = [...prev, edge];
+    pathEdgesRef.current = next;
+    setPathEdges(next);
+    return edge;
+  }, []);
+
+  const pathHitThreshold = useMemo(() => {
+    const plotW = CW - PAD * 2;
+    return ((viewBounds.mxR - viewBounds.mnR) / plotW) * PATH_POINT_HIT_RADIUS;
+  }, [viewBounds]);
+
+  const findPathPointHit = useCallback((rx: number, rz: number) => {
+    const points = pathPointsRef.current;
+    let hit = -1;
+    let best = pathHitThreshold;
+    for (let i = 0; i < points.length; i++) {
+      const d = Math.hypot(points[i].x - rx, points[i].z - rz);
+      if (d < best) { best = d; hit = i; }
+    }
+    return hit;
+  }, [pathHitThreshold]);
 
   // viewer의 SURFACE_COLORS와 일치: 벽1=emerald, 벽2=blue, 벽3=violet, 벽4=lime
   const COLORS = ['#10b981', '#3b82f6', '#8b5cf6', '#84cc16'];
@@ -268,10 +366,41 @@ export default function WallModal({
       ctx.strokeStyle = color; ctx.lineWidth = bold ? 3 : 2; ctx.setLineDash([6, 4]);
       ctx.beginPath(); ctx.moveTo(PAD, toY(v)); ctx.lineTo(CW - PAD, toY(v)); ctx.stroke();
     };
-    drawVLine(wallVals[0], COLORS[0], draggingLine === 0);
-    drawVLine(wallVals[1], COLORS[1], draggingLine === 1);
-    drawHLine(wallVals[2], COLORS[2], draggingLine === 2);
-    drawHLine(wallVals[3], COLORS[3], draggingLine === 3);
+    if (basemapMode) {
+      if (pathEdges.length > 0) {
+        ctx.setLineDash([]);
+        ctx.strokeStyle = '#60a5fa';
+        ctx.lineWidth = 2.5;
+        ctx.beginPath();
+        let hasEdge = false;
+        for (const edge of pathEdges) {
+          const from = pathPoints[edge.from];
+          const to = pathPoints[edge.to];
+          if (!from || !to) continue;
+          ctx.moveTo(toX(from.x), toY(from.z));
+          ctx.lineTo(toX(to.x), toY(to.z));
+          hasEdge = true;
+        }
+        if (hasEdge) ctx.stroke();
+      }
+      for (let i = 0; i < pathPoints.length; i++) {
+        const p = pathPoints[i];
+        const px = toX(p.x);
+        const py = toY(p.z);
+        const isHover = i === hoverPointIdx;
+        const isSelected = i === selectedPointIdx;
+        const radius = isHover ? PATH_POINT_HOVER_RADIUS : PATH_POINT_RADIUS;
+        ctx.fillStyle = isSelected ? '#f59e0b' : '#22d3ee';
+        ctx.beginPath();
+        ctx.arc(px, py, radius, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    } else {
+      drawVLine(wallVals[0], COLORS[0], draggingLine === 0);
+      drawVLine(wallVals[1], COLORS[1], draggingLine === 1);
+      drawHLine(wallVals[2], COLORS[2], draggingLine === 2);
+      drawHLine(wallVals[3], COLORS[3], draggingLine === 3);
+    }
 
     ctx.setLineDash([]);
     ctx.strokeStyle = '#444'; ctx.lineWidth = 1;
@@ -284,7 +413,7 @@ export default function WallModal({
     ctx.rotate(-Math.PI / 2);
     ctx.fillText('Z′', 0, 0);
     ctx.restore();
-  }, [pts, n, angle, viewBounds, wallVals, draggingLine]);
+  }, [pts, n, angle, viewBounds, wallVals, draggingLine, basemapMode, pathPoints, pathEdges, hoverPointIdx, selectedPointIdx]);
 
   useEffect(() => { draw(); }, [draw]);
 
@@ -301,6 +430,33 @@ export default function WallModal({
   }, [viewBounds]);
 
   const handleMouseDown = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (basemapMode) {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      const { rx, rz } = mouseToRot(e);
+      const hit = findPathPointHit(rx, rz);
+      const points = pathPointsRef.current;
+      const selected = selectedPointIdxRef.current;
+
+      if (hit >= 0) {
+        if (selected >= 0 && selected < points.length) {
+          const edge = addPathEdge(selected, hit);
+          if (edge) pathActionsRef.current.push({ type: 'edge', edge, prevSelected: selected });
+        }
+        selectPathPoint(hit);
+        return;
+      }
+
+      const nextIdx = points.length;
+      const fromIdx = selected >= 0 && selected < points.length ? selected : points.length - 1;
+      const next = [...points, { x: rx, z: rz }];
+      pathPointsRef.current = next;
+      setPathPoints(next);
+      const edge = fromIdx >= 0 ? addPathEdge(fromIdx, nextIdx) : null;
+      pathActionsRef.current.push({ type: 'point', pointIdx: nextIdx, edge, prevSelected: selected });
+      selectPathPoint(nextIdx);
+      return;
+    }
     const { rx, rz } = mouseToRot(e);
     const thr = (viewBounds.mxR - viewBounds.mnR) * 0.03;
     const ds = [
@@ -312,9 +468,14 @@ export default function WallModal({
     let best = -1, bestD = thr;
     for (let i = 0; i < 4; i++) if (ds[i] < bestD) { bestD = ds[i]; best = i; }
     if (best >= 0) setDraggingLine(best);
-  }, [mouseToRot, wallVals, viewBounds]);
+  }, [addPathEdge, basemapMode, findPathPointHit, mouseToRot, selectPathPoint, wallVals, viewBounds]);
 
   const handleMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (basemapMode) {
+      const { rx, rz } = mouseToRot(e);
+      setHoverPointIdx(findPathPointHit(rx, rz));
+      return;
+    }
     if (draggingLine === null) return;
     const { rx, rz } = mouseToRot(e);
     setWallVals(prev => {
@@ -322,16 +483,75 @@ export default function WallModal({
       v[draggingLine] = draggingLine < 2 ? rx : rz;
       return v;
     });
-  }, [draggingLine, mouseToRot]);
+  }, [draggingLine, mouseToRot, basemapMode, findPathPointHit]);
 
   const handleMouseUp = useCallback(() => setDraggingLine(null), []);
+
+  const handleContextMenu = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (!basemapMode) return;
+    e.preventDefault();
+    const action = pathActionsRef.current.pop();
+    if (!action) return;
+
+    if (action.type === 'point') {
+      const nextPoints = pathPointsRef.current.filter((_, idx) => idx !== action.pointIdx);
+      const nextEdges = pathEdgesRef.current.filter(edge =>
+        edge.from !== action.pointIdx && edge.to !== action.pointIdx
+      );
+      pathPointsRef.current = nextPoints;
+      pathEdgesRef.current = nextEdges;
+      setPathPoints(nextPoints);
+      setPathEdges(nextEdges);
+      const nextSelected = action.prevSelected >= 0 && action.prevSelected < nextPoints.length
+        ? action.prevSelected
+        : nextPoints.length - 1;
+      selectPathPoint(nextSelected);
+      return;
+    }
+
+    const nextEdges = pathEdgesRef.current.filter(edge =>
+      !((edge.from === action.edge.from && edge.to === action.edge.to) ||
+        (edge.from === action.edge.to && edge.to === action.edge.from))
+    );
+    pathEdgesRef.current = nextEdges;
+    setPathEdges(nextEdges);
+    selectPathPoint(action.prevSelected);
+  }, [basemapMode, selectPathPoint]);
+
+  const derivedWalls = useMemo(() => {
+    if (!basemapMode) return null;
+    if (pathEdges.length === 0) return null;
+    const used = new Set<number>();
+    for (const edge of pathEdges) {
+      if (pathPoints[edge.from] && pathPoints[edge.to]) {
+        used.add(edge.from);
+        used.add(edge.to);
+      }
+    }
+    if (used.size < 2) return null;
+    // pathPoints 는 현재 표시 회전 프레임(rx, rz)이므로,
+    // 기존 wall contract(원본 XZ 기준 angle/walls)에 맞게 역회전 후 계산.
+    const rad = (angle * Math.PI) / 180;
+    const c = Math.cos(rad), s = Math.sin(rad);
+    const worldPoints = Array.from(used, (idx) => {
+      const p = pathPoints[idx];
+      return {
+        x: p.x * c - p.z * s,
+        z: p.x * s + p.z * c,
+      };
+    });
+    return wallsFromPath(worldPoints);
+  }, [basemapMode, pathPoints, pathEdges, angle]);
+  const confirmDisabled = basemapMode ? !derivedWalls : false;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70" onClick={onClose}>
       <div className="bg-gray-900 border border-gray-700 rounded-lg p-5 shadow-2xl" onClick={e => e.stopPropagation()}>
         <div className="text-white font-bold text-sm mb-1">벽면 설정</div>
         <div className="text-gray-400 text-xs mb-3">
-          슬라이더로 회전, 각 선(<span style={{color:'#10b981'}}>벽1</span>/<span style={{color:'#3b82f6'}}>벽2</span>/<span style={{color:'#8b5cf6'}}>벽3</span>/<span style={{color:'#84cc16'}}>벽4</span>)은 드래그해서 평행이동.
+          {basemapMode
+            ? '좌클릭으로 점과 선을 추가합니다. 기존 점을 클릭하면 직전에 선택한 점과 연결되고, 우클릭은 마지막 선과 점을 되돌립니다.'
+            : <>슬라이더로 회전, 각 선(<span style={{color:'#10b981'}}>벽1</span>/<span style={{color:'#3b82f6'}}>벽2</span>/<span style={{color:'#8b5cf6'}}>벽3</span>/<span style={{color:'#84cc16'}}>벽4</span>)은 드래그해서 평행이동.</>}
         </div>
         <div>
           <div className="text-gray-500 text-[10px] mb-1 text-center">Top-down (XZ)</div>
@@ -340,33 +560,48 @@ export default function WallModal({
             onMouseDown={handleMouseDown}
             onMouseMove={handleMouseMove}
             onMouseUp={handleMouseUp}
-            onMouseLeave={handleMouseUp} />
+            onMouseLeave={handleMouseUp}
+            onContextMenu={handleContextMenu} />
         </div>
-        <div className="mt-3 flex items-center gap-2">
-          <span className="text-gray-400 text-xs w-14">회전각</span>
-          <input type="range" min="0" max="90" step="0.5" value={angle}
-            onChange={(e) => { pendingAngle.current = parseFloat(e.target.value); scheduleFlush(); }}
-            onMouseUp={commitAngle}
-            onTouchEnd={commitAngle}
-            className="flex-1 h-1 accent-blue-500 cursor-pointer" />
-          <span className="text-white font-mono text-xs w-14 text-right">{angle.toFixed(1)}°</span>
-          <button onClick={() => { setAngle(bestIdx * 0.5); setCommittedAngle(bestIdx * 0.5); }}
-            className="px-2 py-1 bg-gray-700 hover:bg-gray-600 text-gray-200 rounded cursor-pointer text-xs">
-            자동 ({(bestIdx * 0.5).toFixed(1)}°)
-          </button>
-        </div>
+        {!basemapMode && (
+          <div className="mt-3 flex items-center gap-2">
+            <span className="text-gray-400 text-xs w-14">회전각</span>
+            <input type="range" min="0" max="90" step="0.5" value={angle}
+              onChange={(e) => { pendingAngle.current = parseFloat(e.target.value); scheduleFlush(); }}
+              onMouseUp={commitAngle}
+              onTouchEnd={commitAngle}
+              className="flex-1 h-1 accent-blue-500 cursor-pointer" />
+            <span className="text-white font-mono text-xs w-14 text-right">{angle.toFixed(1)}°</span>
+            <button onClick={() => { setAngle(bestIdx * 0.5); setCommittedAngle(bestIdx * 0.5); }}
+              className="px-2 py-1 bg-gray-700 hover:bg-gray-600 text-gray-200 rounded cursor-pointer text-xs">
+              자동 ({(bestIdx * 0.5).toFixed(1)}°)
+            </button>
+          </div>
+        )}
         <div className="flex items-center justify-between mt-3">
           <div className="text-gray-500 text-xs font-mono">
-            <span style={{color:'#10b981'}}>벽1</span>: {wallVals[0].toFixed(2)}{' '}
-            <span style={{color:'#3b82f6'}}>벽2</span>: {wallVals[1].toFixed(2)}{' '}
-            <span style={{color:'#8b5cf6'}}>벽3</span>: {wallVals[2].toFixed(2)}{' '}
-            <span style={{color:'#84cc16'}}>벽4</span>: {wallVals[3].toFixed(2)}
+            {basemapMode
+              ? `점 ${pathPoints.length}개, 선 ${pathEdges.length}개${derivedWalls ? `, 각도 ${derivedWalls.angleDeg.toFixed(1)}°` : ''}`
+              : <>
+                  <span style={{color:'#10b981'}}>벽1</span>: {wallVals[0].toFixed(2)}{' '}
+                  <span style={{color:'#3b82f6'}}>벽2</span>: {wallVals[1].toFixed(2)}{' '}
+                  <span style={{color:'#8b5cf6'}}>벽3</span>: {wallVals[2].toFixed(2)}{' '}
+                  <span style={{color:'#84cc16'}}>벽4</span>: {wallVals[3].toFixed(2)}
+                </>}
           </div>
           <div className="flex gap-2">
             <button onClick={onClose}
               className="px-4 py-2 bg-gray-700 hover:bg-gray-600 text-gray-300 rounded text-sm cursor-pointer">취소</button>
-            <button onClick={() => onConfirm(angle, wallVals)}
-              className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded text-sm cursor-pointer font-bold">확인</button>
+            <button onClick={() => {
+              if (basemapMode) {
+                if (!derivedWalls) return;
+                onConfirm(derivedWalls.angleDeg, derivedWalls.walls);
+                return;
+              }
+              onConfirm(angle, wallVals);
+            }}
+              disabled={confirmDisabled}
+              className="px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed text-white rounded text-sm cursor-pointer font-bold">확인</button>
           </div>
         </div>
       </div>

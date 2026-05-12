@@ -43,6 +43,8 @@ export interface RefineToolOptions {
   // applyEntityRotation 이 추가 회전을 적용하면 회전 누적이 되어 mesh 와 frame 어긋남.
   // 이 값을 보고 분기해 누적 차단.
   servedVariant?: 'original' | 'refined' | null;
+  // basemap 등록 viewer 에서만 wall modal 을 포인트-라인 입력으로 전환.
+  basemapMode?: boolean;
 }
 
 export const ALL_SURFACES = ['ceiling', 'floor', 'w1a', 'w1b', 'w2a', 'w2b'] as const;

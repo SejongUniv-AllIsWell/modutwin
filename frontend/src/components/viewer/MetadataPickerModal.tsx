@@ -32,6 +32,18 @@ interface Props {
   initial?: Partial<{ building_name: string; floor_number: number; module_name: string; sam_prompt: string }>;
   /** SAM3 프롬프트 입력란 동봉 여부 (현재 모든 흐름에서 false — SAM3 는 별도 팝업으로 분리됨). */
   showSamPrompt?: boolean;
+  fixedContext?: {
+    building_id?: string;
+    building_name: string;
+    floor_id?: string;
+    floor_number: number;
+    module_name?: string;
+    kakao_place_id?: string;
+    address_name?: string;
+    road_address_name?: string;
+    latitude?: number;
+    longitude?: number;
+  } | null;
   onConfirm: (result: MetadataResult) => Promise<void> | void;
   onClose: () => void;
 }
@@ -45,6 +57,7 @@ export default function MetadataPickerModal({
   description = '건물 / 층 / 모듈을 지정하세요.',
   initial,
   showSamPrompt = false,
+  fixedContext = null,
   onConfirm,
   onClose,
 }: Props) {
@@ -68,8 +81,15 @@ export default function MetadataPickerModal({
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    if (fixedContext) {
+      setSelectedBuildingName(fixedContext.building_name);
+      setSelectedBuildingId(fixedContext.building_id ?? null);
+      setSelectedFloorId(fixedContext.floor_id ?? '');
+      setModuleName(fixedContext.module_name ?? initial?.module_name ?? '');
+      return;
+    }
     api.get<Building[]>('/buildings').then(setBuildings).catch(() => {});
-  }, []);
+  }, [fixedContext, initial?.module_name]);
 
   useEffect(() => {
     if (!searchOpen) return;
@@ -89,17 +109,12 @@ export default function MetadataPickerModal({
       setSearchLoading(false);
       return;
     }
-    const KAKAO_KEY = process.env.NEXT_PUBLIC_KAKAO_REST_API_KEY;
-    if (!KAKAO_KEY) return;
     setSearchLoading(true);
     const t = setTimeout(async () => {
       try {
-        const res = await fetch(
-          `https://dapi.kakao.com/v2/local/search/keyword.json?query=${encodeURIComponent(query)}&size=10`,
-          { headers: { Authorization: `KakaoAK ${KAKAO_KEY}` } }
+        const data = await api.get<{ documents: KakaoPlace[] }>(
+          `/kakao/search/keyword?query=${encodeURIComponent(query)}&size=10`
         );
-        if (!res.ok) return;
-        const data = await res.json();
         setSearchResults(data.documents || []);
       } catch {
         setSearchResults([]);
@@ -117,10 +132,12 @@ export default function MetadataPickerModal({
   }, [buildings, selectedBuildingId, selectedBuildingName]);
 
   useEffect(() => {
-    if (!selectedBuildingId) {
+    if (!selectedBuildingId || fixedContext) {
       setMetadataOptions(null);
-      setSelectedFloorId('');
-      setModuleName('');
+      if (!fixedContext) {
+        setSelectedFloorId('');
+        setModuleName('');
+      }
       setOptionsLoading(false);
       return;
     }
@@ -151,12 +168,13 @@ export default function MetadataPickerModal({
     return () => {
       cancelled = true;
     };
-  }, [initial?.floor_number, selectedBuildingId]);
+  }, [fixedContext, initial?.floor_number, selectedBuildingId]);
 
   const selectedFloor: MetadataFloorOption | null =
     metadataOptions?.floors.find(f => f.id === selectedFloorId) ?? null;
 
   useEffect(() => {
+    if (fixedContext) return;
     if (!selectedFloor) {
       setModuleName('');
       return;
@@ -190,20 +208,65 @@ export default function MetadataPickerModal({
 
   const handleConfirm = async () => {
     setError(null);
-    if (!selectedBuildingId || !selectedBuildingName || !selectedFloor || !moduleName.trim()) {
+    const targetBuildingId = fixedContext?.building_id ?? selectedBuildingId;
+    const targetBuildingName = fixedContext?.building_name ?? selectedBuildingName;
+    const targetFloorId = fixedContext?.floor_id ?? selectedFloor?.id;
+    const targetFloorNumber = fixedContext?.floor_number ?? selectedFloor?.floor_number;
+    const effectiveModuleName = fixedContext?.module_name ?? moduleName;
+    if (!targetBuildingName || targetFloorNumber === undefined || !effectiveModuleName.trim()) {
+      setError(fixedContext ? '모듈 이름을 입력하세요.' : '관리자가 등록한 건물, 층, 모듈을 모두 선택하세요.');
+      return;
+    }
+    if (!fixedContext && (!targetBuildingId || !targetFloorId)) {
       setError('관리자가 등록한 건물, 층, 모듈을 모두 선택하세요.');
       return;
     }
     setSubmitting(true);
     try {
-      const moduleId = await findOrCreateModule(selectedFloor.id, moduleName.trim());
+      let resolvedBuildingId = targetBuildingId ?? '';
+      let resolvedFloorId = targetFloorId ?? '';
+      let resolvedFloorNumber = targetFloorNumber;
+      let moduleId = '';
+      const trimmedModuleName = effectiveModuleName.trim();
+
+      if (fixedContext) {
+        const ensured = await api.post<{
+          building_id: string;
+          building_name: string;
+          floor_id: string;
+          floor_number: number;
+          module_id: string | null;
+          module_name: string | null;
+        }>('/buildings/ensure-registration-context', {
+          building_id: fixedContext.building_id,
+          floor_id: fixedContext.floor_id,
+          building_name: fixedContext.building_name,
+          floor_number: fixedContext.floor_number,
+          module_name: trimmedModuleName,
+          kakao_place_id: fixedContext.kakao_place_id,
+          address_name: fixedContext.address_name,
+          road_address_name: fixedContext.road_address_name,
+          latitude: fixedContext.latitude,
+          longitude: fixedContext.longitude,
+        });
+        resolvedBuildingId = ensured.building_id;
+        resolvedFloorId = ensured.floor_id;
+        resolvedFloorNumber = ensured.floor_number;
+        moduleId = ensured.module_id ?? '';
+      } else {
+        moduleId = await findOrCreateModule(targetFloorId as string, trimmedModuleName);
+      }
+
+      if (!resolvedBuildingId || !resolvedFloorId || !moduleId) {
+        throw new Error('등록 컨텍스트를 확정하지 못했습니다.');
+      }
       await onConfirm({
-        building_id: selectedBuildingId,
-        building_name: selectedBuildingName,
-        floor_id: selectedFloor.id,
-        floor_number: selectedFloor.floor_number,
+        building_id: resolvedBuildingId,
+        building_name: targetBuildingName,
+        floor_id: resolvedFloorId,
+        floor_number: resolvedFloorNumber,
         module_id: moduleId,
-        module_name: moduleName.trim(),
+        module_name: trimmedModuleName,
         sam_prompt: showSamPrompt ? samPrompt.trim() : undefined,
       });
     } catch (e: any) {
@@ -222,6 +285,7 @@ export default function MetadataPickerModal({
         </div>
 
         {/* 건물 선택 */}
+        {!fixedContext && (
         <div ref={dropdownRef} className="relative">
           <label className="block text-sm text-gray-400 mb-1">건물</label>
           <button
@@ -283,8 +347,10 @@ export default function MetadataPickerModal({
             </div>
           )}
         </div>
+        )}
 
         {/* 층 / 모듈 */}
+        {!fixedContext && (
         <div className="flex gap-3">
           <div className="flex-1">
             <label className="block text-sm text-gray-400 mb-1">층</label>
@@ -319,6 +385,28 @@ export default function MetadataPickerModal({
             </select>
           </div>
         </div>
+        )}
+        {fixedContext && !fixedContext.module_name && (
+          <div>
+            <label className="block text-sm text-gray-400 mb-1">모듈 이름</label>
+            <input
+              type="text"
+              value={moduleName}
+              onChange={e => setModuleName(e.target.value)}
+              placeholder="모듈 이름"
+              disabled={submitting}
+              className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white text-sm focus:outline-none focus:border-blue-500 disabled:opacity-40"
+            />
+          </div>
+        )}
+        {fixedContext?.module_name && (
+          <div>
+            <label className="block text-sm text-gray-400 mb-1">모듈 이름</label>
+            <div className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white text-sm">
+              {fixedContext.module_name}
+            </div>
+          </div>
+        )}
 
         {showSamPrompt && (
           <div>

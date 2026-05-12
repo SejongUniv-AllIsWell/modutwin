@@ -3176,6 +3176,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
             numSplats={splatDataRef.current.numSplats}
             ceilingY={ceilingY}
             floorY={floorY}
+            basemapMode={options?.basemapMode ?? false}
             initialAngle={wallAngle}
             initialWalls={wallDistances}
             onConfirm={(angleDeg, walls) => {
