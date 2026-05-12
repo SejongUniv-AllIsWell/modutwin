@@ -23,24 +23,21 @@ export interface PriorityCoordinateOverride {
 interface PriorityPlaceConfig {
   campusKeyword: string;
   center: PriorityCoordinate;
-  campusRadiusMeters: number;
-  placeSearchRadiusMeters: number;
   addressSearchRadiusMeters: number;
   coordinateOverrides?: PriorityCoordinateOverride[];
   addressPriority: PriorityPlaceEntry[];
 }
 
 export interface PriorityPlaceScore {
-  priorityIndex: number;
+  isInPriorityList: boolean;
   isCampusPlace: boolean;
   isCampusOnlyName: boolean;
 }
 
 export interface PriorityPlaceCandidate extends PriorityPlaceScore {
+  responseIndex: number;
   distance: number;
 }
-
-const PRIORITY_FALLBACK_INDEX = Number.MAX_SAFE_INTEGER;
 
 export const sejongUniversityPlacePriority = priorityList.sejongUniversity as PriorityPlaceConfig;
 
@@ -50,32 +47,28 @@ const normalizePriorityText = (value: string) => (
     .toLowerCase()
 );
 
-const priorityEntries = sejongUniversityPlacePriority.addressPriority.map((entry, index) => ({
-  index,
-  names: [entry.name, ...(entry.aliases ?? [])]
-    .map(normalizePriorityText)
-    .filter(Boolean),
-}));
+const priorityNameTokens = sejongUniversityPlacePriority.addressPriority
+  .flatMap((entry) => [entry.name, ...(entry.aliases ?? [])])
+  .map(normalizePriorityText)
+  .filter((name) => name.length > 0);
 
-const priorityIndexForPlaceName = (placeName: string) => {
+const matchesPriorityList = (placeName: string) => {
   const normalizedPlaceName = normalizePriorityText(placeName);
-  const matched = priorityEntries.find(({ names }) => (
-    names.some((name) => name.length > 0 && normalizedPlaceName.includes(name))
-  ));
-  return matched?.index ?? PRIORITY_FALLBACK_INDEX;
+  return priorityNameTokens.some((name) => normalizedPlaceName === name);
 };
 
 export const scorePriorityPlaceName = (placeName: string): PriorityPlaceScore => {
   const trimmedPlaceName = placeName.trim();
   return {
-    priorityIndex: priorityIndexForPlaceName(trimmedPlaceName),
+    isInPriorityList: matchesPriorityList(trimmedPlaceName),
     isCampusPlace: trimmedPlaceName.includes(sejongUniversityPlacePriority.campusKeyword),
     isCampusOnlyName: trimmedPlaceName === sejongUniversityPlacePriority.campusKeyword,
   };
 };
 
 export const comparePriorityPlaceCandidates = <T extends PriorityPlaceCandidate>(a: T, b: T) => (
-  a.priorityIndex - b.priorityIndex
+  Number(b.isInPriorityList) - Number(a.isInPriorityList)
+  || a.responseIndex - b.responseIndex
   || Number(b.isCampusPlace) - Number(a.isCampusPlace)
   || Number(a.isCampusOnlyName) - Number(b.isCampusOnlyName)
   || a.distance - b.distance

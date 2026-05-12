@@ -83,6 +83,7 @@ interface Coordinate {
 interface KakaoPlaceCandidate extends PriorityPlaceScore {
   place: KakaoPlaceResult;
   placeName: string;
+  responseIndex: number;
   distance: number;
 }
 
@@ -133,6 +134,11 @@ const loadKakaoMapsSdk = (appKey: string) => {
   return window.__kakaoMapsSdkPromise__;
 };
 
+interface KakaoKeywordSearchResult {
+  documents: KakaoPlaceResult[];
+  isEnd: boolean;
+}
+
 const searchKeywordViaBackend = async (
   {
     query,
@@ -142,9 +148,9 @@ const searchKeywordViaBackend = async (
     page = 1,
     size = 10,
     sort = 'accuracy',
-  }: KakaoKeywordSearchOptions): Promise<KakaoPlaceResult[]> => {
+  }: KakaoKeywordSearchOptions): Promise<KakaoKeywordSearchResult> => {
   const trimmed = query?.trim() ?? '';
-  if (!trimmed) return [];
+  if (!trimmed) return { documents: [], isEnd: true };
   const params = new URLSearchParams({
     query: trimmed,
     page: String(Math.min(Math.max(page, 1), 45)),
@@ -154,8 +160,14 @@ const searchKeywordViaBackend = async (
   if (Number.isFinite(x)) params.set('x', String(x));
   if (Number.isFinite(y)) params.set('y', String(y));
   if (typeof radius === 'number') params.set('radius', String(Math.min(Math.max(radius, 0), 20000)));
-  const result = await api.get<{ documents?: KakaoPlaceResult[] }>(`/kakao/search/keyword?${params.toString()}`);
-  return result.documents ?? [];
+  const result = await api.get<{
+    documents?: KakaoPlaceResult[];
+    meta?: { is_end?: boolean };
+  }>(`/kakao/search/keyword?${params.toString()}`);
+  return {
+    documents: result.documents ?? [],
+    isEnd: Boolean(result.meta?.is_end ?? true),
+  };
 };
 
 const coord2AddressViaBackend = async (x: number, y: number): Promise<KakaoCoord2AddressDocument[]> => {
@@ -171,11 +183,21 @@ const coordinateForBuilding = (building: Building): Coordinate | null => {
   return { lat, lng };
 };
 
-const keywordForAddress = (document: KakaoCoord2AddressDocument | null): string | null => {
+interface AddressQuery {
+  query: string;
+  buildingName: string | null;
+}
+
+const keywordForAddress = (document: KakaoCoord2AddressDocument | null): AddressQuery | null => {
+  const buildingName = document?.road_address?.building_name?.trim();
+  if (buildingName) {
+    return { query: buildingName, buildingName };
+  }
   const roadAddress = document?.road_address?.address_name?.trim();
-  if (roadAddress) return roadAddress;
+  if (roadAddress) return { query: roadAddress, buildingName: null };
   const address = document?.address?.address_name?.trim();
-  return address || null;
+  if (address) return { query: address, buildingName: null };
+  return null;
 };
 
 export default function ExplorePage() {
@@ -193,6 +215,10 @@ export default function ExplorePage() {
   const [buildings, setBuildings] = useState<BuildingWithFloors[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
   const [placeResults, setPlaceResults] = useState<KakaoPlaceResult[]>([]);
+  const [searchPage, setSearchPage] = useState(1);
+  const [searchIsEnd, setSearchIsEnd] = useState(true);
+  const [searchedQuery, setSearchedQuery] = useState('');
+  const [loadingMore, setLoadingMore] = useState(false);
   const [mapLoaded, setMapLoaded] = useState(false);
   const [mapError, setMapError] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
@@ -378,11 +404,16 @@ export default function ExplorePage() {
         y: String(coordinate.lat),
       }, latLng);
 
-      const scorePlaceCandidate = (place: KakaoPlaceResult, latLng: any): KakaoPlaceCandidate => {
+      const scorePlaceCandidate = (
+        place: KakaoPlaceResult,
+        latLng: any,
+        responseIndex: number,
+      ): KakaoPlaceCandidate => {
         const placeName = place.place_name.trim();
         return {
           place,
           placeName,
+          responseIndex,
           distance: distanceMeters(place, latLng),
           ...scorePriorityPlaceName(placeName),
         };
@@ -401,51 +432,41 @@ export default function ExplorePage() {
           .sort((a, b) => a.distance - b.distance)[0]?.override ?? null
       );
 
-      const findNearestSejongUniversityPlace = async (latLng: any): Promise<KakaoPlaceResult | null> => {
-        const campusDistance = distanceFromCoordinate(DEFAULT_MAP_CENTER, latLng);
-        if (campusDistance > sejongUniversityPlacePriority.campusRadiusMeters) return null;
-
-        const places = await searchKeywordViaBackend({
-          query: sejongUniversityPlacePriority.campusKeyword,
-          x: latLng.getLng(),
-          y: latLng.getLat(),
-          radius: sejongUniversityPlacePriority.placeSearchRadiusMeters,
-          sort: 'distance',
-          size: 15,
-        }).catch((): KakaoPlaceResult[] => []);
-
-        return places
-          .map((place) => scorePlaceCandidate(place, latLng))
-          .filter(({ placeName, distance }) => (
-            placeName.includes(sejongUniversityPlacePriority.campusKeyword)
-            && placeName.length >= 2
-            && Number.isFinite(distance)
-            && distance <= sejongUniversityPlacePriority.placeSearchRadiusMeters
-          ))
-          .sort(comparePriorityPlaceCandidates)[0]?.place ?? null;
-      };
-
       const findNearestPlaceByAddress = async (
         address: KakaoCoord2AddressDocument | null,
         latLng: any,
       ): Promise<KakaoPlaceResult | null> => {
-        const query = keywordForAddress(address);
-        if (!query) return null;
-        const places = await searchKeywordViaBackend({
-          query,
-          x: latLng.getLng(),
-          y: latLng.getLat(),
-          radius: sejongUniversityPlacePriority.addressSearchRadiusMeters,
-          sort: 'distance',
-          size: 15,
-        }).catch((): KakaoPlaceResult[] => []);
-        return places
-          .map((place) => scorePlaceCandidate(place, latLng))
-          .filter(({ placeName, distance }) => (
-            placeName.length >= 2
-            && Number.isFinite(distance)
-            && distance <= sejongUniversityPlacePriority.addressSearchRadiusMeters
-          ))
+        const queryInfo = keywordForAddress(address);
+        if (!queryInfo) return null;
+        const { query, buildingName } = queryInfo;
+
+        const collected: KakaoPlaceResult[] = [];
+        const seenIds = new Set<string>();
+        for (let page = 1; page <= 45; page += 1) {
+          const { documents, isEnd } = await searchKeywordViaBackend({
+            query,
+            x: latLng.getLng(),
+            y: latLng.getLat(),
+            radius: sejongUniversityPlacePriority.addressSearchRadiusMeters,
+            sort: 'distance',
+            size: 15,
+            page,
+          }).catch((): KakaoKeywordSearchResult => ({ documents: [], isEnd: true }));
+          for (const place of documents) {
+            if (!seenIds.has(place.id)) {
+              seenIds.add(place.id);
+              collected.push(place);
+            }
+          }
+          if (isEnd || documents.length === 0) break;
+        }
+
+        const filtered = buildingName
+          ? collected.filter((place) => place.place_name.includes(buildingName))
+          : collected;
+
+        return filtered
+          .map((place, index) => scorePlaceCandidate(place, latLng, index))
           .sort(comparePriorityPlaceCandidates)[0]?.place ?? null;
       };
 
@@ -533,11 +554,6 @@ export default function ExplorePage() {
           const registeredBuilding = findRegisteredBuildingAt(latLng);
           if (registeredBuilding) {
             openRegisteredBuilding(registeredBuilding);
-            return;
-          }
-          const sejongPlace = await findNearestSejongUniversityPlace(latLng);
-          if (sejongPlace) {
-            await createBuildingFromPlace(sejongPlace);
             return;
           }
           const addresses = await coord2Address(latLng);
@@ -641,6 +657,9 @@ export default function ExplorePage() {
     const query = searchQuery.trim();
     if (!query) {
       setPlaceResults([]);
+      setSearchedQuery('');
+      setSearchPage(1);
+      setSearchIsEnd(true);
       return;
     }
     const kakao = kakaoRef.current;
@@ -649,14 +668,20 @@ export default function ExplorePage() {
       return;
     }
     try {
-      const result = await searchKeywordViaBackend({ query, size: 10 });
-      if (result.length === 0) {
+      const { documents, isEnd } = await searchKeywordViaBackend({ query, size: 15, page: 1 });
+      if (documents.length === 0) {
         setPlaceResults([]);
+        setSearchedQuery(query);
+        setSearchPage(1);
+        setSearchIsEnd(true);
         showToast('검색 결과가 없습니다.');
         return;
       }
-      setPlaceResults(result);
-      const first = result[0];
+      setPlaceResults(documents);
+      setSearchedQuery(query);
+      setSearchPage(1);
+      setSearchIsEnd(isEnd);
+      const first = documents[0];
       const lat = Number(first.y);
       const lng = Number(first.x);
       if (Number.isFinite(lat) && Number.isFinite(lng)) {
@@ -664,7 +689,40 @@ export default function ExplorePage() {
       }
     } catch (error: any) {
       setPlaceResults([]);
+      setSearchedQuery(query);
+      setSearchPage(1);
+      setSearchIsEnd(true);
       showToast(error?.message || '검색에 실패했습니다.');
+    }
+  };
+
+  const handleLoadMore = async () => {
+    if (loadingMore || searchIsEnd || !searchedQuery) return;
+    const nextPage = searchPage + 1;
+    if (nextPage > 45) {
+      setSearchIsEnd(true);
+      return;
+    }
+    setLoadingMore(true);
+    try {
+      const { documents, isEnd } = await searchKeywordViaBackend({
+        query: searchedQuery,
+        size: 15,
+        page: nextPage,
+      });
+      if (documents.length > 0) {
+        setPlaceResults((prev) => {
+          const existingIds = new Set(prev.map((p) => p.id));
+          const appended = documents.filter((p) => !existingIds.has(p.id));
+          return appended.length > 0 ? [...prev, ...appended] : prev;
+        });
+      }
+      setSearchPage(nextPage);
+      setSearchIsEnd(isEnd || documents.length === 0);
+    } catch (error: any) {
+      showToast(error?.message || '추가 결과를 불러오지 못했습니다.');
+    } finally {
+      setLoadingMore(false);
     }
   };
 
@@ -705,7 +763,13 @@ export default function ExplorePage() {
               className="w-full bg-gray-800 border border-gray-700 rounded-lg pl-9 pr-3 py-2 text-white text-sm focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition"
             />
             {searchQuery && (
-              <button onClick={() => { setSearchQuery(''); setPlaceResults([]); }} className="absolute right-3 text-gray-500 hover:text-gray-300">
+              <button onClick={() => {
+                setSearchQuery('');
+                setPlaceResults([]);
+                setSearchedQuery('');
+                setSearchPage(1);
+                setSearchIsEnd(true);
+              }} className="absolute right-3 text-gray-500 hover:text-gray-300">
                 <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
                 </svg>
@@ -737,6 +801,15 @@ export default function ExplorePage() {
                   </p>
                 </button>
               ))}
+              {!searchIsEnd && (
+                <button
+                  onClick={handleLoadMore}
+                  disabled={loadingMore}
+                  className="w-full px-4 py-3 text-sm text-gray-400 hover:text-white hover:bg-gray-800/70 transition disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {loadingMore ? '불러오는 중...' : '더 보기'}
+                </button>
+              )}
             </div>
           ) : displayBuildings.length === 0 ? (
             <div className="flex flex-col items-center justify-center h-full py-16 text-gray-600">
