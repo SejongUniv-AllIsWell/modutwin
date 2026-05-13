@@ -6,6 +6,7 @@ import tempfile
 from celery_app import app
 from minio_helper import download_file, upload_file
 from redis_helper import update_progress, clear_progress
+from backend_callback import notify_upload_progress
 
 from pipeline.runner import PipelineRunner
 from pipeline.sog_converter import SogConverterModule
@@ -267,11 +268,22 @@ def run_gs_training_from_colmap(self, upload_id: str, user_id: str, zip_minio_ke
             upload_file(sog_path, sog_key)
 
         update_progress(task_id, 100, "완료")
+
+        # 백엔드에 GS 단계 완료 통지 — Upload.status=completed + gsplat_ply_path 저장
+        notify_upload_progress(
+            upload_id, "gsplat", status="completed",
+            ply_key=ply_key, celery_task_id=task_id,
+        )
+
         return {"status": "completed", "upload_id": upload_id, "ply_key": ply_key}
 
     except Exception as e:
         logger.error(f"[Task {task_id}] 실패: {e}")
         update_progress(task_id, -1, f"실패: {str(e)[:200]}")
+        notify_upload_progress(
+            upload_id, "gsplat", status="failed",
+            celery_task_id=task_id, error_message=str(e)[:500],
+        )
         raise
 
     finally:

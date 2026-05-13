@@ -160,6 +160,7 @@ class UploadResponse(BaseModel):
     has_refined: bool = False
     has_doors_json: bool = False
     has_alignment: bool = False
+    has_gsplat_ply: bool = False  # COLMAP→GS 결과 PLY 존재 여부
 
     class Config:
         from_attributes = True

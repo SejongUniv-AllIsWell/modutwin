@@ -58,6 +58,9 @@ class Settings(BaseSettings):
     ENABLE_SAM3: bool = False
     ENABLE_SAM3_DISPATCH: bool | None = None
 
+    # 워커 → 백엔드 콜백 인증 (공유 시크릿). 빈 값이면 콜백 endpoint 가 항상 401.
+    INTERNAL_API_TOKEN: str = ""
+
     @model_validator(mode="after")
     def assemble_urls(self) -> "Settings":
         if not self.DATABASE_URL:

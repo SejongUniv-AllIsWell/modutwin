@@ -148,12 +148,14 @@ export default function UserDashboard({ showHeader = true }: Props) {
                   const canAlign = sam === 'done' || sam === 'failed' || u.has_refined;
                   const stage = progressStage(u);
                   const isColmap = u.ply_target === 'colmap';
-                  const colmapDone = isColmap && u.status === 'completed';
+                  const colmapDone = isColmap && u.status === 'completed' && !!u.has_gsplat_ply;
                   const colmapProcessing = isColmap && u.status === 'processing';
+                  const colmapFailed = isColmap && u.status === 'failed';
+                  const filenameClickable = isViewable(u.original_filename) || colmapDone;
                   return (
                     <tr key={u.id} className="border-b border-gray-800/50">
                       <td className="py-3 pr-4">
-                        {isViewable(u.original_filename) ? (
+                        {filenameClickable ? (
                           <Link
                             href={u.has_refined
                               ? `/viewer?upload_id=${u.id}&mode=align`
@@ -166,9 +168,19 @@ export default function UserDashboard({ showHeader = true }: Props) {
                           <span className="text-gray-300">{u.original_filename}</span>
                         )}
                       </td>
-                      <td className={`py-3 pr-4 ${isColmap ? 'text-emerald-400' : STAGE_COLOR[stage]}`}>
+                      <td className={`py-3 pr-4 ${
+                        isColmap
+                          ? (colmapFailed ? 'text-red-400' : (colmapDone ? STAGE_COLOR['uploaded_only'] : 'text-emerald-400'))
+                          : STAGE_COLOR[stage]
+                      }`}>
                         {isColmap
-                          ? (colmapDone ? 'COLMAP 완료' : colmapProcessing ? 'COLMAP 처리 중' : 'COLMAP 대기')
+                          ? (colmapFailed
+                              ? 'COLMAP 실패'
+                              : colmapDone
+                                ? '업로드 완료'
+                                : colmapProcessing
+                                  ? 'COLMAP 처리 중'
+                                  : 'COLMAP 대기')
                           : STAGE_LABEL[stage]}
                       </td>
                       <td className={`py-3 pr-4 ${sam ? SAM3_COLOR[sam] : 'text-gray-600'}`}>
@@ -178,13 +190,13 @@ export default function UserDashboard({ showHeader = true }: Props) {
                       <td className="py-3 pr-4 text-right">
                         {isColmap ? (
                           <Link
-                            href={`/colmap-viewer?upload_id=${u.id}`}
+                            href={colmapDone ? `/viewer?upload_id=${u.id}` : `/colmap-viewer?upload_id=${u.id}`}
                             className={`inline-block px-3 py-1 rounded text-white text-xs font-bold
                               ${colmapDone
                                 ? 'bg-emerald-600 hover:bg-emerald-500'
                                 : 'bg-gray-700 hover:bg-gray-600'}`}
                           >
-                            {colmapDone ? 'COLMAP 결과 보기' : '처리 중...'}
+                            {colmapDone ? 'PLY 뷰어 열기' : '처리 중...'}
                           </Link>
                         ) : canAlign ? (
                           <Link

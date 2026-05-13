@@ -321,6 +321,7 @@ def _upload_to_response(upload: Upload, has_scene_output: bool = False) -> Uploa
         has_refined=bool(upload.refined_ply_path) or has_scene_output,
         has_doors_json=bool(upload.door_corners_json_path),
         has_alignment=bool(upload.alignment_transform),
+        has_gsplat_ply=bool(upload.gsplat_ply_path),
     )
 
 
@@ -400,11 +401,22 @@ async def get_upload_presigned_url(
     if upload is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="업로드를 찾을 수 없습니다.")
 
+    minio = get_minio_service()
+
+    # COLMAP 업로드는 원본이 ZIP/MP4 이지만 워커가 생성한 결과 PLY 가 있으면 그것을 서빙한다.
+    if upload.ply_target == PlyTarget.colmap:
+        if upload.gsplat_ply_path and minio.object_exists(upload.gsplat_ply_path):
+            url = minio.get_presigned_download_url(upload.gsplat_ply_path)
+            ply_filename = os.path.splitext(upload.original_filename)[0] + ".ply"
+            return {"url": url, "filename": ply_filename, "variant": "gsplat"}
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="아직 결과 PLY 가 준비되지 않았습니다 (학습 진행 중이거나 실패).",
+        )
+
     ext = os.path.splitext(upload.original_filename)[1].lower()
     if ext not in VIEWABLE_EXTENSIONS:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="뷰어를 지원하지 않는 파일 형식입니다.")
-
-    minio = get_minio_service()
 
     # 정제된 PLY 후보 — variant=refined 우선시 + variant=None 일 때 원본 부재 시 fallback 으로도 사용.
     #   1순위: upload.refined_ply_path (SAM3 파이프라인 정식 경로)

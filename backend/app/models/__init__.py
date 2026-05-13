@@ -181,6 +181,9 @@ class Upload(Base):
     status: Mapped[UploadStatus] = mapped_column(Enum(UploadStatus), default=UploadStatus.uploaded, nullable=False)
     uploaded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
+    # COLMAP → 3DGS 파이프라인 결과물 (워커가 생성한 PLY 의 MinIO key)
+    gsplat_ply_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     # SAM3 / 정합 파이프라인 (docs/sam3_alignment_pipeline.md)
     refined_ply_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     door_corners_json_path: Mapped[str | None] = mapped_column(Text, nullable=True)
