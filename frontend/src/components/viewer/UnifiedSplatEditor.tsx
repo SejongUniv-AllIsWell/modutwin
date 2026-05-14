@@ -41,6 +41,9 @@ interface Props {
   initialDisplayName?: string;
   initialMode?: EditorMode;
   initialRegistrationContext?: RegistrationContext | null;
+  /** /upload 페이지에서 blob URL 핸드오프로 들어온 로컬 파일의 원본 크기. register-local 의
+   *  quota 계산을 위해 필요. blob URL 자체로는 size 를 알 수 없다. */
+  initialLocalFileSize?: number;
 }
 
 interface EnsureRegistrationContextResponse {
@@ -58,6 +61,7 @@ export default function UnifiedSplatEditor({
   initialDisplayName,
   initialMode = null,
   initialRegistrationContext = null,
+  initialLocalFileSize = 0,
 }: Props) {
   const router = useRouter();
   const coreRef = useRef<SplatViewerCoreRef>(null);
@@ -74,9 +78,13 @@ export default function UnifiedSplatEditor({
   const [mainVisible, setMainVisible] = useState(true);
 
   // 로컬 파일 → Object URL 추적 (revoke 위해)
-  const localObjectUrlRef = useRef<string | null>(null);
+  const localObjectUrlRef = useRef<string | null>(
+    !initialUploadId && initialSogUrl && initialSogUrl.startsWith('blob:') ? initialSogUrl : null,
+  );
   // 로컬 파일 크기 (문 설정 완료 시 register-local 의 quota 추적용 — 서버 파일이면 미사용)
-  const localFileSizeRef = useRef<number>(0);
+  const localFileSizeRef = useRef<number>(
+    !initialUploadId && initialSogUrl && initialSogUrl.startsWith('blob:') ? (initialLocalFileSize || 0) : 0,
+  );
 
   // ── 현재 작업 메타데이터 (문 설정 완료 시 register-local 결과 또는 정합 진입 시 채워짐) ──
   const [metadata, setMetadata] = useState<MetadataResult | null>(null);
@@ -140,14 +148,73 @@ export default function UnifiedSplatEditor({
   // 추가 레이어 (basemap 등)
   const additional = useAdditionalGsplats(coreRef);
 
+  const ensureRegistrationContext = useCallback(async (moduleName?: string | null) => {
+    const fixed = initialRegistrationContext;
+    if (!fixed) throw new Error('missing registration context');
+    const resolvedModuleName = moduleName === undefined ? fixed.module_name : moduleName ?? undefined;
+    const payload = {
+      building_id: fixed.building_id,
+      floor_id: fixed.floor_id,
+      building_name: fixed.building_name,
+      floor_number: fixed.floor_number,
+      module_name: resolvedModuleName,
+      kakao_place_id: fixed.kakao_place_id,
+      address_name: fixed.address_name,
+      road_address_name: fixed.road_address_name,
+      latitude: fixed.latitude,
+      longitude: fixed.longitude,
+    };
+    return await api.post<EnsureRegistrationContextResponse>(
+      '/buildings/ensure-registration-context',
+      payload,
+    );
+  }, [initialRegistrationContext]);
+
   // ── 메타데이터 입력 모달 흐름 ──
   // - purpose='save': 다듬기 결과 저장 (건물/층/모듈 입력)
   // - purpose='align': 정합 모드 진입 (basemap 위치 지정)
+  // 모듈 추가 진입 (isModulePurpose) 은 빌딩 페이지에서 이미 층/모듈을 확정한 상태이므로
+  // 모달 없이 ensureRegistrationContext + register-local 을 즉시 실행.
   const requestMetadata = useCallback((purpose: 'save' | 'align'): Promise<MetadataResult> => {
+    if (isModulePurpose && initialRegistrationContext?.module_name?.trim()) {
+      return (async () => {
+        const ensured = await ensureRegistrationContext(initialRegistrationContext.module_name);
+        const result: MetadataResult = {
+          building_id: ensured.building_id,
+          building_name: ensured.building_name,
+          floor_id: ensured.floor_id,
+          floor_number: ensured.floor_number,
+          module_id: ensured.module_id ?? '',
+          module_name: ensured.module_name ?? initialRegistrationContext.module_name!.trim(),
+        };
+        if (!result.module_id) throw new Error('module registration failed');
+        metadataRef.current = result;
+        setMetadata(result);
+        let enriched: MetadataResult & { upload_id?: string } = result;
+        if (!uploadId) {
+          const reg = await api.post<{ upload_id: string; minio_path: string }>(
+            '/uploads/register-local',
+            {
+              filename: displayName ?? 'local.ply',
+              building_id: ensured.building_id,
+              floor_id: ensured.floor_id,
+              module_id: result.module_id,
+              file_size: localFileSizeRef.current || 0,
+              content_type: 'application/octet-stream',
+            },
+          );
+          copyRefineState('', reg.upload_id);
+          setUploadId(reg.upload_id);
+          setSource('server');
+          enriched = { ...result, upload_id: reg.upload_id };
+        }
+        return enriched;
+      })();
+    }
     return new Promise((resolve, reject) => {
       setMetadataModal({ purpose, saveResolve: resolve, saveReject: reject });
     });
-  }, []);
+  }, [isModulePurpose, initialRegistrationContext, ensureRegistrationContext, uploadId, displayName]);
 
   const handleMetadataConfirm = useCallback(async (result: MetadataResult) => {
     let enriched: MetadataResult & { upload_id?: string } = result;
@@ -299,25 +366,7 @@ export default function UnifiedSplatEditor({
     }
   }, [mode, lockedStages, uploadId, requestMetadata]);
 
-  // 모듈 측 (자기 자신) 의 첫 도어 (door_1) 4 코너 가져옴. 백그라운드 저장 후엔 서버 doors.json 에 있음.
-  // 백그라운드 저장 직후엔 아직 없을 수 있으니 retry. 정합 단계 진입 직후 호출.
-  const fetchModuleDoorCorners = useCallback(async (id: string) => {
-    setModuleDoorCorners(null);
-    for (let attempt = 0; attempt < 10; attempt++) {
-      try {
-        const doors = await api.get<{ doors: Array<{ id: string; corners: number[][] }> }>(`/uploads/${id}/doors`);
-        const primary = doors.doors.find(d => d.id === 'door_1') ?? doors.doors[0];
-        if (primary && Array.isArray(primary.corners) && primary.corners.length === 4) {
-          setModuleDoorCorners(primary.corners.map(c => [c[0], c[1], c[2]]) as Array<[number, number, number]>);
-          return;
-        }
-      } catch { /* ignore — retry */ }
-      await new Promise(r => setTimeout(r, 500));
-    }
-    console.warn('[align] 모듈 도어 코너 fetch 실패 (10회 재시도 모두 실패)');
-  }, []);
-
-  // basemap fetch + 호수 문 자동 매칭. 모듈 정보 확정 후 정합 진입 시 호출.
+// basemap fetch + 호수 문 자동 매칭. 모듈 정보 확정 후 정합 진입 시 호출.
   // 매칭 실패 시 basemapMatchError 설정 → 정합 버튼 비활성.
   const fetchBasemapAndMatchDoor = useCallback(async (meta: MetadataResult) => {
     setBasemapDoorCorners(null);
@@ -368,7 +417,6 @@ export default function UnifiedSplatEditor({
 
   const refine = useRefineTool(coreRef, {
     active: mode === 'refine',
-    basemapMode: isBasemapPurpose,
     uploadId,
     currentUrl: currentUrl ?? undefined,
     reloadWithUrl,
@@ -586,28 +634,6 @@ export default function UnifiedSplatEditor({
   const handleCollapsePanel = useCallback(() => setPanelHidden(true), []);
   const handleExpandPanel = useCallback(() => setPanelHidden(false), []);
 
-  const ensureRegistrationContext = useCallback(async (moduleName?: string | null) => {
-    const fixed = initialRegistrationContext;
-    if (!fixed) throw new Error('missing registration context');
-    const resolvedModuleName = moduleName === undefined ? fixed.module_name : moduleName ?? undefined;
-    const payload = {
-      building_id: fixed.building_id,
-      floor_id: fixed.floor_id,
-      building_name: fixed.building_name,
-      floor_number: fixed.floor_number,
-      module_name: resolvedModuleName,
-      kakao_place_id: fixed.kakao_place_id,
-      address_name: fixed.address_name,
-      road_address_name: fixed.road_address_name,
-      latitude: fixed.latitude,
-      longitude: fixed.longitude,
-    };
-    return await api.post<EnsureRegistrationContextResponse>(
-      '/buildings/ensure-registration-context',
-      payload,
-    );
-  }, [initialRegistrationContext]);
-
   const alignPanel = mode === 'align' && currentUrl && !uploadId ? (
     <div className="bg-black/70 backdrop-blur-sm border border-white/10 text-gray-300 text-xs rounded-lg shadow-lg p-3 select-none w-72">
       <div className="text-[11px] text-amber-300 bg-amber-900/30 border border-amber-700 rounded px-2 py-1.5 leading-tight">
@@ -758,7 +784,7 @@ export default function UnifiedSplatEditor({
               getCurrentKeepMask={() => refine.getCurrentKeepMask?.() ?? null}
               getBakeRgba={(sid) => refine.getBakeRgba?.(sid) ?? null}
               getCurrentBakedRotation={() => refine.getCurrentBakedRotation?.() ?? { rotX: 0, rotZ: 0, wallAngleRad: 0 }}
-              onSetupSaveDone={async (activeUploadId: string) => {
+              onSetupSaveDone={async (activeUploadId: string, doorCorners) => {
                 // 문 설정 완료 (메모리 직주입 + 백그라운드 저장 + 정합 진입).
                 // - 메모리에 이미 모든 자산 (PLY, wall mesh, doors) 이 있으니 서버 fetch 안 한다.
                 // - useRefinedMeshLoader 우회 + alignmentGroup 으로 reparent.
@@ -773,14 +799,17 @@ export default function UnifiedSplatEditor({
                   coreRef.current?.enterAlignmentMode?.();
                   await handleToggleMode('align', { force: true });
                 }
-                // basemap fetch + 호수 매칭 + 모듈 도어 코너 fetch (백그라운드 저장 끝나면 서버 doors.json 에 있음).
+                // basemap fetch + 호수 매칭. 모듈 도어 코너는 모달이 인자로 전달 (A'+Y 프레임) — 서버 재fetch 안 함.
                 const meta = metadataRef.current;
                 if (meta && !isBasemapPurpose) {
                   void fetchBasemapAndMatchDoor(meta);
                 }
-                // 백그라운드 PLY 업로드 → doors.json PUT 이 끝나야 fetch 가 성공. retry 로 처리.
                 if (!isBasemapPurpose) {
-                  void fetchModuleDoorCorners(activeUploadId);
+                  if (doorCorners && doorCorners.length === 4) {
+                    setModuleDoorCorners(doorCorners.map(c => [c[0], c[1], c[2]] as [number, number, number]));
+                  } else {
+                    setModuleDoorCorners(null);
+                  }
                 } else {
                   await refine.commitRefinedToServer(activeUploadId);
                   await api.post('/basemaps/register', { upload_id: activeUploadId });

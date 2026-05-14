@@ -39,8 +39,13 @@ interface Props {
   onManualPickStart?: () => void;
   /** "문 설정 완료" 가 성공한 후 호출 — 부모가 메타데이터 모달 띄우거나 정합으로 진입할 수 있게.
    *  반환된 promise 가 resolve 되어야 모달이 닫힘 (취소 시 reject 로 닫힘 방지).
-   *  uploadId 인자는 ensureUploadId 가 확정한 값. 부모는 이 값으로 doors fetch 등에 사용. */
-  onSetupSaveDone?: (uploadId: string) => Promise<void> | void;
+   *  uploadId 인자는 ensureUploadId 가 확정한 값.
+   *  doorCorners 는 A'+Y 프레임으로 변환된 4 코너 (서버 doors.json 과 같은 프레임) — 부모가 이걸
+   *  바로 정합 단계에 주입하면 서버에서 doors.json 다시 fetch 할 필요가 없다. basemap mode 면 생략. */
+  onSetupSaveDone?: (
+    uploadId: string,
+    doorCorners?: Array<[number, number, number]> | null,
+  ) => Promise<void> | void;
   /** "문 설정 완료" 누른 직후 호출 — uploadId 가 없으면 부모가 모달 + register-local 처리하고 새 uploadId 반환. */
   ensureUploadId?: () => Promise<string>;
   /** 도어 설정 영속화 직전 호출 — refined PLY + mesh.json + tex_*.png 일괄 업로드.
@@ -2424,8 +2429,14 @@ export default function DoorAlignModal({
                 }
 
                 // 3) 화면 즉시 정합 단계로 전환 — 메모리 자산 그대로 사용.
+                //    doorCorners: 모듈 모드에선 pickedTransformed (A'+Y 프레임) 4 코너를 부모에 전달.
+                //    부모가 이걸 moduleDoorCorners 에 직접 주입하면 서버 doors.json 재fetch 가 필요 없다.
+                //    basemap mode 는 위에서 일찍 return 했으므로 여기 도달 안 함.
+                const cornersForParent = pickedTransformed.every(c => c !== null)
+                  ? (pickedTransformed as PickedCorner[]).map(c => [c.pos[0], c.pos[1], c.pos[2]] as [number, number, number])
+                  : null;
                 if (onSetupSaveDone) {
-                  try { await onSetupSaveDone(activeUploadId); }
+                  try { await onSetupSaveDone(activeUploadId, cornersForParent); }
                   catch { setSaveDoorBusy(false); return; }
                 }
                 setSaveDoorToast('정합 단계로 이동 ✓');

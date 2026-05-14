@@ -140,7 +140,7 @@ export default function FloorDetailPage() {
       module_name: moduleName,
     });
     if (manifest?.floor_id) qs.set('floor_id', manifest.floor_id);
-    router.push(`/viewer?${qs.toString()}`);
+    router.push(`/upload?${qs.toString()}`);
   };
   const renderableModules = useMemo(
     () => moduleRows.filter((module) => module.url && module.is_visible !== false),

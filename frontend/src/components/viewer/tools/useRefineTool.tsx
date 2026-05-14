@@ -1492,16 +1492,42 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         return `refined_${stem}.ply`;
       })();
 
-      // 3.1) PLY 업로드
+      // 3.1) PLY 업로드 (multipart) — Cloudflare 100MB body 한도를 피하려고 청크로 PUT.
       setUploadProgressMessage('파일 업로드 중...');
-      const plyUrl = await api.post<{ put_url: string; key: string }>(
-        '/refine/refined-upload-url',
-        { upload_id: activeUploadId, filename: baseName, session_id: sessionId },
-      );
-      const plyResp = await fetch(plyUrl.put_url, {
-        method: 'PUT', body: bytes, headers: { 'Content-Type': 'application/octet-stream' },
+      const plyInit = await api.post<{
+        key: string;
+        minio_upload_id: string;
+        presigned_urls: string[];
+        part_size: number;
+        part_count: number;
+      }>('/refine/refined-multipart-init', {
+        upload_id: activeUploadId,
+        filename: baseName,
+        file_size: bytes.byteLength,
+        content_type: 'application/octet-stream',
+        session_id: sessionId,
       });
-      if (!plyResp.ok) throw new Error(`PLY PUT failed: ${plyResp.status}`);
+      const plyParts: { part_number: number; etag: string }[] = [];
+      const plyView = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+      for (let i = 0; i < plyInit.presigned_urls.length; i++) {
+        const start = i * plyInit.part_size;
+        const end = Math.min(start + plyInit.part_size, plyView.byteLength);
+        const chunk = plyView.subarray(start, end);
+        const partResp = await fetch(plyInit.presigned_urls[i], { method: 'PUT', body: chunk });
+        if (!partResp.ok) throw new Error(`PLY part ${i + 1} PUT failed: ${partResp.status}`);
+        const etag = partResp.headers.get('etag')?.replace(/"/g, '') ?? '';
+        plyParts.push({ part_number: i + 1, etag });
+        setUploadProgressMessage(`파일 업로드 중... ${i + 1}/${plyInit.presigned_urls.length}`);
+      }
+      const plyUrl = await api.post<{ key: string; get_url: string }>(
+        '/refine/refined-multipart-complete',
+        {
+          upload_id: activeUploadId,
+          key: plyInit.key,
+          minio_upload_id: plyInit.minio_upload_id,
+          parts: plyParts,
+        },
+      );
 
       // 3.2) Wall mesh + 텍스처 영속화 (베이크된 면이 있을 때만)
       const meshSurfaces: Array<{
@@ -3160,7 +3186,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
             numSplats={splatDataRef.current.numSplats}
             ceilingY={ceilingY}
             floorY={floorY}
-            basemapMode={options?.basemapMode ?? false}
+            basemapMode={true}
             initialAngle={wallAngle}
             initialWalls={wallDistances}
             onConfirm={(angleDeg, walls) => {
