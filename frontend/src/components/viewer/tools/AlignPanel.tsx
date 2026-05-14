@@ -278,33 +278,35 @@ export default function AlignPanel({
         dst[i*3] = -t[0]; dst[i*3+1] = -t[1]; dst[i*3+2] = t[2];
       }
 
-      // dst basis 의 n 을 basemap normalInward 기반으로 강제 → cornerpick winding 무관 deterministic.
-      //   normalInward (baked = A'+Y) → world Z-180 적용: (-x, -y, z). outward = -inward.
-      let dstOutwardWorld: [number, number, number] | undefined;
+      // dst basis 의 n 을 강제 — MIRROR_MAP 적용된 dst 의 자연 cross-product 방향과 일치시켜야 R 이 올바름.
+      //   두 사용자가 반대 방향에서 픽 (basemap user 는 corridor 안에서, module user 는 room 안에서) → 두 cross-product 가 world 에서
+      //   같은 방향 (각자의 outward = 상대방 interior 향함). mirror 적용 후 dst 의 cross 는 그 반대 = basemap_inward.
+      //   normalInward (baked = A'+Y) → world Z-180 적용: (-x, -y, z).
+      let dstForcedN: [number, number, number] | undefined;
       if (basemapTargetDoorNormalInward) {
         const ni = basemapTargetDoorNormalInward;
-        // inward_world = (-ni.x, -ni.y, ni.z) → outward_world = (ni.x, ni.y, -ni.z).
-        dstOutwardWorld = [ni[0], ni[1], -ni[2]];
+        dstForcedN = [-ni[0], -ni[1], ni[2]];  // basemap_inward in world
       }
       // gap 적용 전 fit 으로 R, dst plane normal 산출.
-      const preFit = rectFit(src, dst, dstOutwardWorld ? { dstOutwardWorld } : {});
+      const preFit = rectFit(src, dst, dstForcedN ? { dstForcedN } : {});
 
       // doorHeight 계산 — dst 의 e2 길이 = corner[2] - corner[1] 의 magnitude.
       const dh_x = dst[6] - dst[3], dh_y = dst[7] - dst[4], dh_z = dst[8] - dst[5];
       const doorHeight = Math.hypot(dh_x, dh_y, dh_z);
       const gap = Math.max(DOOR_GAP_MIN, doorHeight * DOOR_GAP_RATIO);
 
-      // dst 를 outward 방향으로 gap 만큼 push → module 이 basemap 바깥쪽 (= basemap room 의 outward) 으로 위치.
-      const pushN = preFit.dstN;
+      // gap push 방향 = basemap_outward = -dstN (dstN 은 basemap_inward 로 강제됨).
+      //   module 이 basemap 방 바깥쪽 (= module room 안쪽) 으로 gap 만큼 떨어진 위치에 도달.
+      const pushN: [number, number, number] = [-preFit.dstN[0], -preFit.dstN[1], -preFit.dstN[2]];
       for (let i = 0; i < 4; i++) {
         dst[i*3]   += pushN[0] * gap;
         dst[i*3+1] += pushN[1] * gap;
         dst[i*3+2] += pushN[2] * gap;
       }
-      const fit = rectFit(src, dst, dstOutwardWorld ? { dstOutwardWorld } : {});
+      const fit = rectFit(src, dst, dstForcedN ? { dstForcedN } : {});
       setRmsd(fit.rmsd);
       console.log(`[Align] RMSD=${fit.rmsd.toFixed(4)}m, gap=${gap.toFixed(3)}m, doorH=${doorHeight.toFixed(2)}m, ` +
-        `outwardSource=${dstOutwardWorld ? 'normalInward' : 'cross-product'}`);
+        `nSource=${dstForcedN ? 'normalInward' : 'cross-product'}`);
       if (DEBUG_ALIGN) {
         console.log('  alignmentGroup children:', Array.from(group.children ?? []).map((c: any) => c.name));
         for (let i = 0; i < 4; i++) {
