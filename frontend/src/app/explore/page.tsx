@@ -469,6 +469,9 @@ export default function ExplorePage() {
 
         return filtered
           .map((place, index) => scorePlaceCandidate(place, latLng, index))
+          // 캠퍼스 키워드 자체 ("세종대학교" 등) 만 매칭된 plain 항목은 건물 후보에서 제외 —
+          // 구체적인 건물명 (예: "세종대학교 광개토관") 만 의미 있음.
+          .filter(({ isCampusOnlyName }) => !isCampusOnlyName)
           .sort(comparePriorityPlaceCandidates)[0]?.place ?? null;
       };
 

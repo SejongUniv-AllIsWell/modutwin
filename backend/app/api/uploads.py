@@ -892,12 +892,33 @@ async def get_sam3_status(
 
 # ── doors.json: SAM3 결과 + 사용자 보정 ─────────────────────────────────────
 
+class DoorMeshMeta(BaseModel):
+    """도어 quad mesh 의 영속화 메타 — wall 텍스처에서 도어 영역을 잘라낸 별도 PNG + corners.
+
+    basemap 재로드 시 wall mesh quad entity 재생성에 필요한 정보 전부 포함.
+    """
+    corners: list[list[float]]  # 4 × [x, y, z] — A'+Y 프레임 mesh 코너
+    uvs: list[list[float]]      # 4 × [u, v]   — 텍스처 매핑
+    normalInward: list[float]   # [x, y, z]    — 방 안쪽 normal
+    textureFilename: str        # MinIO 키: "tex_door_<doorId>.png"
+    textureWidth: int
+    textureHeight: int
+
+
+class DoorSplatMeta(BaseModel):
+    """도어 영역 가우시안 splat PLY 의 영속화 메타 (boundary split sub + doorOrig)."""
+    filename: str               # MinIO 키: "door_<doorId>.ply"
+
+
 class DoorEntry(BaseModel):
     """doors.json 의 한 문 엔트리.
 
-    corners 외 나머지 메타 (회전축/회전각/회전방향/벽 surfaceId/두께/분할 옵션 등) 는
+    corners 외 나머지 메타 (회전축/회전각/방향/벽 surfaceId/두께/분할 옵션 등) 는
     문 설정 단계에서 사용자가 확정한 값. 정합·재진입·basemap 매칭 시 모두 활용되므로
     스키마에 명시해 라운드트립 시 손실되지 않게 한다.
+
+    선택 자산 `doorMesh` / `doorSplat`: basemap 의 경우 도어별 텍스처/가우시안을 별도
+    파일로 영속화하면 로드 시 그대로 재생성 가능. 없으면 corners 만으로 정합 매칭 등에 사용.
     """
     id: str
     corners: list[list[float]]  # 4 × [x, y, z]
@@ -908,10 +929,11 @@ class DoorEntry(BaseModel):
     doorThickness: float | None = None
     boundarySplitEnabled: bool | None = None
     safetyMargin: float | None = None
-    # basemap 등록 시 admin 이 각 문에 입력하는 호수 (예: "302호").
-    # 정합 단계에서 모듈의 호수 (Module.name) 와 매칭해 basemap 의 어느 문에 정합할지 결정.
-    # 모듈측 doors.json 에서는 보통 비어있음 (모듈은 단일 호라 호수 = Module.name 으로 자명).
+    # basemap 등록 시 각 문에 부여하는 호수 (예: "302호"). 정합 단계에서 모듈의
+    # 호수 (Module.name) 와 매칭해 basemap 의 어느 문에 정합할지 결정. 모듈측에서는 비어있음.
     unitName: str | None = None
+    doorMesh: DoorMeshMeta | None = None
+    doorSplat: DoorSplatMeta | None = None
 
 
 class DoorsJson(BaseModel):
@@ -955,7 +977,7 @@ async def get_doors(
                 for c in corners
             )
             if not ok: continue
-            entry = DoorEntry(
+            entry_kwargs = dict(
                 id=str(d.get("id") or f"door_{len(clean)+1}"),
                 corners=corners,
                 hingeEdge=d.get("hingeEdge") if isinstance(d.get("hingeEdge"), int) else None,
@@ -967,7 +989,16 @@ async def get_doors(
                 safetyMargin=d.get("safetyMargin") if isinstance(d.get("safetyMargin"), (int, float)) else None,
                 unitName=d.get("unitName") if isinstance(d.get("unitName"), str) else None,
             )
-            clean.append(entry)
+            # doorMesh / doorSplat — 옵션. Pydantic 가 형식 검증; 실패 시 그냥 패스 (corners 만으로 사용 가능).
+            dm = d.get("doorMesh")
+            if isinstance(dm, dict):
+                try: entry_kwargs["doorMesh"] = DoorMeshMeta(**dm)
+                except Exception: pass
+            ds = d.get("doorSplat")
+            if isinstance(ds, dict):
+                try: entry_kwargs["doorSplat"] = DoorSplatMeta(**ds)
+                except Exception: pass
+            clean.append(DoorEntry(**entry_kwargs))
         return DoorsJson(doors=clean)
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"doors.json 파싱 실패: {e}")

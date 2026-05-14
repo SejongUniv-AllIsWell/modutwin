@@ -1,4 +1,6 @@
-# CLAUDE.md — 3DGS Digital Twin Platform
+# CLAUDE.md (LEGACY / OUT-OF-DATE) — 3DGS Digital Twin Platform
+
+> ⚠️ 이 파일은 historic 사본. 현재 정본은 루트의 `CLAUDE.md`.
 
 ## Overview
 

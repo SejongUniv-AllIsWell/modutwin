@@ -1,10 +1,10 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useParams, useRouter, useSearchParams } from 'next/navigation';
 import { api } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
-import type { Floor, FloorOverviewManifest, FloorOverviewManifestEntry } from '@/types';
+import type { FloorOverviewManifest, FloorOverviewManifestEntry } from '@/types';
 
 const floorLabel = (n: number) => (n >= 0 ? `F${n}` : `B${Math.abs(n)}`);
 
@@ -19,17 +19,13 @@ export default function BuildingOverviewPage() {
   const [manifest, setManifest] = useState<FloorOverviewManifest | null>(null);
   const [hoveredFloorId, setHoveredFloorId] = useState<string | null>(null);
   const [brokenImageByFloorId, setBrokenImageByFloorId] = useState<Record<string, boolean>>({});
-
-  // "+ 등록" — 층 추가 모달
-  const [addFloorOpen, setAddFloorOpen] = useState(false);
-  const [addFloorValue, setAddFloorValue] = useState('');
-  const [addFloorError, setAddFloorError] = useState<string | null>(null);
-  const [addFloorBusy, setAddFloorBusy] = useState(false);
-
-  // 층 + → basemap 등록 모달 (이름 입력)
-  const [basemapTarget, setBasemapTarget] = useState<FloorOverviewManifestEntry | null>(null);
-  const [basemapNameValue, setBasemapNameValue] = useState('');
-  const [basemapNameError, setBasemapNameError] = useState<string | null>(null);
+  const [openFloorMenuId, setOpenFloorMenuId] = useState<string | null>(null);
+  const [addMenuOpen, setAddMenuOpen] = useState(false);
+  const [registerPurpose, setRegisterPurpose] = useState<'basemap' | 'module' | null>(null);
+  const [registerFloor, setRegisterFloor] = useState<FloorOverviewManifestEntry | null>(null);
+  const [floorInputValue, setFloorInputValue] = useState('');
+  const [nameInputValue, setNameInputValue] = useState('');
+  const [floorInputError, setFloorInputError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!loading && !user) {
@@ -37,7 +33,7 @@ export default function BuildingOverviewPage() {
     }
   }, [user, loading, router]);
 
-  useEffect(() => {
+  const loadOverview = useCallback(() => {
     if (!buildingId) return;
     if (isPendingBuilding) {
       const pendingName = searchParams.get('building_name')?.trim() || 'Pending Building';
@@ -54,6 +50,8 @@ export default function BuildingOverviewPage() {
       setManifest(null);
     });
   }, [buildingId, isPendingBuilding, searchParams]);
+
+  useEffect(() => { loadOverview(); }, [loadOverview]);
 
   const floors = useMemo(
     () => [...(manifest?.floors ?? [])].sort((a, b) => b.floor_number - a.floor_number),
@@ -74,116 +72,72 @@ export default function BuildingOverviewPage() {
     return parsed;
   };
 
-  const openAddFloor = () => {
-    setAddFloorOpen(true);
-    setAddFloorValue('');
-    setAddFloorError(null);
+  const ensureFloor = async (floorNumber: number): Promise<{ id?: string; floor_number: number }> => {
+    const existing = floors.find((f) => f.floor_number === floorNumber);
+    if (existing) return { id: existing.floor_id, floor_number: existing.floor_number };
+    return { floor_number: floorNumber };
   };
 
-  const closeAddFloor = () => {
-    if (addFloorBusy) return;
-    setAddFloorOpen(false);
-    setAddFloorValue('');
-    setAddFloorError(null);
+  const closeRegisterModal = () => {
+    setRegisterPurpose(null);
+    setRegisterFloor(null);
+    setFloorInputValue('');
+    setNameInputValue('');
+    setFloorInputError(null);
   };
 
-  const handleAddFloor = async () => {
-    const floorNumber = parseFloorNumber(addFloorValue);
+  const openRegisterModal = (purpose: 'basemap' | 'module', floor?: FloorOverviewManifestEntry) => {
+    setAddMenuOpen(false);
+    setOpenFloorMenuId(null);
+    setRegisterPurpose(purpose);
+    setRegisterFloor(floor ?? null);
+    setFloorInputValue(floor ? floorLabel(floor.floor_number) : '');
+    setNameInputValue('');
+    setFloorInputError(null);
+  };
+
+  const handleRegisterFromPlus = async () => {
+    if (!registerPurpose) return;
+    const floorNumber = registerFloor?.floor_number ?? parseFloorNumber(floorInputValue);
     if (floorNumber === null) {
-      setAddFloorError('유효한 층 번호를 입력하세요. 예: 1, -1, B1');
+      setFloorInputError('유효한 층 번호를 입력하세요. 예: 1, -1, B1');
       return;
     }
-    if (floors.some((f) => f.floor_number === floorNumber)) {
-      setAddFloorError('이미 존재하는 층입니다.');
+    // basemap 등록은 호수별로 도어 unitName 부여 — basemap 전체 이름 입력 불필요. 빈 문자열로 진행.
+    const registrationName = registerPurpose === 'basemap' ? '' : nameInputValue.trim();
+    if (registerPurpose !== 'basemap' && !registrationName) {
+      setFloorInputError('모듈 이름을 입력하세요.');
       return;
     }
-    setAddFloorBusy(true);
     try {
+      const floor = registerFloor
+        ? { id: registerFloor.floor_id, floor_number: registerFloor.floor_number }
+        : await ensureFloor(floorNumber);
+      const qs = new URLSearchParams({
+        purpose: registerPurpose,
+        building_name: manifest?.building_name ?? 'Building',
+        floor_number: String(floor.floor_number),
+        module_name: registrationName,
+      });
+      if (!isPendingBuilding) qs.set('building_id', buildingId);
+      if (floor.id) qs.set('floor_id', floor.id);
       if (isPendingBuilding) {
-        // 건물 자체가 아직 서버에 없음 — 로컬 manifest 에만 임시 entry 를 추가.
-        // 실제 floor 레코드는 basemap 등록 흐름의 register-local-basemap 에서 생성됨.
-        setManifest((prev) => prev && ({
-          ...prev,
-          floors: [
-            ...prev.floors,
-            {
-              floor_id: `pending-${floorNumber}`,
-              floor_number: floorNumber,
-              overview_dirty: false,
-              overview_version: null,
-              topdown_url: null,
-              meta_url: null,
-              module_count: 0,
-              has_active_basemap: false,
-            },
-          ],
-        }));
-      } else {
-        const created = await api.post<Floor>(`/buildings/${buildingId}/floors`, {
-          floor_number: floorNumber,
-        });
-        if (user?.role === 'admin') {
-          try { await api.put(`/admin/floors/${created.id}/confirm`); } catch { /* 확정 실패 무시 */ }
-        }
-        // manifest 재요청 — 새 층 entry 포함.
-        const refreshed = await api.get<FloorOverviewManifest>(
-          `/buildings/${buildingId}/floor-overview`,
-        );
-        setManifest(refreshed);
+        const placeId = searchParams.get('place_id');
+        const addressName = searchParams.get('address_name');
+        const roadAddressName = searchParams.get('road_address_name');
+        const lat = searchParams.get('lat');
+        const lng = searchParams.get('lng');
+        if (placeId) qs.set('place_id', placeId);
+        if (addressName) qs.set('address_name', addressName);
+        if (roadAddressName) qs.set('road_address_name', roadAddressName);
+        if (lat) qs.set('lat', lat);
+        if (lng) qs.set('lng', lng);
       }
-      setAddFloorOpen(false);
-      setAddFloorValue('');
-      setAddFloorError(null);
-    } catch (e: any) {
-      setAddFloorError(e?.message || '층 추가에 실패했습니다.');
-    } finally {
-      setAddFloorBusy(false);
+      closeRegisterModal();
+      router.push(`/viewer?${qs.toString()}`);
+    } catch (error: any) {
+      window.alert(error?.message || '뷰어 이동에 실패했습니다.');
     }
-  };
-
-  const openBasemapRegister = (floor: FloorOverviewManifestEntry) => {
-    setBasemapTarget(floor);
-    setBasemapNameValue('');
-    setBasemapNameError(null);
-  };
-
-  const closeBasemapRegister = () => {
-    setBasemapTarget(null);
-    setBasemapNameValue('');
-    setBasemapNameError(null);
-  };
-
-  const handleBasemapRegister = () => {
-    if (!basemapTarget) return;
-    const registrationName = basemapNameValue.trim();
-    if (!registrationName) {
-      setBasemapNameError('저장할 이름을 입력하세요.');
-      return;
-    }
-    const qs = new URLSearchParams({
-      purpose: 'basemap',
-      building_name: manifest?.building_name ?? 'Building',
-      floor_number: String(basemapTarget.floor_number),
-      module_name: registrationName,
-    });
-    if (!isPendingBuilding) qs.set('building_id', buildingId);
-    if (basemapTarget.floor_id && !basemapTarget.floor_id.startsWith('pending-')) {
-      qs.set('floor_id', basemapTarget.floor_id);
-    }
-    if (isPendingBuilding) {
-      const placeId = searchParams.get('place_id');
-      const addressName = searchParams.get('address_name');
-      const roadAddressName = searchParams.get('road_address_name');
-      const lat = searchParams.get('lat');
-      const lng = searchParams.get('lng');
-      if (placeId) qs.set('place_id', placeId);
-      if (addressName) qs.set('address_name', addressName);
-      if (roadAddressName) qs.set('road_address_name', roadAddressName);
-      if (lat) qs.set('lat', lat);
-      if (lng) qs.set('lng', lng);
-    }
-    closeBasemapRegister();
-    router.push(`/upload?${qs.toString()}`);
   };
 
   if (loading) return null;
@@ -213,36 +167,91 @@ export default function BuildingOverviewPage() {
                 >
                   {floorLabel(floor.floor_number)}
                 </button>
-                {!floor.has_active_basemap ? (
+                <div className="relative">
                   <button
                     type="button"
-                    onClick={() => openBasemapRegister(floor)}
+                    onClick={() => setOpenFloorMenuId((prev) => (prev === floor.floor_id ? null : floor.floor_id))}
                     className="w-7 h-7 flex items-center justify-center rounded hover:bg-gray-800 text-gray-400 hover:text-white"
-                    aria-label="basemap 등록"
-                    title="basemap 등록"
                   >
-                    +
+                    ⋮
                   </button>
-                ) : (
-                  <span
-                    className="w-7 h-7 flex items-center justify-center text-gray-500"
-                    title="basemap 등록됨"
-                  >
-                    ✓
-                  </span>
-                )}
+                  {openFloorMenuId === floor.floor_id && (
+                    <div className="absolute right-0 top-8 z-10 w-28 rounded border border-gray-700 bg-gray-900 shadow-lg p-1">
+                      {!floor.has_active_basemap && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            openRegisterModal('basemap', floor);
+                          }}
+                          className="w-full text-left text-xs px-2 py-1.5 rounded hover:bg-gray-800"
+                        >
+                          basemap 등록
+                        </button>
+                      )}
+                      {floor.has_active_basemap && (
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            setOpenFloorMenuId(null);
+                            const ok = window.confirm(
+                              `${floorLabel(floor.floor_number)} 의 활성 basemap 을 삭제하시겠습니까?\n` +
+                              `해당 basemap 의 PLY/메시/도어 자산이 모두 사라지며, 이 층의 기존 정합된 모듈들은 부모 베이스맵을 잃습니다.`
+                            );
+                            if (!ok) return;
+                            try {
+                              const active = await api.get<{ basemap_id: string }>(
+                                `/basemaps/active?floor_id=${floor.floor_id}`,
+                              );
+                              await api.delete(`/admin/basemaps/${active.basemap_id}`);
+                              await loadOverview();
+                            } catch (err: any) {
+                              window.alert(`basemap 삭제 실패: ${err?.message ?? err}`);
+                            }
+                          }}
+                          className="w-full text-left text-xs px-2 py-1.5 rounded text-red-400 hover:bg-red-500/15"
+                        >
+                          basemap 삭제
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </div>
               </div>
             </div>
           ))}
 
-          <button
-            type="button"
-            disabled={!isPendingBuilding && user?.role !== 'admin' && manifest?.building_is_confirmed}
-            onClick={openAddFloor}
-            className="w-full rounded border border-gray-700 px-3 py-2 text-sm text-left hover:border-blue-500 disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            + 등록
-          </button>
+          <div className="space-y-2">
+            <button
+              type="button"
+              disabled={manifest?.building_is_confirmed}
+              onClick={() => setAddMenuOpen((prev) => !prev)}
+              className="w-full rounded border border-gray-700 px-3 py-2 text-sm text-left hover:border-blue-500 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              + 등록
+            </button>
+            {addMenuOpen && !manifest?.building_is_confirmed && (
+              <div className="rounded border border-gray-700 bg-gray-900 p-1 space-y-1">
+                <button
+                  type="button"
+                  onClick={() => {
+                    openRegisterModal('basemap');
+                  }}
+                  className="w-full text-left text-xs px-2 py-1.5 rounded hover:bg-gray-800"
+                >
+                  basemap 등록
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    openRegisterModal('module');
+                  }}
+                  className="w-full text-left text-xs px-2 py-1.5 rounded hover:bg-gray-800"
+                >
+                  module 등록
+                </button>
+              </div>
+            )}
+          </div>
         </div>
       </aside>
 
@@ -275,84 +284,61 @@ export default function BuildingOverviewPage() {
         </div>
       </main>
 
-      {addFloorOpen && (
+      {registerPurpose && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4">
           <div className="w-full max-w-sm rounded-md border border-gray-700 bg-gray-900 p-4 shadow-xl">
-            <h2 className="text-sm font-semibold">층 추가</h2>
-            <p className="mt-1 text-xs text-gray-400">층은 예: 1, -1, B1 형식으로 입력하세요.</p>
-            <input
-              type="text"
-              value={addFloorValue}
-              onChange={(e) => {
-                setAddFloorValue(e.target.value);
-                if (addFloorError) setAddFloorError(null);
-              }}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') handleAddFloor();
-                if (e.key === 'Escape') closeAddFloor();
-              }}
-              autoFocus
-              disabled={addFloorBusy}
-              className="mt-3 w-full rounded border border-gray-700 bg-gray-950 px-3 py-2 text-sm text-gray-100 outline-none focus:border-blue-500 disabled:opacity-50"
-              placeholder="층 번호"
-            />
-            {addFloorError && <p className="mt-2 text-xs text-red-400">{addFloorError}</p>}
-            <div className="mt-4 flex items-center justify-end gap-2">
-              <button
-                type="button"
-                onClick={closeAddFloor}
-                disabled={addFloorBusy}
-                className="rounded border border-gray-700 px-3 py-1.5 text-xs hover:bg-gray-800 disabled:opacity-50"
-              >
-                취소
-              </button>
-              <button
-                type="button"
-                onClick={handleAddFloor}
-                disabled={addFloorBusy}
-                className="rounded bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-500 disabled:bg-gray-700"
-              >
-                {addFloorBusy ? '추가 중...' : '확인'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {basemapTarget && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4">
-          <div className="w-full max-w-sm rounded-md border border-gray-700 bg-gray-900 p-4 shadow-xl">
-            <h2 className="text-sm font-semibold">Basemap 등록 정보</h2>
+            <h2 className="text-sm font-semibold">
+              {registerPurpose === 'basemap' ? 'Basemap 등록 정보' : 'Module 등록 정보'}
+            </h2>
             <p className="mt-1 text-xs text-gray-400">
-              {floorLabel(basemapTarget.floor_number)}에 등록합니다.
+              {registerFloor ? `${floorLabel(registerFloor.floor_number)}에 등록합니다.` : '층은 예: 1, -1, B1 형식으로 입력하세요.'}
             </p>
             <input
               type="text"
-              value={basemapNameValue}
+              value={floorInputValue}
               onChange={(e) => {
-                setBasemapNameValue(e.target.value);
-                if (basemapNameError) setBasemapNameError(null);
+                setFloorInputValue(e.target.value);
+                if (floorInputError) setFloorInputError(null);
               }}
               onKeyDown={(e) => {
-                if (e.key === 'Enter') handleBasemapRegister();
-                if (e.key === 'Escape') closeBasemapRegister();
+                if (e.key === 'Enter') handleRegisterFromPlus();
+                if (e.key === 'Escape') closeRegisterModal();
               }}
-              autoFocus
-              className="mt-3 w-full rounded border border-gray-700 bg-gray-950 px-3 py-2 text-sm text-gray-100 outline-none focus:border-blue-500"
-              placeholder="저장할 이름"
+              autoFocus={!registerFloor}
+              disabled={!!registerFloor}
+              className="mt-3 w-full rounded border border-gray-700 bg-gray-950 px-3 py-2 text-sm text-gray-100 outline-none focus:border-blue-500 disabled:opacity-50"
+              placeholder="층 번호"
             />
-            {basemapNameError && <p className="mt-2 text-xs text-red-400">{basemapNameError}</p>}
+            {/* basemap 등록은 호수별로 도어에 unitName 부여 — basemap 전체 이름 입력 불필요. */}
+            {registerPurpose !== 'basemap' && (
+              <input
+                type="text"
+                value={nameInputValue}
+                onChange={(e) => {
+                  setNameInputValue(e.target.value);
+                  if (floorInputError) setFloorInputError(null);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') handleRegisterFromPlus();
+                  if (e.key === 'Escape') closeRegisterModal();
+                }}
+                autoFocus={!!registerFloor}
+                className="mt-2 w-full rounded border border-gray-700 bg-gray-950 px-3 py-2 text-sm text-gray-100 outline-none focus:border-blue-500"
+                placeholder="모듈 이름"
+              />
+            )}
+            {floorInputError && <p className="mt-2 text-xs text-red-400">{floorInputError}</p>}
             <div className="mt-4 flex items-center justify-end gap-2">
               <button
                 type="button"
-                onClick={closeBasemapRegister}
+                onClick={closeRegisterModal}
                 className="rounded border border-gray-700 px-3 py-1.5 text-xs hover:bg-gray-800"
               >
                 취소
               </button>
               <button
                 type="button"
-                onClick={handleBasemapRegister}
+                onClick={handleRegisterFromPlus}
                 className="rounded bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-500"
               >
                 확인

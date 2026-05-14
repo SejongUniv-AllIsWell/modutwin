@@ -1,10 +1,15 @@
 # SAM3 Door Detection and Callback Plan
 
-Last updated: 2026-05-05
-Status: feature flag OFF by default; real worker/callback not implemented
+Last updated: 2026-05-13
+Status:
+- **Module registration flow (new, since 2026-05-13)**: synchronous via
+  `POST /uploads/sam3/detect-temp`. No Celery, no callback, no MinIO writes for
+  the source PLY. PLY pre-uploaded to `/var/lib/sam3-temp` at file pick.
+- **Basemap registration flow (legacy)**: still uses the Celery/dispatch pipeline
+  described below. Feature flag `ENABLE_SAM3` gates dispatch.
 
-This is the canonical SAM3 document. It replaces the older separate alignment
-pipeline, GPU worker notes, and refine-save service notes.
+This document describes the legacy dispatch pipeline. For module-registration
+specifics see `CLAUDE.md` 의 모듈 등록 흐름 + `backend/app/api/module_register.py`.
 
 ## Current Runtime State
 

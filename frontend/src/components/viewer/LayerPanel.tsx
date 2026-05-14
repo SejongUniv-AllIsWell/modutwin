@@ -126,7 +126,7 @@ export default function LayerPanel({
         </svg>
         <span className="text-xs font-semibold text-gray-200">레이어</span>
         <span className="ml-auto text-[10px] text-gray-500">
-          {(main ? 1 : 0) + additional.length}
+          {(main ? 1 : 0) + additional.filter(it => !it.meta?.hiddenInPanel).length}
         </span>
       </div>
       <div className="p-1.5 max-h-[60vh] overflow-y-auto">
@@ -146,7 +146,7 @@ export default function LayerPanel({
             onRemove={onMainRemove}
           />
         )}
-        {additional.map(item => {
+        {additional.filter(it => !it.meta?.hiddenInPanel).map(item => {
           const selectable = item.source !== 'basemap' && !!onAdditionalSelect && item.loaded && !item.error;
           return (
             <LayerRow

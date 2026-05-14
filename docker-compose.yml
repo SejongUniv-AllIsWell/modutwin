@@ -42,6 +42,8 @@ services:
     volumes:
       - ./core:/app/core:ro
       - ./utilities:/app/utilities:ro
+      # 모듈 신흐름 — SAM3 자동 문 검출용 임시 PLY 저장소 (30분 TTL, 자동 청소).
+      - sam3-temp:/var/lib/sam3-temp
     env_file: .env
     environment:
       - POSTGRES_HOST=postgres
@@ -213,6 +215,7 @@ volumes:
   redisdata:
   rabbitmqdata:
   miniodata:
+  sam3-temp:
 
 
 networks:

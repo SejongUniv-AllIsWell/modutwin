@@ -130,9 +130,12 @@ must log in again after a fresh `refactored_modutwin_pgdata` volume is created.
 
 ### Upload / Register Local
 
-- Multipart upload uses MinIO presigned URLs.
-- Local file flow can create an upload row through `/api/uploads/register-local`
-  before refined assets are uploaded.
+- Multipart upload uses MinIO presigned URLs (basemap flow).
+- Basemap flow: local file creates an upload row through `/api/uploads/register-local-basemap`
+  at 문 설정 완료 prior to MinIO writes.
+- Module flow (new, since 2026-05-13): no `register-local` call at all. PLY is pre-uploaded
+  to a temp directory (`/var/lib/sam3-temp`) for SAM3 forwarding only. All DB+MinIO writes
+  happen atomically at align-complete via `POST /api/uploads/commit-final`.
 - Uploads are scoped to authenticated users.
 
 ### Refine / Door / Alignment
@@ -140,9 +143,17 @@ must log in again after a fresh `refactored_modutwin_pgdata` volume is created.
 1. User opens a PLY/SOG scene in `/viewer`.
 2. Refine mode edits points, wall meshes, textures, and sidecars in the browser.
 3. "다듬기 완료" switches to door setup without committing alignment data early.
-4. Door setup saves `doors.json` under the upload path.
-5. Alignment loads the refined bundle only after entering align mode.
-6. Alignment transform is persisted through upload/module APIs.
+4. Door setup — flow-specific:
+   - Basemap flow: saves `doors.json` under the upload path at 문 설정 완료.
+   - Module flow: keeps door corners in memory (`onSetupCornersFinalized` callback hands
+     them off to the parent for later commit-final).
+5. Alignment loads the refined bundle:
+   - Basemap flow: refreshes from server after background upload.
+   - Module flow: alignment runs on in-memory bundle.
+6. Alignment persistence:
+   - Basemap flow: alignment transform saved through upload/module APIs separately.
+   - Module flow: `POST /uploads/commit-final` multipart submits PLY + mesh + tex + doors +
+     alignment transform atomically. Overwrites existing module assets if same user+room.
 
 Important stability fixes:
 
