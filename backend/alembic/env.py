@@ -9,7 +9,6 @@ from alembic import context
 from app.core.config import get_settings
 from app.core.database import Base
 
-# モデルをインポートしてBaseに登録
 import app.models  # noqa: F401
 
 config = context.config
