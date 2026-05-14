@@ -18,6 +18,12 @@ from app.services.metadata_options import (
     parse_module_name_input,
     validate_floor_number as validate_floor_number_value,
 )
+from app.services.storage_access import (
+    add_storage_key,
+    delete_storage_best_effort,
+    safe_object_exists,
+    safe_presigned_download_url,
+)
 from app.services.storage_paths import module_base_path
 
 router = APIRouter(tags=["buildings"])
@@ -253,50 +259,14 @@ class AdminDeleteResponse(BaseModel):
     counts: dict[str, int]
 
 
-def _safe_object_exists(minio, key: str | None) -> bool:
-    if not key:
-        return False
-    try:
-        return bool(minio.object_exists(key))
-    except Exception:
-        return False
-
-
-def _safe_presigned_download_url(minio, key: str | None) -> str | None:
-    if not _safe_object_exists(minio, key):
-        return None
-    try:
-        return minio.get_presigned_download_url(key)
-    except Exception:
-        return None
-
-
 def _pick_scene_output_path(minio, scene: SceneOutput | None) -> str | None:
     if scene is None:
         return None
-    if _safe_object_exists(minio, scene.sog_path):
+    if safe_object_exists(minio, scene.sog_path):
         return scene.sog_path
-    if _safe_object_exists(minio, scene.ply_path):
+    if safe_object_exists(minio, scene.ply_path):
         return scene.ply_path
     return None
-
-
-def _add_key(keys: set[str], key: str | None) -> None:
-    if key:
-        normalized = key.strip()
-        if normalized:
-            keys.add(normalized)
-
-
-def _delete_storage_best_effort(prefixes: set[str], keys: set[str]) -> int:
-    minio = get_minio_service()
-    deleted = 0
-    for prefix in sorted(prefixes):
-        deleted += minio.delete_prefix(prefix)
-    for key in sorted(keys):
-        if minio.delete_object(key):
-            deleted += 1
-    return deleted
 
 
 async def _collect_delete_scope(
@@ -343,8 +313,8 @@ async def _collect_delete_scope(
             select(Floor.overview_image_path, Floor.overview_meta_path).where(Floor.id.in_(floor_ids))
         )
         for overview_image_path, overview_meta_path in overview_result.all():
-            _add_key(keys, overview_image_path)
-            _add_key(keys, overview_meta_path)
+            add_storage_key(keys, overview_image_path)
+            add_storage_key(keys, overview_meta_path)
 
     if module_ids:
         upload_result = await db.execute(
@@ -353,18 +323,18 @@ async def _collect_delete_scope(
         )
         for upload_id, minio_path, refined_ply_path, door_corners_json_path in upload_result.all():
             upload_ids.append(upload_id)
-            _add_key(keys, minio_path)
-            _add_key(keys, refined_ply_path)
-            _add_key(keys, door_corners_json_path)
+            add_storage_key(keys, minio_path)
+            add_storage_key(keys, refined_ply_path)
+            add_storage_key(keys, door_corners_json_path)
 
         scene_result = await db.execute(
             select(SceneOutput.ply_path, SceneOutput.sog_path, SceneOutput.metadata_path)
             .where(SceneOutput.module_id.in_(module_ids))
         )
         for ply_path, sog_path, metadata_path in scene_result.all():
-            _add_key(keys, ply_path)
-            _add_key(keys, sog_path)
-            _add_key(keys, metadata_path)
+            add_storage_key(keys, ply_path)
+            add_storage_key(keys, sog_path)
+            add_storage_key(keys, metadata_path)
 
     if upload_ids:
         task_result = await db.execute(select(Task.id).where(Task.upload_id.in_(upload_ids)))
@@ -381,7 +351,7 @@ async def _collect_delete_scope(
         )
         for bid, minio_path in basemap_result.all():
             basemap_ids.append(bid)
-            _add_key(keys, minio_path)
+            add_storage_key(keys, minio_path)
 
     scene_count = 0
     if module_ids:
@@ -445,7 +415,13 @@ async def _delete_hierarchy_scope(
         await db.execute(sa_delete(Building).where(Building.id == building_id))
 
     await db.commit()
-    deleted_files = _delete_storage_best_effort(prefixes, keys)
+    deleted_files = delete_storage_best_effort(
+        get_minio_service(),
+        prefixes,
+        keys,
+        sort_items=True,
+        suppress_errors=False,
+    )
 
     return AdminDeleteResponse(
         deleted_scope=scope,
@@ -977,8 +953,8 @@ async def get_floor_overview_manifest(
             floor_number=floor.floor_number,
             overview_dirty=floor.overview_dirty,
             overview_version=floor.overview_version,
-            topdown_url=_safe_presigned_download_url(minio, floor.overview_image_path),
-            meta_url=_safe_presigned_download_url(minio, floor.overview_meta_path),
+            topdown_url=safe_presigned_download_url(minio, floor.overview_image_path),
+            meta_url=safe_presigned_download_url(minio, floor.overview_meta_path),
             module_count=int(module_count_by_floor.get(floor.id, 0)),
             has_active_basemap=floor.id in active_basemap_floor_ids,
         )
@@ -1047,7 +1023,7 @@ async def get_floor_detail_manifest(
             .limit(1)
         )
         has_pending_basemap = pending_check.scalar_one_or_none() is not None
-    basemap_url = _safe_presigned_download_url(minio, basemap.minio_path) if basemap else None
+    basemap_url = safe_presigned_download_url(minio, basemap.minio_path) if basemap else None
     basemap_entry = (
         DetailBasemapEntry(
             id=basemap.id,

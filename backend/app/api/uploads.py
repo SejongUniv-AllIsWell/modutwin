@@ -1,4 +1,5 @@
 import json
+import logging
 import math
 import os
 from typing import Any
@@ -38,10 +39,12 @@ from app.services.sam3_service import (
     mark_sam3_disabled,
     mark_sam3_dispatch_pending,
 )
+from app.services.storage_access import delete_storage_best_effort
 from app.services.storage_paths import doors_json_key, module_base_path, refined_prefix
 
 router = APIRouter(prefix="/uploads", tags=["uploads"])
 settings = get_settings()
+logger = logging.getLogger(__name__)
 
 # 사용자당 업로드 제한 (개수 / 총 용량)
 MAX_UPLOADS_PER_USER = 100
@@ -484,17 +487,7 @@ async def delete_upload(
     await db.execute(sa_delete(Upload).where(Upload.id == upload.id))
     await db.commit()
 
-    minio = get_minio_service()
-    for prefix in prefixes:
-        try:
-            minio.delete_prefix(prefix)
-        except Exception:
-            pass
-    for key in keys:
-        try:
-            minio.delete_object(key)
-        except Exception:
-            pass
+    delete_storage_best_effort(get_minio_service(), prefixes, keys)
 
     return None
 
@@ -834,7 +827,7 @@ async def start_sam3(
     except Exception as e:
         # broker/worker 비가용 — failed 로 두면 사용자가 정합 단계에서 수동 지정 가능.
         upload.sam3_status = Sam3Status.failed
-        print(f"[sam3] dispatch failed: {e}")
+        logger.exception(f"[sam3] dispatch failed: {e}")
 
     if celery_task_id:
         task = Task(

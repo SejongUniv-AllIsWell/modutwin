@@ -4,7 +4,8 @@ import { useRef, useState, useCallback, useEffect, RefObject, lazy, Suspense } f
 import { SplatData, SplatViewerCoreRef } from '../SplatViewerCore';
 import { useDepthNormal } from './useDepthNormal';
 import { surfacePlanesFromRoom, signedDistance } from '@/lib/gs/planes';
-import { loadRefineState, saveRefineState, clearRefineState } from '@/lib/refine/persistence';
+import { clearRefineState } from '@/lib/refine/persistence';
+import { useRefinePersistence } from './refine/useRefinePersistence';
 import type { GaussianScene } from '@/lib/ply/types';
 import {
   AXIS_COLORS,
@@ -1105,63 +1106,39 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     setSplatLoaded(false);
   }, [options?.currentUrl]);
 
-  // ── localStorage 복원: uploadId 진입 시 1회 ──
-  const loadedUploadIdRef = useRef<string | null>(null);
-  useEffect(() => {
-    const uid = options?.uploadId;
-    if (!uid || loadedUploadIdRef.current === uid) return;
-    const saved = loadRefineState(uid);
-    if (!saved) { loadedUploadIdRef.current = uid; return; }
-
-    restoringRef.current = true;
-    // 천장/바닥 + pendingRotation
-    if (saved.cfConfirmed) {
-      setCeilingY(saved.ceilingY); setFloorY(saved.floorY);
-      ceilingYRef.current = saved.ceilingY; floorYRef.current = saved.floorY;
-      setCfMode('confirmed'); cfModeRef.current = 'confirmed';
-      const rot = { rotX: saved.rotX ?? 0, rotZ: saved.rotZ ?? 0 };
-      setPendingRotation(rot); pendingRotationRef.current = rot;
-      // entity 회전도 즉시 동기화 (다음 마운트 시 splatData 가 준비되면 자동 호출되지만 안전 차원).
-    }
-    // 벽면
-    if (saved.wallConfirmed && saved.wallAngle !== null && saved.wallDistances) {
-      setWallAngle(saved.wallAngle); wallAngleRef.current = saved.wallAngle;
-      setWallDistances(saved.wallDistances); wallDistancesRef.current = saved.wallDistances;
-      setWallMode('confirmed'); wallModeRef.current = 'confirmed';
-    }
-    // 경계면 선택
-    setSelectedSurfaces(new Set(saved.selectedSurfaces as Surface[]));
-    setGlobalOffset(saved.globalOffset);
-    setGlobalOffsetText(saved.globalOffsetText);
-    // PLY 자체는 메모리에서만 다루므로 세션 간 복원 안 함. 항상 원본부터 시작.
-
-    loadedUploadIdRef.current = uid;
-    // 한 틱 뒤 복원 플래그 해제
-    setTimeout(() => { restoringRef.current = false; }, 0);
-  }, [options?.uploadId]);
-
-  // ── localStorage 저장: 관련 state 변경 시마다 ──
-  // uploadId 가 없는 로컬 파일도 저장 (빈 문자열 키). 문 설정 단계가 같은 키로 읽어 평면 정보 복원 가능.
-  // restoringRef 가 true 인 동안 (서버 파일 로드 중) 만 skip.
-  useEffect(() => {
-    if (restoringRef.current) return;
-    const uid = options?.uploadId ?? '';
-    saveRefineState(uid, {
-      cfConfirmed: cfMode === 'confirmed',
-      ceilingY, floorY,
-      rotX: pendingRotation.rotX, rotZ: pendingRotation.rotZ,
-      wallConfirmed: wallMode === 'confirmed',
-      wallAngle, wallDistances,
-      selectedSurfaces: Array.from(selectedSurfaces),
-      globalOffset, globalOffsetText,
-    });
-  }, [
-    options?.uploadId, undoDepth,
-    cfMode, ceilingY, floorY,
-    pendingRotation.rotX, pendingRotation.rotZ,
-    wallMode, wallAngle, wallDistances,
-    selectedSurfaces, globalOffset, globalOffsetText,
-  ]);
+  // ── localStorage 복원/저장 ──
+  useRefinePersistence({
+    uploadId: options?.uploadId,
+    undoDepth,
+    restoringRef,
+    cfMode,
+    ceilingY,
+    floorY,
+    pendingRotation,
+    wallMode,
+    wallAngle,
+    wallDistances,
+    selectedSurfaces,
+    globalOffset,
+    globalOffsetText,
+    setCeilingY,
+    setFloorY,
+    setCfMode,
+    setPendingRotation,
+    setWallAngle,
+    setWallDistances,
+    setWallMode,
+    setSelectedSurfaces,
+    setGlobalOffset,
+    setGlobalOffsetText,
+    ceilingYRef,
+    floorYRef,
+    cfModeRef,
+    pendingRotationRef,
+    wallAngleRef,
+    wallDistancesRef,
+    wallModeRef,
+  });
 
   const syncPlanes = useCallback(() => setPlanes([...planesRef.current]), []);
 

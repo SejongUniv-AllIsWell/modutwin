@@ -26,7 +26,9 @@ services:
     container_name: 3dgs-frontend
     expose:
       - "3000"
-    env_file: .env
+    environment:
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
+      - NEXT_PUBLIC_KAKAO_MAP_KEY=${NEXT_PUBLIC_KAKAO_MAP_KEY}
     depends_on:
       backend:
         condition: service_started
