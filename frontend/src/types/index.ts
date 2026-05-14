@@ -160,6 +160,7 @@ export interface Upload {
   has_refined?: boolean;
   has_doors_json?: boolean;
   has_alignment?: boolean;
+  is_basemap_source?: boolean;
 }
 
 // ── Task ──

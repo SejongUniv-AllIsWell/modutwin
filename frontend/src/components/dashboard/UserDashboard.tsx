@@ -76,6 +76,9 @@ interface Props {
 export default function UserDashboard({ showHeader = true }: Props) {
   const [uploads, setUploads] = useState<Upload[]>([]);
   const [notifications, setNotifications] = useState<Notification[]>([]);
+  const [deleteTarget, setDeleteTarget] = useState<Upload | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   useEffect(() => {
     api.get<Upload[]>('/uploads').then(setUploads).catch(() => {});
@@ -94,6 +97,21 @@ export default function UserDashboard({ showHeader = true }: Props) {
   const markAllRead = async () => {
     await api.post('/notifications/read-all');
     setNotifications([]);
+  };
+
+  const handleDelete = async () => {
+    if (!deleteTarget) return;
+    setDeleting(true);
+    setDeleteError(null);
+    try {
+      await api.delete(`/uploads/${deleteTarget.id}`);
+      setUploads(prev => prev.filter(u => u.id !== deleteTarget.id));
+      setDeleteTarget(null);
+    } catch (e: any) {
+      setDeleteError(e?.message || '업로드 삭제 실패');
+    } finally {
+      setDeleting(false);
+    }
   };
 
   return (
@@ -139,14 +157,14 @@ export default function UserDashboard({ showHeader = true }: Props) {
                   <th className="py-2 pr-4">상태</th>
                   <th className="py-2 pr-4">SAM3</th>
                   <th className="py-2 pr-4">날짜</th>
-                  <th className="py-2 pr-4 text-right">정합</th>
+                  <th className="py-2 pr-4 text-right">삭제</th>
                 </tr>
               </thead>
               <tbody>
                 {uploads.map(u => {
                   const sam = u.sam3_status ?? null;
-                  const canAlign = sam === 'done' || sam === 'failed' || u.has_refined;
                   const stage = progressStage(u);
+                  const isBasemap = !!u.is_basemap_source;
                   return (
                     <tr key={u.id} className="border-b border-gray-800/50">
                       <td className="py-3 pr-4">
@@ -169,16 +187,33 @@ export default function UserDashboard({ showHeader = true }: Props) {
                       </td>
                       <td className="py-3 pr-4 text-gray-500">{new Date(u.uploaded_at).toLocaleDateString('ko-KR')}</td>
                       <td className="py-3 pr-4 text-right">
-                        {canAlign ? (
-                          <Link
-                            href={`/viewer?upload_id=${u.id}&mode=align`}
-                            className="inline-block px-3 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold"
-                            title={sam === 'done' ? 'SAM3 결과로 정합 시작' : '수동으로 문 꼭짓점을 지정해 정합'}
-                          >
-                            정합하기
-                          </Link>
+                        {isBasemap ? (
+                          <span className="relative inline-block group">
+                            <button
+                              type="button"
+                              disabled
+                              aria-label="basemap에 등록된 파일은 삭제할 수 없습니다"
+                              className="w-6 h-6 inline-flex items-center justify-center text-gray-600 rounded cursor-not-allowed"
+                            >
+                              ×
+                            </button>
+                            <span
+                              role="tooltip"
+                              className="pointer-events-none absolute right-0 top-full mt-1 z-10 whitespace-nowrap rounded bg-gray-800 px-2 py-1 text-[10px] text-gray-200 opacity-0 group-hover:opacity-100 transition-opacity"
+                            >
+                              관리자에게 문의하세요
+                            </span>
+                          </span>
                         ) : (
-                          <span className="text-gray-600 text-xs">—</span>
+                          <button
+                            type="button"
+                            onClick={() => setDeleteTarget(u)}
+                            aria-label={`${u.original_filename} 삭제`}
+                            title={`${u.original_filename} 삭제`}
+                            className="w-6 h-6 inline-flex items-center justify-center text-gray-400 hover:text-white hover:bg-red-600 rounded"
+                          >
+                            ×
+                          </button>
                         )}
                       </td>
                     </tr>
@@ -189,6 +224,41 @@ export default function UserDashboard({ showHeader = true }: Props) {
           </div>
         )}
       </div>
+
+      {deleteTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4">
+          <div className="w-full max-w-md rounded-lg border border-gray-700 bg-gray-900 p-5 shadow-xl">
+            <h3 className="text-base font-semibold text-white">업로드 삭제</h3>
+            <p className="mt-3 text-sm text-red-300">
+              삭제 시 업로드한 파일과 관련된 모든 데이터가 삭제됩니다.
+            </p>
+            <p className="mt-2 text-sm text-gray-300 truncate">
+              대상: {deleteTarget.original_filename}
+            </p>
+            {deleteError && (
+              <p className="mt-2 text-xs text-red-400">{deleteError}</p>
+            )}
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={handleDelete}
+                disabled={deleting}
+                className="rounded bg-red-600 px-4 py-2 text-sm font-semibold text-white hover:bg-red-700 disabled:bg-gray-700 disabled:text-gray-400"
+              >
+                {deleting ? '삭제 중...' : '삭제'}
+              </button>
+              <button
+                type="button"
+                onClick={() => { if (!deleting) { setDeleteTarget(null); setDeleteError(null); } }}
+                disabled={deleting}
+                className="rounded bg-gray-700 px-4 py-2 text-sm text-gray-200 hover:bg-gray-600 disabled:opacity-50"
+              >
+                취소
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

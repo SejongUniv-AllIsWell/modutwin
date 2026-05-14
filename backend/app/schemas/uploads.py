@@ -148,6 +148,8 @@ class UploadResponse(BaseModel):
     has_refined: bool = False
     has_doors_json: bool = False
     has_alignment: bool = False
+    # basemap 으로 등록된 원본 업로드인지 — 삭제 비활성화 판단용
+    is_basemap_source: bool = False
 
     class Config:
         from_attributes = True
