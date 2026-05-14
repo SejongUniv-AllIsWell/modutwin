@@ -9,8 +9,9 @@
 """
 
 import json
+import math
 import os
-from typing import Optional
+from typing import List, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -22,7 +23,7 @@ from app.core.database import get_db
 from app.core.security import get_current_user
 from app.core.storage_keys import is_key_under_prefix, normalize_minio_key
 from app.models import User, Upload, Task, SceneOutput, TaskType, TaskStatus, Module, Floor
-from app.services.minio_service import get_minio_service
+from app.services.minio_service import get_minio_service, PART_SIZE
 from app.services.storage_paths import (
     build_refined_object_key,
     mesh_meta_key,
@@ -80,6 +81,122 @@ async def refined_upload_url(
         put_url=minio.get_presigned_simple_upload_url(key, expires=3600),
         get_url=minio.get_presigned_download_url(key, expires=3600),
         key=key,
+    )
+
+
+class RefinedMultipartInitRequest(BaseModel):
+    upload_id: UUID
+    filename: str
+    file_size: int
+    content_type: str = "application/octet-stream"
+    session_id: Optional[str] = None
+
+
+class RefinedMultipartInitResponse(BaseModel):
+    key: str
+    minio_upload_id: str
+    presigned_urls: List[str]
+    part_size: int
+    part_count: int
+
+
+class RefinedMultipartPart(BaseModel):
+    part_number: int
+    etag: str
+
+
+class RefinedMultipartCompleteRequest(BaseModel):
+    upload_id: UUID
+    key: str
+    minio_upload_id: str
+    parts: List[RefinedMultipartPart]
+
+
+class RefinedMultipartCompleteResponse(BaseModel):
+    get_url: str
+    key: str
+
+
+@router.post("/refined-multipart-init", response_model=RefinedMultipartInitResponse)
+async def refined_multipart_init(
+    body: RefinedMultipartInitRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Cloudflare 100MB body 한도를 피하기 위해 refined PLY 도 multipart 로 올린다.
+
+    `refined-upload-url` 과 같은 키 경로 규칙을 따르고, 청크별 presigned PUT URL 을
+    발급한다. 클라이언트는 각 청크를 PUT 한 뒤 ETag 를 모아 complete 로 마무리.
+    """
+    if body.file_size <= 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="file_size는 양수여야 합니다.")
+
+    result = await db.execute(
+        select(Upload).where(Upload.id == body.upload_id, Upload.user_id == user.id)
+    )
+    upload = result.scalar_one_or_none()
+    if not upload:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="업로드를 찾을 수 없습니다.")
+
+    try:
+        key = build_refined_object_key(
+            upload_minio_path=upload.minio_path,
+            filename=body.filename,
+            session_id=body.session_id,
+        )
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="유효하지 않은 session_id")
+
+    minio = get_minio_service()
+    part_count = max(1, math.ceil(body.file_size / PART_SIZE))
+    minio_upload_id = minio.init_multipart_upload(key, body.content_type)
+    presigned_urls = minio.get_presigned_upload_urls(key, minio_upload_id, part_count)
+
+    return RefinedMultipartInitResponse(
+        key=key,
+        minio_upload_id=minio_upload_id,
+        presigned_urls=presigned_urls,
+        part_size=PART_SIZE,
+        part_count=part_count,
+    )
+
+
+@router.post("/refined-multipart-complete", response_model=RefinedMultipartCompleteResponse)
+async def refined_multipart_complete(
+    body: RefinedMultipartCompleteRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """클라이언트가 모든 청크 PUT 을 마친 뒤 호출. ETag 목록으로 multipart 완료 처리."""
+    result = await db.execute(
+        select(Upload).where(Upload.id == body.upload_id, Upload.user_id == user.id)
+    )
+    upload = result.scalar_one_or_none()
+    if not upload:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="업로드를 찾을 수 없습니다.")
+
+    # 키가 이 업로드의 refined 영역 안에 있는지 검증 (다른 사용자/업로드 키 위변조 방지)
+    refined_root = refined_prefix(upload.minio_path)
+    try:
+        normalized_key = normalize_minio_key(body.key)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="유효하지 않은 key 입니다.")
+    if not is_key_under_prefix(normalized_key, refined_root):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="이 업로드의 refined 경로가 아닙니다.")
+
+    minio = get_minio_service()
+    try:
+        parts = [{"part_number": p.part_number, "etag": p.etag} for p in body.parts]
+        minio.complete_multipart_upload(normalized_key, body.minio_upload_id, parts)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"MinIO multipart 완료 실패: {str(e)}",
+        )
+
+    return RefinedMultipartCompleteResponse(
+        get_url=minio.get_presigned_download_url(normalized_key, expires=3600),
+        key=normalized_key,
     )
 
 
@@ -170,7 +287,11 @@ async def save_refined(
 
 
 class RefinedBundleDoorEntry(BaseModel):
-    """basemap 의 도어 자산 (mesh + splat) 의 presigned URL 묶음. doors.json + 별도 PNG/PLY 가 있을 때만 채워짐."""
+    """basemap 의 한 도어 자산 묶음 — mesh quad 텍스처 + splat PLY presigned URL.
+
+    `doors.json` 의 `doorMesh` / `doorSplat` 메타에서 추출. 클라이언트가 도어 mesh
+    quad 재생성 + 도어 splat 별도 레이어 추가에 사용. 자산이 없으면 corners 만 채워짐.
+    """
     id: str
     corners: list[list[float]]
     unitName: Optional[str] = None
@@ -181,17 +302,18 @@ class RefinedBundleDoorEntry(BaseModel):
     doorThickness: Optional[float] = None
     boundarySplitEnabled: Optional[bool] = None
     safetyMargin: Optional[float] = None
-    # 도어 mesh 재생성용 — 텍스처 PNG presigned URL + corners/uvs/normalInward + W/H.
-    door_mesh: Optional[dict] = None  # { corners, uvs, normalInward, textureUrl, textureWidth, textureHeight }
-    # 도어 splat 재로드용 — PLY presigned URL.
-    door_splat: Optional[dict] = None  # { url }
+    # corners/uvs/normalInward + 텍스처 PNG presigned URL + 크기.
+    door_mesh: Optional[dict] = None
+    # 도어 splat (PLY) presigned URL.
+    door_splat: Optional[dict] = None
 
 
 class RefinedBundleResponse(BaseModel):
     ply_url: str
     mesh_meta_url: Optional[str]
     textures: dict[str, str]  # surfaceId → presigned URL
-    doors: list[RefinedBundleDoorEntry] = []  # 신규: 도어 자산 (basemap 다중 도어 지원)
+    # basemap 다중 도어 자산 (mesh + splat). doors.json 이 없거나 도어가 없으면 빈 배열.
+    doors: list[RefinedBundleDoorEntry] = []
     scene_id: UUID
 
 
@@ -244,20 +366,20 @@ async def get_refined_bundle(
             # mesh.json 파싱 실패해도 PLY 는 반환
             print(f"[refined-bundle] mesh.json parse failed: {e}")
 
-    # doors.json 도 같이 로드 (basemap 다중 도어 자산 포함). 없으면 빈 배열.
-    # scene.ply_path 는 `{refined_prefix}/{session_id}/final.ply` 식의 경로 — doors.json 은
-    # 그 부모 (refined 디렉터리) 직속이라 두 단계 위.
+    # doors.json 동반 로드 — basemap 다중 도어 자산 포함. scene.ply_path 는 `{refined}/{session}/final.ply`
+    # 형식이라 doors.json 은 그 부모 (`{refined}/doors.json`) 에 위치.
     doors_out: list[RefinedBundleDoorEntry] = []
-    # session_dir = `{refined_prefix}/{session_id}`. doors.json = `{refined_prefix}/doors.json`.
     doors_key = f"{os.path.dirname(session_dir)}/doors.json"
     if minio.object_exists(doors_key):
         try:
             doors_raw = minio.get_object_bytes(doors_key)
             doors_parsed = json.loads(doors_raw.decode("utf-8"))
             for d in doors_parsed.get("doors", []):
-                if not isinstance(d, dict): continue
+                if not isinstance(d, dict):
+                    continue
                 corners = d.get("corners") or []
-                if not isinstance(corners, list) or len(corners) != 4: continue
+                if not isinstance(corners, list) or len(corners) != 4:
+                    continue
                 entry = RefinedBundleDoorEntry(
                     id=str(d.get("id") or f"door_{len(doors_out)+1}"),
                     corners=corners,
@@ -270,7 +392,6 @@ async def get_refined_bundle(
                     boundarySplitEnabled=d.get("boundarySplitEnabled") if isinstance(d.get("boundarySplitEnabled"), bool) else None,
                     safetyMargin=d.get("safetyMargin") if isinstance(d.get("safetyMargin"), (int, float)) else None,
                 )
-                # doorMesh — 텍스처 PNG 의 presigned URL 생성.
                 dm = d.get("doorMesh")
                 if isinstance(dm, dict):
                     tex_key = dm.get("textureFilename")
@@ -283,7 +404,6 @@ async def get_refined_bundle(
                             "textureWidth": dm.get("textureWidth"),
                             "textureHeight": dm.get("textureHeight"),
                         }
-                # doorSplat — PLY 의 presigned URL 생성.
                 ds = d.get("doorSplat")
                 if isinstance(ds, dict):
                     splat_key = ds.get("filename")

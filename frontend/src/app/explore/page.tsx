@@ -83,6 +83,7 @@ interface Coordinate {
 interface KakaoPlaceCandidate extends PriorityPlaceScore {
   place: KakaoPlaceResult;
   placeName: string;
+  responseIndex: number;
   distance: number;
 }
 
@@ -133,6 +134,11 @@ const loadKakaoMapsSdk = (appKey: string) => {
   return window.__kakaoMapsSdkPromise__;
 };
 
+interface KakaoKeywordSearchResult {
+  documents: KakaoPlaceResult[];
+  isEnd: boolean;
+}
+
 const searchKeywordViaBackend = async (
   {
     query,
@@ -142,9 +148,9 @@ const searchKeywordViaBackend = async (
     page = 1,
     size = 10,
     sort = 'accuracy',
-  }: KakaoKeywordSearchOptions): Promise<KakaoPlaceResult[]> => {
+  }: KakaoKeywordSearchOptions): Promise<KakaoKeywordSearchResult> => {
   const trimmed = query?.trim() ?? '';
-  if (!trimmed) return [];
+  if (!trimmed) return { documents: [], isEnd: true };
   const params = new URLSearchParams({
     query: trimmed,
     page: String(Math.min(Math.max(page, 1), 45)),
@@ -154,8 +160,14 @@ const searchKeywordViaBackend = async (
   if (Number.isFinite(x)) params.set('x', String(x));
   if (Number.isFinite(y)) params.set('y', String(y));
   if (typeof radius === 'number') params.set('radius', String(Math.min(Math.max(radius, 0), 20000)));
-  const result = await api.get<{ documents?: KakaoPlaceResult[] }>(`/kakao/search/keyword?${params.toString()}`);
-  return result.documents ?? [];
+  const result = await api.get<{
+    documents?: KakaoPlaceResult[];
+    meta?: { is_end?: boolean };
+  }>(`/kakao/search/keyword?${params.toString()}`);
+  return {
+    documents: result.documents ?? [],
+    isEnd: Boolean(result.meta?.is_end ?? true),
+  };
 };
 
 const coord2AddressViaBackend = async (x: number, y: number): Promise<KakaoCoord2AddressDocument[]> => {
@@ -171,11 +183,21 @@ const coordinateForBuilding = (building: Building): Coordinate | null => {
   return { lat, lng };
 };
 
-const keywordForAddress = (document: KakaoCoord2AddressDocument | null): string | null => {
+interface AddressQuery {
+  query: string;
+  buildingName: string | null;
+}
+
+const keywordForAddress = (document: KakaoCoord2AddressDocument | null): AddressQuery | null => {
+  const buildingName = document?.road_address?.building_name?.trim();
+  if (buildingName) {
+    return { query: buildingName, buildingName };
+  }
   const roadAddress = document?.road_address?.address_name?.trim();
-  if (roadAddress) return roadAddress;
+  if (roadAddress) return { query: roadAddress, buildingName: null };
   const address = document?.address?.address_name?.trim();
-  return address || null;
+  if (address) return { query: address, buildingName: null };
+  return null;
 };
 
 export default function ExplorePage() {
@@ -185,12 +207,18 @@ export default function ExplorePage() {
   const mapInstance = useRef<any>(null);
   const kakaoRef = useRef<any>(null);
   const markersRef = useRef<MarkerBinding[]>([]);
+  const selectedMarkerRef = useRef<any>(null);
+  const selectedInfoWindowRef = useRef<any>(null);
   const buildingsRef = useRef<BuildingWithFloors[]>([]);
   const mapClickInFlightRef = useRef(false);
 
   const [buildings, setBuildings] = useState<BuildingWithFloors[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
   const [placeResults, setPlaceResults] = useState<KakaoPlaceResult[]>([]);
+  const [searchPage, setSearchPage] = useState(1);
+  const [searchIsEnd, setSearchIsEnd] = useState(true);
+  const [searchedQuery, setSearchedQuery] = useState('');
+  const [loadingMore, setLoadingMore] = useState(false);
   const [mapLoaded, setMapLoaded] = useState(false);
   const [mapError, setMapError] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
@@ -270,10 +298,12 @@ export default function ExplorePage() {
     }
   }, [user, loading, router]);
 
-  // 건물 목록 로드 — Scene 유무와 무관하게 등록된(visible) 건물 모두 표시
+  // 건물 목록 로드 — 백엔드 has_output 필터는
+  //   (관리자가 표시관리에서 추가한 건물) OR (표시 중인 floor/module 에 SceneOutput 등록)
+  // 둘 중 하나라도 만족하는 visible 건물을 내려준다.
   const fetchBuildings = useCallback(async () => {
     try {
-      const data = await api.get<Building[]>('/buildings');
+      const data = await api.get<Building[]>('/buildings?has_output=true');
       const withFloors: BuildingWithFloors[] = await Promise.all(
         data.map(async (b) => {
           try {
@@ -321,6 +351,12 @@ export default function ExplorePage() {
     let clickHandler: ((mouseEvent: any) => Promise<void>) | null = null;
     let currentMap: any = null;
 
+    const clearSelectedMarker = () => {
+      selectedMarkerRef.current?.setMap(null);
+      selectedInfoWindowRef.current?.close?.();
+      selectedMarkerRef.current = null;
+      selectedInfoWindowRef.current = null;
+    };
 
     const initMap = (kakao: any) => {
       if (!mapRef.current || disposed) return;
@@ -331,6 +367,19 @@ export default function ExplorePage() {
       mapInstance.current = map;
       kakaoRef.current = kakao;
       currentMap = map;
+
+      const showSelectedMarker = (name: string, lat: number, lng: number) => {
+        clearSelectedMarker();
+        const position = new kakao.maps.LatLng(lat, lng);
+        const marker = new kakao.maps.Marker({ map, position, title: name });
+        const escapedName = escapeHtml(name);
+        const infoWindow = new kakao.maps.InfoWindow({
+          content: `<div style="padding:7px 10px;font-size:12px;font-weight:600;white-space:nowrap;color:#111;">선택됨: ${escapedName}</div>`,
+        });
+        infoWindow.open(map, marker);
+        selectedMarkerRef.current = marker;
+        selectedInfoWindowRef.current = infoWindow;
+      };
 
       const coord2Address = (latLng: any) => (
         coord2AddressViaBackend(latLng.getLng(), latLng.getLat())
@@ -357,11 +406,16 @@ export default function ExplorePage() {
         y: String(coordinate.lat),
       }, latLng);
 
-      const scorePlaceCandidate = (place: KakaoPlaceResult, latLng: any): KakaoPlaceCandidate => {
+      const scorePlaceCandidate = (
+        place: KakaoPlaceResult,
+        latLng: any,
+        responseIndex: number,
+      ): KakaoPlaceCandidate => {
         const placeName = place.place_name.trim();
         return {
           place,
           placeName,
+          responseIndex,
           distance: distanceMeters(place, latLng),
           ...scorePriorityPlaceName(placeName),
         };
@@ -380,54 +434,44 @@ export default function ExplorePage() {
           .sort((a, b) => a.distance - b.distance)[0]?.override ?? null
       );
 
-      const findNearestSejongUniversityPlace = async (latLng: any): Promise<KakaoPlaceResult | null> => {
-        const campusDistance = distanceFromCoordinate(DEFAULT_MAP_CENTER, latLng);
-        if (campusDistance > sejongUniversityPlacePriority.campusRadiusMeters) return null;
-
-        const places = await searchKeywordViaBackend({
-          query: sejongUniversityPlacePriority.campusKeyword,
-          x: latLng.getLng(),
-          y: latLng.getLat(),
-          radius: sejongUniversityPlacePriority.placeSearchRadiusMeters,
-          sort: 'distance',
-          size: 15,
-        }).catch((): KakaoPlaceResult[] => []);
-
-        return places
-          .map((place) => scorePlaceCandidate(place, latLng))
-          .filter(({ placeName, distance, priorityIndex, isCampusOnlyName }) => (
-            !isCampusOnlyName
-            && (placeName.includes(sejongUniversityPlacePriority.campusKeyword)
-              || priorityIndex !== Number.MAX_SAFE_INTEGER)
-            && placeName.length >= 2
-            && Number.isFinite(distance)
-            && distance <= sejongUniversityPlacePriority.placeSearchRadiusMeters
-          ))
-          .sort(comparePriorityPlaceCandidates)[0]?.place ?? null;
-      };
-
       const findNearestPlaceByAddress = async (
         address: KakaoCoord2AddressDocument | null,
         latLng: any,
       ): Promise<KakaoPlaceResult | null> => {
-        const query = keywordForAddress(address);
-        if (!query) return null;
-        const places = await searchKeywordViaBackend({
-          query,
-          x: latLng.getLng(),
-          y: latLng.getLat(),
-          radius: sejongUniversityPlacePriority.addressSearchRadiusMeters,
-          sort: 'distance',
-          size: 15,
-        }).catch((): KakaoPlaceResult[] => []);
-        return places
-          .map((place) => scorePlaceCandidate(place, latLng))
-          .filter(({ placeName, distance, isCampusOnlyName }) => (
-            !isCampusOnlyName
-            && placeName.length >= 2
-            && Number.isFinite(distance)
-            && distance <= sejongUniversityPlacePriority.addressSearchRadiusMeters
-          ))
+        const queryInfo = keywordForAddress(address);
+        if (!queryInfo) return null;
+        const { query, buildingName } = queryInfo;
+
+        const collected: KakaoPlaceResult[] = [];
+        const seenIds = new Set<string>();
+        for (let page = 1; page <= 45; page += 1) {
+          const { documents, isEnd } = await searchKeywordViaBackend({
+            query,
+            x: latLng.getLng(),
+            y: latLng.getLat(),
+            radius: sejongUniversityPlacePriority.addressSearchRadiusMeters,
+            sort: 'distance',
+            size: 15,
+            page,
+          }).catch((): KakaoKeywordSearchResult => ({ documents: [], isEnd: true }));
+          for (const place of documents) {
+            if (!seenIds.has(place.id)) {
+              seenIds.add(place.id);
+              collected.push(place);
+            }
+          }
+          if (isEnd || documents.length === 0) break;
+        }
+
+        const filtered = buildingName
+          ? collected.filter((place) => place.place_name.includes(buildingName))
+          : collected;
+
+        return filtered
+          .map((place, index) => scorePlaceCandidate(place, latLng, index))
+          // 캠퍼스 키워드 자체 ("세종대학교" 등) 만 매칭된 plain 항목은 건물 후보에서 제외 —
+          // 구체적인 건물명 (예: "세종대학교 광개토관") 만 의미 있음.
+          .filter(({ isCampusOnlyName }) => !isCampusOnlyName)
           .sort(comparePriorityPlaceCandidates)[0]?.place ?? null;
       };
 
@@ -448,30 +492,37 @@ export default function ExplorePage() {
         } => Boolean(candidate && candidate.distance <= 45))
         .sort((a, b) => a.distance - b.distance)[0] ?? null;
 
-      const openRegisteredBuilding = (
-        candidate: { building: BuildingWithFloors; coordinate: Coordinate },
-      ) => {
+      const openRegisteredBuilding = (candidate: {
+        building: BuildingWithFloors;
+        coordinate: Coordinate;
+      }) => {
+        showSelectedMarker(candidate.building.name, candidate.coordinate.lat, candidate.coordinate.lng);
+        showToast(`선택됨: ${candidate.building.name}`);
         navigateFromMap(`/buildings/${candidate.building.id}`);
       };
 
-      const createBuildingFromAddress = (name: string, address: any, latLng: any) => (
-        routeBuildingByLookup({
+      const createBuildingFromAddress = async (name: string, address: any, latLng: any) => {
+        showSelectedMarker(name, latLng.getLat(), latLng.getLng());
+        showToast(`선택됨: ${name}`);
+        await routeBuildingByLookup({
           building_name: name,
           address_name: address?.address?.address_name ?? null,
           road_address_name: address?.road_address?.address_name ?? null,
           lat: latLng.getLat(),
           lng: latLng.getLng(),
-        })
-      );
+        });
+      };
 
-      const createBuildingFromPlace = (place: KakaoPlaceResult) => {
+      const createBuildingFromPlace = async (place: KakaoPlaceResult) => {
         const lat = Number(place.y);
         const lng = Number(place.x);
         if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
           showToast('선택한 건물의 좌표가 올바르지 않습니다.');
           return;
         }
-        return routeBuildingByLookup({
+        showSelectedMarker(place.place_name, lat, lng);
+        showToast(`선택됨: ${place.place_name}`);
+        await routeBuildingByLookup({
           building_name: place.place_name,
           place_id: place.id,
           address_name: place.address_name || null,
@@ -481,16 +532,18 @@ export default function ExplorePage() {
         });
       };
 
-      const createBuildingFromCoordinateOverride = (override: PriorityCoordinateOverride) => (
-        routeBuildingByLookup({
+      const createBuildingFromCoordinateOverride = async (override: PriorityCoordinateOverride) => {
+        showSelectedMarker(override.name, override.lat, override.lng);
+        showToast(`선택됨: ${override.name}`);
+        await routeBuildingByLookup({
           building_name: override.name,
           lookup_names: override.aliases,
           address_name: override.address_name ?? null,
           road_address_name: override.road_address_name ?? null,
           lat: override.lat,
           lng: override.lng,
-        })
-      );
+        });
+      };
 
       clickHandler = async (_mouseEvent: any) => {
         if (disposed) return;
@@ -506,11 +559,6 @@ export default function ExplorePage() {
           const registeredBuilding = findRegisteredBuildingAt(latLng);
           if (registeredBuilding) {
             openRegisteredBuilding(registeredBuilding);
-            return;
-          }
-          const sejongPlace = await findNearestSejongUniversityPlace(latLng);
-          if (sejongPlace) {
-            await createBuildingFromPlace(sejongPlace);
             return;
           }
           const addresses = await coord2Address(latLng);
@@ -554,6 +602,7 @@ export default function ExplorePage() {
       if (currentMap && clickHandler) {
         window.kakao?.maps?.event?.removeListener(currentMap, 'click', clickHandler);
       }
+      clearSelectedMarker();
       mapInstance.current = null;
       kakaoRef.current = null;
     };
@@ -613,6 +662,9 @@ export default function ExplorePage() {
     const query = searchQuery.trim();
     if (!query) {
       setPlaceResults([]);
+      setSearchedQuery('');
+      setSearchPage(1);
+      setSearchIsEnd(true);
       return;
     }
     const kakao = kakaoRef.current;
@@ -621,14 +673,20 @@ export default function ExplorePage() {
       return;
     }
     try {
-      const result = await searchKeywordViaBackend({ query, size: 10 });
-      if (result.length === 0) {
+      const { documents, isEnd } = await searchKeywordViaBackend({ query, size: 15, page: 1 });
+      if (documents.length === 0) {
         setPlaceResults([]);
+        setSearchedQuery(query);
+        setSearchPage(1);
+        setSearchIsEnd(true);
         showToast('검색 결과가 없습니다.');
         return;
       }
-      setPlaceResults(result);
-      const first = result[0];
+      setPlaceResults(documents);
+      setSearchedQuery(query);
+      setSearchPage(1);
+      setSearchIsEnd(isEnd);
+      const first = documents[0];
       const lat = Number(first.y);
       const lng = Number(first.x);
       if (Number.isFinite(lat) && Number.isFinite(lng)) {
@@ -636,7 +694,40 @@ export default function ExplorePage() {
       }
     } catch (error: any) {
       setPlaceResults([]);
+      setSearchedQuery(query);
+      setSearchPage(1);
+      setSearchIsEnd(true);
       showToast(error?.message || '검색에 실패했습니다.');
+    }
+  };
+
+  const handleLoadMore = async () => {
+    if (loadingMore || searchIsEnd || !searchedQuery) return;
+    const nextPage = searchPage + 1;
+    if (nextPage > 45) {
+      setSearchIsEnd(true);
+      return;
+    }
+    setLoadingMore(true);
+    try {
+      const { documents, isEnd } = await searchKeywordViaBackend({
+        query: searchedQuery,
+        size: 15,
+        page: nextPage,
+      });
+      if (documents.length > 0) {
+        setPlaceResults((prev) => {
+          const existingIds = new Set(prev.map((p) => p.id));
+          const appended = documents.filter((p) => !existingIds.has(p.id));
+          return appended.length > 0 ? [...prev, ...appended] : prev;
+        });
+      }
+      setSearchPage(nextPage);
+      setSearchIsEnd(isEnd || documents.length === 0);
+    } catch (error: any) {
+      showToast(error?.message || '추가 결과를 불러오지 못했습니다.');
+    } finally {
+      setLoadingMore(false);
     }
   };
 
@@ -677,7 +768,13 @@ export default function ExplorePage() {
               className="w-full bg-gray-800 border border-gray-700 rounded-lg pl-9 pr-3 py-2 text-white text-sm focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition"
             />
             {searchQuery && (
-              <button onClick={() => { setSearchQuery(''); setPlaceResults([]); }} className="absolute right-3 text-gray-500 hover:text-gray-300">
+              <button onClick={() => {
+                setSearchQuery('');
+                setPlaceResults([]);
+                setSearchedQuery('');
+                setSearchPage(1);
+                setSearchIsEnd(true);
+              }} className="absolute right-3 text-gray-500 hover:text-gray-300">
                 <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
                 </svg>
@@ -709,6 +806,15 @@ export default function ExplorePage() {
                   </p>
                 </button>
               ))}
+              {!searchIsEnd && (
+                <button
+                  onClick={handleLoadMore}
+                  disabled={loadingMore}
+                  className="w-full px-4 py-3 text-sm text-gray-400 hover:text-white hover:bg-gray-800/70 transition disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {loadingMore ? '불러오는 중...' : '더 보기'}
+                </button>
+              )}
             </div>
           ) : displayBuildings.length === 0 ? (
             <div className="flex flex-col items-center justify-center h-full py-16 text-gray-600">

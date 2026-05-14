@@ -13,3 +13,4 @@ pydantic-settings
 numpy
 plyfile
 pytest
+pytest-asyncio

@@ -42,6 +42,7 @@ services:
     volumes:
       - ./core:/app/core:ro
       - ./utilities:/app/utilities:ro
+      # 모듈 신흐름 — SAM3 자동 문 검출용 임시 PLY 저장소 (30분 TTL, 자동 청소).
       - sam3-temp:/var/lib/sam3-temp
     env_file: .env
     environment:
@@ -167,6 +168,27 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - 3dgs-net
+    restart: unless-stopped
+
+  colmap-worker:
+    build: ./worker
+    container_name: 3dgs-colmap-worker
+    environment:
+      - RABBITMQ_URL=amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@rabbitmq:5672//
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY}
+      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
+      - MINIO_BUCKET=${MINIO_BUCKET:-3dgs-platform}
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      minio:
+        condition: service_started
+      redis:
+        condition: service_healthy
     networks:
       - 3dgs-net
     restart: unless-stopped

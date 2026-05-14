@@ -9,7 +9,7 @@ Status:
   described below. Feature flag `ENABLE_SAM3` gates dispatch.
 
 This document describes the legacy dispatch pipeline. For module-registration
-specifics see `NEW_FLOW_NOTES.md` and `backend/app/api/module_register.py`.
+specifics see `CLAUDE.md` 의 모듈 등록 흐름 + `backend/app/api/module_register.py`.
 
 ## Current Runtime State
 

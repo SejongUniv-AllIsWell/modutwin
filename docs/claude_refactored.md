@@ -1,7 +1,6 @@
 # CLAUDE.md (LEGACY / OUT-OF-DATE) — 3DGS Digital Twin Platform
 
-> ⚠️ 이 파일은 historic 사본. 현재 정본은 루트의 `CLAUDE.md`. 모듈 등록 신흐름은 `NEW_FLOW_NOTES.md` 참고.
-> 본 파일의 register-local / aligned.ply / commitRefinedToServer 설명은 베이스맵 흐름 한정으로만 유효함.
+> ⚠️ 이 파일은 historic 사본. 현재 정본은 루트의 `CLAUDE.md`.
 
 ## Overview
 

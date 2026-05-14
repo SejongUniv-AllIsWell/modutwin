@@ -16,7 +16,9 @@ from app.core.storage_keys import is_key_under_prefix, normalize_minio_key
 from app.models import (
     User, UserRole, Upload, Task, Module, Floor, Building, SceneOutput,
     UploadStatus, TaskType, TaskStatus, PlyTarget, Sam3Status,
+    Basemap, Notification,
 )
+from sqlalchemy import delete as sa_delete, update as sa_update
 from app.schemas.uploads import (
     UploadInitRequest,
     UploadInitResponse,
@@ -29,6 +31,7 @@ from app.services.minio_service import get_minio_service, PART_SIZE
 from app.services.celery_service import (
     dispatch_training_task,
     dispatch_sam3_door_detection_task,
+    dispatch_colmap_task,
 )
 from app.services.sam3_service import (
     SAM3_DISABLED_DETAIL,
@@ -213,21 +216,18 @@ async def complete_upload(
     upload.file_size = actual_size
     upload.status = UploadStatus.processing
 
-    # 학습 없이 바로 완료 처리할 케이스
-    #  - PLY + alignment 타겟 (정합용 ply)
-    #  - PLY + refined 타겟 (다듬기 결과 ply)
-    #  - .splat / .sog (이미 학습 완료된 산출물)
     ext = os.path.splitext(upload.original_filename)[1].lower()
     is_ply = ext == ".ply"
     is_scene_artifact = ext in {".splat", ".sog"}
-    is_zip = ext == ".zip"
+    is_colmap_input = upload.ply_target == PlyTarget.colmap
+
     skip_training = (
         (is_ply and upload.ply_target in (PlyTarget.alignment, PlyTarget.refined))
         or is_scene_artifact
-        or is_zip
+        or is_colmap_input  # COLMAP은 별도 태스크로 처리
     )
 
-    if skip_training:
+    if skip_training and not is_colmap_input:
         upload.status = UploadStatus.completed
 
     # 모듈 + 계층 정보 조회
@@ -240,9 +240,24 @@ async def complete_upload(
     floor_result = await db.execute(select(Floor).where(Floor.id == module.floor_id))
     floor = floor_result.scalar_one()
 
-    # PLY + alignment 타겟이면 별도 처리 없이 완료
     celery_task_id = None
-    if not skip_training:
+
+    if is_colmap_input:
+        # COLMAP 전처리 태스크 발행
+        upload.status = UploadStatus.processing
+        celery_task_id = dispatch_colmap_task(
+            upload_id=str(upload.id),
+            user_id=str(user.id),
+            minio_input_key=upload.minio_path,
+        )
+        task = Task(
+            upload_id=upload.id,
+            user_id=user.id,
+            task_type=TaskType.colmap_preprocessing,
+            celery_task_id=celery_task_id,
+            status=TaskStatus.pending,
+        )
+    elif not skip_training:
         celery_task_id = dispatch_training_task(
             upload_id=str(upload.id),
             user_id=str(user.id),
@@ -253,39 +268,52 @@ async def complete_upload(
             module_name=module.name,
             ply_target=upload.ply_target.value if upload.ply_target else "gsplat",
         )
+        task = Task(
+            upload_id=upload.id,
+            user_id=user.id,
+            task_type=TaskType.training_3dgs,
+            celery_task_id=celery_task_id,
+            status=TaskStatus.pending,
+        )
+    else:
+        task = Task(
+            upload_id=upload.id,
+            user_id=user.id,
+            task_type=TaskType.training_3dgs,
+            celery_task_id=None,
+            status=TaskStatus.completed,
+        )
 
-    task = Task(
-        upload_id=upload.id,
-        user_id=user.id,
-        task_type=TaskType.training_3dgs,
-        celery_task_id=celery_task_id,
-        status=TaskStatus.completed if skip_training else TaskStatus.pending,
-    )
     db.add(task)
-
     await db.commit()
 
-    if skip_training:
-        if is_zip:
-            msg = "업로드 완료. ZIP 파일이 저장되었습니다. COLMAP 처리는 추후 지원됩니다."
-        elif is_scene_artifact or upload.ply_target == PlyTarget.refined:
+    if is_colmap_input:
+        msg = "업로드 완료. COLMAP 전처리가 시작됩니다."
+    elif skip_training:
+        if is_scene_artifact or upload.ply_target == PlyTarget.refined:
             msg = "업로드 완료. refined 폴더에 저장되었습니다."
         else:
             msg = "업로드 완료. alignment 폴더에 저장되었습니다."
     else:
         msg = "업로드 완료. 3DGS 학습이 시작됩니다."
 
+    final_status = "processing" if (is_colmap_input or not skip_training) else "completed"
     return UploadCompleteResponse(
         upload_id=upload.id,
-        status="processing" if not skip_training else "completed",
+        status=final_status,
         message=msg,
     )
 
 
-def _upload_to_response(upload: Upload, has_scene_output: bool = False) -> UploadResponse:
+def _upload_to_response(
+    upload: Upload,
+    has_scene_output: bool = False,
+    is_basemap_source: bool = False,
+) -> UploadResponse:
     """Upload ORM → UploadResponse (SAM3 파이프라인 파생 플래그 포함).
 
     has_refined: SAM3 정식 경로 (refined_ply_path) 또는 다듬기 저장으로 생성된 SceneOutput 중 하나라도 있으면 true.
+    is_basemap_source: 이 업로드가 어떤 basemap의 원본 PLY 인지 — 삭제 비활성화 판단용.
     """
     return UploadResponse(
         id=upload.id,
@@ -300,6 +328,8 @@ def _upload_to_response(upload: Upload, has_scene_output: bool = False) -> Uploa
         has_refined=bool(upload.refined_ply_path) or has_scene_output,
         has_doors_json=bool(upload.door_corners_json_path),
         has_alignment=bool(upload.alignment_transform),
+        has_gsplat_ply=bool(upload.gsplat_ply_path),
+        is_basemap_source=is_basemap_source,
     )
 
 
@@ -326,7 +356,21 @@ async def list_uploads(
         .distinct()
     )
     has_scene = {row[0] for row in scene_rows.all()}
-    return [_upload_to_response(u, has_scene_output=(u.id in has_scene)) for u in uploads]
+    # basemap 원본으로 사용 중인 업로드 — 삭제 비활성화 판단용.
+    basemap_rows = await db.execute(
+        select(Basemap.source_upload_id)
+        .where(Basemap.source_upload_id.in_(upload_ids))
+        .distinct()
+    )
+    basemap_source_ids = {row[0] for row in basemap_rows.all() if row[0] is not None}
+    return [
+        _upload_to_response(
+            u,
+            has_scene_output=(u.id in has_scene),
+            is_basemap_source=(u.id in basemap_source_ids),
+        )
+        for u in uploads
+    ]
 
 
 @router.get("/{upload_id}", response_model=UploadResponse)
@@ -354,10 +398,105 @@ async def get_upload(
         .limit(1)
     )
     has_scene = scene_check.scalar_one_or_none() is not None
-    return _upload_to_response(upload, has_scene_output=has_scene)
+    basemap_check = await db.execute(
+        select(Basemap.id).where(Basemap.source_upload_id == upload_id).limit(1)
+    )
+    is_basemap_source = basemap_check.scalar_one_or_none() is not None
+    return _upload_to_response(
+        upload,
+        has_scene_output=has_scene,
+        is_basemap_source=is_basemap_source,
+    )
 
 
 VIEWABLE_EXTENSIONS = {".ply", ".splat", ".sog"}
+
+
+@router.delete("/{upload_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_upload(
+    upload_id: UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """업로드 삭제 — 본인 (또는 관리자) 업로드만 삭제.
+
+    basemap의 원본으로 등록된 업로드는 삭제할 수 없다 (관리자가 먼저
+    Basemap 관리 화면에서 등록 취소를 해야 한다).
+
+    함께 정리:
+      - SceneOutput row + MinIO 파일 (ply/sog/metadata)
+      - 관련 Task row + Notification.related_task_id null 처리
+      - Upload 자신의 MinIO 파일 (원본/refined/doors.json + refined prefix)
+    """
+    stmt = select(Upload).where(Upload.id == upload_id)
+    if user.role != UserRole.admin:
+        stmt = stmt.where(Upload.user_id == user.id)
+    upload = (await db.execute(stmt)).scalar_one_or_none()
+    if upload is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="업로드를 찾을 수 없습니다.",
+        )
+
+    basemap_exists = (await db.execute(
+        select(Basemap.id).where(Basemap.source_upload_id == upload.id).limit(1)
+    )).scalar_one_or_none()
+    if basemap_exists is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="basemap에 등록된 업로드는 삭제할 수 없습니다. 관리자에게 문의하세요.",
+        )
+
+    # 정리 대상 키 / prefix 수집.
+    keys: set[str] = set()
+    prefixes: set[str] = set()
+    for k in (upload.minio_path, upload.refined_ply_path, upload.door_corners_json_path):
+        if k:
+            keys.add(k)
+    if upload.minio_path:
+        prefixes.add(refined_prefix(upload.minio_path))
+
+    task_ids_rows = await db.execute(select(Task.id).where(Task.upload_id == upload.id))
+    task_ids = [tid for (tid,) in task_ids_rows.all()]
+
+    scene_rows = await db.execute(
+        select(SceneOutput.id, SceneOutput.ply_path, SceneOutput.sog_path, SceneOutput.metadata_path)
+        .join(Task, SceneOutput.task_id == Task.id)
+        .where(Task.upload_id == upload.id)
+    )
+    scene_ids: list[UUID] = []
+    for sid, ply_path, sog_path, metadata_path in scene_rows.all():
+        scene_ids.append(sid)
+        for k in (ply_path, sog_path, metadata_path):
+            if k:
+                keys.add(k)
+
+    if task_ids:
+        await db.execute(
+            sa_update(Notification)
+            .where(Notification.related_task_id.in_(task_ids))
+            .values(related_task_id=None)
+        )
+    if scene_ids:
+        await db.execute(sa_delete(SceneOutput).where(SceneOutput.id.in_(scene_ids)))
+    if task_ids:
+        await db.execute(sa_delete(Task).where(Task.id.in_(task_ids)))
+    await db.execute(sa_delete(Upload).where(Upload.id == upload.id))
+    await db.commit()
+
+    minio = get_minio_service()
+    for prefix in prefixes:
+        try:
+            minio.delete_prefix(prefix)
+        except Exception:
+            pass
+    for key in keys:
+        try:
+            minio.delete_object(key)
+        except Exception:
+            pass
+
+    return None
 
 
 @router.get("/{upload_id}/presigned-url")
@@ -379,11 +518,22 @@ async def get_upload_presigned_url(
     if upload is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="업로드를 찾을 수 없습니다.")
 
+    minio = get_minio_service()
+
+    # COLMAP 업로드는 원본이 ZIP/MP4 이지만 워커가 생성한 결과 PLY 가 있으면 그것을 서빙한다.
+    if upload.ply_target == PlyTarget.colmap:
+        if upload.gsplat_ply_path and minio.object_exists(upload.gsplat_ply_path):
+            url = minio.get_presigned_download_url(upload.gsplat_ply_path)
+            ply_filename = os.path.splitext(upload.original_filename)[0] + ".ply"
+            return {"url": url, "filename": ply_filename, "variant": "gsplat"}
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="아직 결과 PLY 가 준비되지 않았습니다 (학습 진행 중이거나 실패).",
+        )
+
     ext = os.path.splitext(upload.original_filename)[1].lower()
     if ext not in VIEWABLE_EXTENSIONS:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="뷰어를 지원하지 않는 파일 형식입니다.")
-
-    minio = get_minio_service()
 
     # 정제된 PLY 후보 — variant=refined 우선시 + variant=None 일 때 원본 부재 시 fallback 으로도 사용.
     #   1순위: upload.refined_ply_path (SAM3 파이프라인 정식 경로)
@@ -743,32 +893,32 @@ async def get_sam3_status(
 # ── doors.json: SAM3 결과 + 사용자 보정 ─────────────────────────────────────
 
 class DoorMeshMeta(BaseModel):
-    """도어 quad mesh 의 영속화 메타. wall 텍스처의 도어 영역을 잘라낸 별도 PNG + corners.
+    """도어 quad mesh 의 영속화 메타 — wall 텍스처에서 도어 영역을 잘라낸 별도 PNG + corners.
 
-    basemap 재로드 시 mesh quad entity 재생성에 필요한 정보 전부.
+    basemap 재로드 시 wall mesh quad entity 재생성에 필요한 정보 전부 포함.
     """
-    corners: list[list[float]]  # 4 × [x, y, z] — Z-fight 오프셋 적용된 mesh 코너 (A'+Y)
-    uvs: list[list[float]]      # 4 × [u, v] — 텍스처 매핑
-    normalInward: list[float]   # [x, y, z] — 방 안쪽 normal
-    textureFilename: str        # "tex_door_<doorId>.png"
+    corners: list[list[float]]  # 4 × [x, y, z] — A'+Y 프레임 mesh 코너
+    uvs: list[list[float]]      # 4 × [u, v]   — 텍스처 매핑
+    normalInward: list[float]   # [x, y, z]    — 방 안쪽 normal
+    textureFilename: str        # MinIO 키: "tex_door_<doorId>.png"
     textureWidth: int
     textureHeight: int
 
 
 class DoorSplatMeta(BaseModel):
-    """도어 영역 가우시안 splat (boundary split 결과 + doorOrig) PLY 의 영속화 메타."""
-    filename: str               # "door_<doorId>.ply"
+    """도어 영역 가우시안 splat PLY 의 영속화 메타 (boundary split sub + doorOrig)."""
+    filename: str               # MinIO 키: "door_<doorId>.ply"
 
 
 class DoorEntry(BaseModel):
     """doors.json 의 한 문 엔트리.
 
-    corners 외 나머지 메타 (회전축/회전각/회전방향/벽 surfaceId/두께/분할 옵션 등) 는
+    corners 외 나머지 메타 (회전축/회전각/방향/벽 surfaceId/두께/분할 옵션 등) 는
     문 설정 단계에서 사용자가 확정한 값. 정합·재진입·basemap 매칭 시 모두 활용되므로
     스키마에 명시해 라운드트립 시 손실되지 않게 한다.
 
-    선택적 자산 (doorMesh, doorSplat) — basemap 의 경우 각 문의 텍스처/가우시안을 영속화해서
-    로드 시 재생성 가능. 없으면 corners 만으로 정합 등에 사용.
+    선택 자산 `doorMesh` / `doorSplat`: basemap 의 경우 도어별 텍스처/가우시안을 별도
+    파일로 영속화하면 로드 시 그대로 재생성 가능. 없으면 corners 만으로 정합 매칭 등에 사용.
     """
     id: str
     corners: list[list[float]]  # 4 × [x, y, z]
@@ -779,9 +929,8 @@ class DoorEntry(BaseModel):
     doorThickness: float | None = None
     boundarySplitEnabled: bool | None = None
     safetyMargin: float | None = None
-    # basemap 등록 시 admin 이 각 문에 입력하는 호수 (예: "302호").
-    # 정합 단계에서 모듈의 호수 (Module.name) 와 매칭해 basemap 의 어느 문에 정합할지 결정.
-    # 모듈측 doors.json 에서는 보통 비어있음 (모듈은 단일 호라 호수 = Module.name 으로 자명).
+    # basemap 등록 시 각 문에 부여하는 호수 (예: "302호"). 정합 단계에서 모듈의
+    # 호수 (Module.name) 와 매칭해 basemap 의 어느 문에 정합할지 결정. 모듈측에서는 비어있음.
     unitName: str | None = None
     doorMesh: DoorMeshMeta | None = None
     doorSplat: DoorSplatMeta | None = None
@@ -840,19 +989,15 @@ async def get_doors(
                 safetyMargin=d.get("safetyMargin") if isinstance(d.get("safetyMargin"), (int, float)) else None,
                 unitName=d.get("unitName") if isinstance(d.get("unitName"), str) else None,
             )
-            # doorMesh / doorSplat — 옵션. 있으면 그대로 통과 (Pydantic 가 형식 검증).
+            # doorMesh / doorSplat — 옵션. Pydantic 가 형식 검증; 실패 시 그냥 패스 (corners 만으로 사용 가능).
             dm = d.get("doorMesh")
             if isinstance(dm, dict):
-                try:
-                    entry_kwargs["doorMesh"] = DoorMeshMeta(**dm)
-                except Exception:
-                    pass
+                try: entry_kwargs["doorMesh"] = DoorMeshMeta(**dm)
+                except Exception: pass
             ds = d.get("doorSplat")
             if isinstance(ds, dict):
-                try:
-                    entry_kwargs["doorSplat"] = DoorSplatMeta(**ds)
-                except Exception:
-                    pass
+                try: entry_kwargs["doorSplat"] = DoorSplatMeta(**ds)
+                except Exception: pass
             clean.append(DoorEntry(**entry_kwargs))
         return DoorsJson(doors=clean)
     except Exception as e:

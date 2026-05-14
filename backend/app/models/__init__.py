@@ -32,6 +32,7 @@ class PlyTarget(str, PyEnum):
     gsplat = "gsplat"
     alignment = "alignment"
     refined = "refined"
+    colmap = "colmap"
 
 
 class TaskType(str, PyEnum):
@@ -39,6 +40,7 @@ class TaskType(str, PyEnum):
     door_alignment = "door_alignment"
     basemap_realign = "basemap_realign"
     sam3_door_detection = "sam3_door_detection"
+    colmap_preprocessing = "colmap_preprocessing"
 
 
 class Sam3Status(str, PyEnum):
@@ -191,6 +193,9 @@ class Upload(Base):
     ply_target: Mapped[PlyTarget | None] = mapped_column(Enum(PlyTarget), nullable=True)
     status: Mapped[UploadStatus] = mapped_column(Enum(UploadStatus), default=UploadStatus.uploaded, nullable=False)
     uploaded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    # COLMAP → 3DGS 파이프라인 결과물 (워커가 생성한 PLY 의 MinIO key)
+    gsplat_ply_path: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # SAM3 / 정합 파이프라인 (docs/sam3_alignment_pipeline.md)
     refined_ply_path: Mapped[str | None] = mapped_column(Text, nullable=True)

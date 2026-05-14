@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
+import { useRouter } from 'next/navigation';
 import { api } from '@/lib/api';
 import { wsClient } from '@/lib/ws';
 import { Upload, Notification, WsMessage } from '@/types';
@@ -74,8 +75,39 @@ interface Props {
 }
 
 export default function UserDashboard({ showHeader = true }: Props) {
+  const router = useRouter();
   const [uploads, setUploads] = useState<Upload[]>([]);
   const [notifications, setNotifications] = useState<Notification[]>([]);
+  const [deleteTarget, setDeleteTarget] = useState<Upload | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  // COLMAP 결과 PLY 를 PC 로 다운로드 + viewer 이동 처리 중인 업로드 id (중복 클릭 방지).
+  const [fetchingColmapId, setFetchingColmapId] = useState<string | null>(null);
+
+  // 사용자 PC 에 다운로드 트리거 후 같은 upload_id 로 /viewer 이동 (refine 모드 자동 시작).
+  // presigned URL 을 받아 <a download> 로 저장 → router.push 로 viewer 진입.
+  const handleColmapSelect = async (uploadId: string) => {
+    if (fetchingColmapId) return;
+    setFetchingColmapId(uploadId);
+    try {
+      const data = await api.get<{ url: string; filename: string }>(
+        `/uploads/${uploadId}/presigned-url`,
+      );
+      const a = document.createElement('a');
+      a.href = data.url;
+      const fname = data.filename || 'gsplat.ply';
+      a.download = fname.endsWith('.ply') ? fname : `${fname}.ply`;
+      a.rel = 'noopener';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      router.push(`/viewer?upload_id=${uploadId}`);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      alert(`파일을 가져오지 못했습니다: ${msg}`);
+      setFetchingColmapId(null);
+    }
+  };
 
   useEffect(() => {
     api.get<Upload[]>('/uploads').then(setUploads).catch(() => {});
@@ -94,6 +126,21 @@ export default function UserDashboard({ showHeader = true }: Props) {
   const markAllRead = async () => {
     await api.post('/notifications/read-all');
     setNotifications([]);
+  };
+
+  const handleDelete = async () => {
+    if (!deleteTarget) return;
+    setDeleting(true);
+    setDeleteError(null);
+    try {
+      await api.delete(`/uploads/${deleteTarget.id}`);
+      setUploads(prev => prev.filter(u => u.id !== deleteTarget.id));
+      setDeleteTarget(null);
+    } catch (e: any) {
+      setDeleteError(e?.message || '업로드 삭제 실패');
+    } finally {
+      setDeleting(false);
+    }
   };
 
   return (
@@ -139,18 +186,33 @@ export default function UserDashboard({ showHeader = true }: Props) {
                   <th className="py-2 pr-4">상태</th>
                   <th className="py-2 pr-4">SAM3</th>
                   <th className="py-2 pr-4">날짜</th>
-                  <th className="py-2 pr-4 text-right">정합</th>
+                  <th className="py-2 pr-4 text-right">삭제</th>
                 </tr>
               </thead>
               <tbody>
                 {uploads.map(u => {
                   const sam = u.sam3_status ?? null;
-                  const canAlign = sam === 'done' || sam === 'failed' || u.has_refined;
                   const stage = progressStage(u);
+                  const isColmap = u.ply_target === 'colmap';
+                  const colmapDone = isColmap && u.status === 'completed' && !!u.has_gsplat_ply;
+                  const colmapProcessing = isColmap && u.status === 'processing';
+                  const colmapFailed = isColmap && u.status === 'failed';
+                  const filenameClickable = isViewable(u.original_filename) || colmapDone;
+                  const isBasemap = !!u.is_basemap_source;
+                  const canAlign = !isColmap && (!!u.has_refined || !!u.has_doors_json);
                   return (
                     <tr key={u.id} className="border-b border-gray-800/50">
                       <td className="py-3 pr-4">
-                        {isViewable(u.original_filename) ? (
+                        {isColmap && colmapDone ? (
+                          <button
+                            type="button"
+                            disabled={fetchingColmapId === u.id}
+                            onClick={() => handleColmapSelect(u.id)}
+                            className="text-blue-400 hover:underline disabled:opacity-60 disabled:cursor-wait"
+                          >
+                            {u.original_filename}
+                          </button>
+                        ) : filenameClickable ? (
                           <Link
                             href={u.has_refined
                               ? `/viewer?upload_id=${u.id}&mode=align`
@@ -163,13 +225,63 @@ export default function UserDashboard({ showHeader = true }: Props) {
                           <span className="text-gray-300">{u.original_filename}</span>
                         )}
                       </td>
-                      <td className={`py-3 pr-4 ${STAGE_COLOR[stage]}`}>{STAGE_LABEL[stage]}</td>
+                      <td className={`py-3 pr-4 ${
+                        isColmap
+                          ? (colmapFailed ? 'text-red-400' : (colmapDone ? 'text-blue-400' : 'text-emerald-400'))
+                          : STAGE_COLOR[stage]
+                      }`}>
+                        {isColmap
+                          ? (colmapFailed
+                              ? 'COLMAP 실패'
+                              : colmapDone
+                                ? '학습 완료'
+                                : colmapProcessing
+                                  ? 'COLMAP 처리 중'
+                                  : 'COLMAP 대기')
+                          : STAGE_LABEL[stage]}
+                      </td>
                       <td className={`py-3 pr-4 ${sam ? SAM3_COLOR[sam] : 'text-gray-600'}`}>
-                        {sam ? SAM3_LABEL[sam] : '—'}
+                        {isColmap ? '—' : (sam ? SAM3_LABEL[sam] : '—')}
                       </td>
                       <td className="py-3 pr-4 text-gray-500">{new Date(u.uploaded_at).toLocaleDateString('ko-KR')}</td>
                       <td className="py-3 pr-4 text-right">
-                        {canAlign ? (
+                        {isColmap ? (
+                          colmapDone ? (
+                            <button
+                              type="button"
+                              disabled={fetchingColmapId === u.id}
+                              onClick={() => handleColmapSelect(u.id)}
+                              className="inline-block px-3 py-1 rounded bg-emerald-600 hover:bg-emerald-500 disabled:bg-gray-700 disabled:text-gray-400 text-white text-xs font-bold"
+                              title="PLY를 PC에 저장하고 다듬기 단계로 이동"
+                            >
+                              {fetchingColmapId === u.id ? '준비 중...' : '파일 선택'}
+                            </button>
+                          ) : (
+                            <Link
+                              href={`/colmap-viewer?upload_id=${u.id}`}
+                              className="inline-block px-3 py-1 rounded bg-gray-700 hover:bg-gray-600 text-white text-xs font-bold"
+                            >
+                              처리 중...
+                            </Link>
+                          )
+                        ) : isBasemap ? (
+                          <span className="relative inline-block group">
+                            <button
+                              type="button"
+                              disabled
+                              aria-label="basemap에 등록된 파일은 삭제할 수 없습니다"
+                              className="w-6 h-6 inline-flex items-center justify-center text-gray-600 rounded cursor-not-allowed"
+                            >
+                              ×
+                            </button>
+                            <span
+                              role="tooltip"
+                              className="pointer-events-none absolute right-0 top-full mt-1 z-10 whitespace-nowrap rounded bg-gray-800 px-2 py-1 text-[10px] text-gray-200 opacity-0 group-hover:opacity-100 transition-opacity"
+                            >
+                              관리자에게 문의하세요
+                            </span>
+                          </span>
+                        ) : canAlign ? (
                           <Link
                             href={`/viewer?upload_id=${u.id}&mode=align`}
                             className="inline-block px-3 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold"
@@ -178,7 +290,15 @@ export default function UserDashboard({ showHeader = true }: Props) {
                             정합하기
                           </Link>
                         ) : (
-                          <span className="text-gray-600 text-xs">—</span>
+                          <button
+                            type="button"
+                            onClick={() => setDeleteTarget(u)}
+                            aria-label={`${u.original_filename} 삭제`}
+                            title={`${u.original_filename} 삭제`}
+                            className="w-6 h-6 inline-flex items-center justify-center text-gray-400 hover:text-white hover:bg-red-600 rounded"
+                          >
+                            ×
+                          </button>
                         )}
                       </td>
                     </tr>
@@ -189,6 +309,41 @@ export default function UserDashboard({ showHeader = true }: Props) {
           </div>
         )}
       </div>
+
+      {deleteTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4">
+          <div className="w-full max-w-md rounded-lg border border-gray-700 bg-gray-900 p-5 shadow-xl">
+            <h3 className="text-base font-semibold text-white">업로드 삭제</h3>
+            <p className="mt-3 text-sm text-red-300">
+              삭제 시 업로드한 파일과 관련된 모든 데이터가 삭제됩니다.
+            </p>
+            <p className="mt-2 text-sm text-gray-300 truncate">
+              대상: {deleteTarget.original_filename}
+            </p>
+            {deleteError && (
+              <p className="mt-2 text-xs text-red-400">{deleteError}</p>
+            )}
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={handleDelete}
+                disabled={deleting}
+                className="rounded bg-red-600 px-4 py-2 text-sm font-semibold text-white hover:bg-red-700 disabled:bg-gray-700 disabled:text-gray-400"
+              >
+                {deleting ? '삭제 중...' : '삭제'}
+              </button>
+              <button
+                type="button"
+                onClick={() => { if (!deleting) { setDeleteTarget(null); setDeleteError(null); } }}
+                disabled={deleting}
+                className="rounded bg-gray-700 px-4 py-2 text-sm text-gray-200 hover:bg-gray-600 disabled:opacity-50"
+              >
+                취소
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

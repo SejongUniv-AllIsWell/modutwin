@@ -10,7 +10,7 @@ ALLOWED_EXTENSIONS = {
     ".mp4", ".mov", ".avi", ".mkv", ".webm",  # video
     ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp",  # image
     ".ply", ".splat", ".sog",  # 3D scene
-    ".zip",
+    ".zip",  # COLMAP 사진 묶음
 }
 # 허용 content-type 화이트리스트
 ALLOWED_CONTENT_TYPES = {
@@ -47,6 +47,7 @@ def get_upload_subfolder(filename: str, ply_target: str = "gsplat") -> str:
 
     - .ply: ply_target에 따라 'gsplat' / 'alignment' / 'refined'
     - .splat / .sog: 항상 'refined' (3DGS 학습 결과 또는 다듬기 결과)
+    - .zip: 'colmap_input' (COLMAP용 사진 묶음)
     - 그 외 (영상/이미지): 'web_input'
     """
     ext = os.path.splitext(filename)[1].lower()
@@ -54,6 +55,8 @@ def get_upload_subfolder(filename: str, ply_target: str = "gsplat") -> str:
         return ply_target  # "gsplat", "alignment", "refined"
     if ext in SCENE_3D_EXTENSIONS:
         return "refined"
+    if ext == ".zip":
+        return "colmap_input"
     return "web_input"
 
 
@@ -64,7 +67,7 @@ class UploadInitRequest(BaseModel):
     building_id: UUID
     floor_id: UUID
     module_id: UUID
-    ply_target: Optional[Literal["gsplat", "alignment", "refined"]] = "gsplat"
+    ply_target: Optional[Literal["gsplat", "alignment", "refined", "colmap"]] = "gsplat"
 
     @field_validator("filename")
     @classmethod
@@ -105,6 +108,15 @@ class UploadInitRequest(BaseModel):
                     f"{', '.join(sorted(OCTET_STREAM_ALLOWED_EXTENSIONS))} 파일에만 허용됩니다. "
                     "적절한 content-type을 지정하세요."
                 )
+        return self
+
+    @model_validator(mode="after")
+    def validate_colmap_target(self) -> "UploadInitRequest":
+        """colmap ply_target은 zip 파일에만 허용된다."""
+        if self.ply_target == "colmap":
+            ext = os.path.splitext(self.filename)[1].lower()
+            if ext != ".zip":
+                raise ValueError("colmap ply_target은 .zip 파일에만 허용됩니다.")
         return self
 
 
@@ -148,6 +160,8 @@ class UploadResponse(BaseModel):
     has_refined: bool = False
     has_doors_json: bool = False
     has_alignment: bool = False
+    has_gsplat_ply: bool = False  # COLMAP→GS 결과 PLY 존재 여부
+    is_basemap_source: bool = False  # basemap 으로 등록된 원본 업로드인지 — 삭제 비활성화 판단용
 
     class Config:
         from_attributes = True

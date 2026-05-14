@@ -14,6 +14,7 @@ from app.api.notifications import router as notifications_router
 from app.api.basemaps import router as basemaps_router, public_router as basemaps_public_router
 from app.api.buildings import router as buildings_router
 from app.api.refine import router as refine_router
+from app.api.internal import router as internal_router
 from app.api.internal_worker import router as internal_worker_router
 from app.api.kakao import router as kakao_router
 from app.api.module_register import router as module_register_router
@@ -21,7 +22,10 @@ from app.api.module_register import router as module_register_router
 
 from app.core.config import get_settings
 from app.services.minio_service import get_minio_service
-from app.services.sam3_temp_storage import cleanup_loop as sam3_temp_cleanup_loop, ensure_temp_dir as sam3_ensure_temp_dir
+from app.services.sam3_temp_storage import (
+    cleanup_loop as sam3_temp_cleanup_loop,
+    ensure_temp_dir as sam3_ensure_temp_dir,
+)
 
 settings = get_settings()
 
@@ -67,8 +71,8 @@ app.add_middleware(AccessLogMiddleware)
 
 # 라우터 등록
 app.include_router(auth_router)
-# 새 모듈 등록 흐름 라우터는 uploads_router 보다 먼저 등록해서, 동일 prefix(/uploads) 하에서
-# 새 흐름 경로(/uploads/sam3/prepare, /uploads/sam3/detect-temp, /uploads/commit-final) 가
+# 신흐름 모듈 등록 라우터는 uploads_router 보다 먼저 등록 — 동일 prefix(/uploads) 아래에서
+# 신흐름 경로(/uploads/sam3/prepare, /uploads/sam3/detect-temp, /uploads/commit-final) 가
 # 기존 /uploads/{upload_id}/... 패턴보다 먼저 매칭되도록.
 app.include_router(module_register_router)
 app.include_router(uploads_router)
@@ -80,6 +84,7 @@ app.include_router(basemaps_router)
 app.include_router(basemaps_public_router)
 app.include_router(buildings_router)
 app.include_router(refine_router)
+app.include_router(internal_router)
 app.include_router(internal_worker_router)
 app.include_router(kakao_router)
 
