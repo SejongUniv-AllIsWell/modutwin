@@ -1,11 +1,12 @@
 'use client';
 
-import { useState, useRef, useCallback, useEffect } from 'react';
+import { useState, useRef, useCallback } from 'react';
+import { useRouter } from 'next/navigation';
 import { api } from '@/lib/api';
 import { Building, Floor, Module, UploadInitResponse } from '@/types';
+import { PENDING_LOCAL_PLY_KEY, type PendingLocalPlyPayload } from '@/lib/upload/pendingLocalPly';
 
 const SCENE_3D_EXTENSIONS = ['.ply', '.splat', '.sog'];
-const STORAGE_ZIP_EXTENSIONS = ['.zip'];
 
 function fileExt(filename: string): string {
   return `.${filename.split('.').pop()?.toLowerCase() ?? ''}`;
@@ -19,13 +20,9 @@ function isZipFile(file: File): boolean {
   return fileExt(file.name) === '.zip';
 }
 
-// 브라우저가 file.type을 빈 문자열로 반환할 때 확장자 기반 보완
 const EXT_TO_MIME: Record<string, string> = {
-  mp4: 'video/mp4', mov: 'video/quicktime', avi: 'video/x-msvideo',
-  mkv: 'video/x-matroska', webm: 'video/webm',
-  jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png',
-  gif: 'image/gif', bmp: 'image/bmp', webp: 'image/webp',
-  ply: 'application/octet-stream', splat: 'application/octet-stream',
+  ply: 'application/octet-stream',
+  splat: 'application/octet-stream',
   sog: 'application/octet-stream',
   zip: 'application/zip',
 };
@@ -36,295 +33,201 @@ function resolveContentType(file: File): string {
   return EXT_TO_MIME[ext] ?? 'application/octet-stream';
 }
 
-function isVideoFile(file: File): boolean {
-  return resolveContentType(file).startsWith('video/');
-}
-
-function isImageFile(file: File): boolean {
-  return resolveContentType(file).startsWith('image/');
-}
-
 function isAcceptedFile(file: File): boolean {
-  return isVideoFile(file) || isImageFile(file) || isScene3DFile(file.name) || isZipFile(file);
+  return isScene3DFile(file.name) || isZipFile(file);
 }
 
-// "1","2" → 1,2 / "B1","B2" → -1,-2 / invalid → null
-function parseFloorToInt(value: string): number | null {
-  const v = value.trim().toUpperCase();
-  if (/^B(\d+)$/.test(v)) {
-    const n = parseInt(v.slice(1), 10);
-    return n > 0 ? -n : null;
-  }
-  if (/^\d+$/.test(v)) {
-    const n = parseInt(v, 10);
-    return n > 0 ? n : null;
-  }
-  return null;
-}
-
-// normalize on blur: "-1" or "-1층" → "B1", "b2" → "B2", etc.
-function normalizeFloorInput(value: string): string {
-  const v = value.trim();
-  // "-숫자" or "-숫자층"
-  const negMatch = v.match(/^-(\d+)층?$/);
-  if (negMatch) {
-    const n = parseInt(negMatch[1], 10);
-    return n > 0 ? `B${n}` : '';
-  }
-  // "B숫자" (case insensitive)
-  const bMatch = v.toUpperCase().match(/^B(\d+)$/);
-  if (bMatch) {
-    const n = parseInt(bMatch[1], 10);
-    return n > 0 ? `B${n}` : '';
-  }
-  // 양의 정수
-  if (/^\d+$/.test(v)) {
-    const n = parseInt(v, 10);
-    return n > 0 ? String(n) : '';
-  }
-  return '';
-}
-
-interface KakaoPlace {
-  place_name: string;
-  address_name: string;
-  road_address_name: string;
-  id: string;
+export interface UploaderFixedContext {
+  purpose: string;
+  building_id: string;
+  building_name: string;
+  floor_id: string;
+  floor_number: number;
+  module_name: string;
+  place_id?: string;
+  address_name?: string;
+  road_address_name?: string;
+  lat?: string;
+  lng?: string;
 }
 
 export default function MultipartUploader({
-  fixedContext = null,
+  fixedContext,
 }: {
-  fixedContext?: { building_id: string; building_name: string; floor_id: string; floor_number: number } | null;
+  fixedContext: UploaderFixedContext;
 }) {
+  const router = useRouter();
   const fileRef = useRef<HTMLInputElement>(null);
-  const buildingDropdownRef = useRef<HTMLDivElement>(null);
 
   const [file, setFile] = useState<File | null>(null);
   const [isDragging, setIsDragging] = useState(false);
-  const [uploading, setUploading] = useState(false);
-  const [progress, setProgress] = useState(0);
-  const [uploadStatus, setUploadStatus] = useState<'idle' | 'uploading' | 'done' | 'error'>('idle');
+  const [submitting, setSubmitting] = useState(false);
   const [message, setMessage] = useState('');
+  const [messageKind, setMessageKind] = useState<'error' | 'info' | null>(null);
 
-  // Building state
-  const [buildings, setBuildings] = useState<Building[]>([]);
-  const [selectedBuildingName, setSelectedBuildingName] = useState('');
-  const [buildingSearchOpen, setBuildingSearchOpen] = useState(false);
-  const [buildingSearchQuery, setBuildingSearchQuery] = useState('');
-  const [buildingSearchResults, setBuildingSearchResults] = useState<KakaoPlace[]>([]);
-  const [buildingSearchLoading, setBuildingSearchLoading] = useState(false);
-
-  // Floor and Module (direct input)
-  const [floorNumber, setFloorNumber] = useState('');
-  const [moduleName, setModuleName] = useState('');
-
-  // Load buildings on mount
-  useEffect(() => {
-    if (fixedContext) {
-      setSelectedBuildingName(fixedContext.building_name);
-      setFloorNumber(fixedContext.floor_number < 0 ? `B${Math.abs(fixedContext.floor_number)}` : `${fixedContext.floor_number}`);
-      return;
-    }
-    api.get<Building[]>('/buildings').then(setBuildings).catch(() => {});
-  }, [fixedContext]);
-
-  // Close dropdown on outside click
-  useEffect(() => {
-    if (!buildingSearchOpen) return;
-    const handleClickOutside = (e: MouseEvent) => {
-      if (buildingDropdownRef.current && !buildingDropdownRef.current.contains(e.target as Node)) {
-        setBuildingSearchOpen(false);
-      }
-    };
-    document.addEventListener('mousedown', handleClickOutside);
-    return () => document.removeEventListener('mousedown', handleClickOutside);
-  }, [buildingSearchOpen]);
-
-  // Kakao search with debounce
-  useEffect(() => {
-    const query = buildingSearchQuery.trim();
-    if (!query) {
-      setBuildingSearchResults([]);
-      setBuildingSearchLoading(false);
-      return;
-    }
-
-    setBuildingSearchLoading(true);
-    const timer = setTimeout(async () => {
-      try {
-        const data = await api.get<{ documents: KakaoPlace[] }>(
-          `/kakao/search/keyword?query=${encodeURIComponent(query)}&size=10`
-        );
-        setBuildingSearchResults(data.documents || []);
-      } catch {
-        setBuildingSearchResults([]);
-      } finally {
-        setBuildingSearchLoading(false);
-      }
-    }, 400);
-
-    return () => {
-      clearTimeout(timer);
-      setBuildingSearchLoading(false);
-    };
-  }, [buildingSearchQuery]);
-
-  const handleSelectBuilding = (place: KakaoPlace) => {
-    setSelectedBuildingName(place.place_name);
-    setBuildingSearchOpen(false);
-    setBuildingSearchQuery('');
-    setBuildingSearchResults([]);
-  };
-
-  // find-or-create helpers
-  const findOrCreateBuilding = async (name: string): Promise<string> => {
-    const existing = buildings.find(b => b.name === name);
-    if (existing) return existing.id;
-    const b = await api.post<Building>('/buildings', { name });
-    setBuildings(prev => [...prev, b]);
+  // .zip 분기 — 같은 building/floor/module 로 server upload 진행 후 /dashboard 이동.
+  // basemap purpose 에서는 register-local-basemap 흐름이 필요해 zip(COLMAP) 미지원.
+  const findOrCreateBuilding = async (): Promise<string> => {
+    if (fixedContext.building_id) return fixedContext.building_id;
+    const b = await api.post<Building>('/buildings', {
+      name: fixedContext.building_name,
+      ...(fixedContext.place_id ? { kakao_place_id: fixedContext.place_id } : {}),
+      ...(fixedContext.address_name ? { address_name: fixedContext.address_name } : {}),
+      ...(fixedContext.road_address_name ? { road_address_name: fixedContext.road_address_name } : {}),
+      ...(fixedContext.lat ? { latitude: Number(fixedContext.lat) } : {}),
+      ...(fixedContext.lng ? { longitude: Number(fixedContext.lng) } : {}),
+    });
     return b.id;
   };
 
-  const findOrCreateFloor = async (buildingId: string, floorNum: number): Promise<string> => {
-    const floorList = await api.get<Floor[]>(`/buildings/${buildingId}/floors`);
-    const existing = floorList.find(f => f.floor_number === floorNum);
+  const findOrCreateFloor = async (buildingId: string): Promise<string> => {
+    if (fixedContext.floor_id) return fixedContext.floor_id;
+    const list = await api.get<Floor[]>(`/buildings/${buildingId}/floors`);
+    const existing = list.find((f) => f.floor_number === fixedContext.floor_number);
     if (existing) return existing.id;
-    const f = await api.post<Floor>(`/buildings/${buildingId}/floors`, { floor_number: floorNum });
+    const f = await api.post<Floor>(`/buildings/${buildingId}/floors`, { floor_number: fixedContext.floor_number });
     return f.id;
   };
 
-  const findOrCreateModule = async (floorId: string, name: string): Promise<string> => {
-    const moduleList = await api.get<Module[]>(`/floors/${floorId}/modules`);
-    const existing = moduleList.find(m => m.name === name);
+  const findOrCreateModule = async (floorId: string): Promise<string> => {
+    const list = await api.get<Module[]>(`/floors/${floorId}/modules`);
+    const existing = list.find((m) => m.name === fixedContext.module_name);
     if (existing) return existing.id;
-    const m = await api.post<Module>(`/floors/${floorId}/modules`, { name });
+    const m = await api.post<Module>(`/floors/${floorId}/modules`, { name: fixedContext.module_name });
     return m.id;
   };
 
   const handleDrop = useCallback((e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
     setIsDragging(false);
-    if (uploading) return;
+    if (submitting) return;
     const dropped = e.dataTransfer.files?.[0];
     if (!dropped) return;
     if (!isAcceptedFile(dropped)) {
-      setMessage('이미지, 영상, .ply/.splat/.sog, 또는 사진 묶음(.zip) 파일만 업로드할 수 있습니다.');
-      setUploadStatus('error');
+      setMessage('.ply / .splat / .sog 또는 사진 묶음(.zip) 파일만 업로드할 수 있습니다.');
+      setMessageKind('error');
       return;
     }
     setFile(dropped);
     setMessage('');
-    setUploadStatus('idle');
-  }, [uploading]);
+    setMessageKind(null);
+  }, [submitting]);
 
   const handleDragOver = useCallback((e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
-    if (!uploading) setIsDragging(true);
-  }, [uploading]);
+    if (!submitting) setIsDragging(true);
+  }, [submitting]);
 
   const handleDragLeave = useCallback(() => setIsDragging(false), []);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0] || null;
     if (f && !isAcceptedFile(f)) {
-      setMessage('이미지, 영상, .ply/.splat/.sog, 또는 사진 묶음(.zip) 파일만 업로드할 수 있습니다.');
-      setUploadStatus('error');
+      setMessage('.ply / .splat / .sog 또는 사진 묶음(.zip) 파일만 업로드할 수 있습니다.');
+      setMessageKind('error');
       if (fileRef.current) fileRef.current.value = '';
       return;
     }
     setFile(f);
     setMessage('');
-    setUploadStatus('idle');
+    setMessageKind(null);
   };
 
-  const handleUpload = async () => {
-    const floorInt = parseFloorToInt(floorNumber);
-    if (!file || !selectedBuildingName || floorInt === null || !moduleName.trim()) {
-      setMessage('파일, 건물, 층(양의 정수 또는 B1·B2 형식), 모듈을 모두 입력하세요.');
-      return;
-    }
-
-    setUploading(true);
-    setUploadStatus('uploading');
-    setProgress(0);
+  const handleConfirm = async () => {
+    if (!file) return;
+    setSubmitting(true);
     setMessage('');
+    setMessageKind(null);
 
     try {
-      const buildingId = fixedContext?.building_id ?? await findOrCreateBuilding(selectedBuildingName);
-      const floorId = fixedContext?.floor_id ?? await findOrCreateFloor(buildingId, floorInt);
-      const moduleId = await findOrCreateModule(floorId, moduleName.trim());
+      // 분기 1: .ply / .splat / .sog → 업로드 없이 blob URL 로 viewer 이동 (다듬기 시작)
+      if (isScene3DFile(file.name)) {
+        const blobUrl = URL.createObjectURL(file);
+        const payload: PendingLocalPlyPayload = {
+          blobUrl,
+          filename: file.name,
+          fileSize: file.size,
+          purpose: fixedContext.purpose,
+          building_id: fixedContext.building_id || undefined,
+          building_name: fixedContext.building_name,
+          floor_id: fixedContext.floor_id || undefined,
+          floor_number: fixedContext.floor_number,
+          module_name: fixedContext.module_name,
+          place_id: fixedContext.place_id || undefined,
+          address_name: fixedContext.address_name || undefined,
+          road_address_name: fixedContext.road_address_name || undefined,
+          lat: fixedContext.lat ? Number(fixedContext.lat) : undefined,
+          lng: fixedContext.lng ? Number(fixedContext.lng) : undefined,
+          createdAt: Date.now(),
+        };
+        try {
+          sessionStorage.setItem(PENDING_LOCAL_PLY_KEY, JSON.stringify(payload));
+        } catch {
+          // sessionStorage 가 막혀있어도 blob URL 은 같은 document 안에서 유효하므로 그대로 진행.
+        }
+        router.push('/viewer');
+        return;
+      }
 
-      // 파일 분기: zip → COLMAP, ply/splat/sog → refined, 영상/이미지 → 학습 파이프라인
-      let plyTarget: 'gsplat' | 'alignment' | 'refined' | 'colmap' | undefined;
+      // 분기 2: .zip → COLMAP 파이프라인. 업로드 시작과 동시에 /dashboard 로 이동.
       if (isZipFile(file)) {
-        plyTarget = 'colmap';
-      } else if (isScene3DFile(file.name)) {
-        plyTarget = 'refined';
-      } else {
-        plyTarget = undefined;
+        if (fixedContext.purpose === 'basemap') {
+          setMessage('Basemap 등록은 .ply / .splat / .sog 파일만 지원합니다.');
+          setMessageKind('error');
+          setSubmitting(false);
+          return;
+        }
+        // basemap 이면 module_name 으로 별도 모듈을 생성하지 않도록 막아야 하지만, 현 흐름에서
+        // basemap+zip 조합은 위에서 차단했으므로 이하 module purpose 만 도달.
+        const buildingId = await findOrCreateBuilding();
+        const floorId = await findOrCreateFloor(buildingId);
+        const moduleId = await findOrCreateModule(floorId);
+
+        const initRes = await api.post<UploadInitResponse>('/uploads/init', {
+          filename: file.name,
+          file_size: file.size,
+          content_type: resolveContentType(file),
+          building_id: buildingId,
+          floor_id: floorId,
+          module_id: moduleId,
+          ply_target: 'colmap',
+        });
+
+        const { upload_id, minio_upload_id, presigned_urls, part_size } = initRes;
+
+        // 업로드는 백그라운드로 계속 진행 — 페이지 이동 후에도 fetch 는 살아 있음.
+        runColmapUpload({
+          file,
+          upload_id,
+          minio_upload_id,
+          presigned_urls,
+          part_size,
+        }).catch(() => {
+          // dashboard 에서 status='failed' 로 표시됨.
+        });
+
+        router.push('/dashboard');
+        return;
       }
-
-      // 1. 업로드 초기화
-      const initRes = await api.post<UploadInitResponse>('/uploads/init', {
-        filename: file.name,
-        file_size: file.size,
-        content_type: resolveContentType(file),
-        building_id: buildingId,
-        floor_id: floorId,
-        module_id: moduleId,
-        ...(plyTarget ? { ply_target: plyTarget } : {}),
-      });
-
-      const { upload_id, minio_upload_id, presigned_urls, part_size } = initRes;
-
-      // 2. 파트별 업로드
-      const parts: { part_number: number; etag: string }[] = [];
-
-      for (let i = 0; i < presigned_urls.length; i++) {
-        const start = i * part_size;
-        const end = Math.min(start + part_size, file.size);
-        const chunk = file.slice(start, end);
-
-        const res = await fetch(presigned_urls[i], { method: 'PUT', body: chunk });
-        if (!res.ok) throw new Error(`파트 ${i + 1} 업로드 실패`);
-
-        const etag = res.headers.get('etag')?.replace(/"/g, '') || '';
-        parts.push({ part_number: i + 1, etag });
-        setProgress(Math.round(((i + 1) / presigned_urls.length) * 100));
-      }
-
-      // 3. 업로드 완료
-      const completeRes = await api.post<{ message: string }>('/uploads/complete', {
-        upload_id,
-        minio_upload_id,
-        parts,
-      });
-
-      setUploadStatus('done');
-      setMessage(completeRes.message || '업로드 완료!');
-      setFile(null);
-      if (fileRef.current) fileRef.current.value = '';
-    } catch (e: any) {
-      setUploadStatus('error');
-      setMessage(e.message || '업로드에 실패했습니다.');
-    } finally {
-      setUploading(false);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setMessage(msg || '확인 처리에 실패했습니다.');
+      setMessageKind('error');
+      setSubmitting(false);
     }
   };
 
   return (
     <div className="max-w-lg mx-auto space-y-4">
-      {/* 파일 선택 */}
       <div>
         <label className="block text-sm text-gray-400 mb-2">파일</label>
         <div
-          onClick={() => !uploading && fileRef.current?.click()}
+          onClick={() => !submitting && fileRef.current?.click()}
           onDrop={handleDrop}
           onDragOver={handleDragOver}
           onDragLeave={handleDragLeave}
           className={`flex flex-col items-center justify-center w-full h-40 rounded-lg border-2 border-dashed cursor-pointer transition-colors
-            ${uploading ? 'cursor-not-allowed opacity-50' : ''}
+            ${submitting ? 'cursor-not-allowed opacity-50' : ''}
             ${isDragging ? 'border-blue-400 bg-blue-950' : 'border-gray-600 bg-gray-800 hover:border-blue-500'}`}
         >
           <svg className="w-8 h-8 mb-2 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -334,13 +237,16 @@ export default function MultipartUploader({
             <div className="text-center px-4">
               <p className="text-sm text-blue-400 font-medium truncate max-w-full">{file.name}</p>
               {isZipFile(file) && (
-                <p className="text-xs text-emerald-400 mt-1">COLMAP 사진 묶음 — SfM 전처리 실행됩니다</p>
+                <p className="text-xs text-emerald-400 mt-1">COLMAP 사진 묶음 — 백그라운드 학습 후 마이페이지에서 결과 확인</p>
+              )}
+              {isScene3DFile(file.name) && (
+                <p className="text-xs text-blue-300 mt-1">불러온 PLY 로 곧바로 다듬기 단계가 시작됩니다</p>
               )}
             </div>
           ) : (
             <>
               <p className="text-sm text-gray-300">파일을 끌어다 놓거나 클릭하여 선택</p>
-              <p className="text-xs text-gray-500 mt-1">image / video / .ply / .splat / .sog</p>
+              <p className="text-xs text-gray-500 mt-1">.ply / .splat / .sog</p>
               <p className="text-xs text-emerald-600 mt-0.5">또는 사진 묶음 .zip (COLMAP)</p>
             </>
           )}
@@ -348,119 +254,49 @@ export default function MultipartUploader({
         <input
           ref={fileRef}
           type="file"
-          accept="image/*,video/*,.ply,.splat,.sog,.zip,.jpg,.jpeg,.png,.gif,.bmp,.webp"
+          accept=".ply,.splat,.sog,.zip"
           onChange={handleFileChange}
           className="hidden"
-          disabled={uploading}
+          disabled={submitting}
         />
       </div>
 
-
-      {/* 건물 선택 */}
-      {!fixedContext && <div ref={buildingDropdownRef} className="relative">
-        <label className="block text-sm text-gray-400 mb-1">건물</label>
-        <button
-          type="button"
-          onClick={() => !uploading && setBuildingSearchOpen(prev => !prev)}
-          disabled={uploading}
-          className="w-full text-left bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-blue-500 disabled:opacity-40 transition-colors hover:border-gray-500"
-        >
-          {selectedBuildingName
-            ? <span className="text-white">{selectedBuildingName}</span>
-            : <span className="text-gray-500">건물 선택...</span>
-          }
-        </button>
-
-        {buildingSearchOpen && (
-          <div className="absolute z-10 top-full mt-1 w-full bg-gray-800 border border-gray-700 rounded shadow-lg">
-            <div className="p-2">
-              <input
-                type="text"
-                value={buildingSearchQuery}
-                onChange={e => setBuildingSearchQuery(e.target.value)}
-                placeholder="건물 이름 검색..."
-                autoFocus
-                className="w-full bg-gray-900 border border-gray-600 rounded px-3 py-1.5 text-white text-sm focus:outline-none focus:border-blue-500"
-              />
-            </div>
-            <div className="max-h-60 overflow-y-auto">
-              {buildingSearchLoading && (
-                <div className="px-3 py-2 text-gray-400 text-sm">검색 중...</div>
-              )}
-              {!buildingSearchLoading && buildingSearchQuery.trim() && buildingSearchResults.length === 0 && (
-                <div className="px-3 py-2 text-gray-400 text-sm">검색 결과가 없습니다.</div>
-              )}
-              {buildingSearchResults.map(place => (
-                <button
-                  key={place.id}
-                  type="button"
-                  onClick={() => handleSelectBuilding(place)}
-                  className="w-full text-left px-3 py-2 hover:bg-gray-700 transition-colors border-t border-gray-700 first:border-t-0"
-                >
-                  <div className="text-white text-sm font-medium">{place.place_name}</div>
-                  <div className="text-gray-400 text-xs mt-0.5">{place.road_address_name || place.address_name}</div>
-                </button>
-              ))}
-            </div>
-          </div>
-        )}
-      </div>}
-
-      {/* 층 / 모듈 */}
-      <div className="flex gap-3">
-        <div className="flex-1">
-          <label className="block text-sm text-gray-400 mb-1">층</label>
-          <input
-            type="text"
-            value={floorNumber}
-            onChange={e => setFloorNumber(e.target.value)}
-            onBlur={e => setFloorNumber(normalizeFloorInput(e.target.value))}
-            placeholder="1, 2 또는 B1, B2"
-            disabled={uploading || !!fixedContext}
-            className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white text-sm focus:outline-none focus:border-blue-500 disabled:opacity-40"
-          />
-        </div>
-        <div className="flex-1">
-          <label className="block text-sm text-gray-400 mb-1">모듈</label>
-          <input
-            type="text"
-            value={moduleName}
-            onChange={e => setModuleName(e.target.value)}
-            placeholder="모듈 이름"
-            disabled={uploading}
-            className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white text-sm focus:outline-none focus:border-blue-500 disabled:opacity-40"
-          />
-        </div>
-      </div>
-
-      {/* 업로드 진행률 */}
-      {uploadStatus === 'uploading' && (
-        <div>
-          <div className="flex justify-between text-sm text-gray-400 mb-1">
-            <span>업로드 중...</span>
-            <span>{progress}%</span>
-          </div>
-          <div className="w-full bg-gray-700 rounded-full h-2">
-            <div className="bg-blue-500 h-2 rounded-full transition-all" style={{ width: `${progress}%` }} />
-          </div>
-        </div>
-      )}
-
-      {/* 메시지 */}
       {message && (
-        <p className={`text-sm ${uploadStatus === 'error' ? 'text-red-400' : uploadStatus === 'done' ? 'text-green-400' : 'text-yellow-400'}`}>
+        <p className={`text-sm ${messageKind === 'error' ? 'text-red-400' : 'text-yellow-400'}`}>
           {message}
         </p>
       )}
 
-      {/* 업로드 버튼 */}
       <button
-        onClick={handleUpload}
-        disabled={uploading || !file || !selectedBuildingName || parseFloorToInt(floorNumber) === null || !moduleName.trim()}
+        onClick={handleConfirm}
+        disabled={submitting || !file}
         className="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-gray-700 disabled:text-gray-500 text-white py-2 rounded text-sm font-medium transition"
       >
-        {uploading ? '업로드 중...' : '업로드 시작'}
+        {submitting ? '처리 중...' : '확인'}
       </button>
     </div>
   );
+}
+
+// 백그라운드에서 multipart 업로드를 계속 진행. router.push 직후에도 fetch promise 는 살아남는다.
+// 실패해도 사용자는 /dashboard 에서 상태(=failed) 로 확인 가능.
+async function runColmapUpload(params: {
+  file: File;
+  upload_id: string;
+  minio_upload_id: string;
+  presigned_urls: string[];
+  part_size: number;
+}) {
+  const { file, upload_id, minio_upload_id, presigned_urls, part_size } = params;
+  const parts: { part_number: number; etag: string }[] = [];
+  for (let i = 0; i < presigned_urls.length; i++) {
+    const start = i * part_size;
+    const end = Math.min(start + part_size, file.size);
+    const chunk = file.slice(start, end);
+    const res = await fetch(presigned_urls[i], { method: 'PUT', body: chunk });
+    if (!res.ok) throw new Error(`part ${i + 1} upload failed`);
+    const etag = res.headers.get('etag')?.replace(/"/g, '') || '';
+    parts.push({ part_number: i + 1, etag });
+  }
+  await api.post('/uploads/complete', { upload_id, minio_upload_id, parts });
 }

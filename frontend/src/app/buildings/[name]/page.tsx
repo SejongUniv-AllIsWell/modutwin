@@ -183,7 +183,7 @@ export default function BuildingOverviewPage() {
       if (lng) qs.set('lng', lng);
     }
     closeBasemapRegister();
-    router.push(`/viewer?${qs.toString()}`);
+    router.push(`/upload?${qs.toString()}`);
   };
 
   if (loading) return null;

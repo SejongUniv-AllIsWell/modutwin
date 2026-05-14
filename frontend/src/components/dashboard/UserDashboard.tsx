@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
+import { useRouter } from 'next/navigation';
 import { api } from '@/lib/api';
 import { wsClient } from '@/lib/ws';
 import { Upload, Notification, WsMessage } from '@/types';
@@ -74,11 +75,39 @@ interface Props {
 }
 
 export default function UserDashboard({ showHeader = true }: Props) {
+  const router = useRouter();
   const [uploads, setUploads] = useState<Upload[]>([]);
   const [notifications, setNotifications] = useState<Notification[]>([]);
   const [deleteTarget, setDeleteTarget] = useState<Upload | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  // COLMAP 결과 PLY 를 PC 로 다운로드 + viewer 이동 처리 중인 업로드 id (중복 클릭 방지).
+  const [fetchingColmapId, setFetchingColmapId] = useState<string | null>(null);
+
+  // 사용자 PC 에 다운로드 트리거 후 같은 upload_id 로 /viewer 이동 (refine 모드 자동 시작).
+  // presigned URL 을 받아 <a download> 로 저장 → router.push 로 viewer 진입.
+  const handleColmapSelect = async (uploadId: string) => {
+    if (fetchingColmapId) return;
+    setFetchingColmapId(uploadId);
+    try {
+      const data = await api.get<{ url: string; filename: string }>(
+        `/uploads/${uploadId}/presigned-url`,
+      );
+      const a = document.createElement('a');
+      a.href = data.url;
+      const fname = data.filename || 'gsplat.ply';
+      a.download = fname.endsWith('.ply') ? fname : `${fname}.ply`;
+      a.rel = 'noopener';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      router.push(`/viewer?upload_id=${uploadId}`);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      alert(`파일을 가져오지 못했습니다: ${msg}`);
+      setFetchingColmapId(null);
+    }
+  };
 
   useEffect(() => {
     api.get<Upload[]>('/uploads').then(setUploads).catch(() => {});
@@ -174,7 +203,16 @@ export default function UserDashboard({ showHeader = true }: Props) {
                   return (
                     <tr key={u.id} className="border-b border-gray-800/50">
                       <td className="py-3 pr-4">
-                        {filenameClickable ? (
+                        {isColmap && colmapDone ? (
+                          <button
+                            type="button"
+                            disabled={fetchingColmapId === u.id}
+                            onClick={() => handleColmapSelect(u.id)}
+                            className="text-blue-400 hover:underline disabled:opacity-60 disabled:cursor-wait"
+                          >
+                            {u.original_filename}
+                          </button>
+                        ) : filenameClickable ? (
                           <Link
                             href={u.has_refined
                               ? `/viewer?upload_id=${u.id}&mode=align`
@@ -189,14 +227,14 @@ export default function UserDashboard({ showHeader = true }: Props) {
                       </td>
                       <td className={`py-3 pr-4 ${
                         isColmap
-                          ? (colmapFailed ? 'text-red-400' : (colmapDone ? STAGE_COLOR['uploaded_only'] : 'text-emerald-400'))
+                          ? (colmapFailed ? 'text-red-400' : (colmapDone ? 'text-blue-400' : 'text-emerald-400'))
                           : STAGE_COLOR[stage]
                       }`}>
                         {isColmap
                           ? (colmapFailed
                               ? 'COLMAP 실패'
                               : colmapDone
-                                ? '업로드 완료'
+                                ? '학습 완료'
                                 : colmapProcessing
                                   ? 'COLMAP 처리 중'
                                   : 'COLMAP 대기')
@@ -208,15 +246,24 @@ export default function UserDashboard({ showHeader = true }: Props) {
                       <td className="py-3 pr-4 text-gray-500">{new Date(u.uploaded_at).toLocaleDateString('ko-KR')}</td>
                       <td className="py-3 pr-4 text-right">
                         {isColmap ? (
-                          <Link
-                            href={colmapDone ? `/viewer?upload_id=${u.id}` : `/colmap-viewer?upload_id=${u.id}`}
-                            className={`inline-block px-3 py-1 rounded text-white text-xs font-bold
-                              ${colmapDone
-                                ? 'bg-emerald-600 hover:bg-emerald-500'
-                                : 'bg-gray-700 hover:bg-gray-600'}`}
-                          >
-                            {colmapDone ? 'PLY 뷰어 열기' : '처리 중...'}
-                          </Link>
+                          colmapDone ? (
+                            <button
+                              type="button"
+                              disabled={fetchingColmapId === u.id}
+                              onClick={() => handleColmapSelect(u.id)}
+                              className="inline-block px-3 py-1 rounded bg-emerald-600 hover:bg-emerald-500 disabled:bg-gray-700 disabled:text-gray-400 text-white text-xs font-bold"
+                              title="PLY를 PC에 저장하고 다듬기 단계로 이동"
+                            >
+                              {fetchingColmapId === u.id ? '준비 중...' : '파일 선택'}
+                            </button>
+                          ) : (
+                            <Link
+                              href={`/colmap-viewer?upload_id=${u.id}`}
+                              className="inline-block px-3 py-1 rounded bg-gray-700 hover:bg-gray-600 text-white text-xs font-bold"
+                            >
+                              처리 중...
+                            </Link>
+                          )
                         ) : isBasemap ? (
                           <span className="relative inline-block group">
                             <button
