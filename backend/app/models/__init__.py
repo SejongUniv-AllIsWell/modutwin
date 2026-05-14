@@ -5,6 +5,7 @@ from enum import Enum as PyEnum
 from sqlalchemy import (
     String, Integer, Boolean, DateTime, Text, BigInteger,
     ForeignKey, Enum, func, UniqueConstraint,
+    false as sa_false,
     true as sa_true,
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
@@ -124,6 +125,12 @@ class Building(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    kakao_place_id: Mapped[str | None] = mapped_column(String(255), unique=True, index=True, nullable=True)
+    address_name: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    road_address_name: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    latitude: Mapped[float | None] = mapped_column(nullable=True)
+    longitude: Mapped[float | None] = mapped_column(nullable=True)
+    is_confirmed: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=sa_false(), default=False)
     is_visible: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=sa_true(), default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
@@ -136,7 +143,12 @@ class Floor(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     building_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("buildings.id"), nullable=False)
     floor_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    is_confirmed: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=sa_false(), default=False)
     is_visible: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=sa_true(), default=True)
+    overview_image_path: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    overview_meta_path: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    overview_version: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    overview_dirty: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=sa_true(), default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (UniqueConstraint("building_id", "floor_number", name="uq_floor_building_number"),)
@@ -154,6 +166,7 @@ class Module(Base):
     user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     alignment_transform: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    is_confirmed: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=sa_false(), default=False)
     is_visible: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=sa_true(), default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
@@ -239,6 +252,7 @@ class Basemap(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     floor_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("floors.id"), nullable=False)
+    source_upload_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("uploads.id"), nullable=True)
     minio_path: Mapped[str] = mapped_column(String(1000), nullable=False)
     version: Mapped[int] = mapped_column(Integer, default=1)
     uploaded_by: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)

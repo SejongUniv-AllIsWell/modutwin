@@ -15,6 +15,12 @@ export interface Building {
   id: string;
   name: string;
   is_visible: boolean;
+  is_confirmed?: boolean;
+  kakao_place_id?: string | null;
+  address_name?: string | null;
+  road_address_name?: string | null;
+  latitude?: number | null;
+  longitude?: number | null;
   created_at: string;
 }
 
@@ -23,6 +29,7 @@ export interface Floor {
   building_id: string;
   floor_number: number;
   is_visible: boolean;
+  is_confirmed?: boolean;
   created_at: string;
 }
 
@@ -33,7 +40,54 @@ export interface Module {
   name: string;
   alignment_transform: Record<string, unknown> | null;
   is_visible: boolean;
+  is_confirmed?: boolean;
   created_at: string;
+}
+
+export interface FloorOverviewManifestEntry {
+  floor_id: string;
+  floor_number: number;
+  overview_dirty: boolean;
+  overview_version: string | null;
+  topdown_url: string | null;
+  meta_url: string | null;
+  module_count: number;
+  has_active_basemap: boolean;
+}
+
+export interface FloorOverviewManifest {
+  building_id: string;
+  building_name: string;
+  building_is_confirmed?: boolean;
+  generated_at: string;
+  floors: FloorOverviewManifestEntry[];
+}
+
+export interface FloorDetailBasemapEntry {
+  id: string;
+  version: number;
+  url: string | null;
+  filename: string;
+}
+
+export interface FloorDetailModuleEntry {
+  id: string;
+  name: string;
+  user_id: string;
+  uploader_name: string | null;
+  alignment_transform: Record<string, unknown> | null;
+  is_visible: boolean;
+  version: string | null;
+  url: string | null;
+}
+
+export interface FloorDetailManifest {
+  building_id: string;
+  building_name: string;
+  floor_id: string;
+  floor_number: number;
+  basemap: FloorDetailBasemapEntry | null;
+  modules: FloorDetailModuleEntry[];
 }
 
 export interface ActiveBasemapResponse {
@@ -107,6 +161,7 @@ export interface Upload {
   has_doors_json?: boolean;
   has_alignment?: boolean;
   has_gsplat_ply?: boolean;
+  is_basemap_source?: boolean;
 }
 
 // ── Task ──
@@ -153,7 +208,15 @@ export interface Notification {
 // ── WebSocket ──
 
 export interface WsMessage {
-  type: 'progress' | 'task_complete' | 'task_failed' | 'notification' | 'ping' | 'pong';
+  type:
+    | 'progress'
+    | 'task_complete'
+    | 'task_failed'
+    | 'notification'
+    | 'ping'
+    | 'pong'
+    | 'floor.overview_ready'
+    | 'module.sog_ready';
   task_id?: string;
   progress?: number;
   module?: string;

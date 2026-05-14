@@ -1,9 +1,9 @@
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, field_validator
-from sqlalchemy import exists, select, update as sa_update
+from sqlalchemy import and_, delete as sa_delete, exists, func, or_, select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 from uuid import UUID
 
@@ -11,10 +11,11 @@ from app.core.database import get_db
 from app.core.security import get_current_user, get_current_user_optional, require_admin
 from app.models import (
     User, UserRole, Building, Floor, Module, SceneOutput,
-    Basemap, BasemapStatus, Task, Upload,
+    Basemap, BasemapStatus, Notification, Task, Upload,
 )
 from app.services.minio_service import get_minio_service
 from app.services.metadata_options import validate_floor_number as validate_floor_number_value
+from app.services.storage_paths import module_base_path
 
 router = APIRouter(tags=["buildings"])
 
@@ -41,6 +42,12 @@ class BuildingCreate(BaseModel):
 class BuildingResponse(BaseModel):
     id: UUID
     name: str
+    kakao_place_id: str | None = None
+    address_name: str | None = None
+    road_address_name: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+    is_confirmed: bool
     is_visible: bool
     created_at: datetime
 
@@ -61,6 +68,7 @@ class FloorResponse(BaseModel):
     id: UUID
     building_id: UUID
     floor_number: int
+    is_confirmed: bool
     is_visible: bool
     created_at: datetime
 
@@ -83,6 +91,7 @@ class ModuleResponse(BaseModel):
     user_id: UUID
     name: str
     alignment_transform: dict | None = None
+    is_confirmed: bool
     is_visible: bool
     created_at: datetime
 
@@ -115,6 +124,329 @@ class BuildingMetadataOptionsResponse(BaseModel):
     id: UUID
     name: str
     floors: list[MetadataFloorOption]
+
+
+class FloorOverviewManifestEntry(BaseModel):
+    floor_id: UUID
+    floor_number: int
+    overview_dirty: bool
+    overview_version: datetime | None
+    topdown_url: str | None
+    meta_url: str | None
+    module_count: int
+    has_active_basemap: bool
+
+
+class FloorOverviewManifestResponse(BaseModel):
+    building_id: UUID
+    building_name: str
+    building_is_confirmed: bool
+    generated_at: datetime
+    floors: list[FloorOverviewManifestEntry]
+
+
+class BuildingFromKakaoRequest(BaseModel):
+    place_id: str | None = None
+    name: str
+    address_name: str | None = None
+    road_address_name: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        return _validate_name(v, "name")
+
+
+class BuildingLookupResponse(BaseModel):
+    building: BuildingResponse | None = None
+
+
+class EnsureRegistrationContextRequest(BaseModel):
+    building_id: UUID | None = None
+    floor_id: UUID | None = None
+    building_name: str | None = None
+    floor_number: int | None = None
+    module_name: str | None = None
+    kakao_place_id: str | None = None
+    address_name: str | None = None
+    road_address_name: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+
+    @field_validator("building_name")
+    @classmethod
+    def validate_building_name(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        return _validate_name(v, "building_name")
+
+    @field_validator("module_name")
+    @classmethod
+    def validate_module_name(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        return _validate_name(v, "module_name")
+
+    @field_validator("floor_number")
+    @classmethod
+    def validate_floor_number(cls, v: int | None) -> int | None:
+        if v is None:
+            return None
+        return validate_floor_number_value(v)
+
+
+class EnsureRegistrationContextResponse(BaseModel):
+    building_id: UUID
+    building_name: str
+    floor_id: UUID
+    floor_number: int
+    module_id: UUID | None = None
+    module_name: str | None = None
+
+
+class DetailBasemapEntry(BaseModel):
+    id: UUID
+    version: int
+    source_upload_id: UUID | None = None
+    url: str | None
+    filename: str
+
+
+class DetailModuleEntry(BaseModel):
+    id: UUID
+    name: str
+    user_id: UUID
+    uploader_name: str | None
+    alignment_transform: dict | None
+    is_visible: bool
+    version: datetime | None
+    url: str | None
+
+
+class FloorDetailManifestResponse(BaseModel):
+    building_id: UUID
+    building_name: str
+    floor_id: UUID
+    floor_number: int
+    basemap: DetailBasemapEntry | None
+    modules: list[DetailModuleEntry]
+
+
+class RegenerateOverviewResponse(BaseModel):
+    floor_id: UUID
+    overview_dirty: bool
+    message: str
+
+
+class AdminDeleteResponse(BaseModel):
+    deleted_scope: str
+    deleted_id: UUID
+    deleted_files: int
+    counts: dict[str, int]
+
+
+def _safe_object_exists(minio, key: str | None) -> bool:
+    if not key:
+        return False
+    try:
+        return bool(minio.object_exists(key))
+    except Exception:
+        return False
+
+
+def _safe_presigned_download_url(minio, key: str | None) -> str | None:
+    if not _safe_object_exists(minio, key):
+        return None
+    try:
+        return minio.get_presigned_download_url(key)
+    except Exception:
+        return None
+
+
+def _pick_scene_output_path(minio, scene: SceneOutput | None) -> str | None:
+    if scene is None:
+        return None
+    if _safe_object_exists(minio, scene.sog_path):
+        return scene.sog_path
+    if _safe_object_exists(minio, scene.ply_path):
+        return scene.ply_path
+    return None
+
+
+def _add_key(keys: set[str], key: str | None) -> None:
+    if key:
+        normalized = key.strip()
+        if normalized:
+            keys.add(normalized)
+
+
+def _delete_storage_best_effort(prefixes: set[str], keys: set[str]) -> int:
+    minio = get_minio_service()
+    deleted = 0
+    for prefix in sorted(prefixes):
+        deleted += minio.delete_prefix(prefix)
+    for key in sorted(keys):
+        if minio.delete_object(key):
+            deleted += 1
+    return deleted
+
+
+async def _collect_delete_scope(
+    db: AsyncSession,
+    *,
+    building_id: UUID | None = None,
+    floor_id: UUID | None = None,
+    module_id: UUID | None = None,
+) -> tuple[dict[str, int], set[str], set[str], list[UUID], list[UUID], list[UUID], list[UUID], list[UUID]]:
+    floor_ids: list[UUID] = []
+    module_ids: list[UUID] = []
+    upload_ids: list[UUID] = []
+    task_ids: list[UUID] = []
+    basemap_ids: list[UUID] = []
+    prefixes: set[str] = set()
+    keys: set[str] = set()
+
+    if building_id is not None:
+        floor_result = await db.execute(select(Floor).where(Floor.building_id == building_id))
+        floors = floor_result.scalars().all()
+        floor_ids = [floor.id for floor in floors]
+        prefixes.add(f"buildings/{building_id}")
+    elif floor_id is not None:
+        floor_result = await db.execute(select(Floor).where(Floor.id == floor_id))
+        floor = floor_result.scalar_one_or_none()
+        if floor is not None:
+            floor_ids = [floor.id]
+            prefixes.add(f"buildings/{floor.building_id}/{floor.id}")
+    elif module_id is not None:
+        module_result = await db.execute(
+            select(Module, Floor).join(Floor, Module.floor_id == Floor.id).where(Module.id == module_id)
+        )
+        row = module_result.one_or_none()
+        if row is not None:
+            module, floor = row
+            module_ids = [module.id]
+            prefixes.add(module_base_path(str(floor.building_id), str(floor.id), str(module.id), module.name))
+
+    if floor_ids:
+        module_result = await db.execute(select(Module.id).where(Module.floor_id.in_(floor_ids)))
+        module_ids = [mid for (mid,) in module_result.all()]
+
+        overview_result = await db.execute(
+            select(Floor.overview_image_path, Floor.overview_meta_path).where(Floor.id.in_(floor_ids))
+        )
+        for overview_image_path, overview_meta_path in overview_result.all():
+            _add_key(keys, overview_image_path)
+            _add_key(keys, overview_meta_path)
+
+    if module_ids:
+        upload_result = await db.execute(
+            select(Upload.id, Upload.minio_path, Upload.refined_ply_path, Upload.door_corners_json_path)
+            .where(Upload.module_id.in_(module_ids))
+        )
+        for upload_id, minio_path, refined_ply_path, door_corners_json_path in upload_result.all():
+            upload_ids.append(upload_id)
+            _add_key(keys, minio_path)
+            _add_key(keys, refined_ply_path)
+            _add_key(keys, door_corners_json_path)
+
+        scene_result = await db.execute(
+            select(SceneOutput.ply_path, SceneOutput.sog_path, SceneOutput.metadata_path)
+            .where(SceneOutput.module_id.in_(module_ids))
+        )
+        for ply_path, sog_path, metadata_path in scene_result.all():
+            _add_key(keys, ply_path)
+            _add_key(keys, sog_path)
+            _add_key(keys, metadata_path)
+
+    if upload_ids:
+        task_result = await db.execute(select(Task.id).where(Task.upload_id.in_(upload_ids)))
+        task_ids = [tid for (tid,) in task_result.all()]
+
+    basemap_conditions = []
+    if floor_ids:
+        basemap_conditions.append(Basemap.floor_id.in_(floor_ids))
+    if upload_ids:
+        basemap_conditions.append(Basemap.source_upload_id.in_(upload_ids))
+    if basemap_conditions:
+        basemap_result = await db.execute(
+            select(Basemap.id, Basemap.minio_path).where(or_(*basemap_conditions))
+        )
+        for bid, minio_path in basemap_result.all():
+            basemap_ids.append(bid)
+            _add_key(keys, minio_path)
+
+    scene_count = 0
+    if module_ids:
+        scene_count = int(
+            (await db.execute(
+                select(func.count()).select_from(SceneOutput).where(SceneOutput.module_id.in_(module_ids))
+            )).scalar_one()
+        )
+
+    counts = {
+        "buildings": 1 if building_id is not None else 0,
+        "floors": 1 if floor_id is not None else len(set(floor_ids)),
+        "modules": 1 if module_id is not None else len(set(module_ids)),
+        "uploads": len(set(upload_ids)),
+        "tasks": len(set(task_ids)),
+        "scene_outputs": scene_count,
+        "basemaps": len(set(basemap_ids)),
+    }
+    return counts, prefixes, keys, floor_ids, module_ids, upload_ids, task_ids, basemap_ids
+
+
+async def _delete_hierarchy_scope(
+    db: AsyncSession,
+    *,
+    scope: str,
+    target_id: UUID,
+    building_id: UUID | None = None,
+    floor_id: UUID | None = None,
+    module_id: UUID | None = None,
+) -> AdminDeleteResponse:
+    counts, prefixes, keys, floor_ids, module_ids, upload_ids, task_ids, basemap_ids = await _collect_delete_scope(
+        db,
+        building_id=building_id,
+        floor_id=floor_id,
+        module_id=module_id,
+    )
+
+    if task_ids:
+        await db.execute(
+            sa_update(Notification)
+            .where(Notification.related_task_id.in_(task_ids))
+            .values(related_task_id=None)
+        )
+    if basemap_ids:
+        await db.execute(sa_delete(Basemap).where(Basemap.id.in_(basemap_ids)))
+    if module_ids:
+        await db.execute(sa_delete(SceneOutput).where(SceneOutput.module_id.in_(module_ids)))
+    if task_ids:
+        await db.execute(sa_delete(Task).where(Task.id.in_(task_ids)))
+    if upload_ids:
+        await db.execute(sa_delete(Upload).where(Upload.id.in_(upload_ids)))
+    if module_id is not None:
+        await db.execute(sa_delete(Module).where(Module.id == module_id))
+    elif module_ids:
+        await db.execute(sa_delete(Module).where(Module.id.in_(module_ids)))
+    if floor_id is not None:
+        await db.execute(sa_delete(Floor).where(Floor.id == floor_id))
+    elif building_id is not None and floor_ids:
+        await db.execute(sa_delete(Floor).where(Floor.id.in_(floor_ids)))
+    if building_id is not None:
+        await db.execute(sa_delete(Building).where(Building.id == building_id))
+
+    await db.commit()
+    deleted_files = _delete_storage_best_effort(prefixes, keys)
+
+    return AdminDeleteResponse(
+        deleted_scope=scope,
+        deleted_id=target_id,
+        deleted_files=deleted_files,
+        counts=counts,
+    )
 
 
 # ── Building endpoints ──
@@ -161,6 +493,188 @@ async def create_building(
 
     building = Building(name=body.name)
     db.add(building)
+    await db.commit()
+    await db.refresh(building)
+    return building
+
+
+@router.get("/buildings/lookup", response_model=BuildingLookupResponse)
+async def lookup_building(
+    kakao_place_id: str | None = Query(None),
+    name: str | None = Query(None),
+    _: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    if not kakao_place_id and not name:
+        raise HTTPException(status_code=400, detail="kakao_place_id 또는 name 이 필요합니다.")
+    if name:
+        _validate_name(name, "name")
+
+    building: Building | None = None
+    if kakao_place_id:
+        place_result = await db.execute(select(Building).where(Building.kakao_place_id == kakao_place_id))
+        building = place_result.scalar_one_or_none()
+    if building is None and name:
+        name_result = await db.execute(select(Building).where(Building.name == name))
+        building = name_result.scalar_one_or_none()
+
+    if building is None:
+        return BuildingLookupResponse(building=None)
+    return BuildingLookupResponse(building=BuildingResponse.model_validate(building))
+
+
+@router.post("/buildings/ensure-registration-context", response_model=EnsureRegistrationContextResponse)
+async def ensure_registration_context(
+    body: EnsureRegistrationContextRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    if body.floor_id is None and body.floor_number is None:
+        raise HTTPException(status_code=400, detail="floor_id 또는 floor_number 가 필요합니다.")
+
+    building: Building | None = None
+    floor: Floor | None = None
+
+    if body.floor_id is not None:
+        floor_result = await db.execute(select(Floor).where(Floor.id == body.floor_id))
+        floor = floor_result.scalar_one_or_none()
+        if floor is None:
+            raise HTTPException(status_code=404, detail="층을 찾을 수 없습니다.")
+
+        building_result = await db.execute(select(Building).where(Building.id == floor.building_id))
+        building = building_result.scalar_one_or_none()
+        if building is None:
+            raise HTTPException(status_code=404, detail="건물을 찾을 수 없습니다.")
+
+        if body.floor_number is not None and floor.floor_number != body.floor_number:
+            raise HTTPException(status_code=400, detail="floor_id 와 floor_number 가 일치하지 않습니다.")
+        if body.building_id is not None and building.id != body.building_id:
+            raise HTTPException(status_code=400, detail="floor_id 와 building_id 가 일치하지 않습니다.")
+
+    if building is None and body.building_id is not None:
+        building_result = await db.execute(select(Building).where(Building.id == body.building_id))
+        building = building_result.scalar_one_or_none()
+        if building is None:
+            raise HTTPException(status_code=404, detail="건물을 찾을 수 없습니다.")
+
+    if building is None and body.kakao_place_id:
+        place_result = await db.execute(select(Building).where(Building.kakao_place_id == body.kakao_place_id))
+        building = place_result.scalar_one_or_none()
+
+    if building is None and body.building_name:
+        name_result = await db.execute(select(Building).where(Building.name == body.building_name))
+        building = name_result.scalar_one_or_none()
+
+    if building is None:
+        if not body.building_name:
+            raise HTTPException(status_code=400, detail="building_name 이 필요합니다.")
+        building = Building(
+            name=body.building_name,
+            kakao_place_id=body.kakao_place_id,
+            address_name=body.address_name,
+            road_address_name=body.road_address_name,
+            latitude=body.latitude,
+            longitude=body.longitude,
+        )
+        db.add(building)
+        await db.flush()
+    else:
+        if body.kakao_place_id and not building.kakao_place_id:
+            building.kakao_place_id = body.kakao_place_id
+        if body.address_name and not building.address_name:
+            building.address_name = body.address_name
+        if body.road_address_name and not building.road_address_name:
+            building.road_address_name = body.road_address_name
+        if body.latitude is not None and building.latitude is None:
+            building.latitude = body.latitude
+        if body.longitude is not None and building.longitude is None:
+            building.longitude = body.longitude
+
+    if floor is None:
+        if body.floor_number is None:
+            raise HTTPException(status_code=400, detail="floor_number 가 필요합니다.")
+        floor_result = await db.execute(
+            select(Floor).where(
+                Floor.building_id == building.id,
+                Floor.floor_number == body.floor_number,
+            )
+        )
+        floor = floor_result.scalar_one_or_none()
+        if floor is None:
+            if user.role != UserRole.admin and building.is_confirmed:
+                raise HTTPException(status_code=400, detail="확정된 건물에는 층을 추가할 수 없습니다.")
+            floor = Floor(building_id=building.id, floor_number=body.floor_number)
+            db.add(floor)
+            await db.flush()
+
+    module: Module | None = None
+    module_name = body.module_name.strip() if body.module_name else None
+    if module_name:
+        module_result = await db.execute(
+            select(Module).where(
+                Module.floor_id == floor.id,
+                Module.user_id == user.id,
+                Module.name == module_name,
+            )
+        )
+        module = module_result.scalar_one_or_none()
+        if module is None:
+            module = Module(floor_id=floor.id, user_id=user.id, name=module_name)
+            db.add(module)
+            floor.overview_dirty = True
+            await db.flush()
+
+    await db.commit()
+
+    return EnsureRegistrationContextResponse(
+        building_id=building.id,
+        building_name=building.name,
+        floor_id=floor.id,
+        floor_number=floor.floor_number,
+        module_id=module.id if module is not None else None,
+        module_name=module.name if module is not None else None,
+    )
+
+
+@router.post("/buildings/from-kakao", response_model=BuildingResponse)
+async def create_or_find_building_from_kakao(
+    body: BuildingFromKakaoRequest,
+    _: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    building: Building | None = None
+    if body.place_id:
+        place_result = await db.execute(
+            select(Building).where(Building.kakao_place_id == body.place_id)
+        )
+        building = place_result.scalar_one_or_none()
+
+    if building is None:
+        name_result = await db.execute(select(Building).where(Building.name == body.name))
+        building = name_result.scalar_one_or_none()
+
+    if building is None:
+        building = Building(
+            name=body.name,
+            kakao_place_id=body.place_id,
+            address_name=body.address_name,
+            road_address_name=body.road_address_name,
+            latitude=body.latitude,
+            longitude=body.longitude,
+        )
+        db.add(building)
+    else:
+        if body.place_id and not building.kakao_place_id:
+            building.kakao_place_id = body.place_id
+        if body.address_name and not building.address_name:
+            building.address_name = body.address_name
+        if body.road_address_name and not building.road_address_name:
+            building.road_address_name = body.road_address_name
+        if body.latitude is not None and building.latitude is None:
+            building.latitude = body.latitude
+        if body.longitude is not None and building.longitude is None:
+            building.longitude = body.longitude
+
     await db.commit()
     await db.refresh(building)
     return building
@@ -267,6 +781,7 @@ class ExploreModuleEntry(BaseModel):
 class ExploreBasemapEntry(BaseModel):
     id: UUID
     version: int
+    source_upload_id: UUID | None = None
     url: str
     filename: str
 
@@ -358,6 +873,7 @@ async def explore_building(
             bm_entry = ExploreBasemapEntry(
                 id=bm.id,
                 version=bm.version,
+                source_upload_id=bm.source_upload_id,
                 url=minio.get_presigned_download_url(bm.minio_path),
                 filename=bm.minio_path.rsplit("/", 1)[-1],
             )
@@ -390,6 +906,202 @@ async def explore_building(
     )
 
 
+@router.get("/buildings/{building_id}/floor-overview", response_model=FloorOverviewManifestResponse)
+async def get_floor_overview_manifest(
+    building_id: UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    building_stmt = select(Building).where(Building.id == building_id)
+    if user.role != UserRole.admin:
+        building_stmt = building_stmt.where(Building.is_visible == True)
+    building_result = await db.execute(building_stmt)
+    building = building_result.scalar_one_or_none()
+    if building is None:
+        raise HTTPException(status_code=404, detail="건물을 찾을 수 없습니다.")
+
+    floor_stmt = (
+        select(Floor)
+        .where(Floor.building_id == building_id)
+        .order_by(Floor.floor_number.desc())
+    )
+    if user.role != UserRole.admin:
+        floor_stmt = floor_stmt.where(Floor.is_visible == True)
+    floor_result = await db.execute(floor_stmt)
+    floors = floor_result.scalars().all()
+    if not floors:
+        return FloorOverviewManifestResponse(
+            building_id=building.id,
+            building_name=building.name,
+            building_is_confirmed=building.is_confirmed,
+            generated_at=datetime.now(timezone.utc),
+            floors=[],
+        )
+
+    floor_ids = [floor.id for floor in floors]
+    module_count_stmt = (
+        select(Module.floor_id, func.count(Module.id))
+        .where(Module.floor_id.in_(floor_ids))
+        .group_by(Module.floor_id)
+    )
+    if user.role != UserRole.admin:
+        module_count_stmt = module_count_stmt.where(Module.is_visible == True)
+    module_count_result = await db.execute(module_count_stmt)
+    module_count_by_floor = {floor_id: count for floor_id, count in module_count_result.all()}
+
+    active_basemap_result = await db.execute(
+        select(Basemap.floor_id)
+        .where(
+            Basemap.floor_id.in_(floor_ids),
+            Basemap.is_active == True,
+        )
+    )
+    active_basemap_floor_ids = {floor_id for (floor_id,) in active_basemap_result.all()}
+
+    minio = get_minio_service()
+    entries = [
+        FloorOverviewManifestEntry(
+            floor_id=floor.id,
+            floor_number=floor.floor_number,
+            overview_dirty=floor.overview_dirty,
+            overview_version=floor.overview_version,
+            topdown_url=_safe_presigned_download_url(minio, floor.overview_image_path),
+            meta_url=_safe_presigned_download_url(minio, floor.overview_meta_path),
+            module_count=int(module_count_by_floor.get(floor.id, 0)),
+            has_active_basemap=floor.id in active_basemap_floor_ids,
+        )
+        for floor in floors
+    ]
+
+    return FloorOverviewManifestResponse(
+        building_id=building.id,
+        building_name=building.name,
+        building_is_confirmed=building.is_confirmed,
+        generated_at=datetime.now(timezone.utc),
+        floors=entries,
+    )
+
+
+@router.get(
+    "/buildings/{building_id}/floors/{floor_number}/detail-manifest",
+    response_model=FloorDetailManifestResponse,
+)
+async def get_floor_detail_manifest(
+    building_id: UUID,
+    floor_number: int,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    building_stmt = select(Building).where(Building.id == building_id)
+    if user.role != UserRole.admin:
+        building_stmt = building_stmt.where(Building.is_visible == True)
+    building_result = await db.execute(building_stmt)
+    building = building_result.scalar_one_or_none()
+    if building is None:
+        raise HTTPException(status_code=404, detail="건물을 찾을 수 없습니다.")
+
+    floor_stmt = select(Floor).where(
+        Floor.building_id == building_id,
+        Floor.floor_number == floor_number,
+    )
+    if user.role != UserRole.admin:
+        floor_stmt = floor_stmt.where(Floor.is_visible == True)
+    floor_result = await db.execute(floor_stmt)
+    floor = floor_result.scalar_one_or_none()
+    if floor is None:
+        raise HTTPException(status_code=404, detail="층을 찾을 수 없습니다.")
+
+    minio = get_minio_service()
+
+    basemap_result = await db.execute(
+        select(Basemap)
+        .where(
+            Basemap.floor_id == floor.id,
+            Basemap.is_active == True,
+        )
+        .order_by(Basemap.version.desc())
+        .limit(1)
+    )
+    basemap = basemap_result.scalar_one_or_none()
+    basemap_url = _safe_presigned_download_url(minio, basemap.minio_path) if basemap else None
+    basemap_entry = (
+        DetailBasemapEntry(
+            id=basemap.id,
+            version=basemap.version,
+            source_upload_id=basemap.source_upload_id,
+            url=basemap_url,
+            filename=basemap.minio_path.rsplit("/", 1)[-1],
+        )
+        if basemap is not None
+        else None
+    )
+
+    module_stmt = (
+        select(Module, User.name.label("uploader_name"))
+        .join(User, Module.user_id == User.id)
+        .where(Module.floor_id == floor.id)
+        .order_by(Module.name)
+    )
+    if user.role != UserRole.admin:
+        module_stmt = module_stmt.where(Module.is_visible == True)
+    module_result = await db.execute(module_stmt)
+    module_rows = module_result.all()
+
+    module_ids = [module.id for module, _ in module_rows]
+    latest_scene_by_module: dict[UUID, SceneOutput] = {}
+    if module_ids:
+        scene_stmt = select(SceneOutput).where(SceneOutput.module_id.in_(module_ids))
+        if user.role != UserRole.admin:
+            scene_stmt = (
+                scene_stmt
+                .join(Module, SceneOutput.module_id == Module.id)
+                .join(Floor, Module.floor_id == Floor.id)
+                .join(Building, Floor.building_id == Building.id)
+                .where(
+                    or_(
+                        SceneOutput.user_id == user.id,
+                        and_(
+                            SceneOutput.is_aligned == True,
+                            Module.is_visible == True,
+                            Floor.is_visible == True,
+                            Building.is_visible == True,
+                        ),
+                    )
+                )
+            )
+        scene_result = await db.execute(
+            scene_stmt.order_by(SceneOutput.module_id, SceneOutput.created_at.desc())
+        )
+        for scene in scene_result.scalars().all():
+            latest_scene_by_module.setdefault(scene.module_id, scene)
+
+    module_entries: list[DetailModuleEntry] = []
+    for module, uploader_name in module_rows:
+        latest_scene = latest_scene_by_module.get(module.id)
+        path = _pick_scene_output_path(minio, latest_scene)
+        module_entries.append(
+            DetailModuleEntry(
+                id=module.id,
+                name=module.name,
+                user_id=module.user_id,
+                uploader_name=uploader_name,
+                alignment_transform=module.alignment_transform,
+                is_visible=module.is_visible,
+                version=latest_scene.created_at if latest_scene else None,
+                url=minio.get_presigned_download_url(path) if path else None,
+            )
+        )
+
+    return FloorDetailManifestResponse(
+        building_id=building.id,
+        building_name=building.name,
+        floor_id=floor.id,
+        floor_number=floor.floor_number,
+        basemap=basemap_entry,
+        modules=module_entries,
+    )
+
+
 # ── Floor endpoints ──
 
 @router.get("/buildings/{building_id}/floors", response_model=list[FloorResponse])
@@ -412,13 +1124,16 @@ async def list_floors(
 async def create_floor(
     building_id: UUID,
     body: FloorCreate,
-    _: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     # 건물 존재 확인
     bldg = await db.execute(select(Building).where(Building.id == building_id))
-    if not bldg.scalar_one_or_none():
+    building = bldg.scalar_one_or_none()
+    if not building:
         raise HTTPException(status_code=404, detail="건물을 찾을 수 없습니다.")
+    if user.role != UserRole.admin and building.is_confirmed:
+        raise HTTPException(status_code=400, detail="확정된 건물에는 층을 추가할 수 없습니다.")
 
     # 중복 층 확인
     existing = await db.execute(
@@ -445,6 +1160,27 @@ async def get_floor(
     if not floor:
         raise HTTPException(status_code=404, detail="층을 찾을 수 없습니다.")
     return floor
+
+
+@router.post("/floors/{floor_id}/regenerate-overview", response_model=RegenerateOverviewResponse)
+async def regenerate_floor_overview(
+    floor_id: UUID,
+    _: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(Floor).where(Floor.id == floor_id))
+    floor = result.scalar_one_or_none()
+    if floor is None:
+        raise HTTPException(status_code=404, detail="층을 찾을 수 없습니다.")
+
+    floor.overview_dirty = True
+    await db.commit()
+
+    return RegenerateOverviewResponse(
+        floor_id=floor.id,
+        overview_dirty=floor.overview_dirty,
+        message="층 overview 재생성이 표시되었습니다. 백그라운드 렌더러 연동은 추후 연결됩니다.",
+    )
 
 
 # ── Module endpoints ──
@@ -497,6 +1233,11 @@ async def create_module(
 
     module = Module(floor_id=floor_id, user_id=user.id, name=body.name)
     db.add(module)
+    await db.execute(
+        sa_update(Floor)
+        .where(Floor.id == floor_id)
+        .values(overview_dirty=True)
+    )
     await db.commit()
     await db.refresh(module)
     return module
@@ -537,6 +1278,11 @@ async def update_alignment_transform(
         raise HTTPException(status_code=404, detail="모듈을 찾을 수 없습니다.")
 
     module.alignment_transform = body.transform
+    await db.execute(
+        sa_update(Floor)
+        .where(Floor.id == module.floor_id)
+        .values(overview_dirty=True)
+    )
     await db.commit()
     await db.refresh(module)
     return module
@@ -641,6 +1387,11 @@ async def set_module_visibility(
         raise HTTPException(status_code=404, detail="모듈을 찾을 수 없습니다.")
 
     module.is_visible = body.is_visible
+    await db.execute(
+        sa_update(Floor)
+        .where(Floor.id == module.floor_id)
+        .values(overview_dirty=True)
+    )
 
     # show 시 부모 floor + building 까지 표시 — /explore 즉시 노출 보장
     if body.is_visible:
@@ -656,6 +1407,128 @@ async def set_module_visibility(
                 .values(is_visible=True)
             )
 
+    await db.commit()
+    await db.refresh(module)
+    return module
+
+
+@router.delete("/admin/buildings/{building_id}", response_model=AdminDeleteResponse)
+async def delete_building_admin(
+    building_id: UUID,
+    _: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    building = (await db.execute(select(Building).where(Building.id == building_id))).scalar_one_or_none()
+    if building is None:
+        raise HTTPException(status_code=404, detail="건물을 찾을 수 없습니다.")
+    return await _delete_hierarchy_scope(
+        db,
+        scope="building",
+        target_id=building_id,
+        building_id=building_id,
+    )
+
+
+@router.delete("/admin/floors/{floor_id}", response_model=AdminDeleteResponse)
+async def delete_floor_admin(
+    floor_id: UUID,
+    _: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    floor = (await db.execute(select(Floor).where(Floor.id == floor_id))).scalar_one_or_none()
+    if floor is None:
+        raise HTTPException(status_code=404, detail="층을 찾을 수 없습니다.")
+    return await _delete_hierarchy_scope(
+        db,
+        scope="floor",
+        target_id=floor_id,
+        floor_id=floor_id,
+    )
+
+
+@router.delete("/admin/modules/{module_id}", response_model=AdminDeleteResponse)
+async def delete_module_admin(
+    module_id: UUID,
+    _: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    module = (await db.execute(select(Module).where(Module.id == module_id))).scalar_one_or_none()
+    if module is None:
+        raise HTTPException(status_code=404, detail="모듈을 찾을 수 없습니다.")
+    await db.execute(
+        sa_update(Floor)
+        .where(Floor.id == module.floor_id)
+        .values(overview_dirty=True)
+    )
+    return await _delete_hierarchy_scope(
+        db,
+        scope="module",
+        target_id=module_id,
+        module_id=module_id,
+    )
+
+
+@router.put("/admin/buildings/{building_id}/confirm", response_model=BuildingResponse)
+async def confirm_building(
+    building_id: UUID,
+    _: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(Building).where(Building.id == building_id))
+    building = result.scalar_one_or_none()
+    if building is None:
+        raise HTTPException(status_code=404, detail="건물을 찾을 수 없습니다.")
+
+    building.is_confirmed = True
+    await db.execute(
+        sa_update(Floor)
+        .where(Floor.building_id == building_id)
+        .values(is_confirmed=True)
+    )
+    await db.execute(
+        sa_update(Module)
+        .where(Module.floor_id.in_(select(Floor.id).where(Floor.building_id == building_id)))
+        .values(is_confirmed=True)
+    )
+    await db.commit()
+    await db.refresh(building)
+    return building
+
+
+@router.put("/admin/floors/{floor_id}/confirm", response_model=FloorResponse)
+async def confirm_floor(
+    floor_id: UUID,
+    _: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(Floor).where(Floor.id == floor_id))
+    floor = result.scalar_one_or_none()
+    if floor is None:
+        raise HTTPException(status_code=404, detail="층을 찾을 수 없습니다.")
+
+    floor.is_confirmed = True
+    await db.execute(
+        sa_update(Module)
+        .where(Module.floor_id == floor_id)
+        .values(is_confirmed=True)
+    )
+    await db.commit()
+    await db.refresh(floor)
+    return floor
+
+
+@router.put("/admin/modules/{module_id}/confirm", response_model=ModuleResponse)
+async def confirm_module(
+    module_id: UUID,
+    _: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(Module).where(Module.id == module_id))
+    module = result.scalar_one_or_none()
+    if module is None:
+        raise HTTPException(status_code=404, detail="모듈을 찾을 수 없습니다.")
+
+    module.is_confirmed = True
     await db.commit()
     await db.refresh(module)
     return module

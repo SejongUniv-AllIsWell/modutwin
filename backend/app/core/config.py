@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     # Google OAuth
     GOOGLE_CLIENT_ID: str = ""
     GOOGLE_CLIENT_SECRET: str = ""
+    KAKAO_REST_API_KEY: str = ""
 
     # Public URL (for OAuth redirect behind reverse proxy)
     PUBLIC_BASE_URL: str = ""
@@ -60,6 +61,9 @@ class Settings(BaseSettings):
 
     # 워커 → 백엔드 콜백 인증 (공유 시크릿). 빈 값이면 콜백 endpoint 가 항상 401.
     INTERNAL_API_TOKEN: str = ""
+
+    # door-ml SAM3 inference 서비스 (docker-compose.gpu.yml 의 door-ml 컨테이너).
+    DOOR_ML_URL: str = "http://door-ml:8000"
 
     @model_validator(mode="after")
     def assemble_urls(self) -> "Settings":

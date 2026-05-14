@@ -16,7 +16,9 @@ from app.core.storage_keys import is_key_under_prefix, normalize_minio_key
 from app.models import (
     User, UserRole, Upload, Task, Module, Floor, Building, SceneOutput,
     UploadStatus, TaskType, TaskStatus, PlyTarget, Sam3Status,
+    Basemap, Notification,
 )
+from sqlalchemy import delete as sa_delete, update as sa_update
 from app.schemas.uploads import (
     UploadInitRequest,
     UploadInitResponse,
@@ -303,10 +305,15 @@ async def complete_upload(
     )
 
 
-def _upload_to_response(upload: Upload, has_scene_output: bool = False) -> UploadResponse:
+def _upload_to_response(
+    upload: Upload,
+    has_scene_output: bool = False,
+    is_basemap_source: bool = False,
+) -> UploadResponse:
     """Upload ORM → UploadResponse (SAM3 파이프라인 파생 플래그 포함).
 
     has_refined: SAM3 정식 경로 (refined_ply_path) 또는 다듬기 저장으로 생성된 SceneOutput 중 하나라도 있으면 true.
+    is_basemap_source: 이 업로드가 어떤 basemap의 원본 PLY 인지 — 삭제 비활성화 판단용.
     """
     return UploadResponse(
         id=upload.id,
@@ -322,6 +329,7 @@ def _upload_to_response(upload: Upload, has_scene_output: bool = False) -> Uploa
         has_doors_json=bool(upload.door_corners_json_path),
         has_alignment=bool(upload.alignment_transform),
         has_gsplat_ply=bool(upload.gsplat_ply_path),
+        is_basemap_source=is_basemap_source,
     )
 
 
@@ -348,7 +356,21 @@ async def list_uploads(
         .distinct()
     )
     has_scene = {row[0] for row in scene_rows.all()}
-    return [_upload_to_response(u, has_scene_output=(u.id in has_scene)) for u in uploads]
+    # basemap 원본으로 사용 중인 업로드 — 삭제 비활성화 판단용.
+    basemap_rows = await db.execute(
+        select(Basemap.source_upload_id)
+        .where(Basemap.source_upload_id.in_(upload_ids))
+        .distinct()
+    )
+    basemap_source_ids = {row[0] for row in basemap_rows.all() if row[0] is not None}
+    return [
+        _upload_to_response(
+            u,
+            has_scene_output=(u.id in has_scene),
+            is_basemap_source=(u.id in basemap_source_ids),
+        )
+        for u in uploads
+    ]
 
 
 @router.get("/{upload_id}", response_model=UploadResponse)
@@ -376,10 +398,105 @@ async def get_upload(
         .limit(1)
     )
     has_scene = scene_check.scalar_one_or_none() is not None
-    return _upload_to_response(upload, has_scene_output=has_scene)
+    basemap_check = await db.execute(
+        select(Basemap.id).where(Basemap.source_upload_id == upload_id).limit(1)
+    )
+    is_basemap_source = basemap_check.scalar_one_or_none() is not None
+    return _upload_to_response(
+        upload,
+        has_scene_output=has_scene,
+        is_basemap_source=is_basemap_source,
+    )
 
 
 VIEWABLE_EXTENSIONS = {".ply", ".splat", ".sog"}
+
+
+@router.delete("/{upload_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_upload(
+    upload_id: UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """업로드 삭제 — 본인 (또는 관리자) 업로드만 삭제.
+
+    basemap의 원본으로 등록된 업로드는 삭제할 수 없다 (관리자가 먼저
+    Basemap 관리 화면에서 등록 취소를 해야 한다).
+
+    함께 정리:
+      - SceneOutput row + MinIO 파일 (ply/sog/metadata)
+      - 관련 Task row + Notification.related_task_id null 처리
+      - Upload 자신의 MinIO 파일 (원본/refined/doors.json + refined prefix)
+    """
+    stmt = select(Upload).where(Upload.id == upload_id)
+    if user.role != UserRole.admin:
+        stmt = stmt.where(Upload.user_id == user.id)
+    upload = (await db.execute(stmt)).scalar_one_or_none()
+    if upload is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="업로드를 찾을 수 없습니다.",
+        )
+
+    basemap_exists = (await db.execute(
+        select(Basemap.id).where(Basemap.source_upload_id == upload.id).limit(1)
+    )).scalar_one_or_none()
+    if basemap_exists is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="basemap에 등록된 업로드는 삭제할 수 없습니다. 관리자에게 문의하세요.",
+        )
+
+    # 정리 대상 키 / prefix 수집.
+    keys: set[str] = set()
+    prefixes: set[str] = set()
+    for k in (upload.minio_path, upload.refined_ply_path, upload.door_corners_json_path):
+        if k:
+            keys.add(k)
+    if upload.minio_path:
+        prefixes.add(refined_prefix(upload.minio_path))
+
+    task_ids_rows = await db.execute(select(Task.id).where(Task.upload_id == upload.id))
+    task_ids = [tid for (tid,) in task_ids_rows.all()]
+
+    scene_rows = await db.execute(
+        select(SceneOutput.id, SceneOutput.ply_path, SceneOutput.sog_path, SceneOutput.metadata_path)
+        .join(Task, SceneOutput.task_id == Task.id)
+        .where(Task.upload_id == upload.id)
+    )
+    scene_ids: list[UUID] = []
+    for sid, ply_path, sog_path, metadata_path in scene_rows.all():
+        scene_ids.append(sid)
+        for k in (ply_path, sog_path, metadata_path):
+            if k:
+                keys.add(k)
+
+    if task_ids:
+        await db.execute(
+            sa_update(Notification)
+            .where(Notification.related_task_id.in_(task_ids))
+            .values(related_task_id=None)
+        )
+    if scene_ids:
+        await db.execute(sa_delete(SceneOutput).where(SceneOutput.id.in_(scene_ids)))
+    if task_ids:
+        await db.execute(sa_delete(Task).where(Task.id.in_(task_ids)))
+    await db.execute(sa_delete(Upload).where(Upload.id == upload.id))
+    await db.commit()
+
+    minio = get_minio_service()
+    for prefix in prefixes:
+        try:
+            minio.delete_prefix(prefix)
+        except Exception:
+            pass
+    for key in keys:
+        try:
+            minio.delete_object(key)
+        except Exception:
+            pass
+
+    return None
 
 
 @router.get("/{upload_id}/presigned-url")
@@ -477,6 +594,14 @@ class RegisterLocalResponse(BaseModel):
     minio_path: str   # placeholder (refined PLY 의 base_dir 계산에만 사용됨)
 
 
+class RegisterLocalBasemapRequest(BaseModel):
+    filename: str
+    building_id: UUID
+    floor_id: UUID
+    file_size: int = 0
+    content_type: str = "application/octet-stream"
+
+
 @router.post("/register-local", response_model=RegisterLocalResponse)
 async def register_local_upload(
     body: RegisterLocalRequest,
@@ -559,11 +684,77 @@ async def register_local_upload(
     return RegisterLocalResponse(upload_id=upload.id, minio_path=placeholder_key)
 
 
+@router.post("/register-local-basemap", response_model=RegisterLocalResponse)
+async def register_local_basemap_upload(
+    body: RegisterLocalBasemapRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    floor_result = await db.execute(
+        select(Floor).where(Floor.id == body.floor_id, Floor.building_id == body.building_id)
+    )
+    floor = floor_result.scalar_one_or_none()
+    if floor is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="building_id / floor_id 조합이 유효하지 않습니다.",
+        )
+
+    module_result = await db.execute(
+        select(Module).where(
+            Module.floor_id == body.floor_id,
+            Module.user_id == user.id,
+            Module.name == "__basemap__",
+        )
+    )
+    module = module_result.scalar_one_or_none()
+    if module is None:
+        module = Module(
+            floor_id=body.floor_id,
+            user_id=user.id,
+            name="__basemap__",
+            is_visible=False,
+        )
+        db.add(module)
+        await db.flush()
+    elif module.is_visible:
+        module.is_visible = False
+
+    ext = os.path.splitext(body.filename)[1].lower() or ".ply"
+    base_path = module_base_path(
+        str(body.building_id), str(body.floor_id),
+        str(module.id), module.name,
+    )
+    placeholder_key = f"{base_path}/alignment/{uuid4()}_local{ext}"
+
+    upload = Upload(
+        user_id=user.id,
+        module_id=module.id,
+        original_filename=body.filename,
+        file_size=body.file_size,
+        content_type=body.content_type,
+        minio_path=placeholder_key,
+        ply_target=PlyTarget.alignment,
+        status=UploadStatus.completed,
+    )
+    db.add(upload)
+    await db.commit()
+
+    return RegisterLocalResponse(upload_id=upload.id, minio_path=placeholder_key)
+
+
 # refined PLY: 클라이언트가 /refine/refined-upload-url 로 단일 PUT 업로드 한 후,
 # 이 엔드포인트를 호출해 canonical refined_ply_path 등록 + SAM3 task 발행.
+class BakeRotation(BaseModel):
+    rotX: float = 0.0
+    rotZ: float = 0.0
+    wallAngleRad: float = 0.0
+
+
 class Sam3StartRequest(BaseModel):
-    refined_ply_key: str   # MinIO key
+    refined_ply_key: str   # MinIO key (refined PLY — doors.json 위치 도출용)
     prompt: str = ""
+    bake_rotation: BakeRotation | None = None  # 다듬기에서 베이크된 회전 — 원본 좌표계 검출 결과를 refined 좌표계로 변환할 때 사용
 
 
 class Sam3StartResponse(BaseModel):
@@ -620,16 +811,24 @@ async def start_sam3(
 
     celery_task_id: str | None = None
     try:
+        # SAM3 검출은 다듬기 전 원본 PLY (upload.minio_path) 로 수행. 다듬기 산출물은
+        # 벽 가우시안이 mesh+texture 로 분리돼 SAM3 가 문을 못 봐 본질적으로 검출 실패.
+        # door-ml 결과(원본 좌표계 corners) 는 백엔드에서 베이크 회전 적용 → refined 좌표계로 변환.
+        bake = body.bake_rotation or BakeRotation()
         celery_task_id = dispatch_sam3_door_detection_task(
             upload_id=str(upload.id),
             user_id=str(user.id),
-            refined_ply_key=refined_key,
+            original_ply_key=upload.minio_path,
             prompt=upload.sam3_prompt or "",
             building_id=str(floor.building_id),
             floor_id=str(floor.id),
             floor_number=floor.floor_number,
             module_id=str(mod.id),
             module_name=mod.name,
+            rot_x=bake.rotX,
+            rot_z=bake.rotZ,
+            wall_angle_rad=bake.wallAngleRad,
+            doors_target_key=refined_key,
         )
         upload.sam3_status = Sam3Status.running
     except Exception as e:

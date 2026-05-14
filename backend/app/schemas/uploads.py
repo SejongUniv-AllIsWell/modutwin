@@ -161,6 +161,7 @@ class UploadResponse(BaseModel):
     has_doors_json: bool = False
     has_alignment: bool = False
     has_gsplat_ply: bool = False  # COLMAP→GS 결과 PLY 존재 여부
+    is_basemap_source: bool = False  # basemap 으로 등록된 원본 업로드인지 — 삭제 비활성화 판단용
 
     class Config:
         from_attributes = True

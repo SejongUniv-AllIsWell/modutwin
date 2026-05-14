@@ -39,6 +39,8 @@ export interface RefineToolOptions {
   // 항상 호출되며, 받은 building/floor/module 로 새 upload 를 등록한 뒤 PLY+sidecar 를 그 위에 PUT.
   // reject 되면 저장 흐름 취소.
   onRequestMetadata?: () => Promise<SaveMetadata>;
+  // basemap 등록 viewer 에서만 wall modal 을 포인트-라인 입력으로 전환.
+  basemapMode?: boolean;
 }
 
 export const ALL_SURFACES = ['ceiling', 'floor', 'w1a', 'w1b', 'w2a', 'w2b'] as const;
