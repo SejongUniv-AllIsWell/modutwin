@@ -466,17 +466,23 @@ async def list_buildings(
     if not show_hidden:
         stmt = stmt.where(Building.is_visible == True)
     if has_output:
-        # 표시 중인 floor/module 에 SceneOutput 이 있을 때만 노출 — 모든 모듈이 숨김이면 건물도 사라짐
+        # /explore 노출 조건:
+        #   1) 관리자가 표시관리에서 직접 추가한 건물 (is_confirmed=True, 자동 확정 경로)
+        #   2) 표시 중인 floor/module 에 SceneOutput 이 등록된 건물
+        # 둘 중 하나라도 만족하면 지도 마커/좌측 목록에 노출한다.
         stmt = stmt.where(
-            exists(
-                select(SceneOutput.id)
-                .join(Module, Module.id == SceneOutput.module_id)
-                .join(Floor, Floor.id == Module.floor_id)
-                .where(
-                    Floor.building_id == Building.id,
-                    Floor.is_visible == True,
-                    Module.is_visible == True,
-                )
+            or_(
+                Building.is_confirmed == True,
+                exists(
+                    select(SceneOutput.id)
+                    .join(Module, Module.id == SceneOutput.module_id)
+                    .join(Floor, Floor.id == Module.floor_id)
+                    .where(
+                        Floor.building_id == Building.id,
+                        Floor.is_visible == True,
+                        Module.is_visible == True,
+                    )
+                ),
             )
         )
     result = await db.execute(stmt)
@@ -1303,9 +1309,10 @@ async def update_alignment_transform(
 #     - 층 show   → 부모 building + 하위 module 모두 show
 #     - 모듈 show → 부모 floor + 부모 building 모두 show
 #
-# Show cascade 가 양방향인 이유: /explore 의 has_output 필터는
-# 건물·층·모듈 셋이 모두 visible 이어야 노출되므로, 한 단계만 풀면
-# UI 상 "표시" 가 실제로는 효과가 없어 보인다.
+# Show cascade 가 양방향인 이유: /explore 의 has_output 필터에서
+# SceneOutput 분기는 건물·층·모듈 셋이 모두 visible 이어야 노출되므로,
+# 한 단계만 풀면 UI 상 "표시" 가 실제로는 효과가 없어 보인다.
+# (관리자 추가 분기 is_confirmed=True 는 건물 visibility 만 따른다.)
 
 
 @router.put("/admin/buildings/{building_id}/visibility", response_model=BuildingResponse)

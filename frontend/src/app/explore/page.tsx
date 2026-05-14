@@ -298,7 +298,9 @@ export default function ExplorePage() {
     }
   }, [user, loading, router]);
 
-  // 건물 목록 로드 — 백엔드의 has_output 필터로 visible 조건을 만족하는 것만 내려옴
+  // 건물 목록 로드 — 백엔드 has_output 필터는
+  //   (관리자가 표시관리에서 추가한 건물) OR (표시 중인 floor/module 에 SceneOutput 등록)
+  // 둘 중 하나라도 만족하는 visible 건물을 내려준다.
   const fetchBuildings = useCallback(async () => {
     try {
       const data = await api.get<Building[]>('/buildings?has_output=true');
