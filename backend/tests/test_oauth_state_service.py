@@ -8,6 +8,11 @@ def _reload_oauth_state_service():
     return importlib.reload(module)
 
 
+def _reload_redis_one_time_store():
+    module = importlib.import_module("app.services.redis_one_time_store")
+    return importlib.reload(module)
+
+
 def test_oauth_state_key_has_expected_prefix(required_env: dict[str, str]) -> None:
     oauth_state_service = _reload_oauth_state_service()
     assert oauth_state_service._key("abc123") == "oauth_state:abc123"
@@ -32,11 +37,12 @@ def test_consume_oauth_state_with_blank_state_skips_redis(
     required_env: dict[str, str], monkeypatch
 ) -> None:
     oauth_state_service = _reload_oauth_state_service()
+    redis_one_time_store = _reload_redis_one_time_store()
 
     def _unexpected_call(*args, **kwargs):
         raise AssertionError("redis client should not be created for empty state")
 
-    monkeypatch.setattr(oauth_state_service.aioredis, "from_url", _unexpected_call)
+    monkeypatch.setattr(redis_one_time_store.aioredis, "from_url", _unexpected_call)
     assert asyncio.run(oauth_state_service.consume_oauth_state("")) is None
     assert asyncio.run(oauth_state_service.consume_oauth_state(None)) is None
 
@@ -45,6 +51,7 @@ def test_issue_oauth_state_stores_payload_and_closes_client(
     required_env: dict[str, str], monkeypatch
 ) -> None:
     oauth_state_service = _reload_oauth_state_service()
+    redis_one_time_store = _reload_redis_one_time_store()
 
     class DummyClient:
         def __init__(self) -> None:
@@ -58,7 +65,7 @@ def test_issue_oauth_state_stores_payload_and_closes_client(
             self.closed = True
 
     client = DummyClient()
-    monkeypatch.setattr(oauth_state_service.aioredis, "from_url", lambda *args, **kwargs: client)
+    monkeypatch.setattr(redis_one_time_store.aioredis, "from_url", lambda *args, **kwargs: client)
 
     issued = asyncio.run(oauth_state_service.issue_oauth_state("https://app.example.com/api/auth/callback"))
 
@@ -80,6 +87,7 @@ def test_consume_oauth_state_returns_payload_and_closes_client(
     required_env: dict[str, str], monkeypatch
 ) -> None:
     oauth_state_service = _reload_oauth_state_service()
+    redis_one_time_store = _reload_redis_one_time_store()
 
     class DummyClient:
         def __init__(self) -> None:
@@ -97,7 +105,7 @@ def test_consume_oauth_state_returns_payload_and_closes_client(
             self.closed = True
 
     client = DummyClient()
-    monkeypatch.setattr(oauth_state_service.aioredis, "from_url", lambda *args, **kwargs: client)
+    monkeypatch.setattr(redis_one_time_store.aioredis, "from_url", lambda *args, **kwargs: client)
 
     payload = asyncio.run(oauth_state_service.consume_oauth_state("state-1"))
 
