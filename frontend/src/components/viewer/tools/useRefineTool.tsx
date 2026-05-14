@@ -1313,15 +1313,36 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       let bestSurf: string | null = null;
       let bestD = Infinity;
 
-      if (sel.has('ceiling')) { const d = Math.abs(y - cy); if (d < bandCf && d < bestD) { bestD = d; bestSurf = 'ceiling'; } }
-      if (sel.has('floor'))   { const d = Math.abs(y - fy); if (d < bandCf && d < bestD) { bestD = d; bestSurf = 'floor'; } }
+      // 천장/바닥도 무한 평면 아닌 방 안쪽 (벽 segment 안) 만 색칠. 벽 정보 없으면 전체 사용 (폴백).
+      let inRoomXZ = true;
+      if (wallsReady) {
+        const d1 = x * c1 + z * s1;
+        const d2 = x * c2 + z * s2;
+        const d1Lo = Math.min(a1, b1) - 0.01, d1Hi = Math.max(a1, b1) + 0.01;
+        const d2Lo = Math.min(a2, b2) - 0.01, d2Hi = Math.max(a2, b2) + 0.01;
+        inRoomXZ = d1 >= d1Lo && d1 <= d1Hi && d2 >= d2Lo && d2 <= d2Hi;
+      }
+      if (inRoomXZ) {
+        if (sel.has('ceiling')) { const d = Math.abs(y - cy); if (d < bandCf && d < bestD) { bestD = d; bestSurf = 'ceiling'; } }
+        if (sel.has('floor'))   { const d = Math.abs(y - fy); if (d < bandCf && d < bestD) { bestD = d; bestSurf = 'floor'; } }
+      }
       if (wallsReady && y >= yLo && y <= yHi) {
         const d1 = x * c1 + z * s1;
         const d2 = x * c2 + z * s2;
-        if (sel.has('w1a')) { const d = Math.abs(d1 - a1); if (d < bandWall && d < bestD) { bestD = d; bestSurf = 'w1a'; } }
-        if (sel.has('w1b')) { const d = Math.abs(d1 - b1); if (d < bandWall && d < bestD) { bestD = d; bestSurf = 'w1b'; } }
-        if (sel.has('w2a')) { const d = Math.abs(d2 - a2); if (d < bandWall && d < bestD) { bestD = d; bestSurf = 'w2a'; } }
-        if (sel.has('w2b')) { const d = Math.abs(d2 - b2); if (d < bandWall && d < bestD) { bestD = d; bestSurf = 'w2b'; } }
+        // 벽 선분 안쪽만 색칠 — 무한 평면 전체가 아니라 방의 폭만큼 (수직 방향으로 [a*,b*] 범위).
+        // 약간의 여유 (1cm) 줘 모서리 가우시안도 자연스럽게 포함.
+        const d1Lo = Math.min(a1, b1) - 0.01, d1Hi = Math.max(a1, b1) + 0.01;
+        const d2Lo = Math.min(a2, b2) - 0.01, d2Hi = Math.max(a2, b2) + 0.01;
+        const inSeg1 = d1 >= d1Lo && d1 <= d1Hi; // w2a/w2b 평면(법선 c2,s2)은 d1 으로 segment 제한
+        const inSeg2 = d2 >= d2Lo && d2 <= d2Hi; // w1a/w1b 평면(법선 c1,s1)은 d2 로 segment 제한
+        if (inSeg2) {
+          if (sel.has('w1a')) { const d = Math.abs(d1 - a1); if (d < bandWall && d < bestD) { bestD = d; bestSurf = 'w1a'; } }
+          if (sel.has('w1b')) { const d = Math.abs(d1 - b1); if (d < bandWall && d < bestD) { bestD = d; bestSurf = 'w1b'; } }
+        }
+        if (inSeg1) {
+          if (sel.has('w2a')) { const d = Math.abs(d2 - a2); if (d < bandWall && d < bestD) { bestD = d; bestSurf = 'w2a'; } }
+          if (sel.has('w2b')) { const d = Math.abs(d2 - b2); if (d < bandWall && d < bestD) { bestD = d; bestSurf = 'w2b'; } }
+        }
       }
 
       // flatten preview 우선 (빨강) > surface highlight (혼합) > 기본 + flatten alpha
@@ -1403,13 +1424,133 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   }, [coreRef, syncPlanes]);
 
   // ── 다듬기 완료 버튼 — 서버 통신 없음, 문 설정 단계로 transition 만. ──
-  // 모든 서버 영속은 문 설정 완료 시점에 한 번에 (commitRefinedToServer + persistDoors + register-local).
+  // 서버 영속 타이밍:
+  //   - 모듈 등록 흐름: 정합 완료 시점 `commit-final` 일괄.
+  //   - 베이스맵 등록 흐름: 문 설정 완료 시점 `register-local-basemap` + commitRefinedToServer + persistDoors.
+  // 시각 가이드 (면 하이라이트 틴트, flatten preview 빨강) 는 다듬기 단계에서만 의미 있으니
+  // transition 직전 정리. 가우시안 본체와 baked wall mesh quad 는 그대로 유지.
   const saveRefined = useCallback(async () => {
+    // 평면 선택 해제 → applySurfaceHighlight 가 origColorData 로 복원 (틴트 제거)
+    setSelectedSurfaces(new Set());
+    // flatten preview 빨강도 해제
+    setFlattenPreviewActive(false);
+    flattenPreviewActiveRef.current = false;
     setSaved(true);
     options?.onSwitchToAlign?.();
   }, [options]);
 
-  // 문 설정 완료 시점에 호출됨 — refined PLY + mesh.json + tex_*.png 일괄 업로드 + SceneOutput 등록.
+  // 다듬기 결과 자산(PLY + mesh.json + tex_*.png) 을 메모리에서 빌드해 반환. 업로드 안 함.
+  // 새 흐름(정합 완료 시 일괄 영속화) 의 commit-final 페이로드 작성용.
+  const gatherRefinedAssets = useCallback(async (): Promise<{
+    plyBytes: ArrayBuffer | Uint8Array;
+    meshJson: string;
+    textures: Map<string, Blob>;
+    rotX: number;
+    rotZ: number;
+    wallAngleRad: number;
+    plyFilename: string;
+  }> => {
+    const { serializePly, filterScene } = await import('@/lib/ply');
+    const original = await ensureOriginalScene();
+    const N = original.numSplats;
+    const data = splatDataRef.current;
+    const core = coreRef.current;
+
+    const keep = new Uint8Array(N).fill(1);
+    if (data?.origColorData && core) {
+      const h2f = core.half2Float;
+      for (let i = 0; i < N; i++) {
+        const a = h2f(data.origColorData[i * 4 + 3]);
+        if (a < 1e-3) keep[i] = 0;
+      }
+    }
+    if (flattenMaskRef.current) {
+      for (let i = 0; i < N; i++) if (flattenMaskRef.current[i] && keep[i]) keep[i] = 0;
+    }
+    if (floaterActiveRef.current && floaterMaskRef.current) {
+      for (let i = 0; i < N; i++) if (floaterMaskRef.current[i] && keep[i]) keep[i] = 0;
+    }
+
+    const wallAngleDeg = wallAngleRef.current ?? 0;
+    const wallAngleRad = (wallAngleDeg * Math.PI) / 180;
+    const { rotX, rotZ } = pendingRotationRef.current;
+    const { rotateSceneY } = await import('@/lib/gs');
+    let toRotate = original;
+    if (rotX !== 0 || rotZ !== 0 || wallAngleRad !== 0) {
+      toRotate = await buildRotatedScene(original);
+      if (wallAngleRad !== 0) rotateSceneY(toRotate, wallAngleRad);
+    }
+    const baked = filterScene(toRotate, keep);
+    const plyBytes = serializePly(baked);
+
+    const stripPrefix = (s: string) => s.startsWith('refined_') ? s.slice('refined_'.length) : s;
+    const plyFilename = (() => {
+      const raw = options?.originalFilename ? stripPrefix(options.originalFilename) : 'scene.ply';
+      const dot = raw.lastIndexOf('.');
+      const stem = dot >= 0 ? raw.slice(0, dot) : raw;
+      return `refined_${stem}.ply`;
+    })();
+
+    const textures = new Map<string, Blob>();
+    const meshSurfaces: Array<{
+      surfaceId: string;
+      corners: number[][];
+      uvs: number[][];
+      normalInward: [number, number, number];
+      textureFilename: string;
+      textureWidth: number;
+      textureHeight: number;
+    }> = [];
+
+    if (lastBakesRef.current.size > 0) {
+      const rgbaToPng = async (rgba: Uint8ClampedArray, w: number, h: number): Promise<Blob> => {
+        const canvas = document.createElement('canvas');
+        canvas.width = w; canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) throw new Error('canvas 2d ctx failed');
+        ctx.putImageData(new ImageData(new Uint8ClampedArray(rgba), w, h), 0, 0);
+        return await new Promise<Blob>((res, rej) => {
+          canvas.toBlob(b => b ? res(b) : rej(new Error('toBlob null')), 'image/png');
+        });
+      };
+
+      const cy = Math.cos(wallAngleRad), sy = Math.sin(wallAngleRad);
+      const rotateY = (v: [number, number, number]): [number, number, number] => [
+        cy * v[0] + sy * v[2], v[1], -sy * v[0] + cy * v[2],
+      ];
+
+      for (const [surfaceId, bake] of Array.from(lastBakesRef.current.entries())) {
+        const texFilename = `tex_${surfaceId}.png`;
+        const pngBlob = await rgbaToPng(bake.rgba, bake.width, bake.height);
+        textures.set(surfaceId, pngBlob);
+        const inwardRaw: [number, number, number] = [
+          -bake.input.normal[0], -bake.input.normal[1], -bake.input.normal[2],
+        ];
+        const inward = rotateY(inwardRaw);
+        const cornersOut = bake.corners.map(c => rotateY([c[0], c[1], c[2]]));
+        meshSurfaces.push({
+          surfaceId,
+          corners: cornersOut,
+          uvs: bake.uvs.map(u => [u[0], u[1]]),
+          normalInward: inward,
+          textureFilename: texFilename,
+          textureWidth: bake.width,
+          textureHeight: bake.height,
+        });
+      }
+    }
+
+    const meshJson = JSON.stringify({
+      version: 1,
+      sessionId: `s${Date.now()}`,
+      surfaces: meshSurfaces,
+    });
+
+    return { plyBytes, meshJson, textures, rotX, rotZ, wallAngleRad, plyFilename };
+  }, [ensureOriginalScene, buildRotatedScene, options?.originalFilename]);
+
+  // 베이스맵 등록 흐름의 문 설정 완료 시점에 호출됨 — refined PLY + mesh.json + tex_*.png 일괄 업로드 + SceneOutput 등록.
+  // 모듈 등록 흐름은 이 함수 안 부르고, 정합 완료 시 `gatherRefinedAssets` 결과를 `commit-final` 로 일괄 전송.
   // 반환값:
   //   rotX/rotZ/wallAngleRad — PLY 에 베이크된 회전값. 호출자가 doors corners 등 다른 좌표를
   //     같은 프레임으로 정렬할 때 사용.
@@ -3241,5 +3382,5 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     return { rotX, rotZ, wallAngleRad: (wallAngleDeg * Math.PI) / 180 };
   }, []);
 
-  return { overlay, panel, modals, onSplatLoaded, planes, saveRefined, commitRefinedToServer, getCurrentKeepMask, getBakeRgba, getCurrentBakedRotation };
+  return { overlay, panel, modals, onSplatLoaded, planes, saveRefined, commitRefinedToServer, gatherRefinedAssets, getCurrentKeepMask, getBakeRgba, getCurrentBakedRotation };
 }

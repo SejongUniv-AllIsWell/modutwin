@@ -185,8 +185,6 @@ export default function ExplorePage() {
   const mapInstance = useRef<any>(null);
   const kakaoRef = useRef<any>(null);
   const markersRef = useRef<MarkerBinding[]>([]);
-  const selectedMarkerRef = useRef<any>(null);
-  const selectedInfoWindowRef = useRef<any>(null);
   const buildingsRef = useRef<BuildingWithFloors[]>([]);
   const mapClickInFlightRef = useRef(false);
 
@@ -272,10 +270,10 @@ export default function ExplorePage() {
     }
   }, [user, loading, router]);
 
-  // 건물 목록 로드 — 백엔드의 has_output 필터로 visible 조건을 만족하는 것만 내려옴
+  // 건물 목록 로드 — Scene 유무와 무관하게 등록된(visible) 건물 모두 표시
   const fetchBuildings = useCallback(async () => {
     try {
-      const data = await api.get<Building[]>('/buildings?has_output=true');
+      const data = await api.get<Building[]>('/buildings');
       const withFloors: BuildingWithFloors[] = await Promise.all(
         data.map(async (b) => {
           try {
@@ -323,12 +321,6 @@ export default function ExplorePage() {
     let clickHandler: ((mouseEvent: any) => Promise<void>) | null = null;
     let currentMap: any = null;
 
-    const clearSelectedMarker = () => {
-      selectedMarkerRef.current?.setMap(null);
-      selectedInfoWindowRef.current?.close?.();
-      selectedMarkerRef.current = null;
-      selectedInfoWindowRef.current = null;
-    };
 
     const initMap = (kakao: any) => {
       if (!mapRef.current || disposed) return;
@@ -339,19 +331,6 @@ export default function ExplorePage() {
       mapInstance.current = map;
       kakaoRef.current = kakao;
       currentMap = map;
-
-      const showSelectedMarker = (name: string, lat: number, lng: number) => {
-        clearSelectedMarker();
-        const position = new kakao.maps.LatLng(lat, lng);
-        const marker = new kakao.maps.Marker({ map, position, title: name });
-        const escapedName = escapeHtml(name);
-        const infoWindow = new kakao.maps.InfoWindow({
-          content: `<div style="padding:7px 10px;font-size:12px;font-weight:600;white-space:nowrap;color:#111;">선택됨: ${escapedName}</div>`,
-        });
-        infoWindow.open(map, marker);
-        selectedMarkerRef.current = marker;
-        selectedInfoWindowRef.current = infoWindow;
-      };
 
       const coord2Address = (latLng: any) => (
         coord2AddressViaBackend(latLng.getLng(), latLng.getLat())
@@ -416,8 +395,10 @@ export default function ExplorePage() {
 
         return places
           .map((place) => scorePlaceCandidate(place, latLng))
-          .filter(({ placeName, distance }) => (
-            placeName.includes(sejongUniversityPlacePriority.campusKeyword)
+          .filter(({ placeName, distance, priorityIndex, isCampusOnlyName }) => (
+            !isCampusOnlyName
+            && (placeName.includes(sejongUniversityPlacePriority.campusKeyword)
+              || priorityIndex !== Number.MAX_SAFE_INTEGER)
             && placeName.length >= 2
             && Number.isFinite(distance)
             && distance <= sejongUniversityPlacePriority.placeSearchRadiusMeters
@@ -441,8 +422,9 @@ export default function ExplorePage() {
         }).catch((): KakaoPlaceResult[] => []);
         return places
           .map((place) => scorePlaceCandidate(place, latLng))
-          .filter(({ placeName, distance }) => (
-            placeName.length >= 2
+          .filter(({ placeName, distance, isCampusOnlyName }) => (
+            !isCampusOnlyName
+            && placeName.length >= 2
             && Number.isFinite(distance)
             && distance <= sejongUniversityPlacePriority.addressSearchRadiusMeters
           ))
@@ -466,37 +448,30 @@ export default function ExplorePage() {
         } => Boolean(candidate && candidate.distance <= 45))
         .sort((a, b) => a.distance - b.distance)[0] ?? null;
 
-      const openRegisteredBuilding = (candidate: {
-        building: BuildingWithFloors;
-        coordinate: Coordinate;
-      }) => {
-        showSelectedMarker(candidate.building.name, candidate.coordinate.lat, candidate.coordinate.lng);
-        showToast(`선택됨: ${candidate.building.name}`);
+      const openRegisteredBuilding = (
+        candidate: { building: BuildingWithFloors; coordinate: Coordinate },
+      ) => {
         navigateFromMap(`/buildings/${candidate.building.id}`);
       };
 
-      const createBuildingFromAddress = async (name: string, address: any, latLng: any) => {
-        showSelectedMarker(name, latLng.getLat(), latLng.getLng());
-        showToast(`선택됨: ${name}`);
-        await routeBuildingByLookup({
+      const createBuildingFromAddress = (name: string, address: any, latLng: any) => (
+        routeBuildingByLookup({
           building_name: name,
           address_name: address?.address?.address_name ?? null,
           road_address_name: address?.road_address?.address_name ?? null,
           lat: latLng.getLat(),
           lng: latLng.getLng(),
-        });
-      };
+        })
+      );
 
-      const createBuildingFromPlace = async (place: KakaoPlaceResult) => {
+      const createBuildingFromPlace = (place: KakaoPlaceResult) => {
         const lat = Number(place.y);
         const lng = Number(place.x);
         if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
           showToast('선택한 건물의 좌표가 올바르지 않습니다.');
           return;
         }
-        showSelectedMarker(place.place_name, lat, lng);
-        showToast(`선택됨: ${place.place_name}`);
-        await routeBuildingByLookup({
+        return routeBuildingByLookup({
           building_name: place.place_name,
           place_id: place.id,
           address_name: place.address_name || null,
@@ -506,18 +481,16 @@ export default function ExplorePage() {
         });
       };
 
-      const createBuildingFromCoordinateOverride = async (override: PriorityCoordinateOverride) => {
-        showSelectedMarker(override.name, override.lat, override.lng);
-        showToast(`선택됨: ${override.name}`);
-        await routeBuildingByLookup({
+      const createBuildingFromCoordinateOverride = (override: PriorityCoordinateOverride) => (
+        routeBuildingByLookup({
           building_name: override.name,
           lookup_names: override.aliases,
           address_name: override.address_name ?? null,
           road_address_name: override.road_address_name ?? null,
           lat: override.lat,
           lng: override.lng,
-        });
-      };
+        })
+      );
 
       clickHandler = async (_mouseEvent: any) => {
         if (disposed) return;
@@ -581,7 +554,6 @@ export default function ExplorePage() {
       if (currentMap && clickHandler) {
         window.kakao?.maps?.event?.removeListener(currentMap, 'click', clickHandler);
       }
-      clearSelectedMarker();
       mapInstance.current = null;
       kakaoRef.current = null;
     };

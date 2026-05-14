@@ -31,7 +31,8 @@ type PathPoint = { x: number; z: number };
 type PathEdge = { from: number; to: number };
 type PathAction =
   | { type: 'point'; pointIdx: number; edge: PathEdge | null; prevSelected: number }
-  | { type: 'edge'; edge: PathEdge; prevSelected: number };
+  | { type: 'edge'; edge: PathEdge; prevSelected: number }
+  | { type: 'move'; pointIdx: number; prev: PathPoint };
 
 // Compute 2 wall peaks for a given angle (top peak in bottom 25% + top 25%)
 // score = count × (0.7 + 0.3 · non_empty_ratio) — 가구 덩어리(한 구석 몰림) 페널티
@@ -150,13 +151,14 @@ export default function WallModal({
     for (let i = 0; i < numSplats; i++) {
       if (posY[i] >= yLo && posY[i] <= yHi) valid.push(i);
     }
-    // Percentile trim (2% / 98%) on X & Z to drop distant outliers
+    // Percentile trim on X & Z to drop distant outliers — 너무 큰 비율은 방 경계도 잘림.
+    // 0.5% / 99.5% = 좁은 범위만 정리. 멀리 떨어진 노이즈 가우시안만 제거하는 정도.
     const xs = new Float32Array(valid.length);
     const zs = new Float32Array(valid.length);
     for (let i = 0; i < valid.length; i++) { xs[i] = posX[valid[i]]; zs[i] = posZ[valid[i]]; }
     const sortedX = Float32Array.from(xs).sort();
     const sortedZ = Float32Array.from(zs).sort();
-    const p = 0.02;
+    const p = 0.005;
     const xLo = sortedX[Math.floor(valid.length * p)];
     const xHi = sortedX[Math.floor(valid.length * (1 - p))];
     const zLo = sortedZ[Math.floor(valid.length * p)];
@@ -429,6 +431,20 @@ export default function WallModal({
     return { rx, rz };
   }, [viewBounds]);
 
+  // 픽셀 좌표 → 회전 프레임 좌표 (네이티브 MouseEvent 용 — document listener 가 받는 이벤트는 React event 가 아님).
+  const nativeToRot = useCallback((ev: MouseEvent) => {
+    const el = xzRef.current;
+    if (!el) return null;
+    const rect = el.getBoundingClientRect();
+    const mx = (ev.clientX - rect.left) * (CW / rect.width);
+    const my = (ev.clientY - rect.top) * (CH / rect.height);
+    const { mnR, mxR, mnT, mxT } = viewBounds;
+    const plotW = CW - PAD * 2, plotH = CH - PAD * 2;
+    const rx = mnR + (mx - PAD) * (mxR - mnR) / plotW;
+    const rz = mnT + (my - PAD) * (mxT - mnT) / plotH;
+    return { rx, rz };
+  }, [viewBounds]);
+
   const handleMouseDown = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     if (basemapMode) {
       if (e.button !== 0) return;
@@ -439,11 +455,44 @@ export default function WallModal({
       const selected = selectedPointIdxRef.current;
 
       if (hit >= 0) {
-        if (selected >= 0 && selected < points.length) {
-          const edge = addPathEdge(selected, hit);
-          if (edge) pathActionsRef.current.push({ type: 'edge', edge, prevSelected: selected });
-        }
-        selectPathPoint(hit);
+        // 기존 점 hit — document level mousemove/mouseup 등록해 캔버스 밖으로 나가도 추적.
+        // 임계 픽셀 (3px) 이상 움직였을 때만 drag 로 간주 — 미만이면 click 으로 처리(edge 연결).
+        const startPoint = { ...points[hit] };
+        const startClientX = e.clientX;
+        const startClientY = e.clientY;
+        let moved = false;
+
+        const onMove = (ev: MouseEvent) => {
+          if (!moved) {
+            const dxp = ev.clientX - startClientX;
+            const dyp = ev.clientY - startClientY;
+            if (Math.hypot(dxp, dyp) < 3) return;
+            moved = true;
+          }
+          const r = nativeToRot(ev);
+          if (!r) return;
+          const next = pathPointsRef.current.map((p, i) => i === hit ? { x: r.rx, z: r.rz } : p);
+          pathPointsRef.current = next;
+          setPathPoints(next);
+        };
+        const onUp = () => {
+          document.removeEventListener('mousemove', onMove);
+          document.removeEventListener('mouseup', onUp);
+          if (moved) {
+            pathActionsRef.current.push({ type: 'move', pointIdx: hit, prev: startPoint });
+            selectPathPoint(hit);
+          } else {
+            // 단순 클릭 — 선택된 점이 있으면 edge 연결.
+            const curSelected = selectedPointIdxRef.current;
+            if (curSelected >= 0 && curSelected < pathPointsRef.current.length && curSelected !== hit) {
+              const edge = addPathEdge(curSelected, hit);
+              if (edge) pathActionsRef.current.push({ type: 'edge', edge, prevSelected: curSelected });
+            }
+            selectPathPoint(hit);
+          }
+        };
+        document.addEventListener('mousemove', onMove);
+        document.addEventListener('mouseup', onUp);
         return;
       }
 
@@ -468,10 +517,11 @@ export default function WallModal({
     let best = -1, bestD = thr;
     for (let i = 0; i < 4; i++) if (ds[i] < bestD) { bestD = ds[i]; best = i; }
     if (best >= 0) setDraggingLine(best);
-  }, [addPathEdge, basemapMode, findPathPointHit, mouseToRot, selectPathPoint, wallVals, viewBounds]);
+  }, [addPathEdge, basemapMode, findPathPointHit, mouseToRot, nativeToRot, selectPathPoint, wallVals, viewBounds]);
 
   const handleMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     if (basemapMode) {
+      // basemap 모드: hover 표시만. 드래그 중인 점 이동은 document level listener 가 담당.
       const { rx, rz } = mouseToRot(e);
       setHoverPointIdx(findPathPointHit(rx, rz));
       return;
@@ -485,13 +535,22 @@ export default function WallModal({
     });
   }, [draggingLine, mouseToRot, basemapMode, findPathPointHit]);
 
-  const handleMouseUp = useCallback(() => setDraggingLine(null), []);
+  const handleMouseUp = useCallback(() => {
+    setDraggingLine(null);
+  }, []);
 
   const handleContextMenu = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     if (!basemapMode) return;
     e.preventDefault();
     const action = pathActionsRef.current.pop();
     if (!action) return;
+
+    if (action.type === 'move') {
+      const next = pathPointsRef.current.map((p, i) => i === action.pointIdx ? action.prev : p);
+      pathPointsRef.current = next;
+      setPathPoints(next);
+      return;
+    }
 
     if (action.type === 'point') {
       const nextPoints = pathPointsRef.current.filter((_, idx) => idx !== action.pointIdx);
@@ -555,7 +614,7 @@ export default function WallModal({
         </div>
         <div>
           <div className="text-gray-500 text-[10px] mb-1 text-center">Top-down (XZ)</div>
-          <canvas ref={xzRef} style={{ width: CW, height: CH }}
+          <canvas ref={xzRef} style={{ width: CW, height: CH, userSelect: 'none' }}
             className="border border-gray-700 rounded cursor-crosshair"
             onMouseDown={handleMouseDown}
             onMouseMove={handleMouseMove}

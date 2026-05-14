@@ -22,6 +22,19 @@ export const PRIMARY_DOOR_ID = 'door_1';
 //   doorThickness: 슬랩 깊이 (m, 방 안쪽 단방향).
 //   boundarySplitEnabled: 경계 분할 ON/OFF.
 //   safetyMargin: 분할 안전 마진.
+export interface DoorMeshMeta {
+  corners: number[][];      // 4 × 3 (A'+Y 프레임, z-fight 오프셋 적용)
+  uvs: number[][];          // 4 × 2
+  normalInward: number[];   // [x, y, z]
+  textureFilename: string;  // "tex_door_<doorId>.png"
+  textureWidth: number;
+  textureHeight: number;
+}
+
+export interface DoorSplatMeta {
+  filename: string;         // "door_<doorId>.ply"
+}
+
 interface DoorMeta {
   id: string;
   corners: number[][];
@@ -33,6 +46,8 @@ interface DoorMeta {
   doorThickness?: number;
   boundarySplitEnabled?: boolean;
   safetyMargin?: number;
+  doorMesh?: DoorMeshMeta;
+  doorSplat?: DoorSplatMeta;
 }
 
 interface DoorsJson {
@@ -98,6 +113,10 @@ export interface PersistOpts {
   doorThickness?: number;
   boundarySplitEnabled?: boolean;
   safetyMargin?: number;
+  // basemap 의 다중 도어 영속화 — 각 도어의 mesh quad + door-side gaussian splat 자산 메타.
+  // 별도로 PNG/PLY 를 MinIO 에 업로드한 후 그 파일명/메타를 doors.json 에 함께 저장.
+  doorMesh?: DoorMeshMeta;
+  doorSplat?: DoorSplatMeta;
 }
 
 export async function persistDoorsToServer(
@@ -120,6 +139,8 @@ export async function persistDoorsToServer(
   if (opts.doorThickness !== undefined) door.doorThickness = opts.doorThickness;
   if (opts.boundarySplitEnabled !== undefined) door.boundarySplitEnabled = opts.boundarySplitEnabled;
   if (opts.safetyMargin !== undefined) door.safetyMargin = opts.safetyMargin;
+  if (opts.doorMesh !== undefined) door.doorMesh = opts.doorMesh;
+  if (opts.doorSplat !== undefined) door.doorSplat = opts.doorSplat;
   try {
     const existing = await api.get<DoorsJson>(`/uploads/${uploadId}/doors`).catch(() => ({ doors: [] }));
     // 기존 door_1 의 메타는 새 opts 가 없으면 유지 — partial update.

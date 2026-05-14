@@ -9,6 +9,7 @@
 """
 
 import json
+import os
 from typing import Optional
 from uuid import UUID
 
@@ -168,10 +169,29 @@ async def save_refined(
     return SaveResponse(scene_id=scene.id, message="정제 결과가 저장되었습니다.")
 
 
+class RefinedBundleDoorEntry(BaseModel):
+    """basemap 의 도어 자산 (mesh + splat) 의 presigned URL 묶음. doors.json + 별도 PNG/PLY 가 있을 때만 채워짐."""
+    id: str
+    corners: list[list[float]]
+    unitName: Optional[str] = None
+    hingeEdge: Optional[int] = None
+    swing: Optional[int] = None
+    angleDeg: Optional[float] = None
+    wallSurfaceId: Optional[str] = None
+    doorThickness: Optional[float] = None
+    boundarySplitEnabled: Optional[bool] = None
+    safetyMargin: Optional[float] = None
+    # 도어 mesh 재생성용 — 텍스처 PNG presigned URL + corners/uvs/normalInward + W/H.
+    door_mesh: Optional[dict] = None  # { corners, uvs, normalInward, textureUrl, textureWidth, textureHeight }
+    # 도어 splat 재로드용 — PLY presigned URL.
+    door_splat: Optional[dict] = None  # { url }
+
+
 class RefinedBundleResponse(BaseModel):
     ply_url: str
     mesh_meta_url: Optional[str]
     textures: dict[str, str]  # surfaceId → presigned URL
+    doors: list[RefinedBundleDoorEntry] = []  # 신규: 도어 자산 (basemap 다중 도어 지원)
     scene_id: UUID
 
 
@@ -224,9 +244,61 @@ async def get_refined_bundle(
             # mesh.json 파싱 실패해도 PLY 는 반환
             print(f"[refined-bundle] mesh.json parse failed: {e}")
 
+    # doors.json 도 같이 로드 (basemap 다중 도어 자산 포함). 없으면 빈 배열.
+    # scene.ply_path 는 `{refined_prefix}/{session_id}/final.ply` 식의 경로 — doors.json 은
+    # 그 부모 (refined 디렉터리) 직속이라 두 단계 위.
+    doors_out: list[RefinedBundleDoorEntry] = []
+    # session_dir = `{refined_prefix}/{session_id}`. doors.json = `{refined_prefix}/doors.json`.
+    doors_key = f"{os.path.dirname(session_dir)}/doors.json"
+    if minio.object_exists(doors_key):
+        try:
+            doors_raw = minio.get_object_bytes(doors_key)
+            doors_parsed = json.loads(doors_raw.decode("utf-8"))
+            for d in doors_parsed.get("doors", []):
+                if not isinstance(d, dict): continue
+                corners = d.get("corners") or []
+                if not isinstance(corners, list) or len(corners) != 4: continue
+                entry = RefinedBundleDoorEntry(
+                    id=str(d.get("id") or f"door_{len(doors_out)+1}"),
+                    corners=corners,
+                    unitName=d.get("unitName") if isinstance(d.get("unitName"), str) else None,
+                    hingeEdge=d.get("hingeEdge") if isinstance(d.get("hingeEdge"), int) else None,
+                    swing=d.get("swing") if isinstance(d.get("swing"), int) else None,
+                    angleDeg=d.get("angleDeg") if isinstance(d.get("angleDeg"), (int, float)) else None,
+                    wallSurfaceId=d.get("wallSurfaceId") if isinstance(d.get("wallSurfaceId"), str) else None,
+                    doorThickness=d.get("doorThickness") if isinstance(d.get("doorThickness"), (int, float)) else None,
+                    boundarySplitEnabled=d.get("boundarySplitEnabled") if isinstance(d.get("boundarySplitEnabled"), bool) else None,
+                    safetyMargin=d.get("safetyMargin") if isinstance(d.get("safetyMargin"), (int, float)) else None,
+                )
+                # doorMesh — 텍스처 PNG 의 presigned URL 생성.
+                dm = d.get("doorMesh")
+                if isinstance(dm, dict):
+                    tex_key = dm.get("textureFilename")
+                    if isinstance(tex_key, str) and minio.object_exists(tex_key):
+                        entry.door_mesh = {
+                            "corners": dm.get("corners"),
+                            "uvs": dm.get("uvs"),
+                            "normalInward": dm.get("normalInward"),
+                            "textureUrl": minio.get_presigned_download_url(tex_key),
+                            "textureWidth": dm.get("textureWidth"),
+                            "textureHeight": dm.get("textureHeight"),
+                        }
+                # doorSplat — PLY 의 presigned URL 생성.
+                ds = d.get("doorSplat")
+                if isinstance(ds, dict):
+                    splat_key = ds.get("filename")
+                    if isinstance(splat_key, str) and minio.object_exists(splat_key):
+                        entry.door_splat = {
+                            "url": minio.get_presigned_download_url(splat_key),
+                        }
+                doors_out.append(entry)
+        except Exception as e:
+            print(f"[refined-bundle] doors.json parse failed: {e}")
+
     return RefinedBundleResponse(
         ply_url=ply_url,
         mesh_meta_url=mesh_meta_url,
         textures=textures,
+        doors=doors_out,
         scene_id=scene.id,
     )

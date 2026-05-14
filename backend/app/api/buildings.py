@@ -231,6 +231,9 @@ class FloorDetailManifestResponse(BaseModel):
     floor_id: UUID
     floor_number: int
     basemap: DetailBasemapEntry | None
+    # 활성 basemap 이 없을 때 pending basemap (관리자 승인 대기중) 존재 여부.
+    # 프론트가 빈 뷰어 대신 "승인 대기중" 안내 표시하는 데 사용.
+    basemap_pending_approval: bool = False
     modules: list[DetailModuleEntry]
 
 
@@ -1023,6 +1026,18 @@ async def get_floor_detail_manifest(
         .limit(1)
     )
     basemap = basemap_result.scalar_one_or_none()
+    # 활성 basemap 이 없을 때 pending 기록이 있는지 확인 — UI 에서 "관리자 승인 대기중" 안내.
+    has_pending_basemap = False
+    if basemap is None:
+        pending_check = await db.execute(
+            select(Basemap.id)
+            .where(
+                Basemap.floor_id == floor.id,
+                Basemap.status == BasemapStatus.pending,
+            )
+            .limit(1)
+        )
+        has_pending_basemap = pending_check.scalar_one_or_none() is not None
     basemap_url = _safe_presigned_download_url(minio, basemap.minio_path) if basemap else None
     basemap_entry = (
         DetailBasemapEntry(
@@ -1040,6 +1055,9 @@ async def get_floor_detail_manifest(
         select(Module, User.name.label("uploader_name"))
         .join(User, Module.user_id == User.id)
         .where(Module.floor_id == floor.id)
+        # basemap 등록 시 placeholder 로 생성되는 '__basemap__' 모듈은 사용자 목록에서 항상 숨김
+        # (register_local_basemap_upload 가 is_visible=False 로도 표시하지만 admin 도 안 보게 이름으로 제외).
+        .where(Module.name != "__basemap__")
         .order_by(Module.name)
     )
     if user.role != UserRole.admin:
@@ -1098,6 +1116,7 @@ async def get_floor_detail_manifest(
         floor_id=floor.id,
         floor_number=floor.floor_number,
         basemap=basemap_entry,
+        basemap_pending_approval=has_pending_basemap,
         modules=module_entries,
     )
 

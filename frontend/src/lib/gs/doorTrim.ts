@@ -521,6 +521,8 @@ export function extractDoorRegionTexture(
    *  caller 가 정확한 mesh UV 를 산출하는 데 사용 (axis-aligned bbox crop 이라 도어 corner 가 bbox corner 와
    *  꼭 일치하지 않을 수 있음 — 사다리꼴 등 비축정렬 케이스). */
   doorCornerPx: [[number, number], [number, number], [number, number], [number, number]];
+  /** wall 텍스처에서 cut 한 axis-aligned bbox (픽셀 좌표). 도어 삭제 시 alpha=0 punch 복원에 사용. */
+  bbox: { x: number; y: number; w: number; h: number };
 } {
   const TLw = wallCorners[0], TRw = wallCorners[1], BLw = wallCorners[3];
   const eU = vsub(TRw, TLw);
@@ -578,5 +580,6 @@ export function extractDoorRegionTexture(
     [doorPx[2][0] - xLo, doorPx[2][1] - yLo],
     [doorPx[3][0] - xLo, doorPx[3][1] - yLo],
   ];
-  return { rgba, width: cutW, height: cutH, doorCornerPx };
+  // bbox — 호출자 (DoorAlignModal) 가 도어 삭제 시 cut.rgba 를 동일 위치에 다시 paste 하여 alpha=0 punch 를 복원할 때 사용.
+  return { rgba, width: cutW, height: cutH, doorCornerPx, bbox: { x: xLo, y: yLo, w: cutW, h: cutH } };
 }

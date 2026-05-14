@@ -101,14 +101,18 @@ localX = cross(localY, localZ)     # right
 
 ### MinIO Object Keys
 
-- `users/{user_id}/{building_name}/web_input/` — 원본 PLY 업로드 (private)
-- `users/{user_id}/{building_name}/refined/{session_id}/` — 한 번의 정제 결과를 묶는 디렉토리 (PLY + mesh.json + tex_*.png 들이 같이 들어감)
-  - `final.ply` — 정제된 가우시안 PLY (회전 적용: pendingRotation rotX/rotZ + wallAngle Y, flatten 마스크 적용, 브러시 삭제 적용)
+실제 경로 구조 (코드 기준 — `services/storage_paths.py:module_base_path`):
+
+- `buildings/{building_id}/{floor_id}/modules/{module_id}_{module_name}/alignment/{uuid}_local.ply` — placeholder 원본 PLY 키 (실제 객체는 비어있음; register-local 정책)
+- `buildings/{building_id}/{floor_id}/modules/{module_id}_{module_name}/alignment/refined/{session_id}/` — 한 번의 정제 결과 디렉토리
+  - `final.ply` — 정제된 가우시안 PLY (회전 적용: pendingRotation rotX/rotZ + wallAngle Y, flatten/brush 마스크 적용)
   - `mesh.json` — wall mesh 메타데이터 (각 면 corners[4][3], uvs[4][2], normalInward, textureFilename)
-  - `tex_{surfaceId}.png` — 면별 베이크 텍스처 (ceiling/floor/w1a/w1b/w2a/w2b)
-- `users/{user_id}/{building_name}/refined/{timestamp}_aligned.ply` — 정합 단계 (DoorAlignModal `applyAndSave`) 결과. session_id 없이 업로드되는 legacy timestamp 경로. 새 SceneOutput 은 만들지 않고 즉시 뷰어가 그 URL 로 reload (one-shot).
-- Upload: Multipart + presigned PUT URL (클라이언트가 MinIO로 직접 업로드)
+  - `tex_{surfaceId}.png` — 면별 베이크 텍스처 (ceiling/floor/w1a/w1b/w2a/w2b — 현재 6면 고정)
+- `buildings/{building_id}/{floor_id}/modules/{module_id}_{module_name}/alignment/refined/doors.json` — refined 디렉토리 직속 (세션 폴더 밖). 도어 corners + 메타.
+- Upload: 신흐름 모듈 등록은 `POST /uploads/commit-final` multipart 1회 (정합 완료 시). 베이스맵·레거시는 multipart + presigned PUT URL.
 - Download: presigned GET URL
+
+⚠️ `aligned.ply` 는 **저장하지 않음** — final.ply + module.alignment_transform 으로 재계산 가능. 저장 용량 절약 + basemap 재정합 시 행렬만 갱신.
 
 ### Refine 결과 저장 (SceneOutput)
 
@@ -118,9 +122,9 @@ localX = cross(localY, localZ)     # right
 
 ### Door Alignment
 
-- basemap은 고정. module 의 가우시안 좌표에 4×4 rigid transform 을 클라이언트에서 적용한 결과 PLY 를 통째로 MinIO 에 업로드 (`aligned.ply`). 행렬만 따로 저장하는 엔드포인트는 없음.
-- 4점 수동 클릭 → Kabsch(3×3 SVD)로 rigid transform 추정 (`DoorAlignModal` + `lib/alignment/kabsch.ts`). 추후 segmentation 자동 입력 연동 예정.
-- 같은 모달의 "문 경계 정제하기" 토글: 사용자가 찍은 4점 직사각형의 4 edge plane 에 걸친 가우시안을 boundary 위치 기준으로 두 개로 분할 (`lib/gs/doorTrim.ts` 의 `decomposeBoundaryGaussians`) → 메인 PLY GPU 의 boundary slot 은 wall-side sub 로 in-place 갱신, door-side sub 들은 별도 GaussianScene → blob URL → `useAdditionalGsplats` 로 추가 splat group. wall mesh 의 도어 영역 텍셀은 alpha=0 punch, 도어 영역만 별도 베이크해서 도어 mesh 엔티티 생성. 슬라이더 (베이크 시작 / 안전 margin) 변경 시 600ms 디바운스 후 자동 재적용.
+- basemap은 고정. module 의 정합은 **4×4 rigid transform 행렬을 `modules.alignment_transform` 에 저장** (PLY 는 변환 안 함). 뷰어가 렌더 시 transform 적용. `aligned.ply` 별도 저장 X.
+- 4점 수동 클릭 → Kabsch(3×3 SVD)로 rigid transform 추정 (`AlignPanel.saveResult` + `lib/alignment/kabsch.ts`). 자동 검출은 SAM3 (door-ml HTTP) 로 수행 — 신흐름은 임시 PLY 보관 후 동기 forward (`POST /uploads/sam3/detect-temp`).
+- `DoorAlignModal` 의 "문 경계 정제하기" 토글: 사용자가 찍은 4점 직사각형의 4 edge plane 에 걸친 가우시안을 boundary 위치 기준으로 두 개로 분할 (`lib/gs/doorTrim.ts` 의 `decomposeBoundaryGaussians`) → 메인 PLY GPU 의 boundary slot 은 wall-side sub 로 in-place 갱신, door-side sub 들은 별도 GaussianScene → blob URL → `useAdditionalGsplats` 로 추가 splat group. wall mesh 의 도어 영역 텍셀은 alpha=0 punch, 도어 영역만 별도 베이크해서 도어 mesh 엔티티 생성. 슬라이더 (베이크 시작 / 안전 margin) 변경 시 600ms 디바운스 후 자동 재적용.
 - `lib/alignment/`에는 Kabsch 외에 RANSAC rigid(`ransacRigid`), 평면 RANSAC fit(`ransacPlaneFit`), OBB 4꼭짓점 추출(`fitOrientedRectangle`) 등 보조 유틸이 함께 들어있음 (일부는 Python에서 포팅).
 
 ### Basemap
@@ -146,7 +150,10 @@ localX = cross(localY, localZ)     # right
 - 브라우저 새로고침/닫기 → `beforeunload` 경고.
 - 사이드바 탭 변경 → `window.confirm("저장되지 않은 변경사항이 있습니다...")`. 완료 버튼 (force=true) 만 bypass.
 
-**모든 서버 영속은 문 설정 완료 시점에 일괄 처리** — 다듬기 단계는 메모리/localStorage 만, 다듬기 완료는 단순 mode transition.
+서버 영속 타이밍 — 흐름별 분기:
+
+- **모듈 등록 (신흐름, purpose=`module`)**: 다듬기 + 문 설정 모두 메모리. **정합 완료 시점**에 `POST /uploads/commit-final` 로 modules/uploads/tasks/scene_outputs + MinIO 자산을 atomic 일괄 영속화. SAM3 자동 검출은 파일 선택 직후 백그라운드 임시 업로드 + 동기 forward (`/uploads/sam3/prepare` → `/uploads/sam3/detect-temp`). 자세한 흐름은 [NEW_FLOW_NOTES.md](NEW_FLOW_NOTES.md).
+- **베이스맵 등록 (기존 흐름, purpose=`basemap`)**: 다듬기 단계는 메모리/localStorage, **문 설정 완료** 시점에 `register-local` + `commitRefinedToServer` + `persistDoorsToServer` 백그라운드 일괄 처리. 정합 단계는 베이스맵 자체엔 의미가 없어 진입하지 않음.
 
 ## Refine Pipeline (씬 정제 순서)
 
@@ -157,9 +164,14 @@ localX = cross(localY, localZ)     # right
 3. Wall mesh + 텍스처 베이크 (`lib/gs/textureBake.ts`, `textureBakeGPU.ts`, `wallMesh.ts`) — 각 경계면을 정사영 + alpha 컴포지팅으로 텍스처에 굽고, paint 위치에 텍스처 입힌 quad 메시로 표시. **얇은 막(가우시안 패치) 방식은 폐기됨**.
 4. 경계면 정제 (`lib/gs/clipping.ts`) — 방 경계면 바깥으로 뻗어나가는 가우시안 scale 을 shrink (f = |sd| / 3σ). 시점 회전 시 가우시안 결 회전 artifact 완화.
 5. **다듬기 완료** → 문 설정 단계로 transition (서버 통신 없음).
-6. 문 설정 (`DoorAlignModal` setup view) — SAM3 프롬프트 팝업 (자동 문 지정 / 문 수동 지정 분기) → 4 점 수동 클릭 → 문 추출 (boundary split + wall mesh α punch + 도어 mesh 별도) → 회전축/각도/방향.
-7. **문 설정 완료** → register-local (로컬 파일이면 모듈 정보 모달) → refined PLY + mesh.json + tex_*.png + doors.json 일괄 업로드 → 정합 단계 진입.
-8. 정합 (`DoorAlignModal` align view) — 4점 수동 클릭 → Kabsch → 행렬을 PLY 좌표에 적용 → `aligned.ply` 업로드 후 뷰어 reload.
+6. 문 설정 (`DoorAlignModal` setup view) — SAM3 프롬프트 팝업 (자동 / 수동 분기) → 4점 클릭 → 문 추출 (boundary split + wall mesh α punch + 도어 mesh 별도) → 회전축/각도/방향. **자동 검출은 흐름별 분기**: 모듈 흐름은 임시 PLY 가 백엔드 디스크에 이미 있어 `detect-temp` 동기 호출; 베이스맵 흐름은 `commitRefinedToServer` → `/uploads/{id}/sam3/start` 비동기 dispatch + 폴링.
+7. **문 설정 완료** — 흐름별 분기:
+   - 모듈: 메모리 유지 + `onSetupCornersFinalized` 콜백으로 부모에 4 corners 전달. 서버 영속 X.
+   - 베이스맵: `register-local` (필요 시) + refined PLY + mesh.json + tex_*.png + doors.json 백그라운드 업로드.
+   둘 다 정합 단계로 transition.
+8. 정합 (`AlignPanel`) — 4점 수동 클릭 → Kabsch → 행렬 산출 → 흐름별 분기:
+   - 모듈: `POST /uploads/commit-final` 멀티파트로 PLY+mesh+tex+doors+alignment_transform 일괄. 덮어쓰기 시 기존 자산 청소.
+   - 베이스맵: 해당 단계 없음.
 
 ### Wall mesh 베이크 세부
 
@@ -176,17 +188,47 @@ localX = cross(localY, localZ)     # right
 
 ### 영속화 + 정합 연결 흐름
 
-- 다듬기 단계는 메모리 + localStorage (`refine_state_v5_{uploadId}`) 만 사용 — 평면/벽면 각도/선택된 면/pendingRotation rotX/rotZ 등이 다음 단계에서 평면 6개 복원 + raw↔A' 변환에 쓰임. 서버 통신 없음.
-- **문 설정 완료** 버튼 (DoorAlignModal) 이 모든 서버 영속을 순차 트리거:
-  1. `ensureUploadId` — 로컬 파일이면 모듈 정보 모달 → `register-local` API → 새 `upload_id` 반환. 서버 진입이면 기존 `upload_id` 그대로 재사용.
-  2. `commitRefinedToServer` — refined PLY + mesh.json + tex_*.png 6장 일괄 업로드 (`/refine/refined-upload-url` + PUT) → `/refine/save` 로 `Task` + `SceneOutput` 생성. 베이크된 회전값 + plyKey 반환.
-  3. `persistDoorsToServer` — 별도 호출. doors.json 업로드 (corners + 회전 메타 + boundary split 파라미터).
-  4. `lockedStages` 에 `'door'` 추가 + `setMode('align', { force: true })`.
-- 같은 모달의 재방문 (정합 → 사이드바 클릭은 lock 으로 막힘이지만 다른 경로로 복귀 시) 마다 `문 설정 완료` 누르면 1~3 재실행 (덮어쓰기) 가능.
-- `/viewer?upload_id=X` 베이스 뷰어 — `useRefinedMeshLoader` 가 가장 최근 SceneOutput 의 PLY + mesh + tex 자동 로드.
+- 다듬기 단계는 메모리 + localStorage (`refine_state_v5_{uploadId}` — 베이스맵 흐름 한정. 모듈 흐름은 uploadId 가 'pending' 이라 localStorage 키 미사용) 만 사용. 평면/벽면 각도/선택된 면/pendingRotation rotX/rotZ 등이 다음 단계에서 평면 6개 복원 + raw↔A' 변환에 쓰임. 서버 통신 없음.
+
+#### 모듈 등록 흐름 (신흐름)
+1. 사용자 호수 휠 피커 → 본인이 이미 그 호수에 등록한 모듈 있으면 confirm 모달 → /viewer 진입 (`initialRegistrationContext.purpose='module'`).
+2. 파일 선택 직후 백그라운드 `POST /uploads/sam3/prepare` — PLY 를 백엔드 임시 디스크(`/var/lib/sam3-temp`) 저장, 세션 ID 보관. 30분 TTL.
+3. 다듬기 → 문 설정 모두 메모리. `requestMetadata` 가 placeholder MetadataResult 만 반환 (DB 행 X). `ensureUploadId` → 'pending' 반환.
+4. 자동 문 검출 시 `POST /uploads/sam3/detect-temp` 동기 호출 → 임시 PLY 를 door-ml `/detect` 로 forward → corners 반환 (베이크 회전 적용된 refined 좌표계).
+5. 문 설정 완료 — `DoorAlignModal.onSetupCornersFinalized` 콜백이 자동/수동 무관 최종 4 corners 를 UnifiedSplatEditor `setupDoorCornersRef` + `moduleDoorCorners` 에 세팅. `deferPersistenceToAlign=true` 라 백그라운드 업로드 스킵.
+6. 정합 완료 (`AlignPanel.saveResult`) — `onCommitFinal` 콜백 발화. `refine.gatherRefinedAssets()` 로 메모리에서 PLY+mesh+tex 6장 빌드 + setupDoorCornersRef 로 doors.json 직렬화 + alignment matrix → `POST /uploads/commit-final` multipart 일괄. 백엔드가 atomic 처리: ensure module → 덮어쓰기면 옛 자산 정리 → 새 upload/task/scene_output 행 + MinIO 객체 업로드 + module.alignment_transform 세팅 + is_confirmed=true.
+7. 성공 응답의 `was_overwrite` 가 true 면 사용자에게 알림 + 층 페이지로 이동.
+
+#### 베이스맵 등록 흐름 (신흐름 — 다중 도어, 2026-05-14)
+1. 진입 모달 (`/buildings/[name]/page.tsx`): module_name 입력 안 받음 (basemap 전체에 단일 호수 의미 없음). 층 번호만 확인.
+2. 다듬기 (천장/바닥/벽 정렬 + 외부 가우시안 제거 + 벽 메시 베이크).
+3. 문 설정 단계 — 자동 검출 (`/uploads/sam3/detect-temp`) 또는 수동 4점:
+   - 4점 픽 완료 → `applyDoorRefine` 자동 실행 → 도어 추출 + 메시/splat 생성 + alpha=0 punch.
+   - 추출 직후 **메모리 도어 리스트 (`inMemoryDoors`) 에 push** + 호수 휠 피커 모달 자동 오픈.
+   - 사용자가 호수 (N01~N99) 선택 → 도어 unitName 부여.
+   - picked 자동 초기화 → 다음 도어 4점 픽 가능.
+   - (반복 — 다중 도어 누적).
+4. 도어 목록 박스 — 각 도어 항목:
+   - 호수 설정됨: 🚪 `601호` + X 삭제
+   - 호수 미설정: 노란 강조 + ⚠️ + "호수 미설정 — 클릭해서 설정" + X 삭제
+   - 행 클릭 → 휠 피커 재오픈.
+   - X 클릭 → 메시/splat/outline entity 정리 + 벽 텍스처 alpha=0 punch 복원 (`cut.bbox` 위치에 `cut.rgba` 다시 paste).
+5. **"Basemap 등록 완료"** 버튼 (호수 미설정 도어 있으면 비활성) → 일괄 영속:
+   - `ensureUploadId` → `/uploads/register-local-basemap`
+   - `onCommitRefined` → basemap PLY + mesh.json + tex_*.png 업로드
+   - 각 도어: `tex_<doorId>.png` + `<doorId>.ply` 업로드 (`/refine/refined-upload-url`)
+   - `PUT /uploads/{id}/doors` — 모든 도어 메타 (corners + doorMesh + doorSplat 참조)
+   - `onSetupSaveDone` → `/basemaps/register` (활성화)
+6. **완료 모달** — "Basemap 등록이 완료되었습니다. 이동할 페이지를 선택해주세요." + 가로 3 버튼 (메인/건물/대시보드).
+
+#### 베이스맵 등록 흐름 (레거시, 참고용)
+이전엔 "문 저장" 버튼이 도어 한 개씩 즉시 영속화하는 단일 도어 흐름이었음 (`persistDoorsToServer` per door). 신흐름 이후 메모리 누적 + 일괄 영속으로 단순화. 코드상 분기는 `basemapMode` 플래그.
+
+#### 공통
+- `/viewer?upload_id=X` 베이스 뷰어 — `useRefinedMeshLoader` 가 가장 최근 SceneOutput 의 PLY + mesh + tex 자동 로드 (베이스맵 또는 기존 모듈 뷰).
 - `/viewer?upload_id=X&mode=align` — 대시보드의 "정합" 진입 경로. `initialMode = 'align'`.
-- 라우팅 변경 없음: 문 설정 완료 → 정합은 같은 페이지에서 `setMode('align')` 만 (URL 변경 X).
-- DoorAlignModal 마운트 시 서버 corners 가 있으면 1회 자동 문 추출 (`autoExtractedRef`) — 재진입 시 회전 즉시 가능.
+- 라우팅 변경 없음: 문 설정 완료 → 정합은 같은 페이지에서 `setMode('align')` 만.
+- DoorAlignModal 마운트 시 서버 corners 가 있으면 1회 자동 문 추출 — 재진입 시 회전 즉시 가능 (베이스맵 흐름).
 
 ## TODO (미완)
 
@@ -199,7 +241,14 @@ localX = cross(localY, localZ)     # right
 3. **창문 segmentation + 투명 텍스처** — 텍스처 베이크 시:
    - 창문 영역 자동 segmentation (SAM3 등 활용 검토).
    - 해당 영역 텍스처 알파를 0 으로 → 창문 너머 보이게 (또는 별도 처리).
-4. **SAM3 자동 문 지정 결과 반영** — 백엔드 dispatch 는 구현됨 (`UnifiedSplatEditor.tsx` 의 `Sam3PromptModal::onStartAuto` 가 `commitRefinedToServer` → `/uploads/{id}/sam3/start` 호출). **남은 작업**: SAM3 처리 결과 (4코너 좌표) 가 서버에서 도착하면 DoorAlignModal 의 picked 에 자동 채우기.
+4. **SAM3 자동 문 지정 결과 반영** — 모듈/베이스맵 모두 신흐름은 `detect-temp` 동기 검출. 단일 도어 응답 가정. 백엔드 응답 list 확장 시 다중 도어 자동 누적 가능 (별도 작업).
+
+5. **벽면 자유도 N개** (TODO) — 사용자 폴리곤 픽킹으로 N개 벽 정의 가능하게 (현재 4벽 고정). 신흐름 도입 후 backbone 작업 — [NEW_FLOW_NOTES.md](NEW_FLOW_NOTES.md) "Task 4" 참고.
+   - `lib/gs/planes.ts` 의 `surfacePlanesFromPolygon` + `surfaceColor` (세이지 그린 단일) 는 이미 추가됨. WallModal UI 와 useRefineTool 파이프라인 연결만 남음.
+
+6. **베이스맵 도어 자산 영속화** (✅ 완료) — `doors.json` 의 각 도어 엔트리에 `doorMesh` (cut 텍스처 + uvs + corners) + `doorSplat` (PLY) 참조 메타. 로드 시 `useRefinedMeshLoader` 가 자동으로 도어 mesh quad 재생성 + 도어 splat 추가 레이어 등록.
+
+7. **베이스맵 수정 모드 재진입** (TODO) — 등록 후 도어 추가/삭제/이름 변경.
 
 ## Commands
 

@@ -42,6 +42,7 @@ services:
     volumes:
       - ./core:/app/core:ro
       - ./utilities:/app/utilities:ro
+      - sam3-temp:/var/lib/sam3-temp
     env_file: .env
     environment:
       - POSTGRES_HOST=postgres
@@ -192,6 +193,7 @@ volumes:
   redisdata:
   rabbitmqdata:
   miniodata:
+  sam3-temp:
 
 
 networks:

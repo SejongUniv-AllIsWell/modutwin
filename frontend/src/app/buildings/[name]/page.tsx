@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useParams, useRouter, useSearchParams } from 'next/navigation';
 import { api } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
@@ -33,7 +33,7 @@ export default function BuildingOverviewPage() {
     }
   }, [user, loading, router]);
 
-  useEffect(() => {
+  const loadOverview = useCallback(() => {
     if (!buildingId) return;
     if (isPendingBuilding) {
       const pendingName = searchParams.get('building_name')?.trim() || 'Pending Building';
@@ -50,6 +50,8 @@ export default function BuildingOverviewPage() {
       setManifest(null);
     });
   }, [buildingId, isPendingBuilding, searchParams]);
+
+  useEffect(() => { loadOverview(); }, [loadOverview]);
 
   const floors = useMemo(
     () => [...(manifest?.floors ?? [])].sort((a, b) => b.floor_number - a.floor_number),
@@ -101,9 +103,10 @@ export default function BuildingOverviewPage() {
       setFloorInputError('유효한 층 번호를 입력하세요. 예: 1, -1, B1');
       return;
     }
-    const registrationName = nameInputValue.trim();
-    if (!registrationName) {
-      setFloorInputError(registerPurpose === 'basemap' ? '저장할 이름을 입력하세요.' : '모듈 이름을 입력하세요.');
+    // basemap 등록은 호수별로 도어 unitName 부여 — basemap 전체 이름 입력 불필요. 빈 문자열로 진행.
+    const registrationName = registerPurpose === 'basemap' ? '' : nameInputValue.trim();
+    if (registerPurpose !== 'basemap' && !registrationName) {
+      setFloorInputError('모듈 이름을 입력하세요.');
       return;
     }
     try {
@@ -185,15 +188,31 @@ export default function BuildingOverviewPage() {
                           basemap 등록
                         </button>
                       )}
-                      <button
-                        type="button"
-                        onClick={() => {
-                          openRegisterModal('module', floor);
-                        }}
-                        className="w-full text-left text-xs px-2 py-1.5 rounded hover:bg-gray-800"
-                      >
-                        module 등록
-                      </button>
+                      {floor.has_active_basemap && (
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            setOpenFloorMenuId(null);
+                            const ok = window.confirm(
+                              `${floorLabel(floor.floor_number)} 의 활성 basemap 을 삭제하시겠습니까?\n` +
+                              `해당 basemap 의 PLY/메시/도어 자산이 모두 사라지며, 이 층의 기존 정합된 모듈들은 부모 베이스맵을 잃습니다.`
+                            );
+                            if (!ok) return;
+                            try {
+                              const active = await api.get<{ basemap_id: string }>(
+                                `/basemaps/active?floor_id=${floor.floor_id}`,
+                              );
+                              await api.delete(`/admin/basemaps/${active.basemap_id}`);
+                              await loadOverview();
+                            } catch (err: any) {
+                              window.alert(`basemap 삭제 실패: ${err?.message ?? err}`);
+                            }
+                          }}
+                          className="w-full text-left text-xs px-2 py-1.5 rounded text-red-400 hover:bg-red-500/15"
+                        >
+                          basemap 삭제
+                        </button>
+                      )}
                     </div>
                   )}
                 </div>
@@ -290,21 +309,24 @@ export default function BuildingOverviewPage() {
               className="mt-3 w-full rounded border border-gray-700 bg-gray-950 px-3 py-2 text-sm text-gray-100 outline-none focus:border-blue-500 disabled:opacity-50"
               placeholder="층 번호"
             />
-            <input
-              type="text"
-              value={nameInputValue}
-              onChange={(e) => {
-                setNameInputValue(e.target.value);
-                if (floorInputError) setFloorInputError(null);
-              }}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') handleRegisterFromPlus();
-                if (e.key === 'Escape') closeRegisterModal();
-              }}
-              autoFocus={!!registerFloor}
-              className="mt-2 w-full rounded border border-gray-700 bg-gray-950 px-3 py-2 text-sm text-gray-100 outline-none focus:border-blue-500"
-              placeholder={registerPurpose === 'basemap' ? '저장할 이름' : '모듈 이름'}
-            />
+            {/* basemap 등록은 호수별로 도어에 unitName 부여 — basemap 전체 이름 입력 불필요. */}
+            {registerPurpose !== 'basemap' && (
+              <input
+                type="text"
+                value={nameInputValue}
+                onChange={(e) => {
+                  setNameInputValue(e.target.value);
+                  if (floorInputError) setFloorInputError(null);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') handleRegisterFromPlus();
+                  if (e.key === 'Escape') closeRegisterModal();
+                }}
+                autoFocus={!!registerFloor}
+                className="mt-2 w-full rounded border border-gray-700 bg-gray-950 px-3 py-2 text-sm text-gray-100 outline-none focus:border-blue-500"
+                placeholder="모듈 이름"
+              />
+            )}
             {floorInputError && <p className="mt-2 text-xs text-red-400">{floorInputError}</p>}
             <div className="mt-4 flex items-center justify-end gap-2">
               <button

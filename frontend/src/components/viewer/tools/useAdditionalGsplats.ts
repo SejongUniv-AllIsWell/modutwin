@@ -137,7 +137,11 @@ export function useAdditionalGsplats(
         // 정합 모드 reparent 시 module-side 와 basemap 을 구분하기 위한 태그.
         // SplatViewerCore.enterAlignmentMode 가 'basemap' 태그가 없는 추가 splat 만 alignmentGroup 으로 옮긴다.
         try { ent.tags.add(`source:${source}`); if (source === 'basemap') ent.tags.add('basemap'); } catch {}
-        app.root.addChild(ent);
+        // 비동기 로드가 끝났을 때 이미 alignment 모드라면 곧장 alignmentGroup 의 자식으로 붙인다.
+        // (그렇지 않으면 app.root 에 남아 정합 transform 을 안 받음 — module 측 도어 가우시안 race 문제 원인)
+        const alignGroup = coreRef.current?.getAlignmentGroup?.();
+        const parent = (alignGroup && source !== 'basemap') ? alignGroup : app.root;
+        parent.addChild(ent);
         entityMapRef.current.set(id, ent);
         setItems(prev => prev.map(it => it.id === id ? { ...it, loaded: true, error: null } : it));
         const r = readyMapRef.current.get(id);
@@ -150,6 +154,7 @@ export function useAdditionalGsplats(
   }, [coreRef]);
 
   const remove = useCallback((id: string) => {
+    console.warn(`[DoorSplat:REMOVE] id=${id} stack:`, new Error().stack);
     const cancel = cancelMapRef.current.get(id);
     if (cancel) { cancel(); cancelMapRef.current.delete(id); }
     const ent = entityMapRef.current.get(id);
