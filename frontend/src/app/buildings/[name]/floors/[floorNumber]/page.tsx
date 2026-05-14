@@ -12,6 +12,49 @@ import { useRefinedMeshLoader } from '@/components/viewer/tools/useRefinedMeshLo
 type Vec3 = [number, number, number];
 type Quat = [number, number, number, number];
 type Scale3 = [number, number, number];
+type ModuleGroup = {
+  name: string;
+  modules: FloorDetailModuleEntry[];
+};
+
+const moduleNameCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+const moduleTimeFormatter = new Intl.DateTimeFormat('ko-KR', {
+  dateStyle: 'short',
+  timeStyle: 'short',
+});
+
+function moduleVersionTime(value: string | null): number {
+  if (!value) return Number.POSITIVE_INFINITY;
+  const time = Date.parse(value);
+  return Number.isFinite(time) ? time : Number.POSITIVE_INFINITY;
+}
+
+function hasModuleResult(module: FloorDetailModuleEntry): boolean {
+  return Boolean(module.url || module.version);
+}
+
+function compareModuleVersionAsc(a: FloorDetailModuleEntry, b: FloorDetailModuleEntry): number {
+  const at = moduleVersionTime(a.version);
+  const bt = moduleVersionTime(b.version);
+  if (at !== bt) {
+    if (!Number.isFinite(at)) return 1;
+    if (!Number.isFinite(bt)) return -1;
+    return at - bt;
+  }
+  const au = a.uploader_name?.trim() || a.user_id;
+  const bu = b.uploader_name?.trim() || b.user_id;
+  return moduleNameCollator.compare(au, bu);
+}
+
+function formatModuleVersion(value: string | null): string {
+  const time = moduleVersionTime(value);
+  if (!Number.isFinite(time)) return '';
+  return moduleTimeFormatter.format(new Date(time));
+}
+
+function moduleUploaderLabel(module: FloorDetailModuleEntry): string {
+  return module.uploader_name?.trim() || module.user_id.slice(0, 8);
+}
 
 function readVec3(value: unknown): Vec3 | null {
   if (!Array.isArray(value) || value.length !== 3) return null;
@@ -204,7 +247,7 @@ export default function FloorDetailPage() {
   const [pickerRoomSuffix, setPickerRoomSuffix] = useState(1);
   const [creatingModule, setCreatingModule] = useState(false);
   const [addModuleError, setAddModuleError] = useState<string | null>(null);
-  const [expandedRooms, setExpandedRooms] = useState<Set<string>>(new Set());
+  const [expandedModuleNames, setExpandedModuleNames] = useState<Set<string>>(() => new Set());
 
   const reloadManifest = () => {
     if (!buildingId || !floorNumber) return Promise.resolve();
@@ -212,14 +255,17 @@ export default function FloorDetailPage() {
       .get<FloorDetailManifest>(`/buildings/${buildingId}/floors/${floorNumber}/detail-manifest`)
       .then((data) => {
         setManifest(data);
-        const defaultUrl = data.basemap?.url ?? data.modules.find((module) => module.url)?.url ?? null;
+        const defaultModule = data.modules.find((module) => module.url);
+        const defaultUrl = data.basemap?.url ?? defaultModule?.url ?? null;
         setPrimaryUrl(defaultUrl);
-        setSelectedModuleId(null);
+        setSelectedModuleId(data.basemap?.url ? null : defaultModule?.id ?? null);
+        setExpandedModuleNames(new Set());
       })
       .catch(() => {
         setManifest(null);
         setPrimaryUrl(null);
         setSelectedModuleId(null);
+        setExpandedModuleNames(new Set());
       });
   };
 
@@ -234,29 +280,57 @@ export default function FloorDetailPage() {
   }, [buildingId, floorNumber]);
 
   const moduleRows = useMemo(() => manifest?.modules ?? [], [manifest]);
+  // 모듈을 호수별로 그룹화 + 호수명 자연 정렬 (101 < 102 < 1001).
+  // 각 호수 안 모듈은 등록 시점 오름차순 (가장 오래된 위) — moduleVersionTime 헬퍼 기반.
   const moduleGroups = useMemo(() => {
-    const groups = new Map<string, FloorDetailModuleEntry[]>();
-    for (const m of moduleRows) {
-      const key = m.name;
-      const list = groups.get(key) ?? [];
-      list.push(m);
-      groups.set(key, list);
-    }
-    return Array.from(groups.entries()).sort(([a], [b]) => a.localeCompare(b, 'ko'));
+    const grouped = new Map<string, FloorDetailModuleEntry[]>();
+    moduleRows.forEach((module) => {
+      const modules = grouped.get(module.name) ?? [];
+      modules.push(module);
+      grouped.set(module.name, modules);
+    });
+    return Array.from(grouped.entries())
+      .map(([name, modules]) => [name, [...modules].sort(compareModuleVersionAsc)] as [string, FloorDetailModuleEntry[]])
+      .sort(([a], [b]) => moduleNameCollator.compare(a, b));
   }, [moduleRows]);
   const hasBasemap = !!manifest?.basemap?.url;
+
+  const goRegisterModule = (moduleName: string) => {
+    const qs = new URLSearchParams({
+      purpose: 'module',
+      building_id: buildingId,
+      building_name: manifest?.building_name ?? 'Building',
+      floor_number: String(manifest?.floor_number ?? floorNumber),
+      module_name: moduleName,
+    });
+    if (manifest?.floor_id) qs.set('floor_id', manifest.floor_id);
+    router.push(`/upload?${qs.toString()}`);
+  };
+  const toggleModuleGroup = (moduleName: string) => {
+    setExpandedModuleNames((prev) => {
+      const next = new Set(prev);
+      if (next.has(moduleName)) {
+        next.delete(moduleName);
+      } else {
+        next.add(moduleName);
+      }
+      return next;
+    });
+  };
   const renderableModules = useMemo(
     () => moduleRows.filter((module) => module.url && module.is_visible !== false),
     [moduleRows],
   );
+  const selectedModule = useMemo(
+    () => renderableModules.find((module) => module.id === selectedModuleId) ?? null,
+    [renderableModules, selectedModuleId],
+  );
   const moduleOverlays = useMemo(() => {
-    if (!primaryUrl) return [];
-    return renderableModules.filter((module) => {
-      if (module.url === primaryUrl) return false;
-      if (!hasBasemap) return true;
-      return !!module.alignment_transform;
-    });
-  }, [hasBasemap, primaryUrl, renderableModules]);
+    if (!primaryUrl || !hasBasemap || !selectedModule?.url) return [];
+    if (selectedModule.url === primaryUrl) return [];
+    if (!selectedModule.alignment_transform) return [];
+    return [selectedModule];
+  }, [hasBasemap, primaryUrl, selectedModule]);
 
   if (loading) return null;
 
@@ -278,7 +352,7 @@ export default function FloorDetailPage() {
         </div>
         <div className="mt-3 space-y-2 overflow-y-auto flex-1 min-h-0 pr-1">
           {moduleGroups.map(([roomName, mods]) => {
-            const expanded = expandedRooms.has(roomName);
+            const expanded = expandedModuleNames.has(roomName);
             const anySelected = mods.some((m) => m.id === selectedModuleId);
             const activeCount = mods.filter((m) => m.url).length;
             const totalCount = mods.length;
@@ -287,7 +361,7 @@ export default function FloorDetailPage() {
                 <button
                   type="button"
                   onClick={() => {
-                    setExpandedRooms((prev) => {
+                    setExpandedModuleNames((prev) => {
                       const next = new Set(prev);
                       if (next.has(roomName)) next.delete(roomName);
                       else next.add(roomName);
