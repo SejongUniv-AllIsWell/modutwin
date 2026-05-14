@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { api } from '@/lib/api';
+import { loadKakaoMapsSdk } from '@/lib/map/loadKakaoMapsSdk';
 
 interface Building {
   name: string;
@@ -39,20 +40,13 @@ export default function BuildingMap({ buildings, onBuildingSelect }: BuildingMap
       return;
     }
 
-    // 카카오맵 SDK 로드
-    if (window.kakao?.maps) {
-      initMap();
-      return;
-    }
-
-    const script = document.createElement('script');
-    script.src = `https://dapi.kakao.com/v2/maps/sdk.js?appkey=${kakaoKey}&autoload=false&libraries=services`;
-    script.onload = () => {
-      window.kakao.maps.load(() => {
+    loadKakaoMapsSdk(kakaoKey)
+      .then(() => {
         initMap();
+      })
+      .catch(() => {
+        // 로드 실패 시 기존과 동일하게 로딩 상태 유지
       });
-    };
-    document.head.appendChild(script);
   }, []);
 
   const initMap = () => {
