@@ -412,11 +412,11 @@ export default function VisibilityManager() {
       type="button"
       onClick={() => setDeleteTarget(target)}
       disabled={busyKey === `delete:${target.scope}:${target.id}`}
-      className="w-7 h-7 rounded border border-red-900/60 text-red-400 hover:bg-red-950/60 hover:text-red-200 disabled:opacity-50 shrink-0"
+      className="ml-1 w-6 h-6 flex items-center justify-center text-gray-400 hover:text-white hover:bg-red-600 rounded disabled:opacity-50 shrink-0"
       aria-label={`${target.label} 삭제`}
       title={`${target.label} 삭제`}
     >
-      X
+      ×
     </button>
   );
 
