@@ -19,7 +19,6 @@ export default function BuildingOverviewPage() {
   const [manifest, setManifest] = useState<FloorOverviewManifest | null>(null);
   const [hoveredFloorId, setHoveredFloorId] = useState<string | null>(null);
   const [brokenImageByFloorId, setBrokenImageByFloorId] = useState<Record<string, boolean>>({});
-  const [openFloorMenuId, setOpenFloorMenuId] = useState<string | null>(null);
 
   // "+ 등록" — 층 추가 모달
   const [addFloorOpen, setAddFloorOpen] = useState(false);
@@ -27,7 +26,7 @@ export default function BuildingOverviewPage() {
   const [addFloorError, setAddFloorError] = useState<string | null>(null);
   const [addFloorBusy, setAddFloorBusy] = useState(false);
 
-  // 층 ⋮ → basemap 등록 모달 (이름 입력)
+  // 층 + → basemap 등록 모달 (이름 입력)
   const [basemapTarget, setBasemapTarget] = useState<FloorOverviewManifestEntry | null>(null);
   const [basemapNameValue, setBasemapNameValue] = useState('');
   const [basemapNameError, setBasemapNameError] = useState<string | null>(null);
@@ -76,7 +75,6 @@ export default function BuildingOverviewPage() {
   };
 
   const openAddFloor = () => {
-    setOpenFloorMenuId(null);
     setAddFloorOpen(true);
     setAddFloorValue('');
     setAddFloorError(null);
@@ -144,7 +142,6 @@ export default function BuildingOverviewPage() {
   };
 
   const openBasemapRegister = (floor: FloorOverviewManifestEntry) => {
-    setOpenFloorMenuId(null);
     setBasemapTarget(floor);
     setBasemapNameValue('');
     setBasemapNameError(null);
@@ -216,30 +213,24 @@ export default function BuildingOverviewPage() {
                 >
                   {floorLabel(floor.floor_number)}
                 </button>
-                <div className="relative">
+                {!floor.has_active_basemap ? (
                   <button
                     type="button"
-                    onClick={() => setOpenFloorMenuId((prev) => (prev === floor.floor_id ? null : floor.floor_id))}
+                    onClick={() => openBasemapRegister(floor)}
                     className="w-7 h-7 flex items-center justify-center rounded hover:bg-gray-800 text-gray-400 hover:text-white"
+                    aria-label="basemap 등록"
+                    title="basemap 등록"
                   >
-                    ⋮
+                    +
                   </button>
-                  {openFloorMenuId === floor.floor_id && (
-                    <div className="absolute right-0 top-8 z-10 w-28 rounded border border-gray-700 bg-gray-900 shadow-lg p-1">
-                      {!floor.has_active_basemap ? (
-                        <button
-                          type="button"
-                          onClick={() => openBasemapRegister(floor)}
-                          className="w-full text-left text-xs px-2 py-1.5 rounded hover:bg-gray-800"
-                        >
-                          basemap 등록
-                        </button>
-                      ) : (
-                        <div className="px-2 py-1.5 text-xs text-gray-500">basemap 등록됨</div>
-                      )}
-                    </div>
-                  )}
-                </div>
+                ) : (
+                  <span
+                    className="w-7 h-7 flex items-center justify-center text-gray-500"
+                    title="basemap 등록됨"
+                  >
+                    ✓
+                  </span>
+                )}
               </div>
             </div>
           ))}

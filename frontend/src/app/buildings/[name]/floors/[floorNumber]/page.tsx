@@ -104,7 +104,6 @@ export default function FloorDetailPage() {
   const [manifest, setManifest] = useState<FloorDetailManifest | null>(null);
   const [primaryUrl, setPrimaryUrl] = useState<string | null>(null);
   const [selectedModuleId, setSelectedModuleId] = useState<string | null>(null);
-  const [openModuleMenuId, setOpenModuleMenuId] = useState<string | null>(null);
 
   useEffect(() => {
     if (!loading && !user) {
@@ -133,7 +132,6 @@ export default function FloorDetailPage() {
   const hasBasemap = !!manifest?.basemap?.url;
 
   const goRegisterModule = (moduleName: string) => {
-    setOpenModuleMenuId(null);
     const qs = new URLSearchParams({
       purpose: 'module',
       building_id: buildingId,
@@ -199,27 +197,15 @@ export default function FloorDetailPage() {
               >
                 <div className="text-sm font-medium truncate">{module.name}</div>
               </button>
-              <div className="relative pr-1">
-                <button
-                  type="button"
-                  onClick={() => setOpenModuleMenuId((prev) => (prev === module.id ? null : module.id))}
-                  className="w-7 h-7 flex items-center justify-center rounded hover:bg-gray-800 text-gray-400 hover:text-white"
-                  aria-label="더보기"
-                >
-                  ⋮
-                </button>
-                {openModuleMenuId === module.id && (
-                  <div className="absolute right-0 top-8 z-10 w-28 rounded border border-gray-700 bg-gray-900 shadow-lg p-1">
-                    <button
-                      type="button"
-                      onClick={() => goRegisterModule(module.name)}
-                      className="w-full text-left text-xs px-2 py-1.5 rounded hover:bg-gray-800"
-                    >
-                      module 등록
-                    </button>
-                  </div>
-                )}
-              </div>
+              <button
+                type="button"
+                onClick={() => goRegisterModule(module.name)}
+                className="mr-1 w-7 h-7 flex items-center justify-center rounded hover:bg-gray-800 text-gray-400 hover:text-white"
+                aria-label="module 등록"
+                title="module 등록"
+              >
+                +
+              </button>
             </div>
           ))}
           {moduleRows.length === 0 && <p className="text-sm text-gray-500">No modules available.</p>}
