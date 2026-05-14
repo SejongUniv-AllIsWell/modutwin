@@ -13,6 +13,7 @@ from app.api.notifications import router as notifications_router
 from app.api.basemaps import router as basemaps_router, public_router as basemaps_public_router
 from app.api.buildings import router as buildings_router
 from app.api.refine import router as refine_router
+from app.api.internal import router as internal_router
 from app.api.internal_worker import router as internal_worker_router
 from app.api.kakao import router as kakao_router
 
@@ -64,6 +65,7 @@ app.include_router(basemaps_router)
 app.include_router(basemaps_public_router)
 app.include_router(buildings_router)
 app.include_router(refine_router)
+app.include_router(internal_router)
 app.include_router(internal_worker_router)
 app.include_router(kakao_router)
 

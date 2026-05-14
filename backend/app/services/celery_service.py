@@ -79,6 +79,21 @@ def dispatch_sam3_door_detection_task(
     )
 
 
+def dispatch_colmap_task(
+    upload_id: str,
+    user_id: str,
+    minio_input_key: str,
+) -> str:
+    """COLMAP 전처리 태스크 발행 → celery_task_id 반환"""
+    result = celery_app.send_task(
+        "tasks.colmap.run_colmap_preprocessing",
+        args=[upload_id, user_id, minio_input_key],
+        queue="training",
+    )
+    return result.id
+
+
+
 def dispatch_alignment_task(
     upload_id: str,
     user_id: str,

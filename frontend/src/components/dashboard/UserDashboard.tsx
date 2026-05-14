@@ -164,11 +164,17 @@ export default function UserDashboard({ showHeader = true }: Props) {
                 {uploads.map(u => {
                   const sam = u.sam3_status ?? null;
                   const stage = progressStage(u);
+                  const isColmap = u.ply_target === 'colmap';
+                  const colmapDone = isColmap && u.status === 'completed' && !!u.has_gsplat_ply;
+                  const colmapProcessing = isColmap && u.status === 'processing';
+                  const colmapFailed = isColmap && u.status === 'failed';
+                  const filenameClickable = isViewable(u.original_filename) || colmapDone;
                   const isBasemap = !!u.is_basemap_source;
+                  const canAlign = !isColmap && (!!u.has_refined || !!u.has_doors_json);
                   return (
                     <tr key={u.id} className="border-b border-gray-800/50">
                       <td className="py-3 pr-4">
-                        {isViewable(u.original_filename) ? (
+                        {filenameClickable ? (
                           <Link
                             href={u.has_refined
                               ? `/viewer?upload_id=${u.id}&mode=align`
@@ -181,13 +187,37 @@ export default function UserDashboard({ showHeader = true }: Props) {
                           <span className="text-gray-300">{u.original_filename}</span>
                         )}
                       </td>
-                      <td className={`py-3 pr-4 ${STAGE_COLOR[stage]}`}>{STAGE_LABEL[stage]}</td>
+                      <td className={`py-3 pr-4 ${
+                        isColmap
+                          ? (colmapFailed ? 'text-red-400' : (colmapDone ? STAGE_COLOR['uploaded_only'] : 'text-emerald-400'))
+                          : STAGE_COLOR[stage]
+                      }`}>
+                        {isColmap
+                          ? (colmapFailed
+                              ? 'COLMAP 실패'
+                              : colmapDone
+                                ? '업로드 완료'
+                                : colmapProcessing
+                                  ? 'COLMAP 처리 중'
+                                  : 'COLMAP 대기')
+                          : STAGE_LABEL[stage]}
+                      </td>
                       <td className={`py-3 pr-4 ${sam ? SAM3_COLOR[sam] : 'text-gray-600'}`}>
-                        {sam ? SAM3_LABEL[sam] : '—'}
+                        {isColmap ? '—' : (sam ? SAM3_LABEL[sam] : '—')}
                       </td>
                       <td className="py-3 pr-4 text-gray-500">{new Date(u.uploaded_at).toLocaleDateString('ko-KR')}</td>
                       <td className="py-3 pr-4 text-right">
-                        {isBasemap ? (
+                        {isColmap ? (
+                          <Link
+                            href={colmapDone ? `/viewer?upload_id=${u.id}` : `/colmap-viewer?upload_id=${u.id}`}
+                            className={`inline-block px-3 py-1 rounded text-white text-xs font-bold
+                              ${colmapDone
+                                ? 'bg-emerald-600 hover:bg-emerald-500'
+                                : 'bg-gray-700 hover:bg-gray-600'}`}
+                          >
+                            {colmapDone ? 'PLY 뷰어 열기' : '처리 중...'}
+                          </Link>
+                        ) : isBasemap ? (
                           <span className="relative inline-block group">
                             <button
                               type="button"
@@ -204,6 +234,14 @@ export default function UserDashboard({ showHeader = true }: Props) {
                               관리자에게 문의하세요
                             </span>
                           </span>
+                        ) : canAlign ? (
+                          <Link
+                            href={`/viewer?upload_id=${u.id}&mode=align`}
+                            className="inline-block px-3 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold"
+                            title={sam === 'done' ? 'SAM3 결과로 정합 시작' : '수동으로 문 꼭짓점을 지정해 정합'}
+                          >
+                            정합하기
+                          </Link>
                         ) : (
                           <button
                             type="button"

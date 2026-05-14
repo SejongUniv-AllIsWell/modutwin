@@ -127,7 +127,7 @@ export interface UploadInitRequest {
   building_id: string;
   floor_id: string;
   module_id: string;
-  ply_target?: 'gsplat' | 'alignment' | 'refined';
+  ply_target?: 'gsplat' | 'alignment' | 'refined' | 'colmap';
 }
 
 export interface UploadInitResponse {
@@ -160,6 +160,7 @@ export interface Upload {
   has_refined?: boolean;
   has_doors_json?: boolean;
   has_alignment?: boolean;
+  has_gsplat_ply?: boolean;
   is_basemap_source?: boolean;
 }
 
