@@ -14,7 +14,10 @@ from app.models import (
     Basemap, BasemapStatus, Notification, Task, Upload,
 )
 from app.services.minio_service import get_minio_service
-from app.services.metadata_options import validate_floor_number as validate_floor_number_value
+from app.services.metadata_options import (
+    parse_module_name_input,
+    validate_floor_number as validate_floor_number_value,
+)
 from app.services.storage_paths import module_base_path
 
 router = APIRouter(tags=["buildings"])
@@ -1532,3 +1535,78 @@ async def confirm_module(
     await db.commit()
     await db.refresh(module)
     return module
+
+
+class AdminModuleBulkCreateRequest(BaseModel):
+    module_input: str
+
+
+@router.post(
+    "/admin/floors/{floor_id}/modules",
+    response_model=list[ModuleResponse],
+    status_code=status.HTTP_201_CREATED,
+)
+async def admin_create_modules(
+    floor_id: UUID,
+    body: AdminModuleBulkCreateRequest,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """관리자가 층에 모듈을 일괄 추가한다. module_input 이 `N~M` 형태면 범위로 확장한다."""
+    floor_result = await db.execute(select(Floor).where(Floor.id == floor_id))
+    floor = floor_result.scalar_one_or_none()
+    if floor is None:
+        raise HTTPException(status_code=404, detail="층을 찾을 수 없습니다.")
+
+    try:
+        module_names = parse_module_name_input(body.module_input)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    visible_admin_result = await db.execute(
+        select(Module.name)
+        .join(User, Module.user_id == User.id)
+        .where(
+            Module.floor_id == floor.id,
+            Module.name.in_(module_names),
+            User.role == UserRole.admin,
+            Module.is_visible == True,
+        )
+    )
+    visible_admin_names = {name for (name,) in visible_admin_result.all()}
+
+    admin_owned_result = await db.execute(
+        select(Module).where(
+            Module.floor_id == floor.id,
+            Module.user_id == admin.id,
+            Module.name.in_(module_names),
+        )
+    )
+    admin_owned_by_name = {module.name: module for module in admin_owned_result.scalars().all()}
+
+    affected: list[Module] = []
+    for module_name in module_names:
+        if module_name in visible_admin_names:
+            continue
+        existing_admin_module = admin_owned_by_name.get(module_name)
+        if existing_admin_module is not None:
+            existing_admin_module.is_visible = True
+            existing_admin_module.is_confirmed = True
+            affected.append(existing_admin_module)
+            continue
+        new_module = Module(
+            floor_id=floor.id,
+            user_id=admin.id,
+            name=module_name,
+            is_confirmed=True,
+        )
+        db.add(new_module)
+        affected.append(new_module)
+
+    await db.execute(
+        sa_update(Floor).where(Floor.id == floor.id).values(overview_dirty=True)
+    )
+    await db.commit()
+    for module in affected:
+        await db.refresh(module)
+    return affected
