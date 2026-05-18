@@ -126,6 +126,7 @@ function normalizeDoorRect(
   corners: [Vec3, Vec3, Vec3, Vec3],
   plane: SurfacePlane,
   anchorIdx: number | null = null,
+  rotation: FrameRotation = { rotX: 0, rotZ: 0, wallAngleRad: 0 },
 ): [Vec3, Vec3, Vec3, Vec3] {
   const [nx, ny, nz] = plane.normal;
   // 벽이 아니면 (천장/바닥 normal.y=±1) 정규화 skip — 도어는 벽 위.
@@ -136,9 +137,13 @@ function normalizeDoorRect(
   const hzN = -nx / hxLen;
   const d = plane.d;
 
+  // corners 는 raw 프레임, plane 은 A' 프레임 — u/v 분해 + recon 은 A' 에서 일관 처리.
+  // 진입 시 raw → A' 변환, 반환 시 A' → raw 로 되돌려 caller 의 raw 컨벤션 유지.
+  const cornersA = corners.map(c => rawToA([c[0], c[1], c[2]] as Vec3, rotation)) as [Vec3, Vec3, Vec3, Vec3];
+
   // (u, v) decomposition: u = pos · h (horizontal on wall), v = pos.y.
-  const us = corners.map(c => c[0] * hxN + c[2] * hzN);
-  const vs = corners.map(c => c[1]);
+  const us = cornersA.map(c => c[0] * hxN + c[2] * hzN);
+  const vs = cornersA.map(c => c[1]);
 
   let u_left: number, u_right: number, v_top: number, v_bot: number;
 
@@ -163,19 +168,20 @@ function normalizeDoorRect(
   // 좌우가 바뀜. v_top<v_bot 또는 u_left>u_right 가 PLY 컨벤션에서 정상 상태라 swap 하면 인덱스 → 위치
   // 매핑이 깨져서 정합 시 상하/좌우 반전 발생. 사용자가 시계방향으로 픽한 ORIGINAL 인덱스 그대로 사용.
 
-  // 평면 위 점 P = d * n_xz + u * h + v * Y. (n.y = 0, h.y = 0 가정.)
+  // 평면 위 점 P = d * n_xz + u * h + v * Y. (n.y = 0, h.y = 0 가정.) — A' 프레임 산출.
   const recon = (u: number, v: number): Vec3 => [
     nx * d + hxN * u,
     v,
     nz * d + hzN * u,
   ];
-
-  return [
+  const reconA: [Vec3, Vec3, Vec3, Vec3] = [
     recon(u_left, v_top),
     recon(u_right, v_top),
     recon(u_right, v_bot),
     recon(u_left, v_bot),
   ];
+
+  return reconA.map(p => aToRaw(p, rotation)) as [Vec3, Vec3, Vec3, Vec3];
 }
 
 /**
@@ -488,6 +494,7 @@ export default function DoorAlignModal({
               [next[0]!.pos, next[1]!.pos, next[2]!.pos, next[3]!.pos],
               wallPlane,
               null,
+              getEditorRotation(uploadId),
             );
             next = next.map((p, i) => p ? { pos: normalized[i], surfaceId: p.surfaceId } : null);
           }
@@ -727,6 +734,7 @@ export default function DoorAlignModal({
               [next[0]!.pos, next[1]!.pos, next[2]!.pos, next[3]!.pos],
               wallPlane,
               dragIdx,
+              getEditorRotation(uploadId),
             );
             next = next.map((p, i) => p ? { pos: normalized[i], surfaceId: p.surfaceId } : null);
           }
