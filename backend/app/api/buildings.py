@@ -14,7 +14,10 @@ from app.models import (
     Basemap, BasemapStatus, Notification, Task, Upload,
 )
 from app.services.minio_service import get_minio_service
-from app.services.metadata_options import validate_floor_number as validate_floor_number_value
+from app.services.metadata_options import (
+    parse_module_name_input,
+    validate_floor_number as validate_floor_number_value,
+)
 from app.services.storage_paths import module_base_path
 
 router = APIRouter(tags=["buildings"])
@@ -231,6 +234,9 @@ class FloorDetailManifestResponse(BaseModel):
     floor_id: UUID
     floor_number: int
     basemap: DetailBasemapEntry | None
+    # 활성 basemap 이 없을 때 pending basemap (관리자 승인 대기) 존재 여부.
+    # 프론트가 빈 뷰어 대신 "승인 대기중" 안내를 띄울 때 사용.
+    basemap_pending_approval: bool = False
     modules: list[DetailModuleEntry]
 
 
@@ -463,17 +469,23 @@ async def list_buildings(
     if not show_hidden:
         stmt = stmt.where(Building.is_visible == True)
     if has_output:
-        # 표시 중인 floor/module 에 SceneOutput 이 있을 때만 노출 — 모든 모듈이 숨김이면 건물도 사라짐
+        # /explore 노출 조건:
+        #   1) 관리자가 표시관리에서 직접 추가한 건물 (is_confirmed=True, 자동 확정 경로)
+        #   2) 표시 중인 floor/module 에 SceneOutput 이 등록된 건물
+        # 둘 중 하나라도 만족하면 지도 마커/좌측 목록에 노출한다.
         stmt = stmt.where(
-            exists(
-                select(SceneOutput.id)
-                .join(Module, Module.id == SceneOutput.module_id)
-                .join(Floor, Floor.id == Module.floor_id)
-                .where(
-                    Floor.building_id == Building.id,
-                    Floor.is_visible == True,
-                    Module.is_visible == True,
-                )
+            or_(
+                Building.is_confirmed == True,
+                exists(
+                    select(SceneOutput.id)
+                    .join(Module, Module.id == SceneOutput.module_id)
+                    .join(Floor, Floor.id == Module.floor_id)
+                    .where(
+                        Floor.building_id == Building.id,
+                        Floor.is_visible == True,
+                        Module.is_visible == True,
+                    )
+                ),
             )
         )
     result = await db.execute(stmt)
@@ -1023,6 +1035,18 @@ async def get_floor_detail_manifest(
         .limit(1)
     )
     basemap = basemap_result.scalar_one_or_none()
+    # 활성 basemap 이 없을 때 pending 기록이 있는지 확인 — UI 에 "관리자 승인 대기중" 안내 표시용.
+    has_pending_basemap = False
+    if basemap is None:
+        pending_check = await db.execute(
+            select(Basemap.id)
+            .where(
+                Basemap.floor_id == floor.id,
+                Basemap.status == BasemapStatus.pending,
+            )
+            .limit(1)
+        )
+        has_pending_basemap = pending_check.scalar_one_or_none() is not None
     basemap_url = _safe_presigned_download_url(minio, basemap.minio_path) if basemap else None
     basemap_entry = (
         DetailBasemapEntry(
@@ -1040,6 +1064,8 @@ async def get_floor_detail_manifest(
         select(Module, User.name.label("uploader_name"))
         .join(User, Module.user_id == User.id)
         .where(Module.floor_id == floor.id)
+        # basemap 등록 시 placeholder 로 생성되는 '__basemap__' 모듈은 항상 숨김.
+        .where(Module.name != "__basemap__")
         .order_by(Module.name)
     )
     if user.role != UserRole.admin:
@@ -1098,6 +1124,7 @@ async def get_floor_detail_manifest(
         floor_id=floor.id,
         floor_number=floor.floor_number,
         basemap=basemap_entry,
+        basemap_pending_approval=has_pending_basemap,
         modules=module_entries,
     )
 
@@ -1300,9 +1327,10 @@ async def update_alignment_transform(
 #     - 층 show   → 부모 building + 하위 module 모두 show
 #     - 모듈 show → 부모 floor + 부모 building 모두 show
 #
-# Show cascade 가 양방향인 이유: /explore 의 has_output 필터는
-# 건물·층·모듈 셋이 모두 visible 이어야 노출되므로, 한 단계만 풀면
-# UI 상 "표시" 가 실제로는 효과가 없어 보인다.
+# Show cascade 가 양방향인 이유: /explore 의 has_output 필터에서
+# SceneOutput 분기는 건물·층·모듈 셋이 모두 visible 이어야 노출되므로,
+# 한 단계만 풀면 UI 상 "표시" 가 실제로는 효과가 없어 보인다.
+# (관리자 추가 분기 is_confirmed=True 는 건물 visibility 만 따른다.)
 
 
 @router.put("/admin/buildings/{building_id}/visibility", response_model=BuildingResponse)
@@ -1532,3 +1560,78 @@ async def confirm_module(
     await db.commit()
     await db.refresh(module)
     return module
+
+
+class AdminModuleBulkCreateRequest(BaseModel):
+    module_input: str
+
+
+@router.post(
+    "/admin/floors/{floor_id}/modules",
+    response_model=list[ModuleResponse],
+    status_code=status.HTTP_201_CREATED,
+)
+async def admin_create_modules(
+    floor_id: UUID,
+    body: AdminModuleBulkCreateRequest,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """관리자가 층에 모듈을 일괄 추가한다. module_input 이 `N~M` 형태면 범위로 확장한다."""
+    floor_result = await db.execute(select(Floor).where(Floor.id == floor_id))
+    floor = floor_result.scalar_one_or_none()
+    if floor is None:
+        raise HTTPException(status_code=404, detail="층을 찾을 수 없습니다.")
+
+    try:
+        module_names = parse_module_name_input(body.module_input)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    visible_admin_result = await db.execute(
+        select(Module.name)
+        .join(User, Module.user_id == User.id)
+        .where(
+            Module.floor_id == floor.id,
+            Module.name.in_(module_names),
+            User.role == UserRole.admin,
+            Module.is_visible == True,
+        )
+    )
+    visible_admin_names = {name for (name,) in visible_admin_result.all()}
+
+    admin_owned_result = await db.execute(
+        select(Module).where(
+            Module.floor_id == floor.id,
+            Module.user_id == admin.id,
+            Module.name.in_(module_names),
+        )
+    )
+    admin_owned_by_name = {module.name: module for module in admin_owned_result.scalars().all()}
+
+    affected: list[Module] = []
+    for module_name in module_names:
+        if module_name in visible_admin_names:
+            continue
+        existing_admin_module = admin_owned_by_name.get(module_name)
+        if existing_admin_module is not None:
+            existing_admin_module.is_visible = True
+            existing_admin_module.is_confirmed = True
+            affected.append(existing_admin_module)
+            continue
+        new_module = Module(
+            floor_id=floor.id,
+            user_id=admin.id,
+            name=module_name,
+            is_confirmed=True,
+        )
+        db.add(new_module)
+        affected.append(new_module)
+
+    await db.execute(
+        sa_update(Floor).where(Floor.id == floor.id).values(overview_dirty=True)
+    )
+    await db.commit()
+    for module in affected:
+        await db.refresh(module)
+    return affected

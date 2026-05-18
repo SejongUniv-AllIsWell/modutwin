@@ -57,11 +57,19 @@ export interface SplatViewerCoreRef {
   getAlignmentGroup: () => any | null;
 }
 
+export interface SplatEntry {
+  id: string;
+  url: string;
+  visible: boolean;
+}
+
 interface SplatViewerCoreProps {
   /** 없으면 빈 viewer만 표시 (카메라/기즈모만 활성). */
   sogUrl?: string | null;
   onSplatLoaded?: (data: SplatData) => void;
   children?: React.ReactNode;
+  /** multi-viewer 용 splat 목록 (현재 SplatViewerCore 내부 미구현 — 타입 호환만 위해 노출). */
+  splats?: SplatEntry[];
 }
 
 type CameraMode = 'fly' | 'orbit';
@@ -148,6 +156,13 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
         //   name.startsWith('doorMesh_')           → 도어 메시
         //   name.startsWith('add_splat_') && tag 'basemap' 미부여 → 도어 sub-splat 등 module-side
         // basemap (tag 'basemap') 은 제외.
+        // 정리 단계: 이전 호출에서 잘못 들어간 basemap-tag entity 가 group 안에 있으면 root 로 복귀.
+        const groupChildren: any[] = group.children?.slice() ?? [];
+        for (const c of groupChildren) {
+          if (c?.tags?.has?.('basemap')) {
+            app.root.addChild(c);
+          }
+        }
         const moveCandidates: any[] = app.root.children.slice();
         for (const c of moveCandidates) {
           if (c === group) continue;
@@ -157,8 +172,13 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
           const isWall = name.startsWith('wallMesh_');
           const isDoor = name.startsWith('doorMesh_');
           const isAddSplat = name.startsWith('add_splat_');
-          const isBasemap = isAddSplat && c.tags?.has?.('basemap');
-          const include = isModuleSplat || isWall || isDoor || (isAddSplat && !isBasemap);
+          // moduleDoor wrapper — mesh + splat 자식 통째로 정합 transform 대상.
+          const isModuleDoorWrapper = name === 'moduleDoor';
+          // basemap tag 가 붙은 entity 는 module 정합 transform 적용 대상이 아님 → 무조건 제외.
+          // (useRefinedMeshLoader 가 추가하는 basemap 의 wallMesh/doorMesh/add_splat 모두 'basemap' tag.)
+          const hasBasemapTag = c.tags?.has?.('basemap');
+          if (hasBasemapTag) continue;
+          const include = isModuleSplat || isWall || isDoor || isAddSplat || isModuleDoorWrapper;
           if (!include) continue;
           group.addChild(c);
         }

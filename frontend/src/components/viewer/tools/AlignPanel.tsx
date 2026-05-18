@@ -11,15 +11,49 @@ interface Props {
   metadata: MetadataResult;
   /** basemap 의 호수 매칭된 문 4 코너. null 이면 매칭 실패 (정합 비활성). */
   basemapDoorCorners: Array<[number, number, number]> | null;
+  /** 정합 대상 basemap 도어 ID. doorPivotGroup 에 이 도어 wrapper 만 묶음 (다른 호수 제외). */
+  basemapTargetDoorId: string | null;
+  /** 정합 대상 basemap 도어의 normalInward (baked = A'+Y 프레임). gap 방향 deterministic 산출에 사용.
+   *  미지정이면 rectFit 의 cross-product n 으로 fallback (정합 회전은 정확, gap 방향만 winding 영향). */
+  basemapTargetDoorNormalInward: [number, number, number] | null;
   basemapMatchError: string | null;
   /** 모듈측 (현재 작업 중인) 도어의 4 코너 (A'+Y 프레임). null 이면 정합 불가. */
   moduleDoorCorners: Array<[number, number, number]> | null;
+  /**
+   * 신흐름(모듈 등록): 정합 완료 시 호출. 다듬기 결과 자산 + 정합 행렬을 일괄 영속화.
+   * 제공되면 기존 saveResult (POST /uploads/{id}/alignment + PUT /modules/{id}/alignment-transform)
+   * 대신 이 콜백 사용. UnifiedSplatEditor 가 gatherRefinedAssets + commit-final 호출.
+   */
+  onCommitFinal?: (args: {
+    matrix4x4: number[];
+    position: [number, number, number];
+    rotation: [number, number, number, number];
+    scale: [number, number, number];
+    rmsd: number | null;
+  }) => Promise<void>;
 }
 
 type ManualMode = 'translate' | 'rotate' | 'scale';
 
 const ANIM_MAX_MS = 2500;
 const ANIM_BASE_MS = 400;
+
+// 모듈/베이스맵 도어 corner mirror 매핑 — 모듈 [TL,TR,BR,BL] CW (모듈 안에서 본 시점) ↔
+// 베이스맵 같은 도어 [TR,TL,BL,BR] (베이스맵 안에서 본 시점). 두 방 사이 도어는 양쪽에서 좌우 반전.
+const DOOR_CORNER_MIRROR_MAP = [1, 0, 3, 2] as const;
+
+// 벽 두께 gap — basemap mesh ↔ module mesh 가 정확히 겹치지 않게 띄움. door_height 비율 기반.
+// 표준문 (2.1m) 기준 ≈ 5cm. 한국 차음벽 200mm 보다 작지만 시각적 분리에 충분 + 자연스러움.
+const DOOR_GAP_RATIO = 0.023;
+const DOOR_GAP_MIN = 0.017;
+
+// 도어 frame mesh (모듈↔베이스맵 도어 사이 4면 측벽) 색상.
+// 광원 없는 가우시안 스플래팅 씬에선 emissive 채널만 보이므로, 그냥 "표시 색" 으로 사용.
+// 디버깅용 초록색 — 정합 후 frame 위치/크기 확인 명확히. 추후 도어 텍스처 median 색으로 교체 예정.
+const FRAME_COLOR: [number, number, number] = [0.0, 1.0, 0.0];
+
+// AlignPanel 진단 로그 토글. 디버깅 시에만 true.
+const DEBUG_ALIGN = false;
 
 function easeInOutCubic(t: number): number {
   return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
@@ -31,8 +65,89 @@ function entityWorldMatrix(ent: any): number[] {
   return Array.from(m);
 }
 
+// ── 정합 helpers ──────────────────────────────────────────────────────────────
+
+/**
+ * 한 entity 를 다른 부모로 이동하면서 world transform 보존.
+ * 새 local = newParent.world^-1 × oldParent.world × oldLocal
+ */
+function reparentPreserveWorld(pc: any, ent: any, newParent: any): void {
+  if (!ent || !newParent) return;
+  const oldParent = ent.parent;
+  const oldParentWorld = oldParent ? oldParent.getWorldTransform().clone() : new pc.Mat4();
+  const oldLocalT = ent.getLocalTransform().clone();
+  const entWorld = new pc.Mat4().mul2(oldParentWorld, oldLocalT);
+  const newParentWorld = newParent.getWorldTransform().clone();
+  const newParentWorldInv = newParentWorld.clone().invert();
+  const newLocal = new pc.Mat4().mul2(newParentWorldInv, entWorld);
+  newParent.addChild(ent);
+  const t = new pc.Vec3(), r = new pc.Quat(), s = new pc.Vec3();
+  newLocal.getTranslation(t);
+  r.setFromMat4(newLocal);
+  newLocal.getScale(s);
+  ent.setLocalPosition(t.x, t.y, t.z);
+  ent.setLocalRotation(r.x, r.y, r.z, r.w);
+  ent.setLocalScale(s.x, s.y, s.z);
+}
+
+/** Kabsch row-major R(3×3) + t(3) → PlayCanvas Mat4 (column-major). */
+function rigidToMat4(pc: any, R: number[], t: number[]): any {
+  const m = new pc.Mat4();
+  m.data[0]  = R[0]; m.data[1]  = R[3]; m.data[2]  = R[6]; m.data[3]  = 0;
+  m.data[4]  = R[1]; m.data[5]  = R[4]; m.data[6]  = R[7]; m.data[7]  = 0;
+  m.data[8]  = R[2]; m.data[9]  = R[5]; m.data[10] = R[8]; m.data[11] = 0;
+  m.data[12] = t[0]; m.data[13] = t[1]; m.data[14] = t[2]; m.data[15] = 1;
+  return m;
+}
+
+/**
+ * 모듈 도어 ↔ 베이스맵 도어 사이 4면 frame mesh entity 생성.
+ * moduleWorld[i] 가 basemapWorld[DOOR_CORNER_MIRROR_MAP[i]] 와 짝.
+ * 각 변마다 quad (2 triangles), 총 8 triangles. 양면 렌더.
+ */
+function createDoorFrameMesh(
+  pc: any,
+  app: any,
+  moduleWorld: Array<[number, number, number]>,
+  basemapWorld: Array<[number, number, number]>,
+): any {
+  const positions: number[] = [];
+  const indices: number[] = [];
+  let vi = 0;
+  for (let i = 0; i < 4; i++) {
+    const ni = (i + 1) % 4;
+    const Mi = moduleWorld[i];
+    const Mn = moduleWorld[ni];
+    const Bi = basemapWorld[DOOR_CORNER_MIRROR_MAP[i]];
+    const Bn = basemapWorld[DOOR_CORNER_MIRROR_MAP[ni]];
+    positions.push(Mi[0], Mi[1], Mi[2]);
+    positions.push(Mn[0], Mn[1], Mn[2]);
+    positions.push(Bn[0], Bn[1], Bn[2]);
+    positions.push(Bi[0], Bi[1], Bi[2]);
+    indices.push(vi, vi+1, vi+2, vi, vi+2, vi+3);
+    vi += 4;
+  }
+  const mesh = new pc.Mesh(app.graphicsDevice);
+  mesh.setPositions(positions);
+  mesh.setIndices(indices);
+  mesh.update(pc.PRIMITIVE_TRIANGLES);
+
+  // 광원 없는 씬 → emissive 채널이 곧 표시 색.
+  const mat = new pc.StandardMaterial();
+  mat.emissive = new pc.Color(FRAME_COLOR[0], FRAME_COLOR[1], FRAME_COLOR[2]);
+  mat.useLighting = false;
+  mat.cull = pc.CULLFACE_NONE;
+  mat.update();
+
+  const ent = new pc.Entity('doorFrame');
+  ent.addComponent('render', { meshInstances: [new pc.MeshInstance(mesh, mat)] });
+  app.root.addChild(ent);
+  return ent;
+}
+
 export default function AlignPanel({
-  coreRef, uploadId, metadata, basemapDoorCorners, basemapMatchError, moduleDoorCorners,
+  coreRef, uploadId, metadata, basemapDoorCorners, basemapTargetDoorId, basemapTargetDoorNormalInward,
+  basemapMatchError, moduleDoorCorners, onCommitFinal,
 }: Props) {
   const [aligned, setAligned] = useState(false);   // 자동 정합 한 번이라도 성공
   const [running, setRunning] = useState(false);
@@ -40,6 +155,20 @@ export default function AlignPanel({
   const [manualMode, setManualMode] = useState<ManualMode>('translate');
   const [error, setError] = useState<string | null>(null);
   const [rmsd, setRmsd] = useState<number | null>(null);
+
+  // 도어 frame mesh — 정합 후 모듈 도어 ↔ 베이스맵 도어 사이 공간을 4면 quad 로 둘러쌈.
+  // 정합 다시 돌리면 destroy 후 재생성. 초기화 시 destroy.
+  const frameEntityRef = useRef<any>(null);
+
+  // 도어 통합 그룹 (Phase 3) — 정합 후 양측 도어 (모듈 + basemap) + frame mesh 를 한 부모로 묶어
+  // 슬라이더로 hinge 축 기준 회전. 정합 초기화 시 destroy + 원래 부모로 복원.
+  const doorPivotGroupRef = useRef<any>(null);
+  // doorPivotGroup 에 reparent 된 entity 들의 원래 부모 정보 (revert 용).
+  const doorPivotMembersRef = useRef<Array<{ ent: any; oldParent: any }>>([]);
+  // hinge 회전 상태 (Phase 4).
+  const [doorAngleDeg, setDoorAngleDeg] = useState(0);
+  // hinge 축 (world frame) — basemap door corner [0]→[3] 변 기준 (왼쪽 변, 수직축).
+  const doorHingeRef = useRef<{ origin: [number, number, number]; axis: [number, number, number] } | null>(null);
 
   // 슝 애니메이션 상태 (rAF). DoorAlignModal 의 onUpdate 패턴 그대로 차용.
   const animRef = useRef<{
@@ -49,6 +178,7 @@ export default function AlignPanel({
     fromQuat: [number, number, number, number];
     toPos: [number, number, number];
     toQuat: [number, number, number, number];
+    onComplete?: () => void;
   } | null>(null);
 
   useEffect(() => {
@@ -70,7 +200,11 @@ export default function AlignPanel({
       qOut.slerp(qa, qb, u);
       group.setLocalPosition(px, py, pz);
       group.setLocalRotation(qOut.x, qOut.y, qOut.z, qOut.w);
-      if (prog >= 1) animRef.current = null;
+      if (prog >= 1) {
+        const cb = a.onComplete;
+        animRef.current = null;
+        if (cb) { try { cb(); } catch (e) { console.warn('[Align] onComplete 오류:', e); } }
+      }
     });
   }, [coreRef]);
 
@@ -94,7 +228,33 @@ export default function AlignPanel({
     setError(null);
     setRunning(true);
     try {
-      const { matchCorners } = await import('@/lib/alignment');
+      // 정합 직전 — alignmentGroup 에 누락된 child 가 있는지 다시 한 번 reparent.
+      // (예: 도어 sub-splat 의 asset.ready 가 enterAlignmentMode 이후 fire 된 case)
+      core.enterAlignmentMode?.();
+      // 진단: app.root 와 alignmentGroup 의 모든 children 출력 — 어느 entity 가 어디 있는지 확인.
+      try {
+        const app = core.getApp();
+        const formatChild = (c: any) => {
+          const pos = c.getLocalPosition?.() ?? { x: 0, y: 0, z: 0 };
+          const tags = c.tags ? Array.from(c.tags._list || []) : [];
+          return {
+            name: c.name,
+            tags: tags.join(','),
+            pos: `(${pos.x.toFixed(2)},${pos.y.toFixed(2)},${pos.z.toFixed(2)})`,
+          };
+        };
+        const rootKids = Array.from(app.root.children ?? []).map(formatChild);
+        const groupKids = Array.from(group.children ?? []).map(formatChild);
+        console.log('[Align] app.root children:', rootKids);
+        console.log('[Align] alignmentGroup children:', groupKids);
+        // 도어 splat (add_splat_*) 개수 + 위치 별도 출력 — 복제 추적용.
+        const allDoorSplats = [...rootKids, ...groupKids].filter(k => k.name.startsWith('add_splat_'));
+        console.warn(`[DoorSplat:SUMMARY] total add_splat_*: ${allDoorSplats.length}`, allDoorSplats);
+      } catch {}
+
+      // rectFit — 사용자 픽은 normalizeDoorRect 로 정확한 직사각형이 보장됨.
+      // SVD-기반 Kabsch 대신 두 사각형의 직교 basis 비교로 R, t 를 한 번에 산출. 180° 매칭 모호성 없음.
+      const { rectFit } = await import('@/lib/alignment');
       // 모듈 측 코너는 A'+Y (저장 좌표) 프레임이지만, 화면에 보이는 alignmentGroup 의 자식
       // (splatEntity, wall mesh, door mesh) 는 Z-180 viewer 컨벤션이 entity transform 으로 부여됨.
       // → world 좌표로 변환 (Z-180 적용 후) 해 Kabsch 의 source 로 사용.
@@ -113,11 +273,47 @@ export default function AlignPanel({
       const dst = new Float64Array(12);
       for (let i = 0; i < 4; i++) {
         src[i*3] = srcWorld[i][0]; src[i*3+1] = srcWorld[i][1]; src[i*3+2] = srcWorld[i][2];
-        const t = basemapDoorCorners[i];
-        dst[i*3] = t[0]; dst[i*3+1] = t[1]; dst[i*3+2] = t[2];
+        // basemap A'+Y → world: Z-180 (=diag(-1,-1,1)). DOOR_CORNER_MIRROR_MAP 로 mirror pairing.
+        const t = basemapDoorCorners[DOOR_CORNER_MIRROR_MAP[i]];
+        dst[i*3] = -t[0]; dst[i*3+1] = -t[1]; dst[i*3+2] = t[2];
       }
-      const fit = matchCorners(src, dst);
+
+      // dst basis 의 n 을 강제 — MIRROR_MAP 적용된 dst 의 자연 cross-product 방향과 일치시켜야 R 이 올바름.
+      //   두 사용자가 반대 방향에서 픽 (basemap user 는 corridor 안에서, module user 는 room 안에서) → 두 cross-product 가 world 에서
+      //   같은 방향 (각자의 outward = 상대방 interior 향함). mirror 적용 후 dst 의 cross 는 그 반대 = basemap_inward.
+      //   normalInward (baked = A'+Y) → world Z-180 적용: (-x, -y, z).
+      let dstForcedN: [number, number, number] | undefined;
+      if (basemapTargetDoorNormalInward) {
+        const ni = basemapTargetDoorNormalInward;
+        dstForcedN = [-ni[0], -ni[1], ni[2]];  // basemap_inward in world
+      }
+      // gap 적용 전 fit 으로 R, dst plane normal 산출.
+      const preFit = rectFit(src, dst, dstForcedN ? { dstForcedN } : {});
+
+      // doorHeight 계산 — dst 의 e2 길이 = corner[2] - corner[1] 의 magnitude.
+      const dh_x = dst[6] - dst[3], dh_y = dst[7] - dst[4], dh_z = dst[8] - dst[5];
+      const doorHeight = Math.hypot(dh_x, dh_y, dh_z);
+      const gap = Math.max(DOOR_GAP_MIN, doorHeight * DOOR_GAP_RATIO);
+
+      // gap push 방향 = basemap_outward = -dstN (dstN 은 basemap_inward 로 강제됨).
+      //   module 이 basemap 방 바깥쪽 (= module room 안쪽) 으로 gap 만큼 떨어진 위치에 도달.
+      const pushN: [number, number, number] = [-preFit.dstN[0], -preFit.dstN[1], -preFit.dstN[2]];
+      for (let i = 0; i < 4; i++) {
+        dst[i*3]   += pushN[0] * gap;
+        dst[i*3+1] += pushN[1] * gap;
+        dst[i*3+2] += pushN[2] * gap;
+      }
+      const fit = rectFit(src, dst, dstForcedN ? { dstForcedN } : {});
       setRmsd(fit.rmsd);
+      console.log(`[Align] RMSD=${fit.rmsd.toFixed(4)}m, gap=${gap.toFixed(3)}m, doorH=${doorHeight.toFixed(2)}m, ` +
+        `nSource=${dstForcedN ? 'normalInward' : 'cross-product'}`);
+      if (DEBUG_ALIGN) {
+        console.log('  alignmentGroup children:', Array.from(group.children ?? []).map((c: any) => c.name));
+        for (let i = 0; i < 4; i++) {
+          console.log(`  i=${i} src=(${src[i*3].toFixed(3)}, ${src[i*3+1].toFixed(3)}, ${src[i*3+2].toFixed(3)}) ` +
+            `dst=(${dst[i*3].toFixed(3)}, ${dst[i*3+1].toFixed(3)}, ${dst[i*3+2].toFixed(3)})`);
+        }
+      }
 
       // fit 은 src world → dst world 의 rigid transform.
       // alignmentGroup 의 새 world transform 을 구하려면 fit 을 group 의 현재 world 에 left-multiply 한다.
@@ -125,15 +321,7 @@ export default function AlignPanel({
       // 하지만 group 의 부모는 app.root (identity) 이므로 newGroupLocal = newGroupWorld.
       // PlayCanvas 의 setLocalPosition/Rotation 사용 위해 분해.
 
-      // fit.R 은 row-major 3x3, fit.t 는 [x,y,z]. fit world matrix:
-      const R = fit.R;
-      const tVec = fit.t;
-      const fitMat = new pc.Mat4();
-      // fitMat[col][row] (PlayCanvas Mat4 는 column-major).
-      fitMat.data[0] = R[0]; fitMat.data[1] = R[3]; fitMat.data[2]  = R[6]; fitMat.data[3]  = 0;
-      fitMat.data[4] = R[1]; fitMat.data[5] = R[4]; fitMat.data[6]  = R[7]; fitMat.data[7]  = 0;
-      fitMat.data[8] = R[2]; fitMat.data[9] = R[5]; fitMat.data[10] = R[8]; fitMat.data[11] = 0;
-      fitMat.data[12] = tVec[0]; fitMat.data[13] = tVec[1]; fitMat.data[14] = tVec[2]; fitMat.data[15] = 1;
+      const fitMat = rigidToMat4(pc, fit.R as unknown as number[], fit.t as unknown as number[]);
       const newGroupWorld = new pc.Mat4().mul2(fitMat, groupWorld);
 
       // 분해: position + quaternion + scale.
@@ -158,6 +346,63 @@ export default function AlignPanel({
       // 1m 당 약 200ms 추가, max 2.5s 캡.
       const duration = Math.min(ANIM_MAX_MS, ANIM_BASE_MS + dist * 200);
 
+      // Phase 3 reparent 는 애니메이션 완료 후 실행 (group 의 최종 transform 이 정확해야 world 보존 reparent 가 옳음).
+      //   onComplete 콜백으로 등록 — 애니메이션 onUpdate 가 종료 시점에 호출.
+      const doDoorPivotSetup = () => {
+        try {
+          // 기존 그룹 정리.
+          if (doorPivotGroupRef.current) {
+            for (const m of doorPivotMembersRef.current) {
+              if (m.ent && m.oldParent) {
+                try { reparentPreserveWorld(pc, m.ent, m.oldParent); } catch {}
+              }
+            }
+            doorPivotMembersRef.current = [];
+            try { doorPivotGroupRef.current.destroy(); } catch {}
+            doorPivotGroupRef.current = null;
+          }
+          const app = core.getApp();
+          const doorPivot = new pc.Entity('doorPivotGroup');
+          app.root.addChild(doorPivot);
+          doorPivotGroupRef.current = doorPivot;
+
+          const candidates: any[] = [
+            ...(app.root.children as any[]),
+            ...((group.children as any[]) ?? []),
+          ];
+          for (const c of candidates) {
+            if (c === doorPivot) continue;
+            const name: string = c.name ?? '';
+            const isModuleDoorWrapper = name === 'moduleDoor';
+            // 정합 대상 basemap 도어 wrapper 만 매치 — 다른 호수의 basemapDoor_* 는 회전 대상 제외.
+            const isBasemapDoorWrapper = basemapTargetDoorId
+              ? name === `basemapDoor_${basemapTargetDoorId}`
+              : false;
+            const isFrame = name === 'doorFrame';
+            if (isModuleDoorWrapper || isBasemapDoorWrapper || isFrame) {
+              const oldParent = c.parent;
+              doorPivotMembersRef.current.push({ ent: c, oldParent });
+              reparentPreserveWorld(pc, c, doorPivot);
+            }
+          }
+
+          // hinge 축 — basemap 도어 corner [0]→[3] (왼쪽 변, 수직).
+          const bc0 = basemapDoorCorners[0], bc3 = basemapDoorCorners[3];
+          const h0: [number, number, number] = [-bc0[0], -bc0[1], bc0[2]];
+          const h3: [number, number, number] = [-bc3[0], -bc3[1], bc3[2]];
+          const ax = h3[0] - h0[0], ay = h3[1] - h0[1], az = h3[2] - h0[2];
+          const aLen = Math.hypot(ax, ay, az) || 1;
+          doorHingeRef.current = {
+            origin: [h0[0], h0[1], h0[2]],
+            axis: [ax / aLen, ay / aLen, az / aLen],
+          };
+          setDoorAngleDeg(0);
+          console.log(`[DoorPivot] grouped ${doorPivotMembersRef.current.length} entities under doorPivotGroup (post-animation)`);
+        } catch (e) {
+          console.warn('[DoorPivot] 생성 실패', e);
+        }
+      };
+
       animRef.current = {
         start: performance.now(),
         duration,
@@ -165,9 +410,27 @@ export default function AlignPanel({
         fromQuat,
         toPos: [newPos.x, newPos.y, newPos.z],
         toQuat: [newRot.x, newRot.y, newRot.z, newRot.w],
+        onComplete: doDoorPivotSetup,
       };
       // group scale 도 적용 (애니메이션 안 함 — scale 은 보통 1).
       group.setLocalScale(newScale.x, newScale.y, newScale.z);
+
+      // 도어 frame mesh — 모듈 ↔ 베이스맵 도어 사이 4면 측벽 (시각화).
+      try {
+        if (frameEntityRef.current) {
+          try { frameEntityRef.current.destroy(); } catch {}
+          frameEntityRef.current = null;
+        }
+        const basemapWorld: Array<[number, number, number]> = basemapDoorCorners.map(c => [-c[0], -c[1], c[2]]);
+        const moduleWorld: Array<[number, number, number]> = [];
+        for (let i = 0; i < 4; i++) {
+          moduleWorld.push([dst[i*3], dst[i*3+1], dst[i*3+2]]);
+        }
+        frameEntityRef.current = createDoorFrameMesh(pc, core.getApp(), moduleWorld, basemapWorld);
+      } catch (e) {
+        console.warn('[Align] door frame 생성 실패', e);
+      }
+
       setAligned(true);
     } catch (e: any) {
       setError(`정합 실패: ${e?.message ?? e}`);
@@ -208,6 +471,78 @@ export default function AlignPanel({
     }
   }, [coreRef]);
 
+  // 정합 초기화 — alignmentGroup 의 transform 을 identity 로 되돌리고 자동 정합 결과/RMSD 도 제거.
+  // (수동 nudge 누적분 + frame mesh 도 함께 제거)
+  const resetAlignment = useCallback(() => {
+    const core = coreRef.current;
+    const group = core?.getAlignmentGroup?.();
+    if (!group) return;
+    animRef.current = null;
+    group.setLocalPosition(0, 0, 0);
+    group.setLocalEulerAngles(0, 0, 0);
+    group.setLocalScale(1, 1, 1);
+    if (frameEntityRef.current) {
+      try { frameEntityRef.current.destroy(); } catch {}
+      frameEntityRef.current = null;
+    }
+    // doorPivotGroup 정리 — 멤버들을 원래 부모로 복원하고 그룹 destroy.
+    if (doorPivotGroupRef.current) {
+      const pc = coreRef.current?.getPC();
+      if (pc) {
+        for (const m of doorPivotMembersRef.current) {
+          if (m.ent && m.oldParent) {
+            try { reparentPreserveWorld(pc, m.ent, m.oldParent); } catch {}
+          }
+        }
+      }
+      doorPivotMembersRef.current = [];
+      try { doorPivotGroupRef.current.destroy(); } catch {}
+      doorPivotGroupRef.current = null;
+      doorHingeRef.current = null;
+      setDoorAngleDeg(0);
+    }
+    setAligned(false);
+    setRmsd(null);
+    setError(null);
+  }, [coreRef]);
+
+  // 모달/패널 언마운트 시 frame + doorPivot 정리.
+  useEffect(() => {
+    return () => {
+      if (frameEntityRef.current) {
+        try { frameEntityRef.current.destroy(); } catch {}
+        frameEntityRef.current = null;
+      }
+      if (doorPivotGroupRef.current) {
+        try { doorPivotGroupRef.current.destroy(); } catch {}
+        doorPivotGroupRef.current = null;
+      }
+    };
+  }, []);
+
+  // Phase 4: doorAngleDeg 변경 시 doorPivotGroup 을 hinge 축 기준으로 회전.
+  //   회전 origin = hinge.origin (왼쪽 변 시작점). hinge 축 = hinge.axis.
+  //   localRotation = R_axis(angle), localPosition = origin - R_axis(angle) · origin (hinge 점 고정 유지).
+  useEffect(() => {
+    const pivot = doorPivotGroupRef.current;
+    const hinge = doorHingeRef.current;
+    const core = coreRef.current;
+    const pc = core?.getPC();
+    if (!pivot || !hinge || !pc) return;
+    const angle = (doorAngleDeg * Math.PI) / 180;
+    const half = angle / 2;
+    const sH = Math.sin(half), cH = Math.cos(half);
+    const q = new pc.Quat(hinge.axis[0] * sH, hinge.axis[1] * sH, hinge.axis[2] * sH, cH);
+    // hinge 점이 고정되도록 position 보정: P_new = origin + R(P - origin). entity 의 local 기준,
+    //   doorPivot 의 local = identity 부모 (app.root) 라 world = local.
+    //   회전 후 origin 이 R·origin 으로 이동했으므로 (origin - R·origin) 만큼 평행이동.
+    const o = new pc.Vec3(hinge.origin[0], hinge.origin[1], hinge.origin[2]);
+    const rotated = new pc.Vec3();
+    q.transformVector(o, rotated);
+    pivot.setLocalRotation(q.x, q.y, q.z, q.w);
+    pivot.setLocalPosition(o.x - rotated.x, o.y - rotated.y, o.z - rotated.z);
+  }, [doorAngleDeg, coreRef]);
+
   // 정합 결과 확정 — 4×4 행렬 저장. Upload + Module 양쪽.
   const saveResult = useCallback(async () => {
     const core = coreRef.current;
@@ -219,7 +554,27 @@ export default function AlignPanel({
       const p = group.getLocalPosition();
       const q = group.getLocalRotation();
       const s = group.getLocalScale();
-      // Upload-scoped (현재 정합 행렬 + matches/rmsd).
+
+      // 신흐름: onCommitFinal 제공 시 → 일괄 영속화 (다듬기 결과 자산 포함).
+      if (onCommitFinal) {
+        try {
+          await onCommitFinal({
+            matrix4x4,
+            position: [p.x, p.y, p.z],
+            rotation: [q.x, q.y, q.z, q.w],
+            scale: [s.x, s.y, s.z],
+            rmsd,
+          });
+          setError('정합 완료 ✓');
+        } catch (e: any) {
+          setError(`정합 영속화 실패: ${e?.message ?? e}`);
+        } finally {
+          setSavingResult(false);
+        }
+        return;
+      }
+
+      // 기존 흐름: Upload + Module 별개 엔드포인트 저장.
       try {
         await api.post(`/uploads/${uploadId}/alignment`, {
           transform: {
@@ -234,7 +589,6 @@ export default function AlignPanel({
       } catch (e) {
         console.warn('[AlignPanel] upload alignment 저장 실패', e);
       }
-      // Module-scoped (다른 화면에서 같은 모듈을 띄울 때 적용). 사용자 명시 사양.
       try {
         await api.put(`/modules/${metadata.module_id}/alignment-transform`, {
           transform: {
@@ -251,7 +605,7 @@ export default function AlignPanel({
     } finally {
       setSavingResult(false);
     }
-  }, [coreRef, uploadId, metadata.module_id, rmsd]);
+  }, [coreRef, uploadId, metadata.module_id, rmsd, onCommitFinal]);
 
   const matchReady = !!basemapDoorCorners && !!moduleDoorCorners;
   const runDisabled = !matchReady || running;
@@ -270,13 +624,22 @@ export default function AlignPanel({
         <div className="text-[11px] text-gray-400">basemap 정보 가져오는 중...</div>
       )}
 
-      <button
-        onClick={runAutoAlign}
-        disabled={runDisabled}
-        className="w-full px-3 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 text-white rounded cursor-pointer text-xs font-bold disabled:cursor-not-allowed"
-      >
-        {running ? '정합 중...' : (aligned ? '정합 (다시)' : '정합')}
-      </button>
+      {!aligned ? (
+        <button
+          onClick={runAutoAlign}
+          disabled={runDisabled}
+          className="w-full px-3 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 text-white rounded cursor-pointer text-xs font-bold disabled:cursor-not-allowed"
+        >
+          {running ? '정합 중...' : '정합'}
+        </button>
+      ) : (
+        <button
+          onClick={resetAlignment}
+          className="w-full px-3 py-2 bg-orange-600 hover:bg-orange-500 text-white rounded cursor-pointer text-xs font-bold"
+        >
+          정합 초기화
+        </button>
+      )}
 
       {rmsd !== null && (
         <div className="text-[10px] text-gray-500">RMSD: {rmsd.toFixed(4)} m</div>
@@ -312,9 +675,29 @@ export default function AlignPanel({
               ))}
             </div>
             <div className="text-[10px] text-gray-500 leading-relaxed">
-              이동 5cm / 회전 5° / 스케일 5% 단위. "정합 (다시)" 누르면 수동 변경 무시하고 처음부터 자동.
+              이동 5cm / 회전 5° / 스케일 5% 단위. "정합 초기화" 누르면 변환 전부 리셋.
             </div>
           </div>
+
+          {/* 도어 열기/닫기 슬라이더 — 정합 검증용. 모듈/베이스맵 도어 + frame 측벽 통합 회전. */}
+          {doorPivotGroupRef.current && (
+            <div className="border-t border-gray-700 pt-2 space-y-1">
+              <div className="flex items-center gap-2">
+                <div className="text-[11px] font-bold text-gray-300 flex-1">도어 열기 (확인용)</div>
+                <span className="text-[10px] text-gray-400 font-mono">{doorAngleDeg.toFixed(0)}°</span>
+              </div>
+              <input
+                type="range"
+                min="0" max="90" step="1"
+                value={doorAngleDeg}
+                onChange={(e) => setDoorAngleDeg(parseInt(e.target.value))}
+                className="w-full h-1 accent-amber-500 cursor-pointer"
+              />
+              <div className="text-[10px] text-gray-500 leading-relaxed">
+                hinge 축은 도어 왼쪽 변. 영구 저장 안 됨 (정합 확인용).
+              </div>
+            </div>
+          )}
 
           <button
             onClick={saveResult}

@@ -66,6 +66,7 @@ export interface FloorOverviewManifest {
 export interface FloorDetailBasemapEntry {
   id: string;
   version: number;
+  source_upload_id: string | null;
   url: string | null;
   filename: string;
 }
@@ -87,6 +88,8 @@ export interface FloorDetailManifest {
   floor_id: string;
   floor_number: number;
   basemap: FloorDetailBasemapEntry | null;
+  /** 활성 basemap 이 없을 때 pending basemap (관리자 승인 대기) 존재 여부. */
+  basemap_pending_approval?: boolean;
   modules: FloorDetailModuleEntry[];
 }
 
@@ -127,7 +130,7 @@ export interface UploadInitRequest {
   building_id: string;
   floor_id: string;
   module_id: string;
-  ply_target?: 'gsplat' | 'alignment' | 'refined';
+  ply_target?: 'gsplat' | 'alignment' | 'refined' | 'colmap';
 }
 
 export interface UploadInitResponse {
@@ -160,6 +163,7 @@ export interface Upload {
   has_refined?: boolean;
   has_doors_json?: boolean;
   has_alignment?: boolean;
+  has_gsplat_ply?: boolean;
   is_basemap_source?: boolean;
 }
 

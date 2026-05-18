@@ -9,12 +9,25 @@ from alembic import context
 from app.core.config import get_settings
 from app.core.database import Base
 
-# モデルをインポートしてBaseに登録
 import app.models  # noqa: F401
 
 config = context.config
 settings = get_settings()
-config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
+
+
+def apply_settings_database_url() -> None:
+    config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
+
+
+def build_async_connectable():
+    return async_engine_from_config(
+        config.get_section(config.config_ini_section, {}),
+        prefix="sqlalchemy.",
+        poolclass=pool.NullPool,
+    )
+
+
+apply_settings_database_url()
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
@@ -41,11 +54,7 @@ def do_run_migrations(connection):
 
 
 async def run_async_migrations() -> None:
-    connectable = async_engine_from_config(
-        config.get_section(config.config_ini_section, {}),
-        prefix="sqlalchemy.",
-        poolclass=pool.NullPool,
-    )
+    connectable = build_async_connectable()
     async with connectable.connect() as connection:
         await connection.run_sync(do_run_migrations)
     await connectable.dispose()

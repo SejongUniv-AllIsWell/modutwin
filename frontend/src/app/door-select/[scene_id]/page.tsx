@@ -1,16 +1,17 @@
 'use client';
 
 import { useCallback, useEffect, useState } from 'react';
-import { useParams } from 'next/navigation';
+import { useParams, useRouter } from 'next/navigation';
 import { useAuth } from '@/lib/auth';
-import { api } from '@/lib/api';
-import { DoorPosition } from '@/types';
+import { api, ApiError } from '@/lib/api';
+import { ActiveBasemapResponse, DoorPosition, Module, Scene } from '@/types';
 import dynamic from 'next/dynamic';
 
 const SplatViewer = dynamic(() => import('@/components/viewer/SplatViewer'), { ssr: false });
 
 export default function DoorSelectPage() {
   const params = useParams();
+  const router = useRouter();
   const sceneId = params.scene_id as string;
   const { user, loading } = useAuth();
   const [sogUrl, setSogUrl] = useState<string | null>(null);
@@ -42,6 +43,34 @@ export default function DoorSelectPage() {
     }
     setSaving(true);
     try {
+      // 정합 사전 검증 — 활성 basemap 존재 + basemap 의 모듈 문 등록 여부
+      const scene = await api.get<Scene>(`/scenes/${sceneId}`);
+      const moduleInfo = await api.get<Module>(`/modules/${scene.module_id}`);
+
+      let basemap: ActiveBasemapResponse;
+      try {
+        basemap = await api.get<ActiveBasemapResponse>(
+          `/basemaps/active?module_id=${scene.module_id}`,
+        );
+      } catch (e) {
+        if (e instanceof ApiError && e.status === 404) {
+          alert('basemap이 없습니다.');
+          router.push('/dashboard');
+          return;
+        }
+        throw e;
+      }
+
+      const doorsRes = await api.get<{ doors: Array<{ unitName?: string | null }> }>(
+        `/basemaps/${basemap.basemap_id}/doors`,
+      );
+      const hasModuleDoor = doorsRes.doors.some(d => d.unitName === moduleInfo.name);
+      if (!hasModuleDoor) {
+        alert('basemap에 해당하는 모듈의 문이 설정되지 않았습니다. 관리자에게 문의하세요');
+        router.push('/dashboard');
+        return;
+      }
+
       await api.post(`/scenes/${sceneId}/door-position`, doorPosition);
       setMessage('문 위치가 저장되었습니다. 정합 작업이 시작됩니다.');
     } catch (e: any) {

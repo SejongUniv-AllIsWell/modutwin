@@ -12,6 +12,7 @@ import {
   sejongUniversityPlacePriority,
   type PriorityPlaceScore,
 } from '@/lib/map/placePriority';
+import { loadKakaoMapsSdk } from '@/lib/map/loadKakaoMapsSdk';
 
 declare global {
   interface Window {
@@ -87,7 +88,6 @@ interface KakaoPlaceCandidate extends PriorityPlaceScore {
   distance: number;
 }
 
-const KAKAO_SDK_URL = 'https://dapi.kakao.com/v2/maps/sdk.js';
 const DEFAULT_MAP_CENTER = sejongUniversityPlacePriority.center;
 
 const escapeHtml = (value: string) => value
@@ -95,44 +95,6 @@ const escapeHtml = (value: string) => value
   .replace(/</g, '&lt;')
   .replace(/>/g, '&gt;')
   .replace(/"/g, '&quot;');
-
-const loadKakaoMapsSdk = (appKey: string) => {
-  if (window.kakao?.maps) {
-    return new Promise<any>((resolve) => {
-      window.kakao.maps.load(() => resolve(window.kakao));
-    });
-  }
-  if (window.__kakaoMapsSdkPromise__) return window.__kakaoMapsSdkPromise__;
-
-  window.__kakaoMapsSdkPromise__ = new Promise<any>((resolve, reject) => {
-    const existing = document.querySelector<HTMLScriptElement>(`script[src^="${KAKAO_SDK_URL}"]`);
-    const onReady = () => {
-      window.kakao.maps.load(() => resolve(window.kakao));
-    };
-    const onError = () => {
-      window.__kakaoMapsSdkPromise__ = undefined;
-      reject(new Error('Kakao Maps SDK load failed'));
-    };
-
-    if (existing) {
-      if (window.kakao?.maps) {
-        onReady();
-        return;
-      }
-      existing.addEventListener('load', onReady, { once: true });
-      existing.addEventListener('error', onError, { once: true });
-      return;
-    }
-
-    const script = document.createElement('script');
-    script.src = `${KAKAO_SDK_URL}?appkey=${appKey}&autoload=false&libraries=services`;
-    script.addEventListener('load', onReady, { once: true });
-    script.addEventListener('error', onError, { once: true });
-    document.head.appendChild(script);
-  });
-
-  return window.__kakaoMapsSdkPromise__;
-};
 
 interface KakaoKeywordSearchResult {
   documents: KakaoPlaceResult[];
@@ -298,7 +260,9 @@ export default function ExplorePage() {
     }
   }, [user, loading, router]);
 
-  // 건물 목록 로드 — 백엔드의 has_output 필터로 visible 조건을 만족하는 것만 내려옴
+  // 건물 목록 로드 — 백엔드 has_output 필터는
+  //   (관리자가 표시관리에서 추가한 건물) OR (표시 중인 floor/module 에 SceneOutput 등록)
+  // 둘 중 하나라도 만족하는 visible 건물을 내려준다.
   const fetchBuildings = useCallback(async () => {
     try {
       const data = await api.get<Building[]>('/buildings?has_output=true');
@@ -467,6 +431,9 @@ export default function ExplorePage() {
 
         return filtered
           .map((place, index) => scorePlaceCandidate(place, latLng, index))
+          // 캠퍼스 키워드 자체 ("세종대학교" 등) 만 매칭된 plain 항목은 건물 후보에서 제외 —
+          // 구체적인 건물명 (예: "세종대학교 광개토관") 만 의미 있음.
+          .filter(({ isCampusOnlyName }) => !isCampusOnlyName)
           .sort(comparePriorityPlaceCandidates)[0]?.place ?? null;
       };
 

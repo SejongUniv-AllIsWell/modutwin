@@ -31,6 +31,7 @@ from app.services.minio_service import get_minio_service, PART_SIZE
 from app.services.celery_service import (
     dispatch_training_task,
     dispatch_sam3_door_detection_task,
+    dispatch_colmap_task,
 )
 from app.services.sam3_service import (
     SAM3_DISABLED_DETAIL,
@@ -215,21 +216,18 @@ async def complete_upload(
     upload.file_size = actual_size
     upload.status = UploadStatus.processing
 
-    # 학습 없이 바로 완료 처리할 케이스
-    #  - PLY + alignment 타겟 (정합용 ply)
-    #  - PLY + refined 타겟 (다듬기 결과 ply)
-    #  - .splat / .sog (이미 학습 완료된 산출물)
     ext = os.path.splitext(upload.original_filename)[1].lower()
     is_ply = ext == ".ply"
     is_scene_artifact = ext in {".splat", ".sog"}
-    is_zip = ext == ".zip"
+    is_colmap_input = upload.ply_target == PlyTarget.colmap
+
     skip_training = (
         (is_ply and upload.ply_target in (PlyTarget.alignment, PlyTarget.refined))
         or is_scene_artifact
-        or is_zip
+        or is_colmap_input  # COLMAP은 별도 태스크로 처리
     )
 
-    if skip_training:
+    if skip_training and not is_colmap_input:
         upload.status = UploadStatus.completed
 
     # 모듈 + 계층 정보 조회
@@ -242,9 +240,24 @@ async def complete_upload(
     floor_result = await db.execute(select(Floor).where(Floor.id == module.floor_id))
     floor = floor_result.scalar_one()
 
-    # PLY + alignment 타겟이면 별도 처리 없이 완료
     celery_task_id = None
-    if not skip_training:
+
+    if is_colmap_input:
+        # COLMAP 전처리 태스크 발행
+        upload.status = UploadStatus.processing
+        celery_task_id = dispatch_colmap_task(
+            upload_id=str(upload.id),
+            user_id=str(user.id),
+            minio_input_key=upload.minio_path,
+        )
+        task = Task(
+            upload_id=upload.id,
+            user_id=user.id,
+            task_type=TaskType.colmap_preprocessing,
+            celery_task_id=celery_task_id,
+            status=TaskStatus.pending,
+        )
+    elif not skip_training:
         celery_task_id = dispatch_training_task(
             upload_id=str(upload.id),
             user_id=str(user.id),
@@ -255,31 +268,39 @@ async def complete_upload(
             module_name=module.name,
             ply_target=upload.ply_target.value if upload.ply_target else "gsplat",
         )
+        task = Task(
+            upload_id=upload.id,
+            user_id=user.id,
+            task_type=TaskType.training_3dgs,
+            celery_task_id=celery_task_id,
+            status=TaskStatus.pending,
+        )
+    else:
+        task = Task(
+            upload_id=upload.id,
+            user_id=user.id,
+            task_type=TaskType.training_3dgs,
+            celery_task_id=None,
+            status=TaskStatus.completed,
+        )
 
-    task = Task(
-        upload_id=upload.id,
-        user_id=user.id,
-        task_type=TaskType.training_3dgs,
-        celery_task_id=celery_task_id,
-        status=TaskStatus.completed if skip_training else TaskStatus.pending,
-    )
     db.add(task)
-
     await db.commit()
 
-    if skip_training:
-        if is_zip:
-            msg = "업로드 완료. ZIP 파일이 저장되었습니다. COLMAP 처리는 추후 지원됩니다."
-        elif is_scene_artifact or upload.ply_target == PlyTarget.refined:
+    if is_colmap_input:
+        msg = "업로드 완료. COLMAP 전처리가 시작됩니다."
+    elif skip_training:
+        if is_scene_artifact or upload.ply_target == PlyTarget.refined:
             msg = "업로드 완료. refined 폴더에 저장되었습니다."
         else:
             msg = "업로드 완료. alignment 폴더에 저장되었습니다."
     else:
         msg = "업로드 완료. 3DGS 학습이 시작됩니다."
 
+    final_status = "processing" if (is_colmap_input or not skip_training) else "completed"
     return UploadCompleteResponse(
         upload_id=upload.id,
-        status="processing" if not skip_training else "completed",
+        status=final_status,
         message=msg,
     )
 
@@ -307,6 +328,7 @@ def _upload_to_response(
         has_refined=bool(upload.refined_ply_path) or has_scene_output,
         has_doors_json=bool(upload.door_corners_json_path),
         has_alignment=bool(upload.alignment_transform),
+        has_gsplat_ply=bool(upload.gsplat_ply_path),
         is_basemap_source=is_basemap_source,
     )
 
@@ -496,11 +518,22 @@ async def get_upload_presigned_url(
     if upload is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="업로드를 찾을 수 없습니다.")
 
+    minio = get_minio_service()
+
+    # COLMAP 업로드는 원본이 ZIP/MP4 이지만 워커가 생성한 결과 PLY 가 있으면 그것을 서빙한다.
+    if upload.ply_target == PlyTarget.colmap:
+        if upload.gsplat_ply_path and minio.object_exists(upload.gsplat_ply_path):
+            url = minio.get_presigned_download_url(upload.gsplat_ply_path)
+            ply_filename = os.path.splitext(upload.original_filename)[0] + ".ply"
+            return {"url": url, "filename": ply_filename, "variant": "gsplat"}
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="아직 결과 PLY 가 준비되지 않았습니다 (학습 진행 중이거나 실패).",
+        )
+
     ext = os.path.splitext(upload.original_filename)[1].lower()
     if ext not in VIEWABLE_EXTENSIONS:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="뷰어를 지원하지 않는 파일 형식입니다.")
-
-    minio = get_minio_service()
 
     # 정제된 PLY 후보 — variant=refined 우선시 + variant=None 일 때 원본 부재 시 fallback 으로도 사용.
     #   1순위: upload.refined_ply_path (SAM3 파이프라인 정식 경로)
@@ -524,17 +557,6 @@ async def get_upload_presigned_url(
         refined_url = await _find_refined_url()
         if refined_url is not None:
             return {"url": refined_url, "filename": upload.original_filename, "variant": "refined"}
-
-    # variant=original 명시 — 다듬기 reset 처럼 "원본부터 다시" 의도. refined fallback 안 함.
-    # 원본 부재 시 404 → 프론트엔드가 "원본 PLY 없음" 안내. register-local 케이스가 여기 해당.
-    if variant == "original":
-        if minio.object_exists(upload.minio_path):
-            url = minio.get_presigned_download_url(upload.minio_path)
-            return {"url": url, "filename": upload.original_filename, "variant": "original"}
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="원본 PLY 가 서버에 없습니다 (로컬 파일로 시작한 세션은 원본이 보존되지 않습니다).",
-        )
 
     # variant=None 또는 fallback. 원본이 MinIO 에 실제 존재할 때만 original 을 서빙;
     # 그렇지 않으면 (예: register-local 로 placeholder 만 잡힌 케이스) refined 로 자동 fallback.
@@ -870,12 +892,33 @@ async def get_sam3_status(
 
 # ── doors.json: SAM3 결과 + 사용자 보정 ─────────────────────────────────────
 
+class DoorMeshMeta(BaseModel):
+    """도어 quad mesh 의 영속화 메타 — wall 텍스처에서 도어 영역을 잘라낸 별도 PNG + corners.
+
+    basemap 재로드 시 wall mesh quad entity 재생성에 필요한 정보 전부 포함.
+    """
+    corners: list[list[float]]  # 4 × [x, y, z] — A'+Y 프레임 mesh 코너
+    uvs: list[list[float]]      # 4 × [u, v]   — 텍스처 매핑
+    normalInward: list[float]   # [x, y, z]    — 방 안쪽 normal
+    textureFilename: str        # MinIO 키: "tex_door_<doorId>.png"
+    textureWidth: int
+    textureHeight: int
+
+
+class DoorSplatMeta(BaseModel):
+    """도어 영역 가우시안 splat PLY 의 영속화 메타 (boundary split sub + doorOrig)."""
+    filename: str               # MinIO 키: "door_<doorId>.ply"
+
+
 class DoorEntry(BaseModel):
     """doors.json 의 한 문 엔트리.
 
-    corners 외 나머지 메타 (회전축/회전각/회전방향/벽 surfaceId/두께/분할 옵션 등) 는
+    corners 외 나머지 메타 (회전축/회전각/방향/벽 surfaceId/두께/분할 옵션 등) 는
     문 설정 단계에서 사용자가 확정한 값. 정합·재진입·basemap 매칭 시 모두 활용되므로
     스키마에 명시해 라운드트립 시 손실되지 않게 한다.
+
+    선택 자산 `doorMesh` / `doorSplat`: basemap 의 경우 도어별 텍스처/가우시안을 별도
+    파일로 영속화하면 로드 시 그대로 재생성 가능. 없으면 corners 만으로 정합 매칭 등에 사용.
     """
     id: str
     corners: list[list[float]]  # 4 × [x, y, z]
@@ -886,10 +929,11 @@ class DoorEntry(BaseModel):
     doorThickness: float | None = None
     boundarySplitEnabled: bool | None = None
     safetyMargin: float | None = None
-    # basemap 등록 시 admin 이 각 문에 입력하는 호수 (예: "302호").
-    # 정합 단계에서 모듈의 호수 (Module.name) 와 매칭해 basemap 의 어느 문에 정합할지 결정.
-    # 모듈측 doors.json 에서는 보통 비어있음 (모듈은 단일 호라 호수 = Module.name 으로 자명).
+    # basemap 등록 시 각 문에 부여하는 호수 (예: "302호"). 정합 단계에서 모듈의
+    # 호수 (Module.name) 와 매칭해 basemap 의 어느 문에 정합할지 결정. 모듈측에서는 비어있음.
     unitName: str | None = None
+    doorMesh: DoorMeshMeta | None = None
+    doorSplat: DoorSplatMeta | None = None
 
 
 class DoorsJson(BaseModel):
@@ -933,7 +977,7 @@ async def get_doors(
                 for c in corners
             )
             if not ok: continue
-            entry = DoorEntry(
+            entry_kwargs = dict(
                 id=str(d.get("id") or f"door_{len(clean)+1}"),
                 corners=corners,
                 hingeEdge=d.get("hingeEdge") if isinstance(d.get("hingeEdge"), int) else None,
@@ -945,7 +989,16 @@ async def get_doors(
                 safetyMargin=d.get("safetyMargin") if isinstance(d.get("safetyMargin"), (int, float)) else None,
                 unitName=d.get("unitName") if isinstance(d.get("unitName"), str) else None,
             )
-            clean.append(entry)
+            # doorMesh / doorSplat — 옵션. Pydantic 가 형식 검증; 실패 시 그냥 패스 (corners 만으로 사용 가능).
+            dm = d.get("doorMesh")
+            if isinstance(dm, dict):
+                try: entry_kwargs["doorMesh"] = DoorMeshMeta(**dm)
+                except Exception: pass
+            ds = d.get("doorSplat")
+            if isinstance(ds, dict):
+                try: entry_kwargs["doorSplat"] = DoorSplatMeta(**ds)
+                except Exception: pass
+            clean.append(DoorEntry(**entry_kwargs))
         return DoorsJson(doors=clean)
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"doors.json 파싱 실패: {e}")

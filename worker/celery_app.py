@@ -26,3 +26,7 @@ app.config_from_object({
         'tasks.alignment',
     ),
 })
+
+import tasks.colmap   # noqa: F401
+import tasks.training  # noqa: F401
+import tasks.alignment # noqa: F401
