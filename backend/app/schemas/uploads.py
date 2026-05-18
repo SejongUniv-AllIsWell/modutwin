@@ -112,11 +112,11 @@ class UploadInitRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_colmap_target(self) -> "UploadInitRequest":
-        """colmap ply_target은 zip 파일에만 허용된다."""
+        """colmap ply_target은 zip 또는 영상 파일에만 허용된다."""
         if self.ply_target == "colmap":
             ext = os.path.splitext(self.filename)[1].lower()
-            if ext != ".zip":
-                raise ValueError("colmap ply_target은 .zip 파일에만 허용됩니다.")
+            if ext not in {".zip"} | VIDEO_EXTENSIONS:
+                raise ValueError("colmap ply_target은 .zip 또는 영상 파일에만 허용됩니다.")
         return self
 
 

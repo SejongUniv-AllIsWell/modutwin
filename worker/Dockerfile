@@ -6,6 +6,7 @@ ENV PYTHONPATH=/app
 # ffmpeg + OpenCV 의존 시스템 라이브러리
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
+    colmap \
     libglib2.0-0 \
     libsm6 \
     libxext6 \

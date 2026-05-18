@@ -77,11 +77,12 @@ class FFmpegModule(PipelineModule):
             raise PipelineError(self.name, f"유효하지 않은 zip 파일입니다: {e}")
 
     def _extract_video_frames(self, video_path: str, output_dir: str) -> None:
-        pattern = os.path.join(output_dir, "frame_%06d.jpg")
+        pattern = os.path.join(output_dir, "%04d.jpg")
         cmd = [
             "ffmpeg", "-i", video_path,
+            "-qscale:v", "1",
+            "-qmin", "1",
             "-vf", f"fps={self.fps}",
-            "-q:v", "2",
             pattern,
             "-y",
         ]

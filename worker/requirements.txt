@@ -1,6 +1,7 @@
 celery
 redis
 minio
+requests
 numpy
 plyfile
 # COLMAP 파이프라인
