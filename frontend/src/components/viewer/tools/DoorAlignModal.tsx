@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '@/lib/api';
 import { SplatViewerCoreRef } from '../SplatViewerCore';
 import { loadRefineState } from '@/lib/refine/persistence';
-import { getEditorRotation, rawToA, aToRaw, rawToAY, ayToRaw, type FrameRotation } from '@/lib/refine/coordFrames';
+import { getEditorRotation, rawToA, aToRaw, rawToAY, type FrameRotation } from '@/lib/refine/coordFrames';
 import { surfacePlanesFromRoom, type SurfacePlane } from '@/lib/gs/planes';
 import { useAdditionalGsplats, type AdditionalGsplatsApi } from './useAdditionalGsplats';
 import { useDoorLabels } from './useDoorLabels';
@@ -262,24 +262,21 @@ export default function DoorAlignModal({
   const lastDoorMeshWallSurfaceIdRef = useRef<string | null>(null);
 
   // SAM3 자동 추출 완료 시 부모가 넘겨준 4 코너로 picked 초기 채움.
-  // doors.json contract = A'+Y frame (회전 베이크된 PLY 와 동일 frame). picked.pos contract = raw frame
-  // (raycastToPlanes 가 splatEntity 역변환으로 산출). 다듬기 직후 세션은 메모리 PLY 가 아직 raw 이고
-  // splatEntity 가 시각화 회전을 적용 중 → A'+Y → raw 역변환 필요.
-  // 재진입 세션은 베이크된 PLY 가 새 raw 로 로드되고 getCurrentBakedRotation 이 0 을 반환 → 항등 변환.
-  // 사용자가 이미 직접 픽한 코너가 있으면 덮어쓰지 않음. surfaceId 는 빈 문자열 — 후속 회전/저장 단계가
-  // raycast 로 보정.
+  // autoExtractedCorners 는 raw 프레임 — UnifiedSplatEditor 가 SAM3 응답(A'+Y)에 ayToRaw 를 미리
+  // 적용해 메모리 컨벤션(raw)으로 통일한 뒤 전달. picked.pos contract 도 raw (raycastToPlanes 가
+  // splatEntity 역변환으로 산출) → 추가 변환 없이 그대로 대입. surfaceId 는 빈 문자열 — 후속 회전/저장
+  // 단계가 raycast 로 보정.
   useEffect(() => {
     if (!autoExtractedCorners || autoExtractedCorners.length !== 4) return;
-    const r = getCurrentBakedRotation?.() ?? { rotX: 0, rotZ: 0, wallAngleRad: 0 };
     setPicked(prev => {
       const allEmpty = prev.every(p => p === null);
       if (!allEmpty) return prev;
       return autoExtractedCorners.map(c => ({
-        pos: ayToRaw([c[0], c[1], c[2]] as Vec3, r),
+        pos: [c[0], c[1], c[2]] as Vec3,
         surfaceId: '',
       }));
     });
-  }, [autoExtractedCorners, getCurrentBakedRotation]);
+  }, [autoExtractedCorners]);
 
   // 문 경계 (4 변 노란선 + 힌지 cylinder) 표시 토글. true 면 그리고, false 면 둘 다 숨김.
   const [boundaryVisible, setBoundaryVisible] = useState(true);
