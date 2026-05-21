@@ -64,6 +64,13 @@ class BuildingResponse(BaseModel):
         from_attributes = True
 
 
+class BuildingListItem(BuildingResponse):
+    """리스트 엔드포인트 응답. /buildings 의 결과를 클라이언트가 다시 N+1 fetch 해서
+    floor_count 를 채우던 패턴을 제거하기 위해 같이 묶어 내려준다."""
+
+    floor_count: int = 0
+
+
 class FloorCreate(BaseModel):
     floor_number: int
 
@@ -433,7 +440,7 @@ async def _delete_hierarchy_scope(
 
 # ── Building endpoints ──
 
-@router.get("/buildings", response_model=list[BuildingResponse])
+@router.get("/buildings", response_model=list[BuildingListItem])
 async def list_buildings(
     has_output: bool = Query(False),
     include_hidden: bool = Query(False),
@@ -441,7 +448,19 @@ async def list_buildings(
     db: AsyncSession = Depends(get_db),
 ):
     show_hidden = include_hidden and user is not None and user.role == UserRole.admin
-    stmt = select(Building).order_by(Building.name)
+    # floor_count 는 visible floor 만 집계 — admin 으로 hidden 까지 보더라도
+    # explore 와 동일한 의미를 유지한다.
+    floor_count_subq = (
+        select(Floor.building_id, func.count(Floor.id).label("floor_count"))
+        .where(Floor.is_visible == True)
+        .group_by(Floor.building_id)
+        .subquery()
+    )
+    stmt = (
+        select(Building, func.coalesce(floor_count_subq.c.floor_count, 0))
+        .outerjoin(floor_count_subq, floor_count_subq.c.building_id == Building.id)
+        .order_by(Building.name)
+    )
     if not show_hidden:
         stmt = stmt.where(Building.is_visible == True)
     if has_output:
@@ -465,7 +484,13 @@ async def list_buildings(
             )
         )
     result = await db.execute(stmt)
-    return result.scalars().all()
+    return [
+        BuildingListItem(
+            **BuildingResponse.model_validate(building).model_dump(),
+            floor_count=int(floor_count),
+        )
+        for building, floor_count in result.all()
+    ]
 
 
 @router.post("/buildings", response_model=BuildingResponse, status_code=status.HTTP_201_CREATED)
@@ -490,7 +515,7 @@ async def create_building(
 async def lookup_building(
     kakao_place_id: str | None = Query(None),
     name: str | None = Query(None),
-    _: User = Depends(get_current_user),
+    user: User | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ):
     if not kakao_place_id and not name:
@@ -500,10 +525,16 @@ async def lookup_building(
 
     building: Building | None = None
     if kakao_place_id:
-        place_result = await db.execute(select(Building).where(Building.kakao_place_id == kakao_place_id))
+        place_stmt = select(Building).where(Building.kakao_place_id == kakao_place_id)
+        if user is None or user.role != UserRole.admin:
+            place_stmt = place_stmt.where(Building.is_visible == True)
+        place_result = await db.execute(place_stmt)
         building = place_result.scalar_one_or_none()
     if building is None and name:
-        name_result = await db.execute(select(Building).where(Building.name == name))
+        name_stmt = select(Building).where(Building.name == name)
+        if user is None or user.role != UserRole.admin:
+            name_stmt = name_stmt.where(Building.is_visible == True)
+        name_result = await db.execute(name_stmt)
         building = name_result.scalar_one_or_none()
 
     if building is None:
@@ -671,10 +702,13 @@ async def create_or_find_building_from_kakao(
 @router.get("/buildings/{building_id}", response_model=BuildingResponse)
 async def get_building(
     building_id: UUID,
-    _: User = Depends(get_current_user),
+    user: User | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(select(Building).where(Building.id == building_id))
+    stmt = select(Building).where(Building.id == building_id)
+    if user is None or user.role != UserRole.admin:
+        stmt = stmt.where(Building.is_visible == True)
+    result = await db.execute(stmt)
     building = result.scalar_one_or_none()
     if not building:
         raise HTTPException(status_code=404, detail="건물을 찾을 수 없습니다.")
@@ -790,7 +824,7 @@ class ExploreBuildingResponse(BaseModel):
 @router.get("/buildings/{building_id}/explore", response_model=ExploreBuildingResponse)
 async def explore_building(
     building_id: UUID,
-    _: User = Depends(get_current_user),
+    _: User | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ):
     """건물의 모든 층 → 활성 basemap + cross-user visible module 트리.
@@ -897,11 +931,12 @@ async def explore_building(
 @router.get("/buildings/{building_id}/floor-overview", response_model=FloorOverviewManifestResponse)
 async def get_floor_overview_manifest(
     building_id: UUID,
-    user: User = Depends(get_current_user),
+    user: User | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ):
     building_stmt = select(Building).where(Building.id == building_id)
-    if user.role != UserRole.admin:
+    is_admin = user is not None and user.role == UserRole.admin
+    if not is_admin:
         building_stmt = building_stmt.where(Building.is_visible == True)
     building_result = await db.execute(building_stmt)
     building = building_result.scalar_one_or_none()
@@ -913,7 +948,7 @@ async def get_floor_overview_manifest(
         .where(Floor.building_id == building_id)
         .order_by(Floor.floor_number.desc())
     )
-    if user.role != UserRole.admin:
+    if not is_admin:
         floor_stmt = floor_stmt.where(Floor.is_visible == True)
     floor_result = await db.execute(floor_stmt)
     floors = floor_result.scalars().all()
@@ -932,7 +967,7 @@ async def get_floor_overview_manifest(
         .where(Module.floor_id.in_(floor_ids))
         .group_by(Module.floor_id)
     )
-    if user.role != UserRole.admin:
+    if not is_admin:
         module_count_stmt = module_count_stmt.where(Module.is_visible == True)
     module_count_result = await db.execute(module_count_stmt)
     module_count_by_floor = {floor_id: count for floor_id, count in module_count_result.all()}
@@ -977,11 +1012,12 @@ async def get_floor_overview_manifest(
 async def get_floor_detail_manifest(
     building_id: UUID,
     floor_number: int,
-    user: User = Depends(get_current_user),
+    user: User | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ):
     building_stmt = select(Building).where(Building.id == building_id)
-    if user.role != UserRole.admin:
+    is_admin = user is not None and user.role == UserRole.admin
+    if not is_admin:
         building_stmt = building_stmt.where(Building.is_visible == True)
     building_result = await db.execute(building_stmt)
     building = building_result.scalar_one_or_none()
@@ -992,7 +1028,7 @@ async def get_floor_detail_manifest(
         Floor.building_id == building_id,
         Floor.floor_number == floor_number,
     )
-    if user.role != UserRole.admin:
+    if not is_admin:
         floor_stmt = floor_stmt.where(Floor.is_visible == True)
     floor_result = await db.execute(floor_stmt)
     floor = floor_result.scalar_one_or_none()
@@ -1044,7 +1080,7 @@ async def get_floor_detail_manifest(
         .where(Module.name != "__basemap__")
         .order_by(Module.name)
     )
-    if user.role != UserRole.admin:
+    if not is_admin:
         module_stmt = module_stmt.where(Module.is_visible == True)
     module_result = await db.execute(module_stmt)
     module_rows = module_result.all()
@@ -1053,23 +1089,24 @@ async def get_floor_detail_manifest(
     latest_scene_by_module: dict[UUID, SceneOutput] = {}
     if module_ids:
         scene_stmt = select(SceneOutput).where(SceneOutput.module_id.in_(module_ids))
-        if user.role != UserRole.admin:
+        if not is_admin:
+            public_scene_filter = and_(
+                SceneOutput.is_aligned == True,
+                Module.is_visible == True,
+                Floor.is_visible == True,
+                Building.is_visible == True,
+            )
+            scene_visibility_filter = (
+                or_(SceneOutput.user_id == user.id, public_scene_filter)
+                if user is not None
+                else public_scene_filter
+            )
             scene_stmt = (
                 scene_stmt
                 .join(Module, SceneOutput.module_id == Module.id)
                 .join(Floor, Module.floor_id == Floor.id)
                 .join(Building, Floor.building_id == Building.id)
-                .where(
-                    or_(
-                        SceneOutput.user_id == user.id,
-                        and_(
-                            SceneOutput.is_aligned == True,
-                            Module.is_visible == True,
-                            Floor.is_visible == True,
-                            Building.is_visible == True,
-                        ),
-                    )
-                )
+                .where(scene_visibility_filter)
             )
         scene_result = await db.execute(
             scene_stmt.order_by(SceneOutput.module_id, SceneOutput.created_at.desc())
@@ -1111,13 +1148,17 @@ async def get_floor_detail_manifest(
 async def list_floors(
     building_id: UUID,
     include_hidden: bool = Query(False),
-    user: User = Depends(get_current_user),
+    user: User | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ):
-    show_hidden = include_hidden and user.role == UserRole.admin
-    stmt = select(Floor).where(Floor.building_id == building_id)
+    show_hidden = include_hidden and user is not None and user.role == UserRole.admin
+    stmt = (
+        select(Floor)
+        .join(Building, Floor.building_id == Building.id)
+        .where(Floor.building_id == building_id)
+    )
     if not show_hidden:
-        stmt = stmt.where(Floor.is_visible == True)
+        stmt = stmt.where(Building.is_visible == True, Floor.is_visible == True)
     stmt = stmt.order_by(Floor.floor_number)
     result = await db.execute(stmt)
     return result.scalars().all()

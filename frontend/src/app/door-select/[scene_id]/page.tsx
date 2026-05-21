@@ -2,10 +2,12 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import { useParams, useRouter } from 'next/navigation';
-import { useAuth } from '@/lib/auth';
+import { useRequireAuth } from '@/lib/auth';
 import { api, ApiError } from '@/lib/api';
 import { ActiveBasemapResponse, DoorPosition, Module, Scene } from '@/types';
 import dynamic from 'next/dynamic';
+import { Button } from '@/components/ui/Button';
+import { useToast } from '@/components/ui/Toast';
 
 const SplatViewer = dynamic(() => import('@/components/viewer/SplatViewer'), { ssr: false });
 
@@ -13,23 +15,19 @@ export default function DoorSelectPage() {
   const params = useParams();
   const router = useRouter();
   const sceneId = params.scene_id as string;
-  const { user, loading } = useAuth();
+  const { user, loading } = useRequireAuth();
+  const { show: showToast } = useToast();
   const [sogUrl, setSogUrl] = useState<string | null>(null);
   const [doorPosition, setDoorPosition] = useState<DoorPosition | null>(null);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState('');
 
   useEffect(() => {
-    if (!loading && !user) {
-      window.location.href = '/';
-      return;
-    }
-    if (sceneId) {
-      api.get<{ url: string }>(`/scenes/${sceneId}/download`)
-        .then(data => setSogUrl(data.url))
-        .catch(() => setMessage('씬 파일을 불러올 수 없습니다.'));
-    }
-  }, [user, loading, sceneId]);
+    if (!user || !sceneId) return;
+    api.get<{ url: string }>(`/scenes/${sceneId}/download`)
+      .then(data => setSogUrl(data.url))
+      .catch(() => setMessage('씬 파일을 불러올 수 없습니다.'));
+  }, [user, sceneId]);
 
   const handleSelectionDone = useCallback((indices: number[]) => {
     setDoorPosition({ module_door_indices: indices });
@@ -54,7 +52,7 @@ export default function DoorSelectPage() {
         );
       } catch (e) {
         if (e instanceof ApiError && e.status === 404) {
-          alert('basemap이 없습니다.');
+          showToast('basemap이 없습니다.', 'error');
           router.push('/dashboard');
           return;
         }
@@ -66,7 +64,7 @@ export default function DoorSelectPage() {
       );
       const hasModuleDoor = doorsRes.doors.some(d => d.unitName === moduleInfo.name);
       if (!hasModuleDoor) {
-        alert('basemap에 해당하는 모듈의 문이 설정되지 않았습니다. 관리자에게 문의하세요');
+        showToast('basemap에 해당하는 모듈의 문이 설정되지 않았습니다. 관리자에게 문의하세요', 'error');
         router.push('/dashboard');
         return;
       }
@@ -80,26 +78,26 @@ export default function DoorSelectPage() {
     }
   };
 
-  if (loading || !user) return <div className="flex items-center justify-center h-64 text-gray-500">로딩 중...</div>;
+  if (loading || !user) return <div className="flex items-center justify-center h-64 text-[var(--muted)]">로딩 중...</div>;
 
   return (
     <div className="flex flex-col h-[calc(100vh-56px)]">
-      <div className="flex items-center justify-between px-4 py-3 bg-gray-900 border-b border-gray-800">
+      <div className="flex items-center justify-between px-4 py-3 bg-[var(--paper)] border-b border-[var(--rule)]">
         <h1 className="text-lg font-bold">문 위치 지정</h1>
         <div className="flex items-center gap-3">
           {doorPosition && (
-            <span className="text-sm text-gray-400">
+            <span className="text-sm text-[var(--muted)]">
               {doorPosition.module_door_indices.length}개 선택됨
             </span>
           )}
-          {message && <span className="text-sm text-gray-400">{message}</span>}
-          <button
+          {message && <span className="text-sm text-[var(--muted)]">{message}</span>}
+          <Button
             onClick={handleSave}
             disabled={!doorPosition || saving}
-            className="bg-green-600 hover:bg-green-700 disabled:bg-gray-700 disabled:text-gray-500 text-white text-sm px-4 py-1.5 rounded transition"
+            size="sm"
           >
             {saving ? '저장 중...' : '정합 시작'}
-          </button>
+          </Button>
         </div>
       </div>
 
@@ -111,7 +109,7 @@ export default function DoorSelectPage() {
             onSelectionDone={handleSelectionDone}
           />
         ) : (
-          <div className="flex items-center justify-center h-full text-gray-600">
+          <div className="flex items-center justify-center h-full text-[var(--muted-2)]">
             SOG 파일 로딩 중...
           </div>
         )}

@@ -18,6 +18,7 @@ from app.api.internal import router as internal_router
 from app.api.internal_worker import router as internal_worker_router
 from app.api.kakao import router as kakao_router
 from app.api.module_register import router as module_register_router
+from app.api.landing import router as landing_router
 
 
 from app.core.config import get_settings
@@ -52,16 +53,27 @@ app = FastAPI(
 )
 
 # CORS
-cors_origins = ["*"]
-if settings.PUBLIC_BASE_URL and not settings.DEV_MODE:
+# allow_credentials=True 와 allow_origins=["*"] 의 조합은 브라우저가 거절한다 (CORS 스펙).
+# 운영 환경에서 PUBLIC_BASE_URL 을 깜빡하면 조용히 망가지는 fail-open 이 아니라,
+# 부팅을 막는 fail-fast 가 되도록 검증한다.
+if settings.DEV_MODE:
+    cors_origins = ["*"]
+    cors_allow_credentials = False
+else:
+    if not settings.PUBLIC_BASE_URL:
+        raise RuntimeError(
+            "PUBLIC_BASE_URL is required when DEV_MODE=False. "
+            "Set it to the public origin (e.g. https://example.com) so CORS can be locked down."
+        )
     cors_origins = [settings.PUBLIC_BASE_URL, "http://localhost"]
     if settings.CORS_EXTRA_ORIGINS:
         cors_origins += [o.strip() for o in settings.CORS_EXTRA_ORIGINS.split(",") if o.strip()]
+    cors_allow_credentials = True
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins,
-    allow_credentials=True,
+    allow_credentials=cors_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -87,6 +99,7 @@ app.include_router(refine_router)
 app.include_router(internal_router)
 app.include_router(internal_worker_router)
 app.include_router(kakao_router)
+app.include_router(landing_router)
 
 
 @app.get("/health")

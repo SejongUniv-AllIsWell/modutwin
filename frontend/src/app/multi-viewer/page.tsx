@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { useAuth } from '@/lib/auth';
+import { useRequireAuth } from '@/lib/auth';
 import { api } from '@/lib/api';
 import { Upload } from '@/types';
 import { useRouter } from 'next/navigation';
@@ -26,17 +26,13 @@ interface LoadedSplat {
 }
 
 export default function MultiViewerPage() {
-  const { user, loading } = useAuth();
+  const { user, loading } = useRequireAuth();
   const router = useRouter();
 
   const [uploads, setUploads] = useState<Upload[]>([]);
   const [loadingUploads, setLoadingUploads] = useState(true);
   const [loadedSplats, setLoadedSplats] = useState<LoadedSplat[]>([]);
   const [fetchingIds, setFetchingIds] = useState<Set<string>>(new Set());
-
-  useEffect(() => {
-    if (!loading && !user) window.location.href = '/';
-  }, [user, loading]);
 
   useEffect(() => {
     if (!user) return;
@@ -75,34 +71,34 @@ export default function MultiViewerPage() {
   const visibleCount = loadedSplats.filter(s => s.visible).length;
 
   if (loading || !user) {
-    return <div className="flex items-center justify-center h-[calc(100dvh-56px)] text-gray-500">로딩 중...</div>;
+    return <div className="flex items-center justify-center h-[calc(100dvh-56px)] text-[var(--muted)]">로딩 중...</div>;
   }
 
   return (
     <div className="flex h-[calc(100dvh-56px)]">
       {/* ── 왼쪽 패널 ── */}
-      <div className="w-64 flex flex-col border-r border-gray-800 bg-gray-950 shrink-0">
+      <div className="w-64 flex flex-col border-r border-[var(--rule)] bg-[var(--paper)] shrink-0">
         {/* 헤더 */}
-        <div className="px-4 py-3 border-b border-gray-800">
+        <div className="px-4 py-3 border-b border-[var(--rule)]">
           <button
             onClick={() => router.back()}
-            className="flex items-center gap-1 text-xs text-gray-500 hover:text-gray-300 transition mb-2"
+            className="flex items-center gap-1 text-xs text-[var(--muted)] hover:text-[var(--ink-2)] transition mb-2"
           >
             <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
             </svg>
             대시보드
           </button>
-          <h2 className="text-sm font-semibold text-gray-200">내 파일</h2>
-          <p className="text-[11px] text-gray-500 mt-0.5">+ 버튼으로 뷰어에 추가</p>
+          <h2 className="text-sm font-semibold text-[var(--ink)]">내 파일</h2>
+          <p className="text-[11px] text-[var(--muted)] mt-0.5">+ 버튼으로 뷰어에 추가</p>
         </div>
 
         {/* 파일 목록 */}
         <div className="flex-1 overflow-y-auto">
           {loadingUploads ? (
-            <div className="flex items-center justify-center h-24 text-gray-600 text-xs">불러오는 중...</div>
+            <div className="flex items-center justify-center h-24 text-[var(--muted-2)] text-xs">불러오는 중...</div>
           ) : uploads.length === 0 ? (
-            <div className="flex items-center justify-center h-24 text-gray-600 text-xs">파일 없음</div>
+            <div className="flex items-center justify-center h-24 text-[var(--muted-2)] text-xs">파일 없음</div>
           ) : (
             <div className="divide-y divide-gray-800/50">
               {uploads.map(u => {
@@ -112,10 +108,10 @@ export default function MultiViewerPage() {
                   <div key={u.id} className="px-3 py-2.5 flex items-center gap-2">
                     {/* 파일명 */}
                     <div className="flex-1 min-w-0">
-                      <p className="text-xs text-gray-300 truncate" title={u.original_filename}>
+                      <p className="text-xs text-[var(--ink-2)] truncate" title={u.original_filename}>
                         {u.original_filename}
                       </p>
-                      <p className="text-[10px] text-gray-600 mt-0.5">
+                      <p className="text-[10px] text-[var(--muted-2)] mt-0.5">
                         {new Date(u.uploaded_at).toLocaleDateString('ko-KR')}
                       </p>
                     </div>
@@ -130,7 +126,7 @@ export default function MultiViewerPage() {
                           className={`p-1.5 rounded transition ${
                             loaded.visible
                               ? 'text-blue-400 hover:text-blue-300'
-                              : 'text-gray-600 hover:text-gray-400'
+                              : 'text-[var(--muted-2)] hover:text-[var(--muted)]'
                           }`}
                         >
                           {loaded.visible ? (
@@ -148,7 +144,7 @@ export default function MultiViewerPage() {
                         <button
                           onClick={() => handleRemove(u.id)}
                           title="제거"
-                          className="p-1.5 rounded text-gray-600 hover:text-red-400 transition"
+                          className="p-1.5 rounded text-[var(--muted-2)] hover:text-red-400 transition"
                         >
                           <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
@@ -160,7 +156,7 @@ export default function MultiViewerPage() {
                         onClick={() => handleLoad(u)}
                         disabled={fetching}
                         title="뷰어에 추가"
-                        className="shrink-0 p-1.5 rounded text-gray-500 hover:text-green-400 transition disabled:opacity-40 disabled:cursor-not-allowed"
+                        className="shrink-0 p-1.5 rounded text-[var(--muted)] hover:text-green-400 transition disabled:opacity-40 disabled:cursor-not-allowed"
                       >
                         {fetching ? (
                           <div className="w-3.5 h-3.5 border border-blue-400 border-t-transparent rounded-full animate-spin" />
@@ -179,7 +175,7 @@ export default function MultiViewerPage() {
         </div>
 
         {/* 하단 상태 표시 */}
-        <div className="px-4 py-2 border-t border-gray-800 text-[11px] text-gray-500">
+        <div className="px-4 py-2 border-t border-[var(--rule)] text-[11px] text-[var(--muted)]">
           {loadedSplats.length === 0
             ? '표시 중인 파일 없음'
             : `${visibleCount} / ${loadedSplats.length}개 표시 중`}

@@ -5,8 +5,8 @@ import { useParams, useRouter, useSearchParams } from 'next/navigation';
 import { api } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
 import type { FloorOverviewManifest, FloorOverviewManifestEntry } from '@/types';
-
-const floorLabel = (n: number) => (n >= 0 ? `F${n}` : `B${Math.abs(n)}`);
+import { floorLabel } from '@/lib/format/floor';
+import { useToast } from '@/components/ui/Toast';
 
 export default function BuildingOverviewPage() {
   const router = useRouter();
@@ -15,6 +15,7 @@ export default function BuildingOverviewPage() {
   const buildingId = params.name as string;
   const isPendingBuilding = buildingId === 'pending';
   const { user, loading } = useAuth();
+  const { show: showToast } = useToast();
 
   const [manifest, setManifest] = useState<FloorOverviewManifest | null>(null);
   const [hoveredFloorId, setHoveredFloorId] = useState<string | null>(null);
@@ -26,12 +27,6 @@ export default function BuildingOverviewPage() {
   const [floorInputValue, setFloorInputValue] = useState('');
   const [nameInputValue, setNameInputValue] = useState('');
   const [floorInputError, setFloorInputError] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (!loading && !user) {
-      router.push('/');
-    }
-  }, [user, loading, router]);
 
   const loadOverview = useCallback(() => {
     if (!buildingId) return;
@@ -136,34 +131,52 @@ export default function BuildingOverviewPage() {
       closeRegisterModal();
       router.push(`/viewer?${qs.toString()}`);
     } catch (error: any) {
-      window.alert(error?.message || '뷰어 이동에 실패했습니다.');
+      showToast(error?.message || '뷰어 이동에 실패했습니다.', 'error');
     }
   };
 
   if (loading) return null;
 
   return (
-    <div className="h-[calc(100vh-56px)] bg-gray-950 text-gray-100 flex">
-      <aside className="w-80 border-r border-gray-800 bg-gray-900/70 p-4 flex flex-col shrink-0">
-        <button type="button" onClick={() => router.push('/explore')} className="text-sm text-gray-400 hover:text-white transition self-start">
+    <div
+      className="h-[calc(100vh-56px)] flex"
+      style={{ background: 'var(--bg)', color: 'var(--ink)' }}
+    >
+      <aside
+        className="w-80 border-r p-4 flex flex-col shrink-0"
+        style={{ background: 'var(--paper)', borderColor: 'var(--rule)' }}
+      >
+        <button
+          type="button"
+          onClick={() => router.push('/explore')}
+          className="text-sm transition self-start hover:underline underline-offset-4"
+          style={{ color: 'var(--muted)' }}
+        >
           Back to Explore
         </button>
         <div className="mt-4">
-          <h1 className="text-base font-semibold truncate">{manifest?.building_name ?? 'Building'}</h1>
-          <p className="mt-1 text-xs text-gray-500">Floors: {floors.length}</p>
-          <p className="mt-1 text-xs text-gray-500">
+          <h1 className="text-base font-semibold truncate" style={{ color: 'var(--ink)' }}>
+            {manifest?.building_name ?? 'Building'}
+          </h1>
+          <p className="mt-1 text-xs" style={{ color: 'var(--muted)' }}>Floors: {floors.length}</p>
+          <p className="mt-1 text-xs" style={{ color: 'var(--muted)' }}>
             상태: {manifest?.building_is_confirmed ? '확정' : '미확정'}
           </p>
         </div>
 
         <div className="mt-4 flex-1 overflow-y-auto space-y-1">
           {floors.map((floor) => (
-            <div key={floor.floor_id} className="rounded border border-gray-800 bg-gray-950">
+            <div
+              key={floor.floor_id}
+              className="rounded-sm border"
+              style={{ background: 'var(--bg)', borderColor: 'var(--rule)' }}
+            >
               <div className="px-2 py-1.5 flex items-center gap-2">
                 <button
                   type="button"
                   onClick={() => router.push(`/buildings/${buildingId}/floors/${floor.floor_number}`)}
-                  className="flex-1 text-left text-sm text-gray-200 hover:text-white"
+                  className="flex-1 text-left text-sm hover:underline underline-offset-4"
+                  style={{ color: 'var(--ink)' }}
                 >
                   {floorLabel(floor.floor_number)}
                 </button>
@@ -171,19 +184,24 @@ export default function BuildingOverviewPage() {
                   <button
                     type="button"
                     onClick={() => setOpenFloorMenuId((prev) => (prev === floor.floor_id ? null : floor.floor_id))}
-                    className="w-7 h-7 flex items-center justify-center rounded hover:bg-gray-800 text-gray-400 hover:text-white"
+                    className="w-7 h-7 flex items-center justify-center rounded-sm hover:bg-[var(--bg-soft)]"
+                    style={{ color: 'var(--muted)' }}
                   >
                     ⋮
                   </button>
                   {openFloorMenuId === floor.floor_id && (
-                    <div className="absolute right-0 top-8 z-10 w-28 rounded border border-gray-700 bg-gray-900 shadow-lg p-1">
+                    <div
+                      className="absolute right-0 top-8 z-10 w-28 rounded-sm border shadow-lg p-1"
+                      style={{ background: 'var(--paper)', borderColor: 'var(--rule)' }}
+                    >
                       {!floor.has_active_basemap && (
                         <button
                           type="button"
                           onClick={() => {
                             openRegisterModal('basemap', floor);
                           }}
-                          className="w-full text-left text-xs px-2 py-1.5 rounded hover:bg-gray-800"
+                          className="w-full text-left text-xs px-2 py-1.5 rounded-sm hover:bg-[var(--bg-soft)]"
+                          style={{ color: 'var(--ink)' }}
                         >
                           basemap 등록
                         </button>
@@ -205,10 +223,11 @@ export default function BuildingOverviewPage() {
                               await api.delete(`/admin/basemaps/${active.basemap_id}`);
                               await loadOverview();
                             } catch (err: any) {
-                              window.alert(`basemap 삭제 실패: ${err?.message ?? err}`);
+                              showToast(`basemap 삭제 실패: ${err?.message ?? err}`, 'error');
                             }
                           }}
-                          className="w-full text-left text-xs px-2 py-1.5 rounded text-red-400 hover:bg-red-500/15"
+                          className="w-full text-left text-xs px-2 py-1.5 rounded-sm hover:bg-red-500/10"
+                          style={{ color: '#b04646' }}
                         >
                           basemap 삭제
                         </button>
@@ -223,20 +242,26 @@ export default function BuildingOverviewPage() {
           <div className="space-y-2">
             <button
               type="button"
-              disabled={manifest?.building_is_confirmed}
+              disabled={manifest?.building_is_confirmed || !user}
               onClick={() => setAddMenuOpen((prev) => !prev)}
-              className="w-full rounded border border-gray-700 px-3 py-2 text-sm text-left hover:border-blue-500 disabled:opacity-50 disabled:cursor-not-allowed"
+              title={!user ? '로그인 후 등록 가능합니다' : undefined}
+              className="w-full rounded-sm border px-3 py-2 text-sm text-left disabled:opacity-50 disabled:cursor-not-allowed hover:bg-[var(--bg-soft)]"
+              style={{ borderColor: 'var(--rule)', color: 'var(--ink)' }}
             >
               + 등록
             </button>
-            {addMenuOpen && !manifest?.building_is_confirmed && (
-              <div className="rounded border border-gray-700 bg-gray-900 p-1 space-y-1">
+            {addMenuOpen && !manifest?.building_is_confirmed && user && (
+              <div
+                className="rounded-sm border p-1 space-y-1"
+                style={{ background: 'var(--paper)', borderColor: 'var(--rule)' }}
+              >
                 <button
                   type="button"
                   onClick={() => {
                     openRegisterModal('basemap');
                   }}
-                  className="w-full text-left text-xs px-2 py-1.5 rounded hover:bg-gray-800"
+                  className="w-full text-left text-xs px-2 py-1.5 rounded-sm hover:bg-[var(--bg-soft)]"
+                  style={{ color: 'var(--ink)' }}
                 >
                   basemap 등록
                 </button>
@@ -245,7 +270,8 @@ export default function BuildingOverviewPage() {
                   onClick={() => {
                     openRegisterModal('module');
                   }}
-                  className="w-full text-left text-xs px-2 py-1.5 rounded hover:bg-gray-800"
+                  className="w-full text-left text-xs px-2 py-1.5 rounded-sm hover:bg-[var(--bg-soft)]"
+                  style={{ color: 'var(--ink)' }}
                 >
                   module 등록
                 </button>
@@ -255,7 +281,10 @@ export default function BuildingOverviewPage() {
         </div>
       </aside>
 
-      <main className="flex-1 h-full overflow-y-auto px-4 pt-4 pb-8 lg:px-8 lg:pt-6 lg:pb-12 [perspective:1200px] [scrollbar-width:thin] [scrollbar-color:#374151_#11182766] [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-track]:bg-gray-900/40 [&::-webkit-scrollbar-thumb]:bg-gray-700 [&::-webkit-scrollbar-thumb]:rounded-full">
+      <main
+        className="flex-1 h-full overflow-y-auto px-4 pt-4 pb-8 lg:px-8 lg:pt-6 lg:pb-12 [perspective:1200px]"
+        style={{ background: 'var(--bg)' }}
+      >
         <div className="mx-auto max-w-5xl min-h-full pt-1 lg:pt-2 pr-1">
           {floors.map((floor, idx) => {
             const hovered = hoveredFloorId === floor.floor_id;
@@ -277,7 +306,14 @@ export default function BuildingOverviewPage() {
             );
           })}
           {floors.length === 0 && (
-            <div className="h-64 border border-gray-800 rounded-md bg-gray-900/70 flex items-center justify-center text-sm text-gray-500">
+            <div
+              className="h-64 border rounded-md flex items-center justify-center text-sm"
+              style={{
+                background: 'var(--paper)',
+                borderColor: 'var(--rule)',
+                color: 'var(--muted)',
+              }}
+            >
               No floor overview manifest found.
             </div>
           )}
@@ -285,12 +321,15 @@ export default function BuildingOverviewPage() {
       </main>
 
       {registerPurpose && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4">
-          <div className="w-full max-w-sm rounded-md border border-gray-700 bg-gray-900 p-4 shadow-xl">
-            <h2 className="text-sm font-semibold">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4">
+          <div
+            className="w-full max-w-sm rounded-md border p-4 shadow-xl"
+            style={{ background: 'var(--paper)', borderColor: 'var(--rule)' }}
+          >
+            <h2 className="text-sm font-semibold" style={{ color: 'var(--ink)' }}>
               {registerPurpose === 'basemap' ? 'Basemap 등록 정보' : 'Module 등록 정보'}
             </h2>
-            <p className="mt-1 text-xs text-gray-400">
+            <p className="mt-1 text-xs" style={{ color: 'var(--muted)' }}>
               {registerFloor ? `${floorLabel(registerFloor.floor_number)}에 등록합니다.` : '층은 예: 1, -1, B1 형식으로 입력하세요.'}
             </p>
             <input
@@ -306,7 +345,12 @@ export default function BuildingOverviewPage() {
               }}
               autoFocus={!registerFloor}
               disabled={!!registerFloor}
-              className="mt-3 w-full rounded border border-gray-700 bg-gray-950 px-3 py-2 text-sm text-gray-100 outline-none focus:border-blue-500 disabled:opacity-50"
+              className="mt-3 w-full rounded-sm border px-3 py-2 text-sm outline-none disabled:opacity-50"
+              style={{
+                background: 'var(--bg)',
+                borderColor: 'var(--rule)',
+                color: 'var(--ink)',
+              }}
               placeholder="층 번호"
             />
             {/* basemap 등록은 호수별로 도어에 unitName 부여 — basemap 전체 이름 입력 불필요. */}
@@ -323,23 +367,34 @@ export default function BuildingOverviewPage() {
                   if (e.key === 'Escape') closeRegisterModal();
                 }}
                 autoFocus={!!registerFloor}
-                className="mt-2 w-full rounded border border-gray-700 bg-gray-950 px-3 py-2 text-sm text-gray-100 outline-none focus:border-blue-500"
+                className="mt-2 w-full rounded-sm border px-3 py-2 text-sm outline-none"
+                style={{
+                  background: 'var(--bg)',
+                  borderColor: 'var(--rule)',
+                  color: 'var(--ink)',
+                }}
                 placeholder="모듈 이름"
               />
             )}
-            {floorInputError && <p className="mt-2 text-xs text-red-400">{floorInputError}</p>}
+            {floorInputError && <p className="mt-2 text-xs" style={{ color: '#b04646' }}>{floorInputError}</p>}
             <div className="mt-4 flex items-center justify-end gap-2">
               <button
                 type="button"
                 onClick={closeRegisterModal}
-                className="rounded border border-gray-700 px-3 py-1.5 text-xs hover:bg-gray-800"
+                className="rounded-sm border px-3 py-1.5 text-xs hover:bg-[var(--bg-soft)]"
+                style={{ borderColor: 'var(--rule)', color: 'var(--ink)' }}
               >
                 취소
               </button>
               <button
                 type="button"
                 onClick={handleRegisterFromPlus}
-                className="rounded bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-500"
+                className="rounded-sm px-3 py-1.5 text-xs font-medium border"
+                style={{
+                  background: 'var(--ink)',
+                  color: 'var(--bg)',
+                  borderColor: 'var(--ink)',
+                }}
               >
                 확인
               </button>
@@ -376,17 +431,15 @@ function FloorSlab({
       onMouseEnter={onHover}
       onMouseLeave={onLeave}
       onClick={onClick}
-    className={`group relative w-full h-28 lg:h-32 overflow-hidden text-left transition duration-200 ${
+      className={`group relative w-full h-28 lg:h-32 overflow-hidden text-left transition duration-200 ${
         imageUrl ? 'rounded-sm' : 'rounded-md border'
-      } ${
-        hovered
-          ? imageUrl
-            ? 'ring-2 ring-blue-500/80 shadow-lg shadow-blue-900/30'
-            : 'border-blue-500/80 shadow-lg shadow-blue-900/30'
-          : imageUrl
-            ? 'ring-1 ring-white/10'
-            : 'border-gray-800'
       } ${dimmed ? 'opacity-40' : 'opacity-100'}`}
+      style={{
+        borderColor: hovered ? 'var(--ink)' : imageUrl ? undefined : 'var(--rule)',
+        boxShadow: hovered ? '0 10px 24px -12px rgba(0,0,0,0.25)' : undefined,
+        outline: imageUrl ? (hovered ? '2px solid var(--ink)' : '1px solid var(--rule)') : undefined,
+        outlineOffset: imageUrl ? '-1px' : undefined,
+      }}
     >
       {imageUrl ? (
         <img
@@ -396,9 +449,17 @@ function FloorSlab({
           className="h-full w-full object-cover"
         />
       ) : (
-        <div className="h-full w-full bg-gradient-to-b from-gray-700 to-gray-900" />
+        <div
+          className="h-full w-full"
+          style={{
+            background: 'linear-gradient(to bottom, var(--bg-soft), var(--paper))',
+          }}
+        />
       )}
-      <div className="pointer-events-none absolute left-2 bottom-2 z-10 text-[11px] font-medium text-white/90 drop-shadow">
+      <div
+        className="pointer-events-none absolute left-2 bottom-2 z-10 text-[11px] font-medium drop-shadow"
+        style={{ color: imageUrl ? 'rgba(255,255,255,0.95)' : 'var(--ink)' }}
+      >
         {floorLabel(floor.floor_number)}
       </div>
       {imageUrl && <div className="pointer-events-none absolute inset-x-0 bottom-0 h-12 bg-gradient-to-t from-black/45 to-transparent" />}

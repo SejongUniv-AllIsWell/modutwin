@@ -2,6 +2,8 @@ import type { Metadata } from 'next';
 import './globals.css';
 import { AuthProvider } from '@/lib/auth';
 import Navbar from '@/components/dashboard/Navbar';
+import AppShell from '@/components/dashboard/AppShell';
+import { ToastProvider } from '@/components/ui/Toast';
 
 export const metadata: Metadata = {
   title: '3DGS Digital Twin Platform',
@@ -18,10 +20,12 @@ export const metadata: Metadata = {
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="ko">
-      <body className="bg-gray-950 text-white min-h-screen">
+      <body className="min-h-screen" style={{ background: 'var(--bg)', color: 'var(--ink)' }}>
         <AuthProvider>
-          <Navbar />
-          <main className="pt-14">{children}</main>
+          <ToastProvider>
+            <Navbar />
+            <AppShell>{children}</AppShell>
+          </ToastProvider>
         </AuthProvider>
       </body>
     </html>
