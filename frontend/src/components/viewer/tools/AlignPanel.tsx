@@ -38,9 +38,11 @@ type ManualMode = 'translate' | 'rotate' | 'scale';
 const ANIM_MAX_MS = 2500;
 const ANIM_BASE_MS = 400;
 
-// 모듈/베이스맵 도어 corner mirror 매핑 — 모듈 [TL,TR,BR,BL] CW (모듈 안에서 본 시점) ↔
-// 베이스맵 같은 도어 [TR,TL,BL,BR] (베이스맵 안에서 본 시점). 두 방 사이 도어는 양쪽에서 좌우 반전.
-const DOOR_CORNER_MIRROR_MAP = [1, 0, 3, 2] as const;
+// 모듈/베이스맵 도어 corner pairing — 양측 모두 자연 CW 순서 [TL,TR,BR,BL] 로 픽한다는 가정 하에
+// identity 매핑. 이전엔 [1,0,3,2] mirror 였으나 실제 사용 데이터(같은 카메라 방향 픽)에선 양측 픽이
+// 동일 라벨링이라 mirror 가 도리어 좌우 반전을 만들어 정합이 깨졌음. 자연 픽으로 정합 가능하도록
+// identity 로 변경.
+const DOOR_CORNER_MIRROR_MAP = [0, 1, 2, 3] as const;
 
 // 벽 두께 gap — basemap mesh ↔ module mesh 가 정확히 겹치지 않게 띄움. door_height 비율 기반.
 // 표준문 (2.1m) 기준 ≈ 5cm. 한국 차음벽 200mm 보다 작지만 시각적 분리에 충분 + 자연스러움.
@@ -309,8 +311,22 @@ export default function AlignPanel({
         `nSource=${dstForcedN ? 'normalInward' : 'cross-product'}`);
       if (DEBUG_ALIGN) {
         console.log('  alignmentGroup children:', Array.from(group.children ?? []).map((c: any) => c.name));
+        console.log('  MIRROR_MAP =', Array.from(DOOR_CORNER_MIRROR_MAP), '(module[i] ↔ basemap[mirror[i]])');
+        console.log('  --- moduleDoorCorners (A\'+Y, server convention) ---');
         for (let i = 0; i < 4; i++) {
-          console.log(`  i=${i} src=(${src[i*3].toFixed(3)}, ${src[i*3+1].toFixed(3)}, ${src[i*3+2].toFixed(3)}) ` +
+          const c = moduleDoorCorners[i];
+          console.log(`    module[${i}]=(${c[0].toFixed(3)}, ${c[1].toFixed(3)}, ${c[2].toFixed(3)})`);
+        }
+        console.log('  --- basemapDoorCorners (A\'+Y, server convention) ---');
+        for (let i = 0; i < 4; i++) {
+          const c = basemapDoorCorners[i];
+          console.log(`    basemap[${i}]=(${c[0].toFixed(3)}, ${c[1].toFixed(3)}, ${c[2].toFixed(3)})`);
+        }
+        console.log('  --- src/dst (world, gap-pushed) ---');
+        for (let i = 0; i < 4; i++) {
+          const m = DOOR_CORNER_MIRROR_MAP[i];
+          console.log(`  i=${i} (module[${i}] → basemap[${m}]) ` +
+            `src=(${src[i*3].toFixed(3)}, ${src[i*3+1].toFixed(3)}, ${src[i*3+2].toFixed(3)}) ` +
             `dst=(${dst[i*3].toFixed(3)}, ${dst[i*3+1].toFixed(3)}, ${dst[i*3+2].toFixed(3)})`);
         }
       }
