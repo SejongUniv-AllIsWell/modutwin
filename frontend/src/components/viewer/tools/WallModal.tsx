@@ -2,6 +2,8 @@
 
 import { useRef, useEffect, useState, useMemo, useCallback } from 'react';
 
+export type PathPoint = { x: number; z: number };
+
 interface Props {
   posX: Float32Array;
   posY: Float32Array;
@@ -9,8 +11,15 @@ interface Props {
   numSplats: number;
   ceilingY: number;
   floorY: number;
-  /** 정합 결과로 산출되는 4벽 (axis-aligned, 회전각 + [a1,b1,a2,b2]). 폴리곤에서 derive 됨. */
-  onConfirm: (angleDeg: number, walls: [number, number, number, number]) => void;
+  /**
+   * 확인 클릭 시 호출. polygon 은 cycle 순서의 N개 점 (마지막→첫 점 자동 연결).
+   * angleDeg 는 폴리곤 PCA eigenvector 기반 베이크용 Y 회전 (도).
+   *
+   * Phase 1 임시: cycle 강제 미적용 — edge 에 쓰인 점들을 path 순서대로 polygon 으로 반환.
+   * 4점 직사각 polygon 이면 기존 4벽 시절과 동등 동작.
+   * Phase 2 에서 cycle 감지 + 확인 활성 조건 추가 예정.
+   */
+  onConfirm: (angleDeg: number, polygon: PathPoint[]) => void;
   onClose: () => void;
 }
 
@@ -20,13 +29,14 @@ const PAD = 25;
 const PATH_POINT_RADIUS = 5;
 const PATH_POINT_HOVER_RADIUS = 6.5;
 const PATH_POINT_HIT_RADIUS = 14;
-
-type PathPoint = { x: number; z: number };
 type PathEdge = { from: number; to: number };
 type PathAction =
   | { type: 'point'; pointIdx: number; edge: PathEdge | null; prevSelected: number }
   | { type: 'edge'; edge: PathEdge; prevSelected: number }
-  | { type: 'move'; pointIdx: number; prev: PathPoint };
+  | { type: 'move'; pointIdx: number; prev: PathPoint }
+  | { type: 'parallel'; prevPoints: PathPoint[] };
+
+type CanvasMode = 'draw' | 'parallel';
 
 function normalizeAngle90(deg: number): number {
   let d = ((deg % 180) + 180) % 180;
@@ -35,14 +45,18 @@ function normalizeAngle90(deg: number): number {
 }
 
 /**
- * 폴리곤 점들로부터 axis-aligned 4벽 산출.
- *  - 점 분포의 주축 (eigenvector) 으로 angle 결정.
- *  - 그 frame 의 min/max 두 축 → 4벽 [a1, b1, a2, b2].
+ * 점 분포의 주축(eigenvector)에서 베이크용 Y 회전각 (도) 산출.
  *
- * 현재 4벽 출력은 임시 — 추후 N-벽 (TODO: surfacePlanesFromPolygon 와 연계) 으로 확장 예정.
+ * 사용처: PLY 저장 시 wallAngle Y 회전을 베이크해 재진입 시에도 사용자가 보기 좋은 정렬 상태 유지.
+ *
+ * 정책 (Phase 4 확정): **PCA 자동 갱신**.
+ *   - polygon 모양이 변할 때마다 (점 추가/이동/평행화 적용) 즉시 재계산.
+ *   - normalizeAngle90 으로 0~90° 매핑 — 회전 모호성(±90°/180°) 제거.
+ *   - 비-직사각 polygon 에서는 PCA 주축이 모양에 따라 약간 변동될 수 있으나, 사용자가
+ *     의도적으로 평행화 적용해 직사각/L 자 등으로 정리하면 자연스럽게 수렴.
  */
-function wallsFromPath(points: PathPoint[]): { angleDeg: number; walls: [number, number, number, number] } | null {
-  if (points.length < 2) return null;
+function angleFromPolygon(points: PathPoint[]): number {
+  if (points.length < 2) return 0;
   let cx = 0, cz = 0;
   for (const p of points) { cx += p.x; cz += p.z; }
   cx /= points.length; cz /= points.length;
@@ -64,32 +78,23 @@ function wallsFromPath(points: PathPoint[]): { angleDeg: number; walls: [number,
   const vn = Math.hypot(vx, vz) || 1;
   vx /= vn; vz /= vn;
   const rawDeg = (Math.atan2(vz, vx) * 180) / Math.PI;
-  const angleDeg = normalizeAngle90(rawDeg);
-  const rad = (angleDeg * Math.PI) / 180;
-  const c = Math.cos(rad), s = Math.sin(rad);
-  let minD1 = Infinity, maxD1 = -Infinity, minD2 = Infinity, maxD2 = -Infinity;
-  for (const p of points) {
-    const d1 = p.x * c + p.z * s;
-    const d2 = -p.x * s + p.z * c;
-    if (d1 < minD1) minD1 = d1;
-    if (d1 > maxD1) maxD1 = d1;
-    if (d2 < minD2) minD2 = d2;
-    if (d2 > maxD2) maxD2 = d2;
-  }
-  return { angleDeg, walls: [minD1, maxD1, minD2, maxD2] };
+  return normalizeAngle90(rawDeg);
 }
 
 /**
- * 벽면 설정 모달 — 사용자가 캔버스 위 가우시안 top-down view 에 점/선으로 폴리곤을 그리면
- * eigenvector 기반으로 회전 + 4벽을 derive 한다.
+ * 벽면 설정 모달 — 사용자가 캔버스 위 가우시안 top-down view 에 점/선으로 N각형 폴리곤을 그리고
+ * 닫힌 cycle 이 형성되면 그 폴리곤을 N벽 정의로 사용 (`surfacePlanesFromPolygon`).
+ * 베이크용 Y 회전각 (wallAngle) 은 폴리곤 PCA 주축에서 산출.
  *
- * 조작:
+ * 조작 (draw 모드):
  *  - 좌클릭 빈 공간 → 새 점 추가. 직전 선택점이 있으면 자동으로 edge 연결.
  *  - 좌클릭 기존 점 → 그 점 선택 (다음 빈 공간 클릭 시 그 점으로부터 edge).
- *  - 기존 점 드래그 → 점 이동 (캔버스 밖으로 나가도 추적; document mouseup 시 종료).
- *  - 우클릭 → 마지막 조작 1단계 undo (점 추가 / edge 추가 / 점 이동).
+ *  - 기존 점 드래그 → 점 이동.
+ *  - 우클릭 → 마지막 조작 1단계 undo (점/edge 추가, 점 이동, 평행화 적용).
  *
- * 향후 (TODO): N-벽 자유 (현재는 가장 큰 axis-aligned bbox 만 derive). 폴리곤 그대로 텍스처 베이크.
+ * 평행화 모드 (cycle 형성 후 진입 가능):
+ *  - 좌클릭 선분 → 선택 토글. 첫 선택이 기준, 나머지가 그 각도에 평행해지도록 회전 (적용 시).
+ *  - 인접 선분끼리는 공유 점을 통해 chain reaction.
  */
 export default function WallModal({
   posX, posY, posZ, numSplats,
@@ -165,6 +170,22 @@ export default function WallModal({
   const pathActionsRef = useRef<PathAction[]>([]);
   const selectedPointIdxRef = useRef<number>(-1);
 
+  // 평행화 모드 — cycle 형성 시에만 진입 가능.
+  // mode='parallel' 동안에는 점 추가/이동/edge 그리기 비활성. 캔버스 클릭 = segment 선택.
+  // 선택 순서대로 parallelSelected 에 cycle order 의 segment idx 가 push.
+  // 첫 선택 segment 가 기준 각도 — 본인은 그대로, 나머지가 그 각도에 평행해지도록 회전.
+  const [mode, setMode] = useState<CanvasMode>('draw');
+  const modeRef = useRef<CanvasMode>('draw');
+  const [parallelSelected, setParallelSelected] = useState<number[]>([]);
+  const parallelSelectedRef = useRef<number[]>([]);
+  const [hoverEdgeIdx, setHoverEdgeIdx] = useState<number>(-1);
+
+  // TDZ 우회 — draw/handleMouseDown/handleMouseMove (이 위에 선언) 가 아래 정의된
+  // derivedPolygon / findEdgeHit 을 참조해야 함. ref 로 한 단계 indirect 해서 hoisting 회피.
+  type DerivedPolygon = { angleDeg: number; polygon: PathPoint[]; cycleOrder: number[] };
+  const derivedPolygonRef = useRef<DerivedPolygon | null>(null);
+  const findEdgeHitRef = useRef<(rx: number, rz: number) => number>(() => -1);
+
   const selectPathPoint = useCallback((idx: number) => {
     selectedPointIdxRef.current = idx;
     setSelectedPointIdx(idx);
@@ -235,22 +256,80 @@ export default function WallModal({
     }
     ctx.putImageData(img, 0, 0);
 
-    // 폴리곤 edge.
+    // 폴리곤 edge — draw 모드: 단일 색. parallel 모드: 기본은 회색 base, hover/선택 색 분기.
     if (pathEdges.length > 0) {
       ctx.setLineDash([]);
-      ctx.strokeStyle = '#60a5fa';
-      ctx.lineWidth = 2.5;
-      ctx.beginPath();
-      let hasEdge = false;
-      for (const edge of pathEdges) {
-        const from = pathPoints[edge.from];
-        const to = pathPoints[edge.to];
-        if (!from || !to) continue;
-        ctx.moveTo(toX(from.x), toY(from.z));
-        ctx.lineTo(toX(to.x), toY(to.z));
-        hasEdge = true;
+      if (mode === 'parallel') {
+        // base edges
+        ctx.strokeStyle = '#475569';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        for (const edge of pathEdges) {
+          const from = pathPoints[edge.from];
+          const to = pathPoints[edge.to];
+          if (!from || !to) continue;
+          ctx.moveTo(toX(from.x), toY(from.z));
+          ctx.lineTo(toX(to.x), toY(to.z));
+        }
+        ctx.stroke();
+      } else {
+        ctx.strokeStyle = '#60a5fa';
+        ctx.lineWidth = 2.5;
+        ctx.beginPath();
+        let hasEdge = false;
+        for (const edge of pathEdges) {
+          const from = pathPoints[edge.from];
+          const to = pathPoints[edge.to];
+          if (!from || !to) continue;
+          ctx.moveTo(toX(from.x), toY(from.z));
+          ctx.lineTo(toX(to.x), toY(to.z));
+          hasEdge = true;
+        }
+        if (hasEdge) ctx.stroke();
       }
-      if (hasEdge) ctx.stroke();
+    }
+
+    // 평행화 모드 — 선택/hover segment overlay + 번호 라벨.
+    const dpForDraw = derivedPolygonRef.current;
+    if (mode === 'parallel' && dpForDraw) {
+      const { polygon } = dpForDraw;
+      const N = polygon.length;
+      // hover edge (선택 안 된 것에만)
+      if (hoverEdgeIdx >= 0 && parallelSelected.indexOf(hoverEdgeIdx) < 0) {
+        const a = polygon[hoverEdgeIdx];
+        const b = polygon[(hoverEdgeIdx + 1) % N];
+        ctx.strokeStyle = '#cbd5e1';
+        ctx.lineWidth = 4;
+        ctx.beginPath();
+        ctx.moveTo(toX(a.x), toY(a.z));
+        ctx.lineTo(toX(b.x), toY(b.z));
+        ctx.stroke();
+      }
+      // 선택 edge — 첫 선택 (기준) 은 초록, 나머지는 주황.
+      for (let k = 0; k < parallelSelected.length; k++) {
+        const segIdx = parallelSelected[k];
+        if (segIdx < 0 || segIdx >= N) continue;
+        const a = polygon[segIdx];
+        const b = polygon[(segIdx + 1) % N];
+        ctx.strokeStyle = k === 0 ? '#22c55e' : '#f59e0b';
+        ctx.lineWidth = 5;
+        ctx.beginPath();
+        ctx.moveTo(toX(a.x), toY(a.z));
+        ctx.lineTo(toX(b.x), toY(b.z));
+        ctx.stroke();
+        // 번호 라벨 (변 중점).
+        const mx = (a.x + b.x) / 2, mz = (a.z + b.z) / 2;
+        const lx = toX(mx), ly = toY(mz);
+        ctx.fillStyle = k === 0 ? '#22c55e' : '#f59e0b';
+        ctx.beginPath();
+        ctx.arc(lx, ly, 11, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = '#0f172a';
+        ctx.font = 'bold 12px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(String(k + 1), lx, ly);
+      }
     }
 
     // 폴리곤 점.
@@ -261,7 +340,12 @@ export default function WallModal({
       const isHover = i === hoverPointIdx;
       const isSelected = i === selectedPointIdx;
       const radius = isHover ? PATH_POINT_HOVER_RADIUS : PATH_POINT_RADIUS;
-      ctx.fillStyle = isSelected ? '#f59e0b' : '#22d3ee';
+      // 평행화 모드에서는 점 강조 약화 (선분 선택이 주이므로).
+      if (mode === 'parallel') {
+        ctx.fillStyle = '#64748b';
+      } else {
+        ctx.fillStyle = isSelected ? '#f59e0b' : '#22d3ee';
+      }
       ctx.beginPath();
       ctx.arc(px, py, radius, 0, Math.PI * 2);
       ctx.fill();
@@ -279,7 +363,7 @@ export default function WallModal({
     ctx.rotate(-Math.PI / 2);
     ctx.fillText('Z', 0, 0);
     ctx.restore();
-  }, [pts, n, viewBounds, pathPoints, pathEdges, hoverPointIdx, selectedPointIdx]);
+  }, [pts, n, viewBounds, pathPoints, pathEdges, hoverPointIdx, selectedPointIdx, mode, hoverEdgeIdx, parallelSelected]);
 
   useEffect(() => { draw(); }, [draw]);
 
@@ -315,6 +399,19 @@ export default function WallModal({
     if (e.button !== 0) return;
     e.preventDefault();
     const { rx, rz } = mouseToWorld(e);
+
+    // 평행화 모드 — segment 선택 토글.
+    if (modeRef.current === 'parallel') {
+      const segHit = findEdgeHitRef.current(rx, rz);
+      if (segHit < 0) return;
+      const cur = parallelSelectedRef.current;
+      const exists = cur.indexOf(segHit);
+      const next = exists >= 0 ? cur.filter(s => s !== segHit) : [...cur, segHit];
+      parallelSelectedRef.current = next;
+      setParallelSelected(next);
+      return;
+    }
+
     const hit = findPathPointHit(rx, rz);
     const points = pathPointsRef.current;
     const selected = selectedPointIdxRef.current;
@@ -373,7 +470,13 @@ export default function WallModal({
   // hover 표시만 — 드래그는 document listener 가 담당.
   const handleMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     const { rx, rz } = mouseToWorld(e);
-    setHoverPointIdx(findPathPointHit(rx, rz));
+    if (modeRef.current === 'parallel') {
+      setHoverPointIdx(-1);
+      setHoverEdgeIdx(findEdgeHitRef.current(rx, rz));
+    } else {
+      setHoverEdgeIdx(-1);
+      setHoverPointIdx(findPathPointHit(rx, rz));
+    }
   }, [mouseToWorld, findPathPointHit]);
 
   // 우클릭 — 마지막 조작 1단계 undo.
@@ -381,6 +484,15 @@ export default function WallModal({
     e.preventDefault();
     const action = pathActionsRef.current.pop();
     if (!action) return;
+
+    if (action.type === 'parallel') {
+      pathPointsRef.current = action.prevPoints.map(p => ({ ...p }));
+      setPathPoints(pathPointsRef.current);
+      // 모드는 그대로 둠 (사용자가 적용 직후 되돌리려는 케이스가 자연).
+      parallelSelectedRef.current = [];
+      setParallelSelected([]);
+      return;
+    }
 
     if (action.type === 'move') {
       const next = pathPointsRef.current.map((p, i) => i === action.pointIdx ? action.prev : p);
@@ -414,49 +526,275 @@ export default function WallModal({
     selectPathPoint(action.prevSelected);
   }, [selectPathPoint]);
 
-  // edge 에 사용된 점들만 모아 wallsFromPath 로 4벽 derive.
-  const derivedWalls = useMemo(() => {
-    if (pathEdges.length === 0) return null;
-    const used = new Set<number>();
-    for (const edge of pathEdges) {
-      if (pathPoints[edge.from] && pathPoints[edge.to]) {
-        used.add(edge.from);
-        used.add(edge.to);
+  // edge 그래프에서 **단일 cycle** 추출. cycle 미형성 시 null.
+  //
+  // cycle 인정 조건 (보수적 — 모호한 입력 차단):
+  //   1. 모든 점이 정확히 2개의 edge 에 속한다 (각 노드 degree = 2).
+  //   2. 단일 connected component.
+  //   3. 점 ≥ 3.
+  //
+  // 반환: cycle 순서대로 pathPoints 의 원본 인덱스 배열.
+  // 분기 (degree ≥ 3), 고립점 (degree = 0), 끝점 (degree = 1) 이 하나라도 있으면 cycle 아님.
+  function extractCycleOrder(
+    points: PathPoint[],
+    edges: PathEdge[],
+  ): number[] | null {
+    if (points.length < 3 || edges.length < 3) return null;
+    const N = points.length;
+    const adj = new Map<number, number[]>();
+    for (let i = 0; i < N; i++) adj.set(i, []);
+    for (const e of edges) {
+      if (!points[e.from] || !points[e.to]) continue;
+      adj.get(e.from)!.push(e.to);
+      adj.get(e.to)!.push(e.from);
+    }
+    const active: number[] = [];
+    adj.forEach((nbrs, idx) => { if (nbrs.length > 0) active.push(idx); });
+    if (active.length < 3) return null;
+    for (const idx of active) {
+      if (adj.get(idx)!.length !== 2) return null;
+    }
+    const start = active[0];
+    const visited = new Set<number>();
+    const stack = [start];
+    while (stack.length > 0) {
+      const node = stack.pop()!;
+      if (visited.has(node)) continue;
+      visited.add(node);
+      for (const n of adj.get(node)!) {
+        if (!visited.has(n)) stack.push(n);
       }
     }
-    if (used.size < 2) return null;
-    const worldPoints = Array.from(used, (idx) => pathPoints[idx]);
-    return wallsFromPath(worldPoints);
+    if (visited.size !== active.length) return null;
+    const order: number[] = [start];
+    let prev = -1;
+    let cur = start;
+    while (true) {
+      const nbrs = adj.get(cur)!;
+      const next = nbrs[0] !== prev ? nbrs[0] : nbrs[1];
+      if (next === start) break;
+      if (order.length > active.length) return null;
+      order.push(next);
+      prev = cur;
+      cur = next;
+    }
+    if (order.length !== active.length) return null;
+    return order;
+  }
+
+  /**
+   * 확정 후보 polygon — cycle 형성될 때만 산출. open polyline / 분기 / 고립점 상태에선 null.
+   *
+   * cycleOrder: cycle 순서대로 pathPoints 의 원본 인덱스. polygon[i] = pathPoints[cycleOrder[i]].
+   * → 평행화 적용 시 cycleOrder 로 pathPoints 의 어느 idx 를 갱신해야 할지 매핑.
+   */
+  const derivedPolygon = useMemo<DerivedPolygon | null>(() => {
+    const cycleOrder = extractCycleOrder(pathPoints, pathEdges);
+    if (!cycleOrder) return null;
+    const polygon = cycleOrder.map(i => pathPoints[i]);
+    const angleDeg = angleFromPolygon(polygon);
+    return { angleDeg, polygon, cycleOrder };
   }, [pathPoints, pathEdges]);
+
+  // ref 갱신 — draw / handleMouseDown 이 위에서 ref 통해 read.
+  useEffect(() => { derivedPolygonRef.current = derivedPolygon; }, [derivedPolygon]);
+
+  // 사용자 가이드 — cycle 형성 진행 상황.
+  const cycleStatus = useMemo<string>(() => {
+    if (derivedPolygon) return `cycle 형성 ✓ (${derivedPolygon.polygon.length}각형, 각도 ${derivedPolygon.angleDeg.toFixed(1)}°)`;
+    if (pathPoints.length === 0) return '점을 찍어 시작하세요.';
+    if (pathPoints.length < 3) return '닫힌 다각형이 되려면 최소 3점 필요.';
+    if (pathEdges.length < pathPoints.length) return '아직 닫히지 않았습니다 — 마지막 점을 첫 점과 연결하세요.';
+    // edges >= points 이지만 cycle 아닌 경우 (분기 등).
+    return '닫힌 단일 cycle 이 아닙니다 (분기 / 중복 edge / 고립점 확인).';
+  }, [derivedPolygon, pathPoints.length, pathEdges.length]);
+
+  // cycle 이 깨지면 평행화 모드 강제 해제 + 선택 초기화.
+  useEffect(() => {
+    if (!derivedPolygon && modeRef.current === 'parallel') {
+      modeRef.current = 'draw';
+      setMode('draw');
+      parallelSelectedRef.current = [];
+      setParallelSelected([]);
+    }
+  }, [derivedPolygon]);
+
+  // 점-선 거리 (segment ab 위의 perpendicular projection, segment 범위 밖이면 끝점까지 거리).
+  function segmentDistance(p: PathPoint, a: PathPoint, b: PathPoint): number {
+    const dx = b.x - a.x;
+    const dz = b.z - a.z;
+    const len2 = dx * dx + dz * dz;
+    if (len2 < 1e-12) return Math.hypot(p.x - a.x, p.z - a.z);
+    let t = ((p.x - a.x) * dx + (p.z - a.z) * dz) / len2;
+    t = Math.max(0, Math.min(1, t));
+    const qx = a.x + t * dx;
+    const qz = a.z + t * dz;
+    return Math.hypot(p.x - qx, p.z - qz);
+  }
+
+  // polygon cycle 의 i번째 변 = (polygon[i], polygon[(i+1)%N]). 마우스점에 가장 가까운 변 idx 반환.
+  const findEdgeHit = useCallback((rx: number, rz: number): number => {
+    if (!derivedPolygon) return -1;
+    const { polygon } = derivedPolygon;
+    const N = polygon.length;
+    let best = pathHitThreshold;
+    let hit = -1;
+    for (let i = 0; i < N; i++) {
+      const a = polygon[i];
+      const b = polygon[(i + 1) % N];
+      const d = segmentDistance({ x: rx, z: rz }, a, b);
+      if (d < best) { best = d; hit = i; }
+    }
+    return hit;
+  }, [derivedPolygon, pathHitThreshold]);
+
+  // ref 갱신 — handleMouseDown/Move 가 위에서 ref 통해 read.
+  useEffect(() => { findEdgeHitRef.current = findEdgeHit; }, [findEdgeHit]);
+
+  // 평행화 모드 토글.
+  const toggleParallelMode = useCallback(() => {
+    if (!derivedPolygon && modeRef.current === 'draw') return; // cycle 없으면 진입 불가
+    const next: CanvasMode = modeRef.current === 'parallel' ? 'draw' : 'parallel';
+    modeRef.current = next;
+    setMode(next);
+    parallelSelectedRef.current = [];
+    setParallelSelected([]);
+  }, [derivedPolygon]);
+
+  // 평행화 적용 — 선택 ≥ 2 일 때만. 첫 선택 segment = 기준 각도, 나머지 segment 들의 뒷 점을 회전.
+  // chain reaction 은 자연: 인접 segment 가 공유 점을 통해 자동 propagation.
+  const applyParallel = useCallback(() => {
+    if (!derivedPolygon) return;
+    const sel = parallelSelectedRef.current;
+    if (sel.length < 2) return;
+    const { polygon, cycleOrder } = derivedPolygon;
+    const N = polygon.length;
+
+    // 기준 각도 — 첫 선택 segment 의 (a→b) 방향. polygon 의 그 시점 좌표 사용.
+    const ref = sel[0];
+    const ra = polygon[ref];
+    const rb = polygon[(ref + 1) % N];
+    const theta = Math.atan2(rb.z - ra.z, rb.x - ra.x);
+    const cosT = Math.cos(theta);
+    const sinT = Math.sin(theta);
+
+    // pathPoints 의 변경될 좌표를 별도 배열로 누적.
+    const nextPoints = pathPointsRef.current.map(p => ({ ...p }));
+    // chain reaction 위해 매 segment 마다 nextPoints 의 cycle order 점을 즉시 read.
+    const get = (cycleIdx: number) => nextPoints[cycleOrder[cycleIdx]];
+
+    for (let k = 1; k < sel.length; k++) {
+      const segIdx = sel[k];
+      const aIdx = segIdx;
+      const bIdx = (segIdx + 1) % N;
+      const a = get(aIdx); // 그 시점 polygon 의 앞 점 (이전 변환 결과 반영)
+      const b = get(bIdx);
+      const len = Math.hypot(b.x - a.x, b.z - a.z);
+      if (len < 1e-9) continue;
+      const newBx = a.x + len * cosT;
+      const newBz = a.z + len * sinT;
+      nextPoints[cycleOrder[bIdx]] = { x: newBx, z: newBz };
+    }
+
+    // undo 기록 — 전체 좌표 스냅샷.
+    pathActionsRef.current.push({
+      type: 'parallel',
+      prevPoints: pathPointsRef.current.map(p => ({ ...p })),
+    });
+
+    pathPointsRef.current = nextPoints;
+    setPathPoints(nextPoints);
+    // 적용 후 선택 초기화 (모드는 유지 — 사용자가 추가 선택 가능).
+    parallelSelectedRef.current = [];
+    setParallelSelected([]);
+  }, [derivedPolygon]);
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70" onClick={onClose}>
       <div className="bg-gray-900 border border-gray-700 rounded-lg p-5 shadow-2xl" onClick={e => e.stopPropagation()}>
         <div className="text-white font-bold text-sm mb-1">벽면 설정</div>
         <div className="text-gray-400 text-xs mb-3">
-          좌클릭으로 점과 선을 추가, 기존 점은 드래그로 이동. 점을 클릭하면 직전에 선택한 점과 연결되고, 우클릭은 마지막 조작을 되돌립니다.
+          {mode === 'parallel' ? (
+            <>
+              선분을 클릭해 선택. 첫 선택 선분이 기준 각도, 나머지가 그에 평행해집니다.
+              <br />
+              우클릭으로 마지막 적용 되돌리기.
+            </>
+          ) : (
+            <>
+              좌클릭으로 점과 선을 추가, 기존 점은 드래그로 이동. 점을 클릭하면 직전에 선택한 점과 연결되고, 우클릭은 마지막 조작을 되돌립니다.
+              <br />
+              모든 점이 닫힌 cycle 로 연결되어야 확인이 활성화됩니다.
+            </>
+          )}
         </div>
         <div>
           <div className="text-gray-500 text-[10px] mb-1 text-center">Top-down (XZ)</div>
           <canvas ref={xzRef} style={{ width: CW, height: CH, userSelect: 'none' }}
-            className="border border-gray-700 rounded cursor-crosshair"
+            className={`border border-gray-700 rounded ${mode === 'parallel' ? 'cursor-pointer' : 'cursor-crosshair'}`}
             onMouseDown={handleMouseDown}
             onMouseMove={handleMouseMove}
             onContextMenu={handleContextMenu} />
         </div>
-        <div className="flex items-center justify-between mt-3">
-          <div className="text-gray-500 text-xs font-mono">
-            {`점 ${pathPoints.length}개, 선 ${pathEdges.length}개${derivedWalls ? `, 각도 ${derivedWalls.angleDeg.toFixed(1)}°` : ''}`}
+        {/* 평행화 컨트롤 — cycle 형성 시 활성. 평행화 모드에서는 적용/선택 초기화 노출. */}
+        <div className="flex items-center justify-between mt-3 gap-3">
+          <div className="text-xs font-mono flex-1 min-w-0">
+            <div className="text-gray-500">{`점 ${pathPoints.length}개, 선 ${pathEdges.length}개`}</div>
+            <div className={`truncate ${derivedPolygon ? 'text-green-400' : 'text-amber-400'}`}>
+              {cycleStatus}
+            </div>
+            {mode === 'parallel' && (
+              <div className="text-cyan-400 truncate">
+                {parallelSelected.length === 0
+                  ? '선분을 클릭해 기준을 선택하세요.'
+                  : parallelSelected.length === 1
+                    ? `기준 선분 선택됨. 평행하게 만들 선분을 추가 선택.`
+                    : `${parallelSelected.length}개 선택 (기준 1개 + 대상 ${parallelSelected.length - 1}개)`}
+              </div>
+            )}
           </div>
-          <div className="flex gap-2">
-            <button onClick={onClose}
-              className="px-4 py-2 bg-gray-700 hover:bg-gray-600 text-gray-300 rounded text-sm cursor-pointer">취소</button>
-            <button onClick={() => {
-              if (!derivedWalls) return;
-              onConfirm(derivedWalls.angleDeg, derivedWalls.walls);
-            }}
-              disabled={!derivedWalls}
-              className="px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed text-white rounded text-sm cursor-pointer font-bold">확인</button>
+          <div className="flex gap-2 shrink-0">
+            {mode === 'parallel' ? (
+              <>
+                <button
+                  onClick={() => { parallelSelectedRef.current = []; setParallelSelected([]); }}
+                  disabled={parallelSelected.length === 0}
+                  className="px-3 py-2 bg-gray-700 hover:bg-gray-600 disabled:bg-gray-800 disabled:text-gray-500 disabled:cursor-not-allowed text-gray-300 rounded text-xs cursor-pointer">
+                  선택 초기화
+                </button>
+                <button
+                  onClick={() => applyParallel()}
+                  disabled={parallelSelected.length < 2}
+                  title={parallelSelected.length < 2 ? '기준 + 대상 선분 2개 이상 선택 필요' : ''}
+                  className="px-3 py-2 bg-cyan-600 hover:bg-cyan-500 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed text-white rounded text-xs cursor-pointer font-bold">
+                  적용
+                </button>
+                <button
+                  onClick={() => toggleParallelMode()}
+                  className="px-3 py-2 bg-amber-600 hover:bg-amber-500 text-white rounded text-xs cursor-pointer">
+                  모드 해제
+                </button>
+              </>
+            ) : (
+              <>
+                <button
+                  onClick={() => toggleParallelMode()}
+                  disabled={!derivedPolygon}
+                  title={derivedPolygon ? '' : 'cycle 형성 후 사용 가능'}
+                  className="px-3 py-2 bg-cyan-700 hover:bg-cyan-600 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed text-white rounded text-xs cursor-pointer">
+                  평행하게 만들기
+                </button>
+                <button onClick={onClose}
+                  className="px-4 py-2 bg-gray-700 hover:bg-gray-600 text-gray-300 rounded text-sm cursor-pointer">취소</button>
+                <button onClick={() => {
+                  if (!derivedPolygon) return;
+                  onConfirm(derivedPolygon.angleDeg, derivedPolygon.polygon);
+                }}
+                  disabled={!derivedPolygon}
+                  title={derivedPolygon ? '' : cycleStatus}
+                  className="px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed text-white rounded text-sm cursor-pointer font-bold">확인</button>
+              </>
+            )}
           </div>
         </div>
       </div>

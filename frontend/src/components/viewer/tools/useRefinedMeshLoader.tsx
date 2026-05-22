@@ -177,7 +177,8 @@ export function useRefinedMeshLoader(
               });
               if (cancelled) return;
               if (img) {
-                const wallSid = door.wallSurfaceId ?? 'w1a';
+                // N벽 일반화 — door 가 어느 벽에 속하는지는 정합 시 closest-plane 으로 결정. fallback: 'w0'.
+                const wallSid = door.wallSurfaceId ?? 'w0';
                 const ent = createWallMeshFromPersisted(pc, app, {
                   surfaceId: `door_${door.id}_${wallSid}`,
                   corners: dm.corners,

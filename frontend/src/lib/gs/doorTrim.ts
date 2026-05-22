@@ -91,7 +91,7 @@ export interface DecomposeOptions {
   doorThickness?: number;
   /**
    * 벽 평면의 outward 방향 단위벡터 (방 바깥 방향). 슬랩의 비대칭 방향 결정에 사용.
-   * `surfacePlanesFromRoom` 의 plane.normal 을 그대로 넘기면 됨.
+   * `surfacePlanesFromPolygon` 의 wall plane.normal 을 그대로 넘기면 됨.
    * 미지정 시 rectGeom.planeNormal 의 부호를 임의로 사용 — 비대칭이 의도와 반대로 동작할 수 있으므로 가능하면 명시.
    */
   wallOutwardNormal?: Vec3;

@@ -41,10 +41,24 @@ export interface RefineToolOptions {
   onRequestMetadata?: () => Promise<SaveMetadata>;
 }
 
-export const ALL_SURFACES = ['ceiling', 'floor', 'w1a', 'w1b', 'w2a', 'w2b'] as const;
-export type Surface = typeof ALL_SURFACES[number];
-export const CF_SURFACES: Surface[] = ['ceiling', 'floor'];
-export const WALL_SURFACES: Surface[] = ['w1a', 'w1b', 'w2a', 'w2b'];
+// 표면 종류 — 천장/바닥은 고정 ID, 벽은 폴리곤 변 수만큼 동적 `w0..w(N-1)`.
+//   ex. polygon 4점 → 'w0','w1','w2','w3'. polygon 5점 → 'w0'..'w4'.
+//   surfaceId 가 동적이므로 Surface 는 string 으로 통일 (template literal 로 좁힐 수도 있으나
+//   여러 사용처에서 set/map 키로 쓰여 단순 string 이 실용적).
+export type Surface = string;
+
+export const CF_SURFACES: ReadonlyArray<Surface> = ['ceiling', 'floor'];
+
+/** wall surface id pattern: `w` + 정수. polygon 의 i번째 변 → `w${i}`. */
+export const isWallSurface = (s: Surface): boolean => /^w\d+$/.test(s);
+export const isFixedSurface = (s: Surface): boolean => s === 'ceiling' || s === 'floor';
+
+/** polygon 의 변 수 → wall surfaceId 배열. */
+export function wallSurfaceIds(numEdges: number): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < numEdges; i++) out.push(`w${i}`);
+  return out;
+}
 
 export type OpRecord =
   | { type: 'rotation'; prevRotation: { rotX: number; rotZ: number } }

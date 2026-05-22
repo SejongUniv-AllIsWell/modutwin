@@ -7,52 +7,89 @@
  *
  * 좌표는 A' 프레임 (raw + pendingRotation) — wallMesh와 동일하게
  * Z-180만 직접 부여하여 splat과 정렬.
+ *
+ * N벽 일반화: 입력은 SurfacePlane[] + 폴리곤 (XZ) + 천장/바닥 Y. wall face center 는
+ * 폴리곤 i 번째 변의 중점, ceiling/floor 는 폴리곤 centroid 위에 위치.
  */
 
 import type { Vec3 } from './textureBake';
+import type { SurfacePlane, PolygonPoint } from './planes';
 
-export interface SafetyVizRoom {
-  angleDeg: number;
-  walls: [number, number, number, number]; // a1, b1, a2, b2
+export interface SafetyVizGeometry {
+  /** ceiling/floor + w0..w(N-1) 모두 포함 (보통 surfacePlanesFromPolygon 결과). */
+  planes: SurfacePlane[];
+  /** wall 변 정의용 폴리곤 (cycle 순서). planes 의 `w${i}` 와 인덱스 매칭. */
+  polygon: PolygonPoint[];
   ceilingY: number;
   floorY: number;
 }
 
 interface FaceDef {
-  id: 'ceiling' | 'floor' | 'w1a' | 'w1b' | 'w2a' | 'w2b';
+  id: string;
   center: Vec3;
   normal: Vec3;
   color: [number, number, number];
 }
 
-function buildFaces(room: SafetyVizRoom): FaceDef[] {
-  const rad = (room.angleDeg * Math.PI) / 180;
-  const c = Math.cos(rad), s = Math.sin(rad);
-  const [a1, b1, a2, b2] = room.walls;
-  const { ceilingY: cy, floorY: fy } = room;
+// w0, w1, w2, ... 순환 색상 (HSV-spread). 단일 시각 가이드이므로 정확한 색 불필요.
+const WALL_PALETTE: Array<[number, number, number]> = [
+  [1.0, 0.3, 0.3],
+  [0.3, 1.0, 0.3],
+  [1.0, 1.0, 0.3],
+  [0.6, 0.3, 1.0],
+  [0.3, 1.0, 1.0],
+  [1.0, 0.3, 1.0],
+  [1.0, 0.6, 0.2],
+  [0.2, 0.6, 1.0],
+];
 
-  const ux = c, uz = s;
-  const vx = -s, vz = c;
-  const uMid = (a1 + b1) / 2;
-  const vMid = (a2 + b2) / 2;
+function buildFaces(geom: SafetyVizGeometry): FaceDef[] {
+  const { planes, polygon, ceilingY: cy, floorY: fy } = geom;
   const yMid = (cy + fy) / 2;
 
-  const cxz = (u: number, v: number): [number, number] => [u * ux + v * vx, u * uz + v * vz];
+  // 폴리곤 centroid (XZ) — ceiling/floor face center.
+  let cxSum = 0, czSum = 0;
+  for (const p of polygon) { cxSum += p.x; czSum += p.z; }
+  const cx = polygon.length > 0 ? cxSum / polygon.length : 0;
+  const cz = polygon.length > 0 ? czSum / polygon.length : 0;
 
-  const [cMidX, cMidZ] = cxz(uMid, vMid);
-  const [w1aX, w1aZ] = cxz(a1, vMid);
-  const [w1bX, w1bZ] = cxz(b1, vMid);
-  const [w2aX, w2aZ] = cxz(uMid, a2);
-  const [w2bX, w2bZ] = cxz(uMid, b2);
-
-  return [
-    { id: 'ceiling', center: [cMidX, cy, cMidZ], normal: [0, 1, 0],   color: [1.0, 0.5, 0.2] },
-    { id: 'floor',   center: [cMidX, fy, cMidZ], normal: [0, -1, 0],  color: [0.4, 0.7, 1.0] },
-    { id: 'w1a',     center: [w1aX, yMid, w1aZ], normal: [-c, 0, -s], color: [1.0, 0.3, 0.3] },
-    { id: 'w1b',     center: [w1bX, yMid, w1bZ], normal: [c, 0, s],   color: [0.3, 1.0, 0.3] },
-    { id: 'w2a',     center: [w2aX, yMid, w2aZ], normal: [s, 0, -c],  color: [1.0, 1.0, 0.3] },
-    { id: 'w2b',     center: [w2bX, yMid, w2bZ], normal: [-s, 0, c],  color: [0.6, 0.3, 1.0] },
-  ];
+  const faces: FaceDef[] = [];
+  const N = polygon.length;
+  for (const plane of planes) {
+    if (plane.id === 'ceiling') {
+      faces.push({
+        id: 'ceiling',
+        center: [cx, cy, cz],
+        normal: [plane.normal[0], plane.normal[1], plane.normal[2]],
+        color: [1.0, 0.5, 0.2],
+      });
+      continue;
+    }
+    if (plane.id === 'floor') {
+      faces.push({
+        id: 'floor',
+        center: [cx, fy, cz],
+        normal: [plane.normal[0], plane.normal[1], plane.normal[2]],
+        color: [0.4, 0.7, 1.0],
+      });
+      continue;
+    }
+    const m = /^w(\d+)$/.exec(plane.id);
+    if (!m) continue;
+    const i = parseInt(m[1], 10);
+    if (i < 0 || i >= N) continue;
+    const a = polygon[i];
+    const b = polygon[(i + 1) % N];
+    const mx = (a.x + b.x) * 0.5;
+    const mz = (a.z + b.z) * 0.5;
+    faces.push({
+      id: plane.id,
+      center: [mx, yMid, mz],
+      normal: [plane.normal[0], plane.normal[1], plane.normal[2]],
+      color: WALL_PALETTE[i % WALL_PALETTE.length],
+    });
+  }
+  return faces;
 }
 
 function createArrow(
@@ -125,12 +162,12 @@ export interface OffsetArrowsOptions {
 }
 
 /**
- * 6면에 화살표를 배치한 부모 엔티티 반환.
+ * 모든 면 (천장/바닥/N벽) 에 화살표를 배치한 부모 엔티티 반환.
  * app.root에 붙이면 됨 (Z-180은 내부에서 부여).
  */
 export function createOffsetArrows(
   pc: any,
-  room: SafetyVizRoom,
+  geom: SafetyVizGeometry,
   offset: number,
   opts: OffsetArrowsOptions,
 ): any {
@@ -140,7 +177,7 @@ export function createOffsetArrows(
 
   const thickness = opts.thickness ?? 0.015;
   const originOffset = opts.originOffset ?? 0;
-  const faces = buildFaces(room);
+  const faces = buildFaces(geom);
   for (const f of faces) {
     const color = opts.colorOverride ?? f.color;
     const originCenter: Vec3 = [

@@ -3,7 +3,7 @@
 import { useRef, useState, useCallback, useEffect, RefObject, lazy, Suspense } from 'react';
 import { SplatData, SplatViewerCoreRef } from '../SplatViewerCore';
 import { useDepthNormal } from './useDepthNormal';
-import { surfacePlanesFromRoom, signedDistance } from '@/lib/gs/planes';
+import { surfacePlanesFromPolygon, signedDistance, type SurfacePlane, type PolygonPoint } from '@/lib/gs/planes';
 import { loadRefineState, saveRefineState, clearRefineState } from '@/lib/refine/persistence';
 import type { GaussianScene } from '@/lib/ply/types';
 import {
@@ -29,12 +29,13 @@ import {
   type Vec3,
 } from './refineMath';
 import {
-  ALL_SURFACES,
   CF_SURFACES,
   SELECT_SUB_MODES,
   UNDO_STACK_LIMIT,
-  WALL_SURFACES,
+  isFixedSurface,
   isSelectMode,
+  isWallSurface,
+  wallSurfaceIds,
   type OpRecord,
   type PaintMode,
   type RefineMode,
@@ -98,12 +99,13 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   const cfModeRef = useRef<'none' | 'confirmed'>('none');
 
   // ── Wall state ──
+  // N벽 모델 — wallPolygon 의 cycle 순서 i번째 변이 surfaceId `w${i}` 평면.
   const [wallModalOpen, setWallModalOpen] = useState(false);
   const [wallMode, setWallMode] = useState<'none' | 'confirmed'>('none');
   const [wallAngle, setWallAngle] = useState<number | null>(null);
-  const [wallDistances, setWallDistances] = useState<[number, number, number, number] | null>(null);
+  const [wallPolygon, setWallPolygon] = useState<PolygonPoint[] | null>(null);
   const wallAngleRef = useRef<number | null>(null);
-  const wallDistancesRef = useRef<[number, number, number, number] | null>(null);
+  const wallPolygonRef = useRef<PolygonPoint[] | null>(null);
   const wallModeRef = useRef<'none' | 'confirmed'>('none');
   const selectedSurfacesRef = useRef<Set<string>>(new Set());
 
@@ -116,20 +118,19 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   // 진행 중 전체 화면 오버레이 (업로드 단계 가시화).
   const [uploadProgressOpen, setUploadProgressOpen] = useState(false);
   const [uploadProgressMessage, setUploadProgressMessage] = useState('');
-  // 단일 안전거리 — 모든 경계면(천장/바닥/4벽)이 공유
+  // 단일 안전거리 — 모든 경계면(천장/바닥/N벽)이 공유
   // 외부 splat 제거 임계값 (m). 0 이면 평면(sd=0) 보다 바깥(sd>0)인 모든 splat 을 제거.
   // 사용자가 추가 안전거리 (e.g., 평면이 약간 부정확할 때 일부 보호) 원하면 양수 값으로 미세 조정.
   const [globalOffset, setGlobalOffset] = useState(0);
   const [globalOffsetText, setGlobalOffsetText] = useState('0');
-  // shell 마스크 계산용 (모든 면 동일 globalOffset)
-  const surfaceOffsets: Record<Surface, number> = {
-    ceiling: globalOffset, floor: globalOffset, w1a: globalOffset, w1b: globalOffset, w2a: globalOffset, w2b: globalOffset,
-  };
+
+  // 현재 폴리곤 변 수 (N) — wall surfaceId 목록 derive.
+  const wallSurfaceIdList: string[] = wallPolygon ? wallSurfaceIds(wallPolygon.length) : [];
 
   const toggleSurface = (s: Surface) => {
     // Don't allow toggling disabled surfaces
-    if (CF_SURFACES.includes(s) && cfMode !== 'confirmed') return;
-    if (WALL_SURFACES.includes(s) && wallMode !== 'confirmed') return;
+    if (isFixedSurface(s) && cfMode !== 'confirmed') return;
+    if (isWallSurface(s) && wallMode !== 'confirmed') return;
     setSelectedSurfaces(prev => {
       const next = new Set(prev);
       if (next.has(s)) next.delete(s); else next.add(s);
@@ -138,8 +139,8 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   };
   const toggleAllSurfaces = () => {
     const available: Surface[] = [
-      ...(cfMode === 'confirmed' ? CF_SURFACES : []),
-      ...(wallMode === 'confirmed' ? WALL_SURFACES : []),
+      ...(cfMode === 'confirmed' ? Array.from(CF_SURFACES) : []),
+      ...(wallMode === 'confirmed' ? wallSurfaceIdList : []),
     ];
     setSelectedSurfaces(prev => prev.size === available.length ? new Set() : new Set(available));
   };
@@ -356,7 +357,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     };
     cleanup();
 
-    const wallReady = wallMode === 'confirmed' && wallAngle !== null && wallDistances !== null;
+    const wallReady = wallMode === 'confirmed' && wallPolygon !== null;
     const cfReady = cfMode === 'confirmed';
     if (!wallReady || !cfReady) return;
     if (!safetyVizActive) return;
@@ -365,13 +366,15 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     (async () => {
       const { createOffsetArrows } = await import('@/lib/gs/safetyArrows');
       if (cancelled) return;
-      const room = {
-        angleDeg: wallAngle!,
-        walls: wallDistances! as [number, number, number, number],
-        ceilingY,
-        floorY,
-      };
-      const ent = createOffsetArrows(pc, room, globalOffset, {
+      const planes = surfacePlanesFromPolygon({
+        polygon: wallPolygon!,
+        ceilingY, floorY,
+      });
+      const ent = createOffsetArrows(pc, {
+        planes,
+        polygon: wallPolygon!,
+        ceilingY, floorY,
+      }, globalOffset, {
         direction: 'both',
         name: 'safetyArrows',
       });
@@ -382,7 +385,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     return () => { cancelled = true; cleanup(); };
   }, [
     safetyVizActive, globalOffset,
-    wallMode, wallAngle, wallDistances, cfMode, ceilingY, floorY,
+    wallMode, wallPolygon, cfMode, ceilingY, floorY,
     coreRef,
   ]);
 
@@ -405,34 +408,56 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       paintFlattenMask();
       return;
     }
-    const hasWall = Array.from(selectedSurfaces).some(s => WALL_SURFACES.includes(s));
-    if (hasWall && (wallAngle === null || !wallDistances)) return;
+    const hasWall = Array.from(selectedSurfaces).some(s => isWallSurface(s));
+    if (hasWall && !wallPolygon) return;
 
     let cancelled = false;
     (async () => {
-      const { surfacePlanesFromRoom, signedDistance } = await import('@/lib/gs/planes');
       if (cancelled) return;
-
-      const allPlanes = surfacePlanesFromRoom({
-        angleDeg: wallAngle ?? 0,
-        walls: (wallDistances ?? [0, 0, 0, 0]) as [number, number, number, number],
-        ceilingY, floorY,
-      });
-      const planes = allPlanes.filter(p => selectedSurfaces.has(p.id as Surface));
-      // 평면(sd=0) 바깥(sd > globalOffset) 인 splat 을 kill. globalOffset=0 이면 sd>0 모든 외부 splat.
-      // (이전 버전의 nearProtect=3cm hardcoded floor 제거 — 평면 본체 보호는 splat 위치 자체가 sd≤0
-      //  영역에 모여있어 자연스럽게 보장됨.)
+      // applyFlatten 과 동일 알고리즘 — wall 선택 시 polygon-inside test, ceiling/floor 는 Y 비교.
       const cutThreshold = globalOffset;
+      const selectsCeiling = selectedSurfaces.has('ceiling');
+      const selectsFloor = selectedSurfaces.has('floor');
+      const selectsAnyWall = Array.from(selectedSurfaces).some(s => isWallSurface(s));
+      const polygonReady = !!wallPolygon && wallPolygon.length >= 3;
+
+      const polygonSD = polygonReady
+        ? (x: number, z: number): number => {
+            let inside = false;
+            let minDist = Infinity;
+            const P = wallPolygon!;
+            for (let i = 0, j = P.length - 1; i < P.length; j = i++) {
+              const xi = P[i].x, zi = P[i].z;
+              const xj = P[j].x, zj = P[j].z;
+              if (((zi > z) !== (zj > z)) &&
+                  (x < (xj - xi) * (z - zi) / ((zj - zi) || 1e-12) + xi)) {
+                inside = !inside;
+              }
+              const dx = xi - xj, dz = zi - zj;
+              const len2 = dx * dx + dz * dz;
+              let t = len2 > 0 ? ((x - xj) * dx + (z - zj) * dz) / len2 : 0;
+              t = Math.max(0, Math.min(1, t));
+              const qx = xj + t * dx, qz = zj + t * dz;
+              const d = Math.hypot(x - qx, z - qz);
+              if (d < minDist) minDist = d;
+            }
+            return inside ? -minDist : minDist;
+          }
+        : null;
 
       const rotPos = buildRotatedPositions(data.posX, data.posY, data.posZ);
       const N = data.numSplats;
       const mask = new Uint8Array(N);
       for (let i = 0; i < N; i++) {
         const x = rotPos.x[i], y = rotPos.y[i], z = rotPos.z[i];
-        for (const p of planes) {
-          const sd = signedDistance(p, x, y, z);
-          if (sd > cutThreshold) { mask[i] = 1; break; }
+        let outside = false;
+        if (selectsCeiling && y > ceilingY + cutThreshold) outside = true;
+        if (!outside && selectsFloor && y < floorY - cutThreshold) outside = true;
+        if (!outside && selectsAnyWall && polygonSD) {
+          const sd = polygonSD(x, z);
+          if (sd > cutThreshold) outside = true;
         }
+        if (outside) mask[i] = 1;
       }
       if (cancelled) return;
       flattenPreviewMaskRef.current = mask;
@@ -442,7 +467,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     return () => { cancelled = true; };
   }, [
     flattenPreviewActive, globalOffset, selectedSurfaces,
-    wallAngle, wallDistances, ceilingY, floorY,
+    wallPolygon, ceilingY, floorY,
     buildRotatedPositions, paintFlattenMask,
   ]);
 
@@ -482,25 +507,48 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
 
     // 비활성 → 마스크 계산 + 활성
     if (selectedSurfaces.size === 0) { alert('경계면을 하나 이상 선택하세요.'); return; }
-    const hasWall = Array.from(selectedSurfaces).some(s => WALL_SURFACES.includes(s));
-    if (hasWall && (wallAngleRef.current === null || !wallDistancesRef.current)) return;
+    const hasWall = Array.from(selectedSurfaces).some(s => isWallSurface(s));
+    if (hasWall && !wallPolygonRef.current) return;
 
     const data = splatDataRef.current;
     if (!data) return;
 
     setFlattening(true);
     try {
-      const { surfacePlanesFromRoom, signedDistance } = await import('@/lib/gs/planes');
-
-      const allPlanes = surfacePlanesFromRoom({
-        angleDeg: wallAngleRef.current ?? 0,
-        walls: wallDistancesRef.current ?? [0, 0, 0, 0] as [number, number, number, number],
-        ceilingY: ceilingYRef.current,
-        floorY: floorYRef.current,
-      });
-      const planes = allPlanes.filter(p => selectedSurfaces.has(p.id as Surface));
-      // 평면(sd=0) 바깥 (sd > globalOffset) 인 splat 을 kill. globalOffset=0 이면 sd>0 모든 외부 splat.
+      const polygon = wallPolygonRef.current;
+      const cy = ceilingYRef.current;
+      const fy = floorYRef.current;
       const cutThreshold = globalOffset;
+
+      const selectsCeiling = selectedSurfaces.has('ceiling');
+      const selectsFloor = selectedSurfaces.has('floor');
+      const selectsAnyWall = Array.from(selectedSurfaces).some(s => isWallSurface(s));
+      const polygonReady = !!polygon && polygon.length >= 3;
+
+      // polygon signed distance (음수 = 내부, 양수 = 외부). 비-볼록 polygon 도 정확.
+      const polygonSD = polygonReady
+        ? (x: number, z: number): number => {
+            let inside = false;
+            let minDist = Infinity;
+            const P = polygon!;
+            for (let i = 0, j = P.length - 1; i < P.length; j = i++) {
+              const xi = P[i].x, zi = P[i].z;
+              const xj = P[j].x, zj = P[j].z;
+              if (((zi > z) !== (zj > z)) &&
+                  (x < (xj - xi) * (z - zi) / ((zj - zi) || 1e-12) + xi)) {
+                inside = !inside;
+              }
+              const dx = xi - xj, dz = zi - zj;
+              const len2 = dx * dx + dz * dz;
+              let t = len2 > 0 ? ((x - xj) * dx + (z - zj) * dz) / len2 : 0;
+              t = Math.max(0, Math.min(1, t));
+              const qx = xj + t * dx, qz = zj + t * dz;
+              const d = Math.hypot(x - qx, z - qz);
+              if (d < minDist) minDist = d;
+            }
+            return inside ? -minDist : minDist;
+          }
+        : null;
 
       // splatData posX/Y/Z (A 프레임)을 회전 → A' 프레임. 이 프레임에서 평면과 비교.
       const rotPos = buildRotatedPositions(data.posX, data.posY, data.posZ);
@@ -508,24 +556,25 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       const N = data.numSplats;
       const newMask = new Uint8Array(N);
       let deletedCount = 0;
-      const killByPlane: Record<string, number> = {};
-      for (const p of planes) killByPlane[p.id] = 0;
+      const killStats = { ceiling: 0, floor: 0, wallOutside: 0 };
       for (let i = 0; i < N; i++) {
         const x = rotPos.x[i], y = rotPos.y[i], z = rotPos.z[i];
         let outside = false;
-        for (const p of planes) {
-          const sd = signedDistance(p, x, y, z);
-          if (sd > cutThreshold) {
-            outside = true;
-            killByPlane[p.id]++;
-            break;
-          }
+        // 천장 — selected 시 ceilingY 위쪽 (cutThreshold 확장) 제거.
+        if (selectsCeiling && y > cy + cutThreshold) { outside = true; killStats.ceiling++; }
+        // 바닥 — selected 시 floorY 아래쪽 제거.
+        if (!outside && selectsFloor && y < fy - cutThreshold) { outside = true; killStats.floor++; }
+        // 벽 — wall 이 하나라도 선택되면 polygon 외부 전체 제거 (polygon signed distance > cutThreshold).
+        //   각 wall 의 무한 평면 sd 가 아닌 polygon 경계 자체 기준 → polygon 변 segment 너머도 정확히 처리.
+        if (!outside && selectsAnyWall && polygonSD) {
+          const sd = polygonSD(x, z);
+          if (sd > cutThreshold) { outside = true; killStats.wallOutside++; }
         }
         if (outside) { newMask[i] = 1; deletedCount++; }
       }
       console.log(`[Shell] flatten mask: ${deletedCount} / ${N} gaussians`);
-      console.log('[Shell] kill-by-plane:', killByPlane);
-      console.log('[Shell] params:', { cutThreshold, pendingRot: pendingRotationRef.current });
+      console.log('[Shell] kill-stats:', killStats);
+      console.log('[Shell] params:', { cutThreshold, selectsCeiling, selectsFloor, selectsAnyWall, polygonReady, pendingRot: pendingRotationRef.current });
 
       // undo 기록 (이전 상태 = 비활성 + 마스크 없음)
       pushOp({ type: 'flatten', prevMask: null, prevActive: false });
@@ -541,7 +590,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     } finally {
       setFlattening(false);
     }
-  }, [selectedSurfaces, surfaceOffsets, buildRotatedPositions, paintFlattenMask, pushOp]);
+  }, [selectedSurfaces, globalOffset, buildRotatedPositions, paintFlattenMask, pushOp]);
 
   // ── applyClipping: 토글식 — 비등방 scale 축소로 가우시안 extent 가 6 평면을 넘지 않게.
   // ON: 평면별 g_i² = 1 - a_in² (1 - f²), f = |sd|/ext. axis 별 min(g²) 적용.
@@ -582,17 +631,16 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       }
 
       // ON → clip 계산 + 적용.
-      const wallReady = wallMode === 'confirmed' && wallAngleRef.current !== null && wallDistancesRef.current !== null;
+      const wallReady = wallMode === 'confirmed' && wallPolygonRef.current !== null;
       const cfReady = cfMode === 'confirmed';
       if (!wallReady || !cfReady) {
-        alert('천장/바닥 + 벽 4면을 먼저 확정하세요.');
+        alert('천장/바닥 + 벽면을 먼저 확정하세요.');
         return;
       }
 
-      const { surfacePlanesFromRoom } = await import('@/lib/gs/planes');
-      const planes = surfacePlanesFromRoom({
-        angleDeg: wallAngleRef.current!,
-        walls: wallDistancesRef.current! as [number, number, number, number],
+      const { surfacePlanesFromPolygon } = await import('@/lib/gs/planes');
+      const planes = surfacePlanesFromPolygon({
+        polygon: wallPolygonRef.current!,
         ceilingY: ceilingYRef.current,
         floorY: floorYRef.current,
       });
@@ -735,9 +783,9 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       // 그 외엔 fall through 해서 새로 베이크
     }
     if (selectedSurfaces.size === 0) { alert('테스트할 면을 하나 이상 선택하세요.'); return; }
-    const hasCF = Array.from(selectedSurfaces).some(s => CF_SURFACES.includes(s));
-    // 벽 거리는 천장/바닥 막의 가로/세로 범위 산정에도 쓰이므로 어떤 면이든 벽면 설정이 확정돼야 함.
-    if (wallAngleRef.current === null || !wallDistancesRef.current) { alert('벽면 (X/Z) 설정이 먼저 확정돼야 합니다.'); return; }
+    const hasCF = Array.from(selectedSurfaces).some(s => isFixedSurface(s));
+    // 천장/바닥 텍스처도 폴리곤 bbox 로 정의하므로 어떤 면이든 벽면 설정이 확정돼야 함.
+    if (!wallPolygonRef.current) { alert('벽면 설정이 먼저 확정돼야 합니다.'); return; }
     if (hasCF && cfModeRef.current !== 'confirmed') { alert('천장/바닥 정보가 확정되지 않았습니다.'); return; }
 
     setWallMeshBaking(true);
@@ -769,12 +817,37 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       const rotated = await buildRotatedScene(brushFilteredOriginal);
       const source = rotated;
 
+      const polygon = wallPolygonRef.current!;
+      const cy = ceilingYRef.current, fy = floorYRef.current;
+      const surfacePlanes = surfacePlanesFromPolygon({ polygon, ceilingY: cy, floorY: fy });
       const room = {
-        angleDeg: wallAngleRef.current ?? 0,
-        walls: (wallDistancesRef.current ?? [0, 0, 0, 0]) as [number, number, number, number],
-        ceilingY: ceilingYRef.current,
-        floorY: floorYRef.current,
+        surfacePlanes,
+        polygon,
+        ceilingY: cy,
+        floorY: fy,
       };
+
+      // 진단 로그 — polygon 점 좌표 + cycle 순서 + winding + 각 wall 의 변 양끝/길이/normal.
+      let signed2A = 0;
+      for (let i = 0; i < polygon.length; i++) {
+        const a = polygon[i];
+        const b = polygon[(i + 1) % polygon.length];
+        signed2A += a.x * b.z - b.x * a.z;
+      }
+      const winding = signed2A > 0 ? 'CCW' : (signed2A < 0 ? 'CW' : 'degenerate');
+      console.log(`[bakeWallMeshTest] polygon N=${polygon.length}, winding=${winding} (signed2A=${signed2A.toFixed(3)}), ceilingY=${cy.toFixed(3)}, floorY=${fy.toFixed(3)}`);
+      console.log(`[bakeWallMeshTest] polygon points (cycle order):`);
+      polygon.forEach((p, i) => console.log(`    [${i}] (${p.x.toFixed(3)}, ${p.z.toFixed(3)})`));
+      console.log(`[bakeWallMeshTest] wall edges (w_i 는 polygon[i] → polygon[(i+1)%N]):`);
+      for (let i = 0; i < polygon.length; i++) {
+        const a = polygon[i];
+        const b = polygon[(i + 1) % polygon.length];
+        const dx = b.x - a.x, dz = b.z - a.z;
+        const len = Math.hypot(dx, dz);
+        const plane = surfacePlanes.find(p => p.id === `w${i}`);
+        const nrm = plane ? `n=(${plane.normal[0].toFixed(3)}, ${plane.normal[2].toFixed(3)})` : 'plane MISSING';
+        console.log(`    w${i}: a=(${a.x.toFixed(3)}, ${a.z.toFixed(3)}) → b=(${b.x.toFixed(3)}, ${b.z.toFixed(3)}), len=${len.toFixed(3)}m, ${nrm}`);
+      }
 
       const core = coreRef.current;
       const splatData = core?.getSplatData();
@@ -817,7 +890,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     } finally {
       setWallMeshBaking(false);
     }
-  }, [selectedSurfaces, surfaceOffsets, ensureOriginalScene, buildRotatedScene, coreRef, wallMeshDebugWhite, bakeInnerGate, pushOp]);
+  }, [selectedSurfaces, globalOffset, ensureOriginalScene, buildRotatedScene, coreRef, wallMeshDebugWhite, bakeInnerGate, pushOp]);
 
   // 가장 최근 베이크 결과를 PNG로 다운로드 (디버그)
   const downloadBakedTextures = useCallback(() => {
@@ -1081,7 +1154,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   useEffect(() => { floorYRef.current = floorY; }, [floorY]);
   useEffect(() => { cfModeRef.current = cfMode; }, [cfMode]);
   useEffect(() => { wallAngleRef.current = wallAngle; }, [wallAngle]);
-  useEffect(() => { wallDistancesRef.current = wallDistances; }, [wallDistances]);
+  useEffect(() => { wallPolygonRef.current = wallPolygon; }, [wallPolygon]);
   useEffect(() => { wallModeRef.current = wallMode; }, [wallMode]);
 
   useEffect(() => {
@@ -1124,9 +1197,9 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       // entity 회전도 즉시 동기화 (다음 마운트 시 splatData 가 준비되면 자동 호출되지만 안전 차원).
     }
     // 벽면
-    if (saved.wallConfirmed && saved.wallAngle !== null && saved.wallDistances) {
+    if (saved.wallConfirmed && saved.wallAngle !== null && saved.wallPolygon) {
       setWallAngle(saved.wallAngle); wallAngleRef.current = saved.wallAngle;
-      setWallDistances(saved.wallDistances); wallDistancesRef.current = saved.wallDistances;
+      setWallPolygon(saved.wallPolygon); wallPolygonRef.current = saved.wallPolygon;
       setWallMode('confirmed'); wallModeRef.current = 'confirmed';
     }
     // 경계면 선택
@@ -1151,7 +1224,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       ceilingY, floorY,
       rotX: pendingRotation.rotX, rotZ: pendingRotation.rotZ,
       wallConfirmed: wallMode === 'confirmed',
-      wallAngle, wallDistances,
+      wallAngle, wallPolygon,
       selectedSurfaces: Array.from(selectedSurfaces),
       globalOffset, globalOffsetText,
     });
@@ -1159,7 +1232,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     options?.uploadId, undoDepth,
     cfMode, ceilingY, floorY,
     pendingRotation.rotX, pendingRotation.rotZ,
-    wallMode, wallAngle, wallDistances,
+    wallMode, wallAngle, wallPolygon,
     selectedSurfaces, globalOffset, globalOffsetText,
   ]);
 
@@ -1237,13 +1310,26 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   // ── Unified surface highlight: tint gaussians near selected surfaces ──
   // 컨벤션 주의: PLY 프레임 'ceiling' = 시각적 바닥, 'floor' = 시각적 천장 (180Z 회전 영향)
   // 따라서 색도 시각 의미에 맞게 swap: ceiling(=바닥)=밤색, floor(=천장)=하늘색
-  const SURFACE_COLORS: Record<string, [number, number, number]> = {
-    ceiling: [0.573, 0.251, 0.055], // #92400e 밤색 (시각적 바닥)
-    floor:   [0.133, 0.827, 0.933], // #22d3ee 하늘색 (시각적 천장)
-    w1a:     [0.063, 0.725, 0.506], // #10b981 emerald
-    w1b:     [0.231, 0.510, 0.965], // #3b82f6 blue
-    w2a:     [0.545, 0.361, 0.965], // #8b5cf6 violet
-    w2b:     [0.518, 0.800, 0.086], // #84cc16 lime
+  // 벽은 polygon 변 인덱스별 순환 팔레트.
+  const WALL_PALETTE: Array<[number, number, number]> = [
+    [0.063, 0.725, 0.506], // emerald
+    [0.231, 0.510, 0.965], // blue
+    [0.545, 0.361, 0.965], // violet
+    [0.518, 0.800, 0.086], // lime
+    [0.965, 0.620, 0.043], // amber
+    [0.925, 0.286, 0.600], // pink
+    [0.376, 0.890, 0.749], // teal
+    [0.851, 0.341, 0.341], // rose
+  ];
+  const surfaceColor = (id: string): [number, number, number] => {
+    if (id === 'ceiling') return [0.573, 0.251, 0.055];
+    if (id === 'floor')   return [0.133, 0.827, 0.933];
+    const m = /^w(\d+)$/.exec(id);
+    if (m) {
+      const i = parseInt(m[1], 10);
+      return WALL_PALETTE[i % WALL_PALETTE.length];
+    }
+    return [1, 1, 1]; // fallback
   };
   const applySurfaceHighlight = useCallback(() => {
     const data = splatDataRef.current; const core = coreRef.current;
@@ -1279,24 +1365,47 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     const cy = ceilingYRef.current, fy = floorYRef.current;
     // 색칠 밴드 = 평면 ±1cm. 시각 가이드 only — 후속 처리는 평면(sd=0) 자체를 strict 기준으로 사용.
     const bandCf = 0.01;
+    const bandWall = 0.01;
     const yLo = Math.min(cy, fy), yHi = Math.max(cy, fy);
 
-    let c1 = 0, s1 = 0, c2 = 0, s2 = 0, a1 = 0, b1 = 0, a2 = 0, b2 = 0, bandWall = 0;
-    const ang = wallAngleRef.current, walls = wallDistancesRef.current;
-    const wallsReady = ang !== null && walls !== null;
-    if (wallsReady) {
-      const rad = (ang as number) * Math.PI / 180;
-      c1 = Math.cos(rad); s1 = Math.sin(rad);
-      c2 = Math.cos(rad + Math.PI / 2); s2 = Math.sin(rad + Math.PI / 2);
-      [a1, b1, a2, b2] = walls as [number, number, number, number];
-      bandWall = 0.01;
+    // N벽 segment 데이터 — surfaceId, 변 양 끝점, normalized direction, 길이.
+    type WallSeg = { id: string; ax: number; az: number; bx: number; bz: number; dx: number; dz: number; len: number };
+    const wallPoly = wallPolygonRef.current;
+    const wallSegs: WallSeg[] = [];
+    if (wallPoly && wallPoly.length >= 2) {
+      const N = wallPoly.length;
+      for (let i = 0; i < N; i++) {
+        const a = wallPoly[i];
+        const b = wallPoly[(i + 1) % N];
+        const dx = b.x - a.x;
+        const dz = b.z - a.z;
+        const len = Math.hypot(dx, dz);
+        if (len < 1e-9) continue;
+        wallSegs.push({ id: `w${i}`, ax: a.x, az: a.z, bx: b.x, bz: b.z, dx: dx / len, dz: dz / len, len });
+      }
     }
+    const wallsReady = wallSegs.length > 0;
 
     // pendingRotation을 가우시안 좌표에 적용해서 평면(A' 프레임)과 비교 — flatten/막과 동일한 프레임
     const { rotX, rotZ } = pendingRotationRef.current;
     const rotActive = rotX !== 0 || rotZ !== 0;
     const rcx = Math.cos(rotX), rsx = Math.sin(rotX);
     const rcz = Math.cos(rotZ), rsz = Math.sin(rotZ);
+
+    // 폴리곤 안쪽 여부 (XZ point-in-polygon, ray casting).
+    const insidePolygon = (px: number, pz: number): boolean => {
+      if (!wallPoly || wallPoly.length < 3) return true; // 폴리곤 미정의 — 전체 허용 (폴백)
+      let inside = false;
+      const M = wallPoly.length;
+      for (let j = M - 1, k = 0; k < M; j = k++) {
+        const xi = wallPoly[k].x, zi = wallPoly[k].z;
+        const xj = wallPoly[j].x, zj = wallPoly[j].z;
+        const intersect = ((zi > pz) !== (zj > pz)) &&
+          (px < ((xj - xi) * (pz - zi)) / ((zj - zi) || 1e-12) + xi);
+        if (intersect) inside = !inside;
+      }
+      return inside;
+    };
 
     for (let i = 0; i < data.numSplats; i++) {
       const idx = i * 4;
@@ -1313,35 +1422,25 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       let bestSurf: string | null = null;
       let bestD = Infinity;
 
-      // 천장/바닥도 무한 평면 아닌 방 안쪽 (벽 segment 안) 만 색칠. 벽 정보 없으면 전체 사용 (폴백).
-      let inRoomXZ = true;
-      if (wallsReady) {
-        const d1 = x * c1 + z * s1;
-        const d2 = x * c2 + z * s2;
-        const d1Lo = Math.min(a1, b1) - 0.01, d1Hi = Math.max(a1, b1) + 0.01;
-        const d2Lo = Math.min(a2, b2) - 0.01, d2Hi = Math.max(a2, b2) + 0.01;
-        inRoomXZ = d1 >= d1Lo && d1 <= d1Hi && d2 >= d2Lo && d2 <= d2Hi;
-      }
+      // 천장/바닥은 폴리곤 안쪽 점만 색칠 (폴리곤 미정의면 전체 허용).
+      const inRoomXZ = wallsReady ? insidePolygon(x, z) : true;
       if (inRoomXZ) {
         if (sel.has('ceiling')) { const d = Math.abs(y - cy); if (d < bandCf && d < bestD) { bestD = d; bestSurf = 'ceiling'; } }
         if (sel.has('floor'))   { const d = Math.abs(y - fy); if (d < bandCf && d < bestD) { bestD = d; bestSurf = 'floor'; } }
       }
       if (wallsReady && y >= yLo && y <= yHi) {
-        const d1 = x * c1 + z * s1;
-        const d2 = x * c2 + z * s2;
-        // 벽 선분 안쪽만 색칠 — 무한 평면 전체가 아니라 방의 폭만큼 (수직 방향으로 [a*,b*] 범위).
-        // 약간의 여유 (1cm) 줘 모서리 가우시안도 자연스럽게 포함.
-        const d1Lo = Math.min(a1, b1) - 0.01, d1Hi = Math.max(a1, b1) + 0.01;
-        const d2Lo = Math.min(a2, b2) - 0.01, d2Hi = Math.max(a2, b2) + 0.01;
-        const inSeg1 = d1 >= d1Lo && d1 <= d1Hi; // w2a/w2b 평면(법선 c2,s2)은 d1 으로 segment 제한
-        const inSeg2 = d2 >= d2Lo && d2 <= d2Hi; // w1a/w1b 평면(법선 c1,s1)은 d2 로 segment 제한
-        if (inSeg2) {
-          if (sel.has('w1a')) { const d = Math.abs(d1 - a1); if (d < bandWall && d < bestD) { bestD = d; bestSurf = 'w1a'; } }
-          if (sel.has('w1b')) { const d = Math.abs(d1 - b1); if (d < bandWall && d < bestD) { bestD = d; bestSurf = 'w1b'; } }
-        }
-        if (inSeg1) {
-          if (sel.has('w2a')) { const d = Math.abs(d2 - a2); if (d < bandWall && d < bestD) { bestD = d; bestSurf = 'w2a'; } }
-          if (sel.has('w2b')) { const d = Math.abs(d2 - b2); if (d < bandWall && d < bestD) { bestD = d; bestSurf = 'w2b'; } }
+        // 각 변에 대해: 변 위 투영 (t ∈ [0,1]) 안쪽이면 수직 거리 비교.
+        for (const seg of wallSegs) {
+          if (!sel.has(seg.id)) continue;
+          const px = x - seg.ax, pz = z - seg.az;
+          const t = (px * seg.dx + pz * seg.dz) / seg.len; // 0..1 정규화
+          if (t < -0.01 || t > 1.01) continue;
+          // 수직 거리 — t*direction 빼고 남은 수직 성분의 절댓값.
+          const proju = t * seg.len;
+          const ex = px - proju * seg.dx;
+          const ez = pz - proju * seg.dz;
+          const d = Math.hypot(ex, ez);
+          if (d < bandWall && d < bestD) { bestD = d; bestSurf = seg.id; }
         }
       }
 
@@ -1349,7 +1448,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       if (previewMask && previewMask[i]) {
         td[idx] = redR; td[idx+1] = redG; td[idx+2] = redB; td[idx+3] = orig[idx+3];
       } else if (bestSurf) {
-        const [cr, cg, cb] = SURFACE_COLORS[bestSurf];
+        const [cr, cg, cb] = surfaceColor(bestSurf);
         const r = h2f(orig[idx]), g = h2f(orig[idx+1]), b = h2f(orig[idx+2]);
         td[idx] = f2h(r*(1-mixT)+cr*mixT); td[idx+1] = f2h(g*(1-mixT)+cg*mixT); td[idx+2] = f2h(b*(1-mixT)+cb*mixT);
         td[idx+3] = (appliedMask && appliedMask[i]) ? zeroAlpha : orig[idx+3];
@@ -1365,7 +1464,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   useEffect(() => {
     selectedSurfacesRef.current = selectedSurfaces;
     applySurfaceHighlight();
-  }, [selectedSurfaces, applySurfaceHighlight, globalOffset, ceilingY, floorY, wallAngle, wallDistances]);
+  }, [selectedSurfaces, applySurfaceHighlight, globalOffset, ceilingY, floorY, wallAngle, wallPolygon]);
 
   // ── Restore original colors (mode switch) ──
   // 단순히 origColorData로 덮어쓰면 flatten 마스크(alpha=0)가 사라지므로,
@@ -1841,8 +1940,8 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     setCfModalOpen(false);
     // 4) 벽면
     setWallMode('none'); wallModeRef.current = 'none';
-    setWallAngle(null); setWallDistances(null);
-    wallAngleRef.current = null; wallDistancesRef.current = null;
+    setWallAngle(null); setWallPolygon(null);
+    wallAngleRef.current = null; wallPolygonRef.current = null;
     setWallModalOpen(false);
     // 5) 경계면 선택 + 안전거리
     setSelectedSurfaces(new Set()); selectedSurfacesRef.current = new Set();
@@ -2920,27 +3019,35 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
                 // 주의: PLY 좌표계에 Z-180 회전이 렌더링에 적용돼서 코드의 'ceiling' surfaceId 가
                 //  시각적으로 바닥 위치에 그려지고, 'floor' 가 시각적으로 천장 위치에 그려진다.
                 //  사용자에게는 시각적 위치 기준으로 라벨 표시.
-                const labels: Record<Surface, { name: string; color: string }> = {
+                // N벽 동적: ceiling/floor 고정 + wallPolygon 변 수만큼 '벽 0'..'벽 N-1'.
+                const fixedLabels: Record<string, { name: string; color: string }> = {
                   ceiling: { name: '바닥', color: '#92400e' },  // 시각적 바닥 (PLY frame ceiling) — 밤색
                   floor:   { name: '천장', color: '#22d3ee' },  // 시각적 천장 (PLY frame floor) — 하늘색
-                  w1a:     { name: '벽1', color: '#10b981' },
-                  w1b:     { name: '벽2', color: '#3b82f6' },
-                  w2a:     { name: '벽3', color: '#8b5cf6' },
-                  w2b:     { name: '벽4', color: '#84cc16' },
                 };
+                const wallHexPalette = ['#10b981','#3b82f6','#8b5cf6','#84cc16','#f59e0b','#ec4899','#22d3ee','#ef4444'];
+                const wallEntries = wallSurfaceIdList.map((sid, i) => ({
+                  id: sid,
+                  name: `벽 ${i + 1}`,
+                  color: wallHexPalette[i % wallHexPalette.length],
+                }));
+                const surfaceList: Array<{ id: Surface; name: string; color: string }> = [
+                  { id: 'ceiling', ...fixedLabels.ceiling },
+                  { id: 'floor', ...fixedLabels.floor },
+                  ...wallEntries,
+                ];
                 const isDisabled = (s: Surface) =>
-                  CF_SURFACES.includes(s) ? cfMode !== 'confirmed' : wallMode !== 'confirmed';
+                  isFixedSurface(s) ? cfMode !== 'confirmed' : wallMode !== 'confirmed';
                 return (
                   <>
                     <div className="grid grid-cols-3 gap-x-2 gap-y-1">
-                      {ALL_SURFACES.map(s => {
-                        const disabled = isDisabled(s);
+                      {surfaceList.map(entry => {
+                        const disabled = isDisabled(entry.id);
                         return (
-                          <label key={s} className={`flex items-center gap-1 text-[11px] ${disabled ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer'}`}>
-                            <input type="checkbox" checked={selectedSurfaces.has(s)} disabled={disabled}
-                              onChange={() => toggleSurface(s)}
+                          <label key={entry.id} className={`flex items-center gap-1 text-[11px] ${disabled ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer'}`}>
+                            <input type="checkbox" checked={selectedSurfaces.has(entry.id)} disabled={disabled}
+                              onChange={() => toggleSurface(entry.id)}
                               className="accent-blue-500" />
-                            <span style={{ color: labels[s].color }}>{labels[s].name}</span>
+                            <span style={{ color: entry.color }}>{entry.name}</span>
                           </label>
                         );
                       })}
@@ -3292,7 +3399,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
                 if (wallModeRef.current === 'confirmed') {
                   setWallMode('none'); wallModeRef.current = 'none';
                   setWallAngle(null); wallAngleRef.current = null;
-                  setWallDistances(null); wallDistancesRef.current = null;
+                  setWallPolygon(null); wallPolygonRef.current = null;
                 }
               }
 
@@ -3327,14 +3434,14 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
             numSplats={splatDataRef.current.numSplats}
             ceilingY={ceilingY}
             floorY={floorY}
-            onConfirm={(angleDeg, walls) => {
+            onConfirm={(angleDeg, polygon) => {
               setWallAngle(angleDeg); wallAngleRef.current = angleDeg;
-              setWallDistances(walls); wallDistancesRef.current = walls;
+              setWallPolygon(polygon); wallPolygonRef.current = polygon;
               setWallMode('confirmed'); wallModeRef.current = 'confirmed';
               setWallModalOpen(false);
               setSelectedSurfaces(prev => {
                 const next = new Set(prev);
-                WALL_SURFACES.forEach(s => next.add(s));
+                wallSurfaceIds(polygon.length).forEach(s => next.add(s));
                 return next;
               });
             }}
