@@ -431,32 +431,32 @@ export default function WallModal({
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70" onClick={onClose}>
-      <div className="bg-gray-900 border border-gray-700 rounded-lg p-5 shadow-2xl" onClick={e => e.stopPropagation()}>
-        <div className="text-white font-bold text-sm mb-1">벽면 설정</div>
-        <div className="text-gray-400 text-xs mb-3">
+      <div className="bg-[var(--paper)] border border-[var(--rule)] rounded-lg p-5 shadow-2xl" onClick={e => e.stopPropagation()}>
+        <div className="text-[var(--ink)] font-bold text-sm mb-1">벽면 설정</div>
+        <div className="text-[var(--muted)] text-xs mb-3">
           좌클릭으로 점과 선을 추가, 기존 점은 드래그로 이동. 점을 클릭하면 직전에 선택한 점과 연결되고, 우클릭은 마지막 조작을 되돌립니다.
         </div>
         <div>
-          <div className="text-gray-500 text-[10px] mb-1 text-center">Top-down (XZ)</div>
+          <div className="text-[var(--muted)] text-[10px] mb-1 text-center">Top-down (XZ)</div>
           <canvas ref={xzRef} style={{ width: CW, height: CH, userSelect: 'none' }}
-            className="border border-gray-700 rounded cursor-crosshair"
+            className="border border-[var(--rule)] rounded cursor-crosshair"
             onMouseDown={handleMouseDown}
             onMouseMove={handleMouseMove}
             onContextMenu={handleContextMenu} />
         </div>
         <div className="flex items-center justify-between mt-3">
-          <div className="text-gray-500 text-xs font-mono">
+          <div className="text-[var(--muted)] text-xs font-mono">
             {`점 ${pathPoints.length}개, 선 ${pathEdges.length}개${derivedWalls ? `, 각도 ${derivedWalls.angleDeg.toFixed(1)}°` : ''}`}
           </div>
           <div className="flex gap-2">
             <button onClick={onClose}
-              className="px-4 py-2 bg-gray-700 hover:bg-gray-600 text-gray-300 rounded text-sm cursor-pointer">취소</button>
+              className="px-4 py-2 bg-[var(--bg-soft)] hover:bg-[var(--rule)] text-[var(--ink-2)] rounded text-sm cursor-pointer">취소</button>
             <button onClick={() => {
               if (!derivedWalls) return;
               onConfirm(derivedWalls.angleDeg, derivedWalls.walls);
             }}
               disabled={!derivedWalls}
-              className="px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed text-white rounded text-sm cursor-pointer font-bold">확인</button>
+              className="px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] disabled:cursor-not-allowed text-[var(--ink)] rounded text-sm cursor-pointer font-bold">확인</button>
           </div>
         </div>
       </div>

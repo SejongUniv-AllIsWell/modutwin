@@ -2,12 +2,57 @@
 @tailwind components;
 @tailwind utilities;
 
-/* 다크 테마(bg-gray-950)에 맞춘 커스텀 스크롤바.
-   Firefox 는 scrollbar-color / scrollbar-width, 그 외는 ::-webkit-scrollbar 로 처리. */
+/* 랜딩 페이지의 종이 / 크림 팔레트를 사이트 전역 기본값으로. 3D 캔버스 영역 (viewer 등)은
+   각 페이지에서 별도로 어두운 배경을 지정해 splat 가시성을 유지한다. */
+:root {
+  --bg: #f4f1ea;
+  --bg-soft: #ede9df;
+  --paper: #faf7f0;
+  --ink: #1a1a1a;
+  --ink-2: #2c2a26;
+  --muted: #6b665e;
+  --muted-2: #908a7e;
+  --rule: #d9d3c4;
+  --rule-soft: #e7e1d1;
+  --accent: #1a1a1a;
+}
+
+/* 뷰어 영역: 어두운 캔버스 위에서 같은 토큰 이름을 쓰지만 색을 반전.
+   라이트 토큰을 그대로 두면 ink:#1a1a1a 가 어두운 배경 위에 깔려 가독성 0. */
+.viewer-dark {
+  --bg: #141414;
+  --bg-soft: #1f1d1a;
+  --paper: #1c1a17;
+  --ink: #f5f1e6;
+  --ink-2: #d8d3c4;
+  --muted: #b8b3a4;
+  --muted-2: #8a8676;
+  --rule: #3b3833;
+  --rule-soft: #2a2824;
+}
+
 @layer base {
+  html, body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--font-noto-sans-kr), 'Noto Sans KR', Helvetica, 'Helvetica Neue', Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  /* splat.wiki Landing.html 와 동일한 보조 글꼴 — Source Serif 4 (serif), JetBrains Mono (mono).
+     로드 실패 시 시스템 폰트로 fallback. */
+  .serif {
+    font-family: var(--font-source-serif-4), 'Source Serif 4', Georgia, serif;
+  }
+  .mono {
+    font-family: var(--font-jetbrains-mono), 'JetBrains Mono', ui-monospace, Menlo, monospace;
+  }
+
+  /* 종이 톤 위에서는 스크롤바도 부드러운 베이지 계열. */
   * {
     scrollbar-width: thin;
-    scrollbar-color: #374151 transparent; /* thumb: gray-700, track: 투명 */
+    scrollbar-color: var(--rule) transparent;
   }
 
   *::-webkit-scrollbar {
@@ -20,18 +65,18 @@
   }
 
   *::-webkit-scrollbar-thumb {
-    background-color: #374151; /* gray-700 */
+    background-color: var(--rule);
     border-radius: 8px;
     border: 2px solid transparent;
     background-clip: padding-box;
   }
 
   *::-webkit-scrollbar-thumb:hover {
-    background-color: #4b5563; /* gray-600 */
+    background-color: var(--muted-2);
   }
 
   *::-webkit-scrollbar-thumb:active {
-    background-color: #6b7280; /* gray-500 */
+    background-color: var(--muted);
   }
 
   *::-webkit-scrollbar-corner {

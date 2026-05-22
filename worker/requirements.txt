@@ -1,8 +1,10 @@
 celery
 redis
+requests
 minio
 numpy
 plyfile
+requests
 # COLMAP 파이프라인
 pycolmap>=0.6.0
 opencv-python-headless>=4.8.0

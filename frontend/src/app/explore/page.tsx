@@ -3,11 +3,12 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
 import { api } from '@/lib/api';
-import { Building, Floor } from '@/types';
+import { Building, BuildingListItem } from '@/types';
 import { useAuth } from '@/lib/auth';
 import {
   comparePriorityPlaceCandidates,
   type PriorityCoordinateOverride,
+  resolveCanonicalPlace,
   scorePriorityPlaceName,
   sejongUniversityPlacePriority,
   type PriorityPlaceScore,
@@ -21,9 +22,7 @@ declare global {
   }
 }
 
-interface BuildingWithFloors extends Building {
-  floorCount: number;
-}
+type BuildingWithFloors = BuildingListItem;
 
 interface KakaoPlaceResult {
   id: string;
@@ -164,7 +163,7 @@ const keywordForAddress = (document: KakaoCoord2AddressDocument | null): Address
 
 export default function ExplorePage() {
   const router = useRouter();
-  const { user, loading } = useAuth();
+  const { loading } = useAuth();
   const mapRef = useRef<HTMLDivElement>(null);
   const mapInstance = useRef<any>(null);
   const kakaoRef = useRef<any>(null);
@@ -254,29 +253,14 @@ export default function ExplorePage() {
     }, 2200);
   }, []);
 
-  useEffect(() => {
-    if (!loading && !user) {
-      router.push('/');
-    }
-  }, [user, loading, router]);
-
   // 건물 목록 로드 — 백엔드 has_output 필터는
   //   (관리자가 표시관리에서 추가한 건물) OR (표시 중인 floor/module 에 SceneOutput 등록)
   // 둘 중 하나라도 만족하는 visible 건물을 내려준다.
+  // floor_count 는 응답에 포함되므로 추가 fetch 없음.
   const fetchBuildings = useCallback(async () => {
     try {
-      const data = await api.get<Building[]>('/buildings?has_output=true');
-      const withFloors: BuildingWithFloors[] = await Promise.all(
-        data.map(async (b) => {
-          try {
-            const floors = await api.get<Floor[]>(`/buildings/${b.id}/floors`);
-            return { ...b, floorCount: floors.length };
-          } catch {
-            return { ...b, floorCount: 0 };
-          }
-        })
-      );
-      setBuildings(withFloors);
+      const data = await api.get<BuildingListItem[]>('/buildings?has_output=true');
+      setBuildings(data);
     } catch {
       // 무시
     }
@@ -482,10 +466,13 @@ export default function ExplorePage() {
           showToast('선택한 건물의 좌표가 올바르지 않습니다.');
           return;
         }
-        showSelectedMarker(place.place_name, lat, lng);
-        showToast(`선택됨: ${place.place_name}`);
+        const canonical = resolveCanonicalPlace(place.place_name);
+        const displayName = canonical?.canonicalName ?? place.place_name;
+        showSelectedMarker(displayName, lat, lng);
+        showToast(`선택됨: ${displayName}`);
         await routeBuildingByLookup({
-          building_name: place.place_name,
+          building_name: displayName,
+          lookup_names: canonical?.aliases,
           place_id: place.id,
           address_name: place.address_name || null,
           road_address_name: place.road_address_name || null,
@@ -594,7 +581,7 @@ export default function ExplorePage() {
       const marker = new window.kakao.maps.Marker({ map, position, title: building.name });
 
       const infowindow = new window.kakao.maps.InfoWindow({
-        content: `<div style="padding:8px 12px;font-size:13px;font-weight:600;white-space:nowrap;color:#111;">${escapeHtml(building.name)}<br/><span style="font-size:11px;font-weight:400;color:#666;">${building.floorCount}개 층</span></div>`,
+        content: `<div style="padding:8px 12px;font-size:13px;font-weight:600;white-space:nowrap;color:#111;">${escapeHtml(building.name)}<br/><span style="font-size:11px;font-weight:400;color:#666;">${building.floor_count}개 층</span></div>`,
       });
 
       const onMouseOver = () => infowindow.open(map, marker);
@@ -695,8 +682,10 @@ export default function ExplorePage() {
 
   const handlePlaceSelect = async (place: KakaoPlaceResult) => {
     try {
+      const canonical = resolveCanonicalPlace(place.place_name);
       await routeBuildingByLookup({
-        building_name: place.place_name,
+        building_name: canonical?.canonicalName ?? place.place_name,
+        lookup_names: canonical?.aliases,
         place_id: place.id,
         address_name: place.address_name || null,
         road_address_name: place.road_address_name || null,
@@ -713,10 +702,17 @@ export default function ExplorePage() {
   return (
     <div className="flex h-[calc(100vh-56px)]">
       {/* 좌측 패널 */}
-      <div className="w-80 flex flex-col border-r border-gray-800 bg-gray-900 shrink-0">
-        <div className="p-3 border-b border-gray-800">
+      <div
+        className="w-80 flex flex-col border-r shrink-0"
+        style={{ background: 'var(--paper)', borderColor: 'var(--rule)' }}
+      >
+        <div className="p-3 border-b" style={{ borderColor: 'var(--rule)' }}>
           <div className="relative flex items-center">
-            <svg className="absolute left-3 w-4 h-4 text-gray-500 pointer-events-none" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <svg
+              className="absolute left-3 w-4 h-4 pointer-events-none"
+              style={{ color: 'var(--muted)' }}
+              fill="none" stroke="currentColor" viewBox="0 0 24 24"
+            >
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
             </svg>
             <input
@@ -726,17 +722,26 @@ export default function ExplorePage() {
               onKeyDown={(e) => {
                 if (e.key === 'Enter') handleSearch();
               }}
-              placeholder="건물 검색..."
-              className="w-full bg-gray-800 border border-gray-700 rounded-lg pl-9 pr-3 py-2 text-white text-sm focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition"
+              placeholder="건물 검색"
+              className="w-full border rounded-sm pl-9 pr-3 py-2 text-sm focus:outline-none transition"
+              style={{
+                background: 'var(--bg)',
+                borderColor: 'var(--rule)',
+                color: 'var(--ink)',
+              }}
             />
             {searchQuery && (
-              <button onClick={() => {
-                setSearchQuery('');
-                setPlaceResults([]);
-                setSearchedQuery('');
-                setSearchPage(1);
-                setSearchIsEnd(true);
-              }} className="absolute right-3 text-gray-500 hover:text-gray-300">
+              <button
+                onClick={() => {
+                  setSearchQuery('');
+                  setPlaceResults([]);
+                  setSearchedQuery('');
+                  setSearchPage(1);
+                  setSearchIsEnd(true);
+                }}
+                className="absolute right-3 hover:opacity-70"
+                style={{ color: 'var(--muted)' }}
+              >
                 <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
                 </svg>
@@ -745,25 +750,35 @@ export default function ExplorePage() {
           </div>
         </div>
 
-        <div className="px-4 py-2.5 border-b border-gray-800">
-          <p className="text-xs font-medium text-gray-500 uppercase tracking-wider">
-            {placeResults.length > 0 ? `카카오 검색 결과 (${placeResults.length})` : `건물 목록 (${displayBuildings.length})`}
+        <div className="px-4 py-2.5 border-b" style={{ borderColor: 'var(--rule)' }}>
+          <p
+            className="text-xs font-medium uppercase tracking-wider"
+            style={{ color: 'var(--muted)', fontFamily: 'ui-monospace, Menlo, monospace' }}
+          >
+            {placeResults.length > 0 ? `카카오 검색 결과 (${placeResults.length})` : '건물 목록'}
           </p>
         </div>
 
         <div className="flex-1 overflow-y-auto">
           {placeResults.length > 0 ? (
-            <div className="divide-y divide-gray-800/60">
+            <div className="divide-y" style={{ borderColor: 'var(--rule-soft)' }}>
               {placeResults.map((place) => (
                 <button
                   key={place.id}
                   onClick={() => handlePlaceSelect(place)}
-                  className="w-full text-left px-4 py-3.5 hover:bg-gray-800/70 transition group"
+                  className="w-full text-left px-4 py-3.5 hover:bg-[var(--bg-soft)] transition group"
+                  style={{ borderColor: 'var(--rule-soft)' }}
                 >
-                  <p className="text-sm font-medium text-gray-200 truncate group-hover:text-white transition">
+                  <p
+                    className="text-sm font-medium truncate"
+                    style={{ color: 'var(--ink)' }}
+                  >
                     {place.place_name}
                   </p>
-                  <p className="text-xs text-gray-500 mt-0.5 truncate">
+                  <p
+                    className="text-xs mt-0.5 truncate"
+                    style={{ color: 'var(--muted)' }}
+                  >
                     {place.road_address_name || place.address_name}
                   </p>
                 </button>
@@ -772,14 +787,18 @@ export default function ExplorePage() {
                 <button
                   onClick={handleLoadMore}
                   disabled={loadingMore}
-                  className="w-full px-4 py-3 text-sm text-gray-400 hover:text-white hover:bg-gray-800/70 transition disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="w-full px-4 py-3 text-sm hover:bg-[var(--bg-soft)] transition disabled:opacity-50 disabled:cursor-not-allowed"
+                  style={{ color: 'var(--muted)' }}
                 >
                   {loadingMore ? '불러오는 중...' : '더 보기'}
                 </button>
               )}
             </div>
           ) : displayBuildings.length === 0 ? (
-            <div className="flex flex-col items-center justify-center h-full py-16 text-gray-600">
+            <div
+              className="flex flex-col items-center justify-center h-full py-16"
+              style={{ color: 'var(--muted-2)' }}
+            >
               <svg className="w-12 h-12 mb-3 opacity-40" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-2 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4" />
               </svg>
@@ -788,26 +807,35 @@ export default function ExplorePage() {
               </p>
             </div>
           ) : (
-            <div className="divide-y divide-gray-800/60">
+            <div className="divide-y" style={{ borderColor: 'var(--rule-soft)' }}>
               {displayBuildings.map((building) => (
                 <button
                   key={building.id}
                   onClick={() => router.push(`/buildings/${building.id}`)}
-                  className="w-full text-left px-4 py-3.5 hover:bg-gray-800/70 transition group"
+                  className="w-full text-left px-4 py-3.5 hover:bg-[var(--bg-soft)] transition group"
                 >
                   <div className="flex items-center gap-3">
-                    <div className="shrink-0 w-9 h-9 rounded-lg bg-blue-600/15 text-blue-400 flex items-center justify-center group-hover:bg-blue-600/25 transition">
+                    <div
+                      className="shrink-0 w-9 h-9 rounded-md flex items-center justify-center"
+                      style={{ background: 'var(--bg-soft)', color: 'var(--ink)' }}
+                    >
                       <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-2 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4" />
                       </svg>
                     </div>
                     <div className="flex-1 min-w-0">
-                      <p className="text-sm font-medium text-gray-200 truncate group-hover:text-white transition">
+                      <p
+                        className="text-sm font-medium truncate"
+                        style={{ color: 'var(--ink)' }}
+                      >
                         {building.name}
                       </p>
-                      <p className="text-xs text-gray-500 mt-0.5">{building.floorCount}개 층</p>
                     </div>
-                    <svg className="w-4 h-4 text-gray-600 group-hover:text-gray-400 transition shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <svg
+                      className="w-4 h-4 transition shrink-0"
+                      style={{ color: 'var(--muted-2)' }}
+                      fill="none" stroke="currentColor" viewBox="0 0 24 24"
+                    >
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
                     </svg>
                   </div>
@@ -822,15 +850,21 @@ export default function ExplorePage() {
       <div className="flex-1 relative">
         <div ref={mapRef} className="w-full h-full" />
         {!mapLoaded && (
-          <div className="absolute inset-0 flex items-center justify-center bg-gray-900 text-gray-500">
+          <div
+            className="absolute inset-0 flex items-center justify-center"
+            style={{ background: 'var(--paper)', color: 'var(--muted)' }}
+          >
             <div className="text-center">
               {mapError ? (
-                <p className="text-sm text-red-400">지도를 불러오지 못했습니다</p>
+                <p className="text-sm" style={{ color: '#b04646' }}>지도를 불러오지 못했습니다</p>
               ) : !process.env.NEXT_PUBLIC_KAKAO_MAP_KEY ? (
                 <p className="text-sm">카카오맵 API 키가 설정되지 않았습니다</p>
               ) : (
                 <>
-                  <div className="w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full animate-spin mx-auto mb-3" />
+                  <div
+                    className="w-8 h-8 border-2 rounded-full animate-spin mx-auto mb-3"
+                    style={{ borderColor: 'var(--rule)', borderTopColor: 'transparent' }}
+                  />
                   <p className="text-sm">지도 로딩 중...</p>
                 </>
               )}
@@ -838,7 +872,14 @@ export default function ExplorePage() {
           </div>
         )}
         {toast && (
-          <div className="absolute top-4 left-1/2 -translate-x-1/2 px-3 py-1.5 rounded bg-gray-900/95 border border-gray-700 text-xs text-gray-100">
+          <div
+            className="absolute top-4 left-1/2 -translate-x-1/2 px-3 py-1.5 rounded-sm border text-xs"
+            style={{
+              background: 'var(--paper)',
+              borderColor: 'var(--rule)',
+              color: 'var(--ink)',
+            }}
+          >
             {toast}
           </div>
         )}

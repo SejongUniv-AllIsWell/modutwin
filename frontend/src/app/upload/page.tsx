@@ -1,13 +1,15 @@
 'use client';
 
-import { Suspense, useEffect } from 'react';
-import { useAuth } from '@/lib/auth';
+import { Suspense } from 'react';
+import { useRequireAuth } from '@/lib/auth';
 import MultipartUploader from '@/components/upload/MultipartUploader';
 import { useRouter, useSearchParams } from 'next/navigation';
+import { floorLabelKo } from '@/lib/format/floor';
+import { Button } from '@/components/ui/Button';
 
 function UploadContent() {
   const router = useRouter();
-  const { user, loading } = useAuth();
+  const { user, loading } = useRequireAuth();
   const searchParams = useSearchParams();
   const purpose = searchParams.get('purpose');
   const buildingId = searchParams.get('building_id') ?? '';
@@ -38,28 +40,18 @@ function UploadContent() {
       }
     : null;
 
-  useEffect(() => {
-    if (!loading && !user) {
-      window.location.href = '/';
-    }
-  }, [user, loading]);
-
-  if (loading || !user) return <div className="flex items-center justify-center h-64 text-gray-500">로딩 중...</div>;
+  if (loading || !user) return <div className="flex items-center justify-center h-64 text-[var(--muted)]">로딩 중...</div>;
 
   if (!fixedContext) {
     return (
       <div className="max-w-2xl mx-auto px-4 py-16 text-center">
         <h1 className="text-2xl font-bold mb-3">업로드</h1>
-        <p className="text-gray-400 text-sm mb-6">
+        <p className="text-[var(--muted)] text-sm mb-6">
           업로드는 건물 상세 페이지의 등록 버튼을 통해 시작할 수 있습니다.
         </p>
-        <button
-          type="button"
-          onClick={() => router.push('/explore')}
-          className="bg-blue-600 hover:bg-blue-700 text-white text-sm px-4 py-2 rounded"
-        >
+        <Button type="button" onClick={() => router.push('/explore')}>
           건물 둘러보기로 이동
-        </button>
+        </Button>
       </div>
     );
   }
@@ -67,12 +59,12 @@ function UploadContent() {
   return (
     <div className="max-w-2xl mx-auto px-4 py-8">
       <h1 className="text-2xl font-bold mb-2">업로드</h1>
-      <p className="text-gray-400 text-sm mb-2">
+      <p className="text-[var(--muted)] text-sm mb-2">
         .ply / .splat / .sog 또는 사진 묶음(.zip) 파일을 업로드하세요.
       </p>
-      <p className="text-gray-500 text-xs mb-8">
+      <p className="text-[var(--muted)] text-xs mb-8">
         {fixedContext.purpose === 'basemap' ? 'Basemap' : 'Module'} · {fixedContext.building_name} ·{' '}
-        {fixedContext.floor_number < 0 ? `B${Math.abs(fixedContext.floor_number)}` : `${fixedContext.floor_number}`}층 ·{' '}
+        {floorLabelKo(fixedContext.floor_number)} ·{' '}
         {fixedContext.module_name}
       </p>
       <MultipartUploader fixedContext={fixedContext} />
@@ -82,7 +74,7 @@ function UploadContent() {
 
 export default function UploadPage() {
   return (
-    <Suspense fallback={<div className="flex items-center justify-center h-64 text-gray-500">로딩 중...</div>}>
+    <Suspense fallback={<div className="flex items-center justify-center h-64 text-[var(--muted)]">로딩 중...</div>}>
       <UploadContent />
     </Suspense>
   );

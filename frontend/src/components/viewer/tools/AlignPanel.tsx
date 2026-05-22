@@ -627,8 +627,8 @@ export default function AlignPanel({
   const runDisabled = !matchReady || running;
 
   return (
-    <div className="bg-gray-900/95 border border-gray-700 rounded-lg shadow-2xl text-white text-xs select-none flex flex-col w-72 p-3 gap-2">
-      <div className="text-sm font-bold text-gray-100">정합</div>
+    <div className="bg-[var(--paper)]/95 border border-[var(--rule)] rounded-lg shadow-2xl text-[var(--ink)] text-xs select-none flex flex-col w-72 p-3 gap-2">
+      <div className="text-sm font-bold text-[var(--ink)]">정합</div>
 
       {basemapMatchError && (
         <div className="text-[11px] text-red-400 bg-red-950/40 border border-red-800 rounded px-2 py-1.5 leading-relaxed">
@@ -637,42 +637,42 @@ export default function AlignPanel({
       )}
 
       {!basemapMatchError && !matchReady && (
-        <div className="text-[11px] text-gray-400">basemap 정보 가져오는 중...</div>
+        <div className="text-[11px] text-[var(--muted)]">basemap 정보 가져오는 중...</div>
       )}
 
       {!aligned ? (
         <button
           onClick={runAutoAlign}
           disabled={runDisabled}
-          className="w-full px-3 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 text-white rounded cursor-pointer text-xs font-bold disabled:cursor-not-allowed"
+          className="w-full px-3 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] text-[var(--ink)] rounded cursor-pointer text-xs font-bold disabled:cursor-not-allowed"
         >
           {running ? '정합 중...' : '정합'}
         </button>
       ) : (
         <button
           onClick={resetAlignment}
-          className="w-full px-3 py-2 bg-orange-600 hover:bg-orange-500 text-white rounded cursor-pointer text-xs font-bold"
+          className="w-full px-3 py-2 bg-orange-600 hover:bg-orange-500 text-[var(--ink)] rounded cursor-pointer text-xs font-bold"
         >
           정합 초기화
         </button>
       )}
 
       {rmsd !== null && (
-        <div className="text-[10px] text-gray-500">RMSD: {rmsd.toFixed(4)} m</div>
+        <div className="text-[10px] text-[var(--muted)]">RMSD: {rmsd.toFixed(4)} m</div>
       )}
 
       {/* 자동 정합 1 회 후에만 수동 핸들 + 확정 저장 표시 */}
       {aligned && (
         <>
-          <div className="border-t border-gray-700 pt-2 space-y-2">
-            <div className="text-[11px] font-bold text-gray-300">수동 조정</div>
+          <div className="border-t border-[var(--rule)] pt-2 space-y-2">
+            <div className="text-[11px] font-bold text-[var(--ink-2)]">수동 조정</div>
             <div className="flex gap-1">
               {(['translate', 'rotate', 'scale'] as ManualMode[]).map(m => (
                 <button
                   key={m}
                   onClick={() => setManualMode(m)}
                   className={`flex-1 px-2 py-1 rounded text-[10px] font-bold cursor-pointer ${
-                    manualMode === m ? 'bg-blue-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                    manualMode === m ? 'bg-blue-600 text-[var(--ink)]' : 'bg-[var(--bg-soft)] text-[var(--ink-2)] hover:bg-[var(--rule)]'
                   }`}
                 >
                   {m === 'translate' ? '이동' : m === 'rotate' ? '회전' : '스케일'}
@@ -682,25 +682,25 @@ export default function AlignPanel({
             <div className="grid grid-cols-3 gap-1">
               {(['X', 'Y', 'Z'] as const).map((axisLabel, ax) => (
                 <div key={axisLabel} className="flex flex-col gap-1">
-                  <div className="text-center text-[10px] text-gray-400">{axisLabel}</div>
+                  <div className="text-center text-[10px] text-[var(--muted)]">{axisLabel}</div>
                   <button onClick={() => nudge(manualMode, ax as 0 | 1 | 2, 1)}
-                    className="px-1 py-0.5 bg-gray-700 hover:bg-gray-600 rounded text-[10px] cursor-pointer">+</button>
+                    className="px-1 py-0.5 bg-[var(--bg-soft)] hover:bg-[var(--rule)] rounded text-[10px] cursor-pointer">+</button>
                   <button onClick={() => nudge(manualMode, ax as 0 | 1 | 2, -1)}
-                    className="px-1 py-0.5 bg-gray-700 hover:bg-gray-600 rounded text-[10px] cursor-pointer">−</button>
+                    className="px-1 py-0.5 bg-[var(--bg-soft)] hover:bg-[var(--rule)] rounded text-[10px] cursor-pointer">−</button>
                 </div>
               ))}
             </div>
-            <div className="text-[10px] text-gray-500 leading-relaxed">
+            <div className="text-[10px] text-[var(--muted)] leading-relaxed">
               이동 5cm / 회전 5° / 스케일 5% 단위. "정합 초기화" 누르면 변환 전부 리셋.
             </div>
           </div>
 
           {/* 도어 열기/닫기 슬라이더 — 정합 검증용. 모듈/베이스맵 도어 + frame 측벽 통합 회전. */}
           {doorPivotGroupRef.current && (
-            <div className="border-t border-gray-700 pt-2 space-y-1">
+            <div className="border-t border-[var(--rule)] pt-2 space-y-1">
               <div className="flex items-center gap-2">
-                <div className="text-[11px] font-bold text-gray-300 flex-1">도어 열기 (확인용)</div>
-                <span className="text-[10px] text-gray-400 font-mono">{doorAngleDeg.toFixed(0)}°</span>
+                <div className="text-[11px] font-bold text-[var(--ink-2)] flex-1">도어 열기 (확인용)</div>
+                <span className="text-[10px] text-[var(--muted)] font-mono">{doorAngleDeg.toFixed(0)}°</span>
               </div>
               <input
                 type="range"
@@ -709,7 +709,7 @@ export default function AlignPanel({
                 onChange={(e) => setDoorAngleDeg(parseInt(e.target.value))}
                 className="w-full h-1 accent-amber-500 cursor-pointer"
               />
-              <div className="text-[10px] text-gray-500 leading-relaxed">
+              <div className="text-[10px] text-[var(--muted)] leading-relaxed">
                 hinge 축은 도어 왼쪽 변. 영구 저장 안 됨 (정합 확인용).
               </div>
             </div>
@@ -718,7 +718,7 @@ export default function AlignPanel({
           <button
             onClick={saveResult}
             disabled={savingResult}
-            className="w-full px-3 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:bg-gray-700 text-white rounded cursor-pointer text-xs font-bold disabled:cursor-not-allowed"
+            className="w-full px-3 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:bg-[var(--bg-soft)] text-[var(--ink)] rounded cursor-pointer text-xs font-bold disabled:cursor-not-allowed"
           >
             {savingResult ? '저장 중...' : '정합 완료'}
           </button>

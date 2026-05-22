@@ -2493,17 +2493,17 @@ export default function DoorAlignModal({
 
   return (
     // 좌측 패널 컬럼 안에 들어가는 일반 블록 — 부모가 layout 결정. 너비 256 (w-64) 로 다듬기 panel 들과 통일.
-    <div className="bg-gray-900/95 border border-gray-700 rounded-lg shadow-2xl text-white text-xs select-none flex flex-col w-72 max-h-[calc(100vh-200px)] overflow-hidden">
+    <div className="bg-[var(--paper)]/95 border border-[var(--rule)] rounded-lg shadow-2xl text-[var(--ink)] text-xs select-none flex flex-col w-72 max-h-[calc(100vh-200px)] overflow-hidden">
       {autoExtracting && (
         <div className="px-3 py-2 bg-indigo-900/40 border-b border-indigo-700 text-indigo-200 text-[11px] flex items-center gap-2">
           <span className="inline-block w-3 h-3 border-2 border-indigo-300 border-t-transparent rounded-full animate-spin" />
           <span>자동 문 추출 진행 중...</span>
         </div>
       )}
-      <div className="flex items-center justify-between px-3 py-2 border-b border-gray-700 shrink-0">
+      <div className="flex items-center justify-between px-3 py-2 border-b border-[var(--rule)] shrink-0">
         <div className="font-bold">{view === 'align' ? '문 정합' : '문 설정'}</div>
         <div className="flex items-center gap-2">
-          <label className="flex items-center gap-1 cursor-pointer text-[11px] text-gray-300" title="추출된 코너의 화면 마커 표시">
+          <label className="flex items-center gap-1 cursor-pointer text-[11px] text-[var(--ink-2)]" title="추출된 코너의 화면 마커 표시">
             <input
               type="checkbox"
               checked={showMarkers}
@@ -2512,7 +2512,7 @@ export default function DoorAlignModal({
             />
             마커 표시
           </label>
-          <button onClick={onClose} className="text-gray-400 hover:text-white cursor-pointer">✕</button>
+          <button onClick={onClose} className="text-[var(--muted)] hover:text-[var(--ink)] cursor-pointer">✕</button>
         </div>
       </div>
       <div className="p-3 space-y-2 overflow-y-auto">
@@ -2560,8 +2560,8 @@ export default function DoorAlignModal({
               onManualPickStart?.();   // 자동 추출 중이면 부모가 autoExtracting=false 로 내림.
             }}
             disabled={!planes}
-            className={`flex-1 w-1/2 px-3 py-1.5 rounded text-[11px] font-bold cursor-pointer disabled:bg-gray-800 disabled:text-gray-600 disabled:cursor-not-allowed ${
-              seqArmed ? 'bg-yellow-500 hover:bg-yellow-400 text-black' : 'bg-blue-600 hover:bg-blue-500 text-white'
+            className={`flex-1 w-1/2 px-3 py-1.5 rounded text-[11px] font-bold cursor-pointer disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted-2)] disabled:cursor-not-allowed ${
+              seqArmed ? 'bg-yellow-500 hover:bg-yellow-400 text-black' : 'bg-blue-600 hover:bg-blue-500 text-[var(--ink)]'
             }`}
           >
             {seqArmed ? '문 수동 지정 중' : '문 수동 지정'}
@@ -2572,7 +2572,7 @@ export default function DoorAlignModal({
             className={`flex-1 w-1/2 px-3 py-1.5 rounded text-[11px] font-bold cursor-pointer ${
               boundaryVisible
                 ? 'bg-yellow-500 hover:bg-yellow-400 text-black'
-                : 'bg-gray-700 hover:bg-gray-600 text-gray-200'
+                : 'bg-[var(--bg-soft)] hover:bg-[var(--rule)] text-[var(--ink)]'
             }`}
             title="4 코너 노란선 + 힌지 원기둥 표시 토글"
           >
@@ -2590,11 +2590,11 @@ export default function DoorAlignModal({
             const isNext = seqArmed && i === nextIdx;
             return (
               <div key={c.id} className={`flex items-center gap-1.5 px-2 py-1 rounded text-[10px] ${
-                isNext ? 'bg-sky-500/25 ring-1 ring-sky-400/60' : 'bg-gray-800/50'
+                isNext ? 'bg-sky-500/25 ring-1 ring-sky-400/60' : 'bg-[var(--bg-soft)]/50'
               }`}>
                 <div className="w-3 h-3 rounded-full shrink-0 border border-white/30" style={{ backgroundColor: c.hex }} />
-                <span className="text-gray-300 flex-1 truncate">{c.label}</span>
-                <span className={p ? 'text-green-400' : 'text-gray-600'}>{p ? '✓' : '—'}</span>
+                <span className="text-[var(--ink-2)] flex-1 truncate">{c.label}</span>
+                <span className={p ? 'text-green-400' : 'text-[var(--muted-2)]'}>{p ? '✓' : '—'}</span>
               </div>
             );
           })}
@@ -2609,7 +2609,7 @@ export default function DoorAlignModal({
               // 진행 중인 픽 초기화 — 사용자가 잘못 찍었거나 다시 시작하고 싶을 때.
               setPicked(emptyPicked());
             }}
-            className="w-full px-3 py-1.5 rounded text-xs text-center font-bold bg-gray-800 text-gray-300 hover:bg-gray-700 transition cursor-pointer"
+            className="w-full px-3 py-1.5 rounded text-xs text-center font-bold bg-[var(--bg-soft)] text-[var(--ink-2)] hover:bg-[var(--bg-soft)] transition cursor-pointer"
           >
             취소
           </button>
@@ -2617,13 +2617,13 @@ export default function DoorAlignModal({
 
 
         {/* ── 문 추출하기 (메인 PLY 에서 도어 영역 분리 → mesh + 추가 splat group) — 4 점 픽 + 자동 추출 미진행 시에만 활성. */}
-        <div className={`border-t border-gray-700 pt-2 space-y-1.5 ${(!allPicked || autoExtracting) ? 'opacity-40 pointer-events-none' : ''}`}>
+        <div className={`border-t border-[var(--rule)] pt-2 space-y-1.5 ${(!allPicked || autoExtracting) ? 'opacity-40 pointer-events-none' : ''}`}>
           <div className="flex items-center justify-between">
-            <div className="text-[11px] font-bold text-gray-200">문 추출하기</div>
+            <div className="text-[11px] font-bold text-[var(--ink)]">문 추출하기</div>
             <span className="text-[10px]">
               {doorRefineActive
                 ? <span className="text-green-400">추출됨</span>
-                : <span className="text-gray-600">미추출</span>}
+                : <span className="text-[var(--muted-2)]">미추출</span>}
             </span>
           </div>
 
@@ -2632,13 +2632,13 @@ export default function DoorAlignModal({
             className="flex items-center gap-1.5 text-[10px]"
             title={doorRefineActive ? '문 추출을 비활성화하세요.' : '벽 평면에서 방 안쪽으로 [N]cm 깊이 안의 가우시안을 도어 영역으로 분류. 손잡이/잠금처럼 돌출된 부분이 빠지면 값을 키우세요.'}
           >
-            <span className="text-gray-400 w-16">문 두께 (안쪽)</span>
+            <span className="text-[var(--muted)] w-16">문 두께 (안쪽)</span>
             <input type="range" min={0.02} max={0.5} step={0.005}
               value={doorThickness}
               disabled={doorRefineActive}
               onChange={e => setDoorThickness(parseFloat(e.target.value))}
               className="flex-1 accent-purple-500 cursor-pointer disabled:cursor-not-allowed disabled:opacity-40" />
-            <span className="text-white font-mono w-12 text-right">
+            <span className="text-[var(--ink)] font-mono w-12 text-right">
               {(doorThickness * 100).toFixed(1)}cm
             </span>
           </div>
@@ -2648,7 +2648,7 @@ export default function DoorAlignModal({
           )}
 
           {/* 문 가장자리 정제 — 문 추출 전에 먼저 켜둘 수 있음. ON 시 boundary 가우시안 split (SAGS-style). */}
-          <label className="flex items-center gap-1.5 text-[10px] cursor-pointer text-gray-300">
+          <label className="flex items-center gap-1.5 text-[10px] cursor-pointer text-[var(--ink-2)]">
             <input
               type="checkbox"
               checked={boundarySplitEnabled}
@@ -2663,10 +2663,10 @@ export default function DoorAlignModal({
             <button
               onClick={toggleDoorInternalShow}
               disabled={!allPicked}
-              className={`flex-1 px-3 py-1.5 rounded cursor-pointer text-xs font-bold disabled:bg-gray-700 disabled:text-gray-500 ${
+              className={`flex-1 px-3 py-1.5 rounded cursor-pointer text-xs font-bold disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] ${
                 doorInternalShow
                   ? 'bg-yellow-500 hover:bg-yellow-400 text-black'
-                  : 'bg-gray-700 hover:bg-gray-600 text-gray-200'
+                  : 'bg-[var(--bg-soft)] hover:bg-[var(--rule)] text-[var(--ink)]'
               }`}
               title="현재 문 두께 설정 기준 도어 영역 가우시안 + 메시를 노랑으로 표시"
             >
@@ -2675,10 +2675,10 @@ export default function DoorAlignModal({
             <button
               onClick={() => { if (doorRefineActive) revertDoorRefine(); else applyDoorRefine(); }}
               disabled={!allPicked || doorRefining}
-              className={`flex-1 px-3 py-1.5 rounded cursor-pointer text-xs font-bold disabled:bg-gray-700 disabled:text-gray-500 ${
+              className={`flex-1 px-3 py-1.5 rounded cursor-pointer text-xs font-bold disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] ${
                 doorRefineActive
-                  ? 'bg-amber-600 hover:bg-amber-500 text-white'
-                  : 'bg-blue-600 hover:bg-blue-500 text-white'
+                  ? 'bg-amber-600 hover:bg-amber-500 text-[var(--ink)]'
+                  : 'bg-blue-600 hover:bg-blue-500 text-[var(--ink)]'
               }`}
             >
               {doorRefining ? '처리 중...' : (doorRefineActive ? '문 추출 취소' : '문 추출')}
@@ -2690,15 +2690,15 @@ export default function DoorAlignModal({
         {/* ── 문 회전 (힌지 + 각도 + 방향) — 모듈 등록에서만. ──
             basemap 등록은 문 위치만 마킹하면 충분 (회전 메타는 모듈측 데이터 — 정합 후 모듈의 회전 파라미터 사용). */}
         {!basemapMode && <div
-          className={`border-t border-gray-700 pt-2 space-y-1.5 ${(doorRefineActive && !autoExtracting) ? '' : 'opacity-40 pointer-events-none'}`}
+          className={`border-t border-[var(--rule)] pt-2 space-y-1.5 ${(doorRefineActive && !autoExtracting) ? '' : 'opacity-40 pointer-events-none'}`}
           title={doorRefineActive ? '' : '먼저 문 추출 을 누르세요.'}
         >
           <div className="flex items-center justify-between">
-            <div className="text-[11px] font-bold text-gray-200">문 회전</div>
+            <div className="text-[11px] font-bold text-[var(--ink)]">문 회전</div>
             <span className="text-[10px]">
               {doorRotated
                 ? <span className="text-green-400">회전 적용</span>
-                : <span className="text-gray-600">회전 미적용</span>}
+                : <span className="text-[var(--muted-2)]">회전 미적용</span>}
             </span>
           </div>
 
@@ -2714,10 +2714,10 @@ export default function DoorAlignModal({
               }
             }}
             disabled={!allPicked || !doorRefineActive}
-            className={`w-full px-2 py-1.5 rounded text-[11px] font-bold cursor-pointer disabled:bg-gray-800 disabled:text-gray-600 disabled:cursor-not-allowed ${
+            className={`w-full px-2 py-1.5 rounded text-[11px] font-bold cursor-pointer disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted-2)] disabled:cursor-not-allowed ${
               edgePickArmed || hingeEdge !== null
                 ? 'bg-yellow-500 hover:bg-yellow-400 text-black'
-                : 'bg-blue-600 hover:bg-blue-500 text-white'
+                : 'bg-blue-600 hover:bg-blue-500 text-[var(--ink)]'
             }`}
           >
             {hingeEdge !== null && !edgePickArmed ? '회전축 재선택' : '회전축 선택'}
@@ -2725,27 +2725,27 @@ export default function DoorAlignModal({
 
           {/* 회전각 슬라이더 */}
           <div className="flex items-center gap-1.5 text-[10px]">
-            <span className="text-gray-400 w-16">회전각</span>
+            <span className="text-[var(--muted)] w-16">회전각</span>
             <input type="range" min={0} max={120} step={1}
               value={doorAngleDeg}
               disabled={!doorRefineActive}
               onChange={e => setDoorAngleDeg(parseFloat(e.target.value))}
               className="flex-1 accent-cyan-500 cursor-pointer disabled:opacity-40" />
-            <span className="text-white font-mono w-12 text-right">{doorAngleDeg}°</span>
+            <span className="text-[var(--ink)] font-mono w-12 text-right">{doorAngleDeg}°</span>
           </div>
 
           {/* 방향 토글 */}
           <div className="flex items-center gap-1.5 text-[10px]">
-            <span className="text-gray-400 w-16">회전 방향</span>
+            <span className="text-[var(--muted)] w-16">회전 방향</span>
             <button
               onClick={() => setDoorSwing(1)}
               disabled={!doorRefineActive}
-              className={`flex-1 px-2 py-1 rounded text-[10px] font-bold cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${doorSwing === 1 ? 'bg-blue-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'}`}
+              className={`flex-1 px-2 py-1 rounded text-[10px] font-bold cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${doorSwing === 1 ? 'bg-blue-600 text-[var(--ink)]' : 'bg-[var(--bg-soft)] text-[var(--ink-2)] hover:bg-[var(--rule)]'}`}
             >방 안쪽</button>
             <button
               onClick={() => setDoorSwing(-1)}
               disabled={!doorRefineActive}
-              className={`flex-1 px-2 py-1 rounded text-[10px] font-bold cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${doorSwing === -1 ? 'bg-blue-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'}`}
+              className={`flex-1 px-2 py-1 rounded text-[10px] font-bold cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${doorSwing === -1 ? 'bg-blue-600 text-[var(--ink)]' : 'bg-[var(--bg-soft)] text-[var(--ink-2)] hover:bg-[var(--rule)]'}`}
             >방 바깥쪽</button>
           </div>
 
@@ -2753,8 +2753,8 @@ export default function DoorAlignModal({
             onClick={() => { if (doorRotated) resetDoorRotation(); else applyDoorRotation(); }}
             disabled={hingeIndices.length !== 2 || !doorRefineActive}
             title={!doorRefineActive ? '먼저 문 추출 을 누르세요.' : (hingeIndices.length !== 2 ? '회전축 변을 먼저 선택' : '')}
-            className={`w-full px-3 py-1.5 rounded cursor-pointer text-xs font-bold disabled:bg-gray-700 disabled:text-gray-500 ${
-              doorRotated ? 'bg-amber-600 hover:bg-amber-500 text-white' : 'bg-blue-600 hover:bg-blue-500 text-white'
+            className={`w-full px-3 py-1.5 rounded cursor-pointer text-xs font-bold disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] ${
+              doorRotated ? 'bg-amber-600 hover:bg-amber-500 text-[var(--ink)]' : 'bg-blue-600 hover:bg-blue-500 text-[var(--ink)]'
             }`}
           >
             {doorRotated ? '문 닫기' : '문 열기'}
@@ -2763,12 +2763,12 @@ export default function DoorAlignModal({
 
         {/* basemap 다중 도어 목록 — 추출한 도어가 순서대로 누적. 각 항목: 호수 + X. */}
         {basemapMode && (
-          <div className="border-t border-gray-700 pt-2 space-y-1.5">
+          <div className="border-t border-[var(--rule)] pt-2 space-y-1.5">
             <div className="flex items-center justify-between">
-              <div className="text-[11px] font-bold text-gray-200">등록된 문 ({inMemoryDoors.length}개)</div>
+              <div className="text-[11px] font-bold text-[var(--ink)]">등록된 문 ({inMemoryDoors.length}개)</div>
             </div>
             {inMemoryDoors.length === 0 ? (
-              <p className="text-[10px] text-gray-500 italic px-1">4점 픽 → 자동 추출 → 자동으로 이 목록에 추가</p>
+              <p className="text-[10px] text-[var(--muted)] italic px-1">4점 픽 → 자동 추출 → 자동으로 이 목록에 추가</p>
             ) : (
               <div className="max-h-32 overflow-y-auto space-y-1 pr-1">
                 {inMemoryDoors.map((d) => {
@@ -2779,7 +2779,7 @@ export default function DoorAlignModal({
                       className={`flex items-stretch rounded transition cursor-pointer ${
                         unset
                           ? 'bg-yellow-900/40 border border-yellow-600/60 hover:bg-yellow-900/60'
-                          : 'bg-gray-800/60 border border-gray-700 hover:bg-gray-800'
+                          : 'bg-[var(--bg-soft)]/60 border border-[var(--rule)] hover:bg-[var(--bg-soft)]'
                       }`}
                       onClick={() => setUnitNamePickerOpen({ doorId: d.doorId, initialSuffix: 1 })}
                       title={unset ? '클릭해서 호수를 설정' : '클릭해서 호수 변경'}
@@ -2787,7 +2787,7 @@ export default function DoorAlignModal({
                       <div className="flex-1 min-w-0 px-2 py-1.5 flex items-center gap-1.5">
                         <span className="text-yellow-400 text-[10px]">{unset ? '⚠️' : '🚪'}</span>
                         <div className="flex-1 min-w-0">
-                          <div className={`text-[11px] font-medium truncate ${unset ? 'text-yellow-200' : 'text-gray-100'}`}>
+                          <div className={`text-[11px] font-medium truncate ${unset ? 'text-yellow-200' : 'text-[var(--ink)]'}`}>
                             {d.unitName || '호수 미설정'}
                           </div>
                           {unset && (
@@ -2843,7 +2843,7 @@ export default function DoorAlignModal({
                           }
                           setInMemoryDoors(prev => prev.filter(it => it.doorId !== d.doorId));
                         }}
-                        className="px-2 flex items-center text-gray-400 hover:text-red-400 hover:bg-red-500/10 transition rounded-r"
+                        className="px-2 flex items-center text-[var(--muted)] hover:text-red-400 hover:bg-red-500/10 transition rounded-r"
                         aria-label="도어 삭제"
                         title="도어 목록에서 삭제"
                       >
@@ -2971,7 +2971,7 @@ export default function DoorAlignModal({
               !rotationApplied ? '문 열기를 한 번 눌러 회전각/회전 방향을 확정하세요' :
               '도어 설정 (corners, hinge, 회전각, 회전방향, doorThickness 등) 즉시 영속화'
             }
-            className="w-full px-3 py-1.5 rounded cursor-pointer text-xs font-bold bg-green-700 hover:bg-green-600 text-white disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed"
+            className="w-full px-3 py-1.5 rounded cursor-pointer text-xs font-bold bg-green-700 hover:bg-green-600 text-[var(--ink)] disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] disabled:cursor-not-allowed"
           >
             {saveDoorBusy ? '저장 중...' : (saveDoorToast ?? '문 설정 완료')}
           </button>}
@@ -3122,7 +3122,7 @@ export default function DoorAlignModal({
                   committing ? '저장 중...' :
                   '모든 도어를 일괄 영속화하고 basemap 활성화'
                 }
-                className="w-full px-3 py-2 rounded cursor-pointer text-xs font-bold bg-emerald-600 hover:bg-emerald-500 text-white disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed"
+                className="w-full px-3 py-2 rounded cursor-pointer text-xs font-bold bg-emerald-600 hover:bg-emerald-500 text-[var(--ink)] disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] disabled:cursor-not-allowed"
               >
                 {committing ? '저장 중...' : 'Basemap 등록 완료'}
               </button>
@@ -3153,7 +3153,7 @@ export default function DoorAlignModal({
       {/* basemap 등록 완료 — 페이지 이동 선택 모달 (화면 정중앙, 큰 사이즈) */}
       {basemapMode && completionModalOpen && (
         <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/75 backdrop-blur-sm">
-          <div className="bg-gray-900 border border-gray-700 rounded-2xl px-10 py-9 w-full max-w-2xl shadow-2xl">
+          <div className="bg-[var(--paper)] border border-[var(--rule)] rounded-2xl px-10 py-9 w-full max-w-2xl shadow-2xl">
             <div className="flex items-center justify-center mb-5">
               <div className="w-16 h-16 rounded-full bg-green-500/15 border border-green-500/50 flex items-center justify-center">
                 <svg className="w-9 h-9 text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -3161,23 +3161,23 @@ export default function DoorAlignModal({
                 </svg>
               </div>
             </div>
-            <h3 className="text-2xl font-bold text-white text-center">Basemap 등록이 완료되었습니다</h3>
-            <p className="mt-3 text-base text-gray-300 text-center">이동할 페이지를 선택해주세요</p>
+            <h3 className="text-2xl font-bold text-[var(--ink)] text-center">Basemap 등록이 완료되었습니다</h3>
+            <p className="mt-3 text-base text-[var(--ink-2)] text-center">이동할 페이지를 선택해주세요</p>
             <div className="mt-8 flex items-center gap-3">
               <button
                 type="button"
                 onClick={() => onBasemapDone?.('main')}
-                className="flex-1 px-4 py-4 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-base font-bold transition"
+                className="flex-1 px-4 py-4 rounded-xl bg-blue-600 hover:bg-blue-500 text-[var(--ink)] text-base font-bold transition"
               >메인 페이지</button>
               <button
                 type="button"
                 onClick={() => onBasemapDone?.('building')}
-                className="flex-1 px-4 py-4 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-base font-bold transition"
+                className="flex-1 px-4 py-4 rounded-xl bg-blue-600 hover:bg-blue-500 text-[var(--ink)] text-base font-bold transition"
               >건물 페이지</button>
               <button
                 type="button"
                 onClick={() => onBasemapDone?.('dashboard')}
-                className="flex-1 px-4 py-4 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-base font-bold transition"
+                className="flex-1 px-4 py-4 rounded-xl bg-blue-600 hover:bg-blue-500 text-[var(--ink)] text-base font-bold transition"
               >대시보드</button>
             </div>
           </div>
@@ -3224,9 +3224,9 @@ function DoorUnitNamePickerModal({
 
   return (
     <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={onCancel}>
-      <div className="w-[320px] rounded-xl bg-gray-900 border border-gray-800 p-5 shadow-2xl" onClick={(e) => e.stopPropagation()}>
-        <h3 className="text-base font-semibold text-white text-center">호수를 선택하세요</h3>
-        <p className="text-xs text-gray-500 text-center mt-1">Floor {floorNumber}</p>
+      <div className="w-[320px] rounded-xl bg-[var(--paper)] border border-[var(--rule)] p-5 shadow-2xl" onClick={(e) => e.stopPropagation()}>
+        <h3 className="text-base font-semibold text-[var(--ink)] text-center">호수를 선택하세요</h3>
+        <p className="text-xs text-[var(--muted)] text-center mt-1">Floor {floorNumber}</p>
         <div className="mt-4 relative h-[220px] w-40 mx-auto select-none">
           <div className="pointer-events-none absolute inset-x-0 top-1/2 -translate-y-1/2 h-[44px] rounded-md border-y border-blue-500/60 bg-blue-500/10" />
           <ul
@@ -3242,7 +3242,7 @@ function DoorUnitNamePickerModal({
                 <li
                   key={s}
                   style={{ height: ROOM_PICKER_ITEM_HEIGHT, scrollSnapAlign: 'center' }}
-                  className={`flex items-center justify-center text-lg transition ${active ? 'text-white font-bold' : 'text-gray-500'}`}
+                  className={`flex items-center justify-center text-lg transition ${active ? 'text-[var(--ink)] font-bold' : 'text-[var(--muted)]'}`}
                   onClick={() => {
                     listRef.current?.scrollTo({ top: (s - 1) * ROOM_PICKER_ITEM_HEIGHT, behavior: 'smooth' });
                   }}
@@ -3254,8 +3254,8 @@ function DoorUnitNamePickerModal({
           </ul>
         </div>
         <div className="mt-5 flex gap-2">
-          <button type="button" onClick={onCancel} className="flex-1 rounded-md border border-gray-700 hover:bg-gray-800 py-2 text-sm text-gray-300">취소</button>
-          <button type="button" onClick={() => onConfirm(unitName)} className="flex-1 rounded-md bg-blue-600 hover:bg-blue-500 py-2 text-sm font-semibold text-white">{unitName} 설정</button>
+          <button type="button" onClick={onCancel} className="flex-1 rounded-md border border-[var(--rule)] hover:bg-[var(--bg-soft)] py-2 text-sm text-[var(--ink-2)]">취소</button>
+          <button type="button" onClick={() => onConfirm(unitName)} className="flex-1 rounded-md bg-blue-600 hover:bg-blue-500 py-2 text-sm font-semibold text-[var(--ink)]">{unitName} 설정</button>
         </div>
       </div>
     </div>

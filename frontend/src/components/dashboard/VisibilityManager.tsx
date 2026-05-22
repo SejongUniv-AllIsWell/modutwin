@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { api } from '@/lib/api';
 import { Building, Floor, Module } from '@/types';
+import { floorLabelKo as formatFloor } from '@/lib/format/floor';
 
 interface FloorWithModules extends Floor {
   modules: Module[];
@@ -25,10 +26,6 @@ type DeleteTarget =
   | { scope: 'building'; id: string; label: string; noun: '건물' }
   | { scope: 'floor'; id: string; label: string; noun: '층' }
   | { scope: 'module'; id: string; label: string; noun: '모듈' };
-
-function formatFloor(n: number): string {
-  return n < 0 ? `B${-n}` : `${n}층`;
-}
 
 export default function VisibilityManager() {
   const [buildings, setBuildings] = useState<BuildingWithFloors[]>([]);
@@ -387,7 +384,7 @@ export default function VisibilityManager() {
   const visBadge = (visible: boolean) => (
     <span
       className={`text-xs px-2 py-0.5 rounded ${
-        visible ? 'bg-green-600/20 text-green-400' : 'bg-gray-800 text-gray-400'
+        visible ? 'bg-green-600/20 text-green-400' : 'bg-[var(--bg-soft)] text-[var(--muted)]'
       }`}
     >
       {visible ? '표시' : '숨김'}
@@ -398,8 +395,8 @@ export default function VisibilityManager() {
     <button
       onClick={onClick}
       disabled={busy}
-      className={`text-xs px-3 py-1 rounded text-white disabled:bg-gray-700 shrink-0 ${
-        visible ? 'bg-gray-700 hover:bg-gray-600' : 'bg-blue-600 hover:bg-blue-700'
+      className={`text-xs px-3 py-1 rounded text-[var(--ink)] disabled:bg-[var(--bg-soft)] shrink-0 ${
+        visible ? 'bg-[var(--bg-soft)] hover:bg-[var(--rule)]' : 'bg-blue-600 hover:bg-blue-700'
       }`}
     >
       {busy ? '...' : visible ? '숨기기' : '표시'}
@@ -411,7 +408,7 @@ export default function VisibilityManager() {
       type="button"
       onClick={() => setDeleteTarget(target)}
       disabled={busyKey === `delete:${target.scope}:${target.id}`}
-      className="ml-1 w-6 h-6 flex items-center justify-center text-gray-400 hover:text-white hover:bg-red-600 rounded disabled:opacity-50 shrink-0"
+      className="ml-1 w-6 h-6 flex items-center justify-center text-[var(--muted)] hover:text-[var(--ink)] hover:bg-red-600 rounded disabled:opacity-50 shrink-0"
       aria-label={`${target.label} 삭제`}
       title={`${target.label} 삭제`}
     >
@@ -420,26 +417,26 @@ export default function VisibilityManager() {
   );
 
   return (
-    <section className="bg-gray-900 border border-gray-800 rounded-lg p-6">
+    <section className="bg-[var(--paper)] border border-[var(--rule)] rounded-lg p-6">
       <div className="flex items-center justify-between mb-4">
         <h2 className="text-lg font-semibold">건물 / 층 / 모듈 표시 관리</h2>
         <div className="flex items-center gap-3">
           <button
             onClick={openAddBuilding}
-            className="text-xs px-3 py-1 rounded bg-blue-600 hover:bg-blue-700 text-white"
+            className="text-xs px-3 py-1 rounded bg-blue-600 hover:bg-blue-700 text-[var(--ink)]"
           >
             + 건물 추가
           </button>
           <button
             onClick={loadAll}
-            className="text-xs text-gray-400 hover:text-white"
+            className="text-xs text-[var(--muted)] hover:text-[var(--ink)]"
             disabled={loading}
           >
             새로고침
           </button>
         </div>
       </div>
-      <p className="text-xs text-gray-500 mb-4">
+      <p className="text-xs text-[var(--muted)] mb-4">
         숨기기/표시는 하위 항목으로 자동 전파되며, 하위 항목을 표시하면 상위도 함께 표시됩니다.
       </p>
 
@@ -450,9 +447,9 @@ export default function VisibilityManager() {
       )}
 
       {loading ? (
-        <p className="text-gray-500 text-sm">불러오는 중...</p>
+        <p className="text-[var(--muted)] text-sm">불러오는 중...</p>
       ) : buildings.length === 0 ? (
-        <p className="text-gray-500 text-sm">등록된 건물이 없습니다.</p>
+        <p className="text-[var(--muted)] text-sm">등록된 건물이 없습니다.</p>
       ) : (
         <div className="space-y-2">
           {buildings.map((b) => {
@@ -463,14 +460,14 @@ export default function VisibilityManager() {
             return (
               <div
                 key={b.id}
-                className={`bg-gray-950 border rounded-lg ${
-                  b.is_visible ? 'border-gray-800' : 'border-gray-800 opacity-70'
+                className={`bg-[var(--bg)] border rounded-lg ${
+                  b.is_visible ? 'border-[var(--rule)]' : 'border-[var(--rule)] opacity-70'
                 }`}
               >
                 <div className="flex items-center justify-between px-3 py-2.5 gap-3">
                   <button
                     onClick={() => toggleBuildingOpen(b.id)}
-                    className="flex-1 flex items-center gap-2 text-left text-sm text-gray-200 hover:text-white min-w-0"
+                    className="flex-1 flex items-center gap-2 text-left text-sm text-[var(--ink)] hover:text-[var(--ink)] min-w-0"
                   >
                     <svg
                       className={`w-4 h-4 transition-transform shrink-0 ${
@@ -484,7 +481,7 @@ export default function VisibilityManager() {
                     </svg>
                     <span className="font-medium truncate">{b.name}</span>
                     {visBadge(b.is_visible)}
-                    <span className="text-xs text-gray-500 ml-1 shrink-0">
+                    <span className="text-xs text-[var(--muted)] ml-1 shrink-0">
                       {b.floors.length}개 층 · {moduleCount}개 모듈
                     </span>
                   </button>
@@ -495,7 +492,7 @@ export default function VisibilityManager() {
                 </div>
 
                 {isOpen && (
-                  <div className="border-t border-gray-800 p-2 space-y-1">
+                  <div className="border-t border-[var(--rule)] p-2 space-y-1">
                     <div className="flex items-center justify-end px-1 pb-1">
                       {floorAddTarget === b.id ? (
                         <div className="flex items-center gap-2">
@@ -508,19 +505,19 @@ export default function VisibilityManager() {
                               if (e.key === 'Escape') cancelAddFloor();
                             }}
                             placeholder="예: 1, -1"
-                            className="w-24 bg-gray-900 border border-gray-700 rounded px-2 py-1 text-xs text-white"
+                            className="w-24 bg-[var(--paper)] border border-[var(--rule)] rounded px-2 py-1 text-xs text-[var(--ink)]"
                             autoFocus
                           />
                           <button
                             onClick={() => submitAddFloor(b.id)}
                             disabled={busyKey === `addFloor:${b.id}`}
-                            className="text-xs px-2 py-1 rounded bg-blue-600 hover:bg-blue-700 text-white disabled:bg-gray-700"
+                            className="text-xs px-2 py-1 rounded bg-blue-600 hover:bg-blue-700 text-[var(--ink)] disabled:bg-[var(--bg-soft)]"
                           >
                             {busyKey === `addFloor:${b.id}` ? '...' : '추가'}
                           </button>
                           <button
                             onClick={cancelAddFloor}
-                            className="text-xs px-2 py-1 rounded bg-gray-700 hover:bg-gray-600 text-gray-200"
+                            className="text-xs px-2 py-1 rounded bg-[var(--bg-soft)] hover:bg-[var(--rule)] text-[var(--ink)]"
                           >
                             취소
                           </button>
@@ -528,14 +525,14 @@ export default function VisibilityManager() {
                       ) : (
                         <button
                           onClick={() => beginAddFloor(b.id)}
-                          className="text-xs px-2 py-1 rounded bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-700"
+                          className="text-xs px-2 py-1 rounded bg-[var(--bg-soft)] hover:bg-[var(--bg-soft)] text-[var(--ink-2)] border border-[var(--rule)]"
                         >
                           + 층 추가
                         </button>
                       )}
                     </div>
                     {sortedFloors.length === 0 ? (
-                      <p className="text-xs text-gray-600 px-2 py-1">층이 없습니다.</p>
+                      <p className="text-xs text-[var(--muted-2)] px-2 py-1">층이 없습니다.</p>
                     ) : (
                       sortedFloors.map((f) => {
                         const floorBusy = busyKey === `floor:${f.id}`;
@@ -544,13 +541,13 @@ export default function VisibilityManager() {
                           <div
                             key={f.id}
                             className={`border rounded ${
-                              f.is_visible ? 'border-gray-800' : 'border-gray-800 opacity-70'
+                              f.is_visible ? 'border-[var(--rule)]' : 'border-[var(--rule)] opacity-70'
                             }`}
                           >
                             <div className="flex items-center justify-between px-3 py-1.5 gap-3">
                               <button
                                 onClick={() => toggleFloorOpen(f.id)}
-                                className="flex-1 flex items-center gap-2 text-left text-sm text-gray-300 hover:text-white min-w-0"
+                                className="flex-1 flex items-center gap-2 text-left text-sm text-[var(--ink-2)] hover:text-[var(--ink)] min-w-0"
                               >
                                 <svg
                                   className={`w-3.5 h-3.5 transition-transform shrink-0 ${
@@ -564,7 +561,7 @@ export default function VisibilityManager() {
                                 </svg>
                                 <span className="font-medium">{formatFloor(f.floor_number)}</span>
                                 {visBadge(f.is_visible)}
-                                <span className="text-xs text-gray-500 ml-1 shrink-0">
+                                <span className="text-xs text-[var(--muted)] ml-1 shrink-0">
                                   {f.modules.length}개 모듈
                                 </span>
                               </button>
@@ -588,19 +585,19 @@ export default function VisibilityManager() {
                                           if (e.key === 'Escape') cancelAddModule();
                                         }}
                                         placeholder="모듈명 또는 1~10"
-                                        className="w-40 bg-gray-900 border border-gray-700 rounded px-2 py-1 text-xs text-white"
+                                        className="w-40 bg-[var(--paper)] border border-[var(--rule)] rounded px-2 py-1 text-xs text-[var(--ink)]"
                                         autoFocus
                                       />
                                       <button
                                         onClick={() => submitAddModule(f.id)}
                                         disabled={busyKey === `addModule:${f.id}`}
-                                        className="text-xs px-2 py-1 rounded bg-blue-600 hover:bg-blue-700 text-white disabled:bg-gray-700"
+                                        className="text-xs px-2 py-1 rounded bg-blue-600 hover:bg-blue-700 text-[var(--ink)] disabled:bg-[var(--bg-soft)]"
                                       >
                                         {busyKey === `addModule:${f.id}` ? '...' : '추가'}
                                       </button>
                                       <button
                                         onClick={cancelAddModule}
-                                        className="text-xs px-2 py-1 rounded bg-gray-700 hover:bg-gray-600 text-gray-200"
+                                        className="text-xs px-2 py-1 rounded bg-[var(--bg-soft)] hover:bg-[var(--rule)] text-[var(--ink)]"
                                       >
                                         취소
                                       </button>
@@ -608,26 +605,26 @@ export default function VisibilityManager() {
                                   ) : (
                                     <button
                                       onClick={() => beginAddModule(f.id)}
-                                      className="text-xs px-2 py-1 rounded bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-700"
+                                      className="text-xs px-2 py-1 rounded bg-[var(--bg-soft)] hover:bg-[var(--bg-soft)] text-[var(--ink-2)] border border-[var(--rule)]"
                                     >
                                       + 모듈 추가
                                     </button>
                                   )}
                                 </div>
                                 {f.modules.length === 0 ? (
-                                  <p className="text-xs text-gray-600">모듈이 없습니다.</p>
+                                  <p className="text-xs text-[var(--muted-2)]">모듈이 없습니다.</p>
                                 ) : (
                                   f.modules.map((m) => {
                                     const modBusy = busyKey === `mod:${m.id}`;
                                     return (
                                       <div
                                         key={m.id}
-                                        className={`flex items-center justify-between bg-gray-900 border rounded px-3 py-1.5 ${
-                                          m.is_visible ? 'border-gray-800' : 'border-gray-800 opacity-70'
+                                        className={`flex items-center justify-between bg-[var(--paper)] border rounded px-3 py-1.5 ${
+                                          m.is_visible ? 'border-[var(--rule)]' : 'border-[var(--rule)] opacity-70'
                                         }`}
                                       >
                                         <div className="flex items-center gap-2 text-sm min-w-0">
-                                          <span className="text-gray-300 truncate">{m.name}</span>
+                                          <span className="text-[var(--ink-2)] truncate">{m.name}</span>
                                           {visBadge(m.is_visible)}
                                         </div>
                                         <div className="flex items-center gap-2">
@@ -653,14 +650,14 @@ export default function VisibilityManager() {
       )}
       {addBuildingOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4">
-          <div className="w-full max-w-lg rounded-lg border border-gray-700 bg-gray-900 p-5 shadow-xl">
+          <div className="w-full max-w-lg rounded-lg border border-[var(--rule)] bg-[var(--paper)] p-5 shadow-xl">
             <div className="flex items-center justify-between mb-3">
-              <h3 className="text-base font-semibold text-white">건물 추가 — 카카오 검색</h3>
+              <h3 className="text-base font-semibold text-[var(--ink)]">건물 추가 — 카카오 검색</h3>
               <button
                 type="button"
                 onClick={closeAddBuilding}
                 disabled={addBuildingBusy}
-                className="text-gray-400 hover:text-white disabled:opacity-50"
+                className="text-[var(--muted)] hover:text-[var(--ink)] disabled:opacity-50"
               >
                 ✕
               </button>
@@ -672,17 +669,17 @@ export default function VisibilityManager() {
               placeholder="건물 이름 / 주소 검색..."
               autoFocus
               disabled={addBuildingBusy}
-              className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white text-sm focus:outline-none focus:border-blue-500 disabled:opacity-50"
+              className="w-full bg-[var(--bg-soft)] border border-[var(--rule)] rounded px-3 py-2 text-[var(--ink)] text-sm focus:outline-none focus:border-blue-500 disabled:opacity-50"
             />
-            <div className="mt-3 max-h-80 overflow-y-auto border border-gray-800 rounded">
+            <div className="mt-3 max-h-80 overflow-y-auto border border-[var(--rule)] rounded">
               {searchLoading && (
-                <div className="px-3 py-3 text-sm text-gray-400">검색 중...</div>
+                <div className="px-3 py-3 text-sm text-[var(--muted)]">검색 중...</div>
               )}
               {!searchLoading && searchQuery.trim() && searchResults.length === 0 && (
-                <div className="px-3 py-3 text-sm text-gray-500">검색 결과가 없습니다.</div>
+                <div className="px-3 py-3 text-sm text-[var(--muted)]">검색 결과가 없습니다.</div>
               )}
               {!searchLoading && !searchQuery.trim() && (
-                <div className="px-3 py-3 text-sm text-gray-500">검색어를 입력하세요.</div>
+                <div className="px-3 py-3 text-sm text-[var(--muted)]">검색어를 입력하세요.</div>
               )}
               {searchResults.map((place) => (
                 <button
@@ -690,17 +687,17 @@ export default function VisibilityManager() {
                   type="button"
                   onClick={() => addBuildingFromKakao(place)}
                   disabled={addBuildingBusy}
-                  className="w-full text-left px-3 py-2 hover:bg-gray-800 transition-colors border-t border-gray-800 first:border-t-0 disabled:opacity-50"
+                  className="w-full text-left px-3 py-2 hover:bg-[var(--bg-soft)] transition-colors border-t border-[var(--rule)] first:border-t-0 disabled:opacity-50"
                 >
-                  <div className="text-white text-sm font-medium truncate">{place.place_name}</div>
-                  <div className="text-gray-400 text-xs mt-0.5 truncate">
+                  <div className="text-[var(--ink)] text-sm font-medium truncate">{place.place_name}</div>
+                  <div className="text-[var(--muted)] text-xs mt-0.5 truncate">
                     {place.road_address_name || place.address_name || '주소 정보 없음'}
                   </div>
                 </button>
               ))}
             </div>
             {addBuildingBusy && (
-              <p className="mt-3 text-xs text-gray-400">등록 중...</p>
+              <p className="mt-3 text-xs text-[var(--muted)]">등록 중...</p>
             )}
           </div>
         </div>
@@ -708,12 +705,12 @@ export default function VisibilityManager() {
 
       {deleteTarget && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4">
-          <div className="w-full max-w-md rounded-lg border border-gray-700 bg-gray-900 p-5 shadow-xl">
-            <h3 className="text-base font-semibold text-white">삭제 확인</h3>
+          <div className="w-full max-w-md rounded-lg border border-[var(--rule)] bg-[var(--paper)] p-5 shadow-xl">
+            <h3 className="text-base font-semibold text-[var(--ink)]">삭제 확인</h3>
             <p className="mt-3 text-sm text-red-300">
               {deleteWarningText(deleteTarget)}
             </p>
-            <p className="mt-2 text-sm text-gray-300 truncate">
+            <p className="mt-2 text-sm text-[var(--ink-2)] truncate">
               대상: {deleteTarget.label}
             </p>
             <div className="mt-5 flex justify-end gap-2">
@@ -721,7 +718,7 @@ export default function VisibilityManager() {
                 type="button"
                 onClick={handleDelete}
                 disabled={busyKey === `delete:${deleteTarget.scope}:${deleteTarget.id}`}
-                className="rounded bg-red-600 px-4 py-2 text-sm font-semibold text-white hover:bg-red-700 disabled:bg-gray-700 disabled:text-gray-400"
+                className="rounded bg-red-600 px-4 py-2 text-sm font-semibold text-[var(--ink)] hover:bg-red-700 disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)]"
               >
                 {busyKey === `delete:${deleteTarget.scope}:${deleteTarget.id}` ? '삭제 중...' : '삭제'}
               </button>
@@ -729,7 +726,7 @@ export default function VisibilityManager() {
                 type="button"
                 onClick={() => setDeleteTarget(null)}
                 disabled={busyKey === `delete:${deleteTarget.scope}:${deleteTarget.id}`}
-                className="rounded bg-gray-700 px-4 py-2 text-sm text-gray-200 hover:bg-gray-600 disabled:opacity-50"
+                className="rounded bg-[var(--bg-soft)] px-4 py-2 text-sm text-[var(--ink)] hover:bg-[var(--rule)] disabled:opacity-50"
               >
                 취소
               </button>

@@ -5,6 +5,7 @@ import { useRouter } from 'next/navigation';
 import { api } from '@/lib/api';
 import { Building, Floor, Module, UploadInitResponse } from '@/types';
 import { PENDING_LOCAL_PLY_KEY, type PendingLocalPlyPayload } from '@/lib/upload/pendingLocalPly';
+import { Button } from '@/components/ui/Button';
 
 const SCENE_3D_EXTENSIONS = ['.ply', '.splat', '.sog'];
 
@@ -220,7 +221,7 @@ export default function MultipartUploader({
   return (
     <div className="max-w-lg mx-auto space-y-4">
       <div>
-        <label className="block text-sm text-gray-400 mb-2">파일</label>
+        <label className="block text-sm text-[var(--muted)] mb-2">파일</label>
         <div
           onClick={() => !submitting && fileRef.current?.click()}
           onDrop={handleDrop}
@@ -228,9 +229,9 @@ export default function MultipartUploader({
           onDragLeave={handleDragLeave}
           className={`flex flex-col items-center justify-center w-full h-40 rounded-lg border-2 border-dashed cursor-pointer transition-colors
             ${submitting ? 'cursor-not-allowed opacity-50' : ''}
-            ${isDragging ? 'border-blue-400 bg-blue-950' : 'border-gray-600 bg-gray-800 hover:border-blue-500'}`}
+            ${isDragging ? 'border-blue-400 bg-blue-950' : 'border-[var(--rule)] bg-[var(--bg-soft)] hover:border-blue-500'}`}
         >
-          <svg className="w-8 h-8 mb-2 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <svg className="w-8 h-8 mb-2 text-[var(--muted)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
           </svg>
           {file ? (
@@ -245,8 +246,8 @@ export default function MultipartUploader({
             </div>
           ) : (
             <>
-              <p className="text-sm text-gray-300">파일을 끌어다 놓거나 클릭하여 선택</p>
-              <p className="text-xs text-gray-500 mt-1">.ply / .splat / .sog</p>
+              <p className="text-sm text-[var(--ink-2)]">파일을 끌어다 놓거나 클릭하여 선택</p>
+              <p className="text-xs text-[var(--muted)] mt-1">.ply / .splat / .sog</p>
               <p className="text-xs text-emerald-600 mt-0.5">또는 사진 묶음 .zip (COLMAP)</p>
             </>
           )}
@@ -267,13 +268,13 @@ export default function MultipartUploader({
         </p>
       )}
 
-      <button
+      <Button
         onClick={handleConfirm}
         disabled={submitting || !file}
-        className="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-gray-700 disabled:text-gray-500 text-white py-2 rounded text-sm font-medium transition"
+        className="w-full"
       >
         {submitting ? '처리 중...' : '확인'}
-      </button>
+      </Button>
     </div>
   );
 }

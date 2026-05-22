@@ -125,7 +125,7 @@ function ViewerContent() {
 
   if (resolving) {
     return (
-      <div className="flex items-center justify-center h-[calc(100vh-56px)] text-gray-500">
+      <div className="flex items-center justify-center h-[calc(100vh-56px)] text-[var(--muted)]">
         <div className="text-center">
           <div className="w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full animate-spin mx-auto mb-3" />
           <p className="text-sm">파일 로딩 중...</p>
@@ -136,17 +136,17 @@ function ViewerContent() {
 
   if (resolveError) {
     return (
-      <div className="flex items-center justify-center h-[calc(100vh-56px)] text-gray-300">
+      <div className="flex items-center justify-center h-[calc(100vh-56px)] text-[var(--ink-2)]">
         <div className="text-center max-w-md px-6">
           <p className="text-sm font-bold text-red-400 mb-2">파일을 열 수 없습니다</p>
-          <p className="text-xs text-gray-500 leading-relaxed">{resolveError}</p>
+          <p className="text-xs text-[var(--muted)] leading-relaxed">{resolveError}</p>
         </div>
       </div>
     );
   }
 
   return (
-    <div className="relative h-[calc(100vh-56px)] bg-[#141414]">
+    <div className="viewer-dark relative h-[calc(100vh-56px)] bg-[var(--bg)]">
       <UnifiedSplatEditor
         initialSogUrl={fileUrl}
         initialUploadId={uploadId}
@@ -161,7 +161,7 @@ function ViewerContent() {
 
 export default function ViewerPage() {
   return (
-    <Suspense fallback={<div className="flex items-center justify-center h-[calc(100vh-56px)] text-gray-500">로딩 중...</div>}>
+    <Suspense fallback={<div className="flex items-center justify-center h-[calc(100vh-56px)] text-[var(--muted)]">로딩 중...</div>}>
       <ViewerContent />
     </Suspense>
   );

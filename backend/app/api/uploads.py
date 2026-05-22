@@ -1,4 +1,5 @@
 import json
+import logging
 import math
 import os
 from typing import Any
@@ -38,10 +39,12 @@ from app.services.sam3_service import (
     mark_sam3_disabled,
     mark_sam3_dispatch_pending,
 )
+from app.services.storage_access import delete_storage_best_effort
 from app.services.storage_paths import doors_json_key, module_base_path, refined_prefix
 
 router = APIRouter(prefix="/uploads", tags=["uploads"])
 settings = get_settings()
+logger = logging.getLogger(__name__)
 
 # 사용자당 업로드 제한 (개수 / 총 용량)
 MAX_UPLOADS_PER_USER = 100
@@ -338,10 +341,10 @@ async def list_uploads(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """내 업로드 목록 조회"""
+    """내 업로드 목록 조회 — 사용자가 직접 숨김 처리한 항목은 제외."""
     result = await db.execute(
         select(Upload)
-        .where(Upload.user_id == user.id)
+        .where(Upload.user_id == user.id, Upload.hidden_from_history.is_(False))
         .order_by(Upload.uploaded_at.desc())
     )
     uploads = result.scalars().all()
@@ -484,17 +487,45 @@ async def delete_upload(
     await db.execute(sa_delete(Upload).where(Upload.id == upload.id))
     await db.commit()
 
-    minio = get_minio_service()
-    for prefix in prefixes:
-        try:
-            minio.delete_prefix(prefix)
-        except Exception:
-            pass
-    for key in keys:
-        try:
-            minio.delete_object(key)
-        except Exception:
-            pass
+    delete_storage_best_effort(get_minio_service(), prefixes, keys)
+
+    return None
+
+
+@router.post("/{upload_id}/hide", status_code=status.HTTP_204_NO_CONTENT)
+async def hide_upload(
+    upload_id: UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """basemap 으로 채택되어 삭제가 막힌 업로드를 내 업로드 내역에서만 숨김.
+
+    파일과 DB row 는 그대로 유지되며, /uploads 목록에서만 제외된다. basemap 의
+    원본으로 등록되지 않은 업로드는 일반 DELETE 로 완전 삭제하면 되므로 이
+    엔드포인트가 거부한다.
+    """
+    stmt = select(Upload).where(Upload.id == upload_id)
+    if user.role != UserRole.admin:
+        stmt = stmt.where(Upload.user_id == user.id)
+    upload = (await db.execute(stmt)).scalar_one_or_none()
+    if upload is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="업로드를 찾을 수 없습니다.",
+        )
+
+    basemap_exists = (await db.execute(
+        select(Basemap.id).where(Basemap.source_upload_id == upload.id).limit(1)
+    )).scalar_one_or_none()
+    if basemap_exists is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="basemap 원본이 아닌 업로드는 숨김 대신 삭제하세요.",
+        )
+
+    if not upload.hidden_from_history:
+        upload.hidden_from_history = True
+        await db.commit()
 
     return None
 
@@ -834,7 +865,7 @@ async def start_sam3(
     except Exception as e:
         # broker/worker 비가용 — failed 로 두면 사용자가 정합 단계에서 수동 지정 가능.
         upload.sam3_status = Sam3Status.failed
-        print(f"[sam3] dispatch failed: {e}")
+        logger.exception(f"[sam3] dispatch failed: {e}")
 
     if celery_task_id:
         task = Task(

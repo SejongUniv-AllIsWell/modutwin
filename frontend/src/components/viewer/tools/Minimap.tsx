@@ -129,19 +129,19 @@ export default function Minimap({ floorplan, cameraGetter, size = 220, cutoff, o
 
   return (
     <div
-      className="absolute top-3 right-3 z-30 rounded-lg overflow-hidden border-2 border-gray-700 shadow-xl bg-gray-900"
+      className="absolute top-3 right-3 z-30 rounded-lg overflow-hidden border-2 border-[var(--rule)] shadow-xl bg-[var(--paper)]"
       style={{ width: size, height: size }}
     >
       <canvas ref={canvasRef} width={size} height={size} className="block" />
-      <div className="absolute top-1 left-1 text-[10px] text-white bg-black/70 px-1.5 py-0.5 rounded font-bold tracking-wide">
+      <div className="absolute top-1 left-1 text-[10px] text-[var(--ink)] bg-black/70 px-1.5 py-0.5 rounded font-bold tracking-wide">
         평면도
       </div>
-      <div className="absolute bottom-1 right-1 text-[9px] text-gray-400 bg-black/50 px-1 py-0.5 rounded">
+      <div className="absolute bottom-1 right-1 text-[9px] text-[var(--muted)] bg-black/50 px-1 py-0.5 rounded">
         휠: 줌
       </div>
       {/* 천장 컷 슬라이더 — 천장에서 이만큼 아래까지의 splat 만 평면도에 보임. */}
       <div
-        className="absolute bottom-1 left-1 right-1 flex items-center gap-1 text-[9px] text-gray-200 bg-black/60 px-1.5 py-1 rounded"
+        className="absolute bottom-1 left-1 right-1 flex items-center gap-1 text-[9px] text-[var(--ink)] bg-black/60 px-1.5 py-1 rounded"
         title="천장에서 이만큼 아래까지의 splat 만 평면도에 보임"
       >
         <span className="shrink-0">천장 컷</span>
