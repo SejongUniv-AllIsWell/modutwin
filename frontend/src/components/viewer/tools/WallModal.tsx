@@ -689,10 +689,16 @@ export default function WallModal({
       const bIdx = (segIdx + 1) % N;
       const a = get(aIdx); // 그 시점 polygon 의 앞 점 (이전 변환 결과 반영)
       const b = get(bIdx);
-      const len = Math.hypot(b.x - a.x, b.z - a.z);
+      const dxOrig = b.x - a.x;
+      const dzOrig = b.z - a.z;
+      const len = Math.hypot(dxOrig, dzOrig);
       if (len < 1e-9) continue;
-      const newBx = a.x + len * cosT;
-      const newBz = a.z + len * sinT;
+      // "평행" = 같은 방향 또는 반대 방향 둘 다 OK. 원래 방향과 기준 방향의 내적 부호로
+      // 더 가까운 쪽 선택 — 작은 회전만 적용 (180° 점프 방지).
+      const dot = dxOrig * cosT + dzOrig * sinT;
+      const sign = dot >= 0 ? 1 : -1;
+      const newBx = a.x + sign * len * cosT;
+      const newBz = a.z + sign * len * sinT;
       nextPoints[cycleOrder[bIdx]] = { x: newBx, z: newBz };
     }
 
