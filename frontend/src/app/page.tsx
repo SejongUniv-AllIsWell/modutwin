@@ -9,18 +9,24 @@ import { floorLabel } from '@/lib/format/floor';
 
 const WORLD_ATLAS_URL = 'https://unpkg.com/world-atlas@2.0.2/countries-110m.json';
 
+interface StepsCard {
+  numeral: string;
+  title: string;
+  body: string;
+}
+
 interface StepsSectionDef {
   slug: string;
   eyebrow: string;
+  title: string;
   variant: 'steps';
-  cardCount: number;
-  cardNumerals: string[];
-  ctaKey?: 'browse' | 'contribute';
+  cards: StepsCard[];
 }
 
 interface ListSectionDef {
   slug: string;
   eyebrow: string;
+  title: string;
   variant: 'list';
   cardCount: number;
   entryLeading: 'rank' | 'date';
@@ -28,22 +34,43 @@ interface ListSectionDef {
 
 type SectionDef = StepsSectionDef | ListSectionDef;
 
-// 섹션 구조 (슬러그·eyebrow·variant·entry 슬롯 수) 는 코드에 박혀 있고,
-// 텍스트 내용 (title·body·cta_label) 만 DB 에서 채운다.
-//   §01: splat.wiki 'Ways to add your record' 풍의 .steps 카드 — i/ii/iii 로마자.
-//   §02: 'Most liked' 풍의 .entries 리스트 — 좌측에 #1..#N 랭크.
-//   §03: 'Recently edited' 풍의 .entries 리스트 — 좌측에 카드 updated_at.
+//   §01: 'Ways to add your record' 풍의 .steps 카드 — i/ii/iii 로마자.
+//   §02: 'Most liked' 풍의 .entries 리스트 — 좌측에 #1..#N 랭크. /landing/feed 의 popular.
+//   §03: 'Recently edited' 풍의 .entries 리스트 — 좌측에 항목 날짜. /landing/feed 의 recent.
 const SECTIONS: SectionDef[] = [
   {
     slug: 'participate',
     eyebrow: '01 · How to participate',
+    title: '기록을 추가하는 방법',
     variant: 'steps',
-    cardCount: 3,
-    cardNumerals: ['i.', 'ii.', 'iii.'],
+    cards: [
+      {
+        numeral: 'i.',
+        title: '영상 업로드',
+        body:
+          '휴대폰이나 드론 영상 한 편을 올리면 서버가 프레임 추출 · SfM · 3DGS 학습을 ' +
+          '자동으로 진행합니다. 학습이 끝나는 즉시 아틀라스의 일부가 됩니다.',
+      },
+      {
+        numeral: 'ii.',
+        title: '포인트 클라우드 제출',
+        body:
+          '이미 학습한 splat 이 있다면 .ply / .sog / .splat 파일을 직접 업로드하세요. ' +
+          '지오태그만 붙이면 즉시 둘러볼 수 있습니다.',
+      },
+      {
+        numeral: 'iii.',
+        title: '이미지 + SfM 기여',
+        body:
+          '직접 찍은 사진과 COLMAP / OpenSfM 결과물을 가져오세요. 그 지점부터 재구성을 ' +
+          '이어 받고, 결과 씬에 기여자를 함께 표기합니다.',
+      },
+    ],
   },
   {
     slug: 'community',
     eyebrow: '02 · Community favourites',
+    title: 'Most liked',
     variant: 'list',
     cardCount: 5,
     entryLeading: 'rank',
@@ -51,27 +78,12 @@ const SECTIONS: SectionDef[] = [
   {
     slug: 'wiki',
     eyebrow: '03 · From the wiki',
+    title: 'Recently edited',
     variant: 'list',
     cardCount: 5,
     entryLeading: 'date',
   },
 ];
-
-interface LandingCard {
-  card_index: number;
-  title: string | null;
-  body: string | null;
-  updated_at: string | null;
-}
-
-interface LandingSection {
-  slug: string;
-  title: string | null;
-  cta_label: string | null;
-  cards: LandingCard[];
-}
-
-type CmsMap = Record<string, LandingSection>;
 
 interface LandingStats {
   buildings: number;
@@ -104,7 +116,6 @@ export default function LandingPage() {
   const fadeRef = useRef<HTMLDivElement | null>(null);
   const [isDigital, setIsDigital] = useState(false);
   const isZoomingRef = useRef(false);
-  const [cms, setCms] = useState<CmsMap>({});
   const [stats, setStats] = useState<LandingStats | null>(null);
   const [feed, setFeed] = useState<LandingFeed | null>(null);
 
@@ -154,17 +165,6 @@ export default function LandingPage() {
 
   useEffect(() => {
     let disposed = false;
-    api
-      .get<LandingSection[]>('/landing/sections')
-      .then((rows) => {
-        if (disposed) return;
-        const map: CmsMap = {};
-        for (const r of rows) map[r.slug] = r;
-        setCms(map);
-      })
-      .catch(() => {
-        // 행이 없거나 엔드포인트가 죽어도 비워둔 채로 렌더
-      });
     api
       .get<LandingStats>('/landing/stats')
       .then((s) => {
@@ -295,25 +295,11 @@ export default function LandingPage() {
     };
   }, []);
 
-  const scrollTo = (id: string) => {
-    const el = document.getElementById(id);
-    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  };
-
-  const cardAt = (slug: string, idx: number): LandingCard | undefined => {
-    return cms[slug]?.cards.find((c) => c.card_index === idx);
-  };
-
   const formatEntryDate = (iso: string | null | undefined): string => {
     if (!iso) return '';
     const d = new Date(iso);
     if (Number.isNaN(d.getTime())) return '';
     return `${d.getFullYear()} · ${String(d.getMonth() + 1).padStart(2, '0')} · ${String(d.getDate()).padStart(2, '0')}`;
-  };
-
-  const onSectionCta = (key: 'browse' | 'contribute') => {
-    if (key === 'browse') goExplore();
-    else requireLoginThenExplore();
   };
 
   return (
@@ -329,16 +315,11 @@ export default function LandingPage() {
           --muted-2: #908a7e;
           --rule: #d9d3c4;
           --rule-soft: #e7e1d1;
-          font-family: 'Noto Sans KR', Helvetica, 'Helvetica Neue', Arial, sans-serif;
+          font-family: var(--font-noto-sans-kr), 'Noto Sans KR', Helvetica, 'Helvetica Neue', Arial, sans-serif;
           -webkit-font-smoothing: antialiased;
           text-rendering: optimizeLegibility;
         }
-        .landing .serif {
-          font-family: 'Times New Roman', Georgia, serif;
-        }
-        .landing .mono {
-          font-family: ui-monospace, Menlo, monospace;
-        }
+        /* .serif / .mono 는 globals.css 의 전역 정의(Source Serif 4 / JetBrains Mono)를 사용. */
         .landing-fade {
           position: fixed;
           inset: 0;
@@ -403,7 +384,7 @@ export default function LandingPage() {
           <nav className="flex items-center gap-6 text-[13.5px]">
             <button
               type="button"
-              onClick={() => scrollTo('participate')}
+              onClick={() => router.push('/about')}
               className="hover:underline underline-offset-4"
               style={{ color: 'var(--ink-2)' }}
             >
@@ -426,12 +407,14 @@ export default function LandingPage() {
               Contribute
             </button>
             {user ? (
-              <span
-                className="px-3 py-1.5 rounded-sm border text-[13.5px]"
+              <button
+                type="button"
+                onClick={() => router.push('/dashboard')}
+                className="px-3 py-1.5 rounded-sm border text-[13.5px] hover:bg-[var(--bg-soft)]"
                 style={{ borderColor: 'var(--rule)', color: 'var(--ink-2)' }}
               >
                 {user.name}
-              </span>
+              </button>
             ) : (
               <button
                 type="button"
@@ -487,7 +470,7 @@ export default function LandingPage() {
             >
               <div>
                 <b
-                  className="serif font-semibold text-[14px]"
+                  className="mono font-semibold text-[14px]"
                   style={{ color: 'var(--ink)', letterSpacing: 0 }}
                 >
                   {stats ? stats.buildings.toLocaleString() : '—'}
@@ -496,16 +479,16 @@ export default function LandingPage() {
               </div>
               <div>
                 <b
-                  className="serif font-semibold text-[14px]"
+                  className="mono font-semibold text-[14px]"
                   style={{ color: 'var(--ink)', letterSpacing: 0 }}
                 >
                   {stats ? stats.modules.toLocaleString() : '—'}
                 </b>{' '}
-                모듈 등록
+                모듈
               </div>
               <div>
                 <b
-                  className="serif font-semibold text-[14px]"
+                  className="mono font-semibold text-[14px]"
                   style={{ color: 'var(--ink)', letterSpacing: 0 }}
                 >
                   {stats ? stats.contributors.toLocaleString() : '—'}
@@ -538,7 +521,6 @@ export default function LandingPage() {
       </section>
 
       {SECTIONS.map((section, sectionIdx) => {
-        const sectionData = cms[section.slug];
         return (
           <section
             key={section.slug}
@@ -571,63 +553,42 @@ export default function LandingPage() {
                     color: 'var(--ink)',
                   }}
                 >
-                  {sectionData?.title ?? ''}
+                  {section.title}
                 </h2>
               </div>
 
               {section.variant === 'steps' ? (
-                <>
-                  <div className="grid grid-cols-1 md:grid-cols-3 gap-3.5">
-                    {Array.from({ length: section.cardCount }).map((_, i) => {
-                      const card = cardAt(section.slug, i);
-                      return (
-                        <div
-                          key={i}
-                          className="p-7 rounded-xl flex flex-col gap-3.5"
-                          style={{
-                            background: '#ffffff',
-                            border: '1px solid var(--rule-soft)',
-                          }}
-                        >
-                          <div
-                            className="serif italic text-[56px] leading-none"
-                            style={{ color: 'var(--ink)', letterSpacing: '-0.02em' }}
-                          >
-                            {section.cardNumerals[i] ?? ''}
-                          </div>
-                          <h3
-                            className="serif font-medium m-0 min-h-[1.2em]"
-                            style={{ fontSize: 24, letterSpacing: '-0.01em' }}
-                          >
-                            {card?.title ?? ''}
-                          </h3>
-                          <p
-                            className="m-0 min-h-[1.4em]"
-                            style={{ color: 'var(--ink-2)' }}
-                          >
-                            {card?.body ?? ''}
-                          </p>
-                        </div>
-                      );
-                    })}
-                  </div>
-                  {section.ctaKey && (
-                    <div className="mt-8">
-                      <button
-                        type="button"
-                        onClick={() => onSectionCta(section.ctaKey!)}
-                        className="inline-flex items-center gap-2 px-4 py-2.5 rounded-sm text-[13.5px] border"
-                        style={{
-                          background: 'var(--ink)',
-                          color: 'var(--bg)',
-                          borderColor: 'var(--ink)',
-                        }}
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3.5">
+                  {section.cards.map((card, i) => (
+                    <div
+                      key={i}
+                      className="p-7 rounded-xl flex flex-col gap-3.5"
+                      style={{
+                        background: '#ffffff',
+                        border: '1px solid var(--rule-soft)',
+                      }}
+                    >
+                      <div
+                        className="serif italic text-[56px] leading-none"
+                        style={{ color: 'var(--ink)', letterSpacing: '-0.02em' }}
                       >
-                        {sectionData?.cta_label ?? ''}
-                      </button>
+                        {card.numeral}
+                      </div>
+                      <h3
+                        className="serif font-medium m-0 min-h-[1.2em]"
+                        style={{ fontSize: 24, letterSpacing: '-0.01em' }}
+                      >
+                        {card.title}
+                      </h3>
+                      <p
+                        className="m-0 min-h-[1.4em]"
+                        style={{ color: 'var(--ink-2)' }}
+                      >
+                        {card.body}
+                      </p>
                     </div>
-                  )}
-                </>
+                  ))}
+                </div>
               ) : (
                 <ul className="list-none p-0 m-0 grid gap-3">
                   {Array.from({ length: section.cardCount }).map((_, i) => {

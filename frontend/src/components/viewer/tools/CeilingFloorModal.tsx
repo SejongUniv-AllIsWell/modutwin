@@ -409,69 +409,69 @@ export default function CeilingFloorModal({
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70" onClick={onClose}>
-      <div className="bg-gray-900 border border-gray-700 rounded-lg p-5 shadow-2xl" onClick={e => e.stopPropagation()}>
-        <div className="text-white font-bold text-sm mb-1">천장 / 바닥 설정</div>
-        <div className="text-gray-400 text-xs mb-3">
+      <div className="bg-[var(--paper)] border border-[var(--rule)] rounded-lg p-5 shadow-2xl" onClick={e => e.stopPropagation()}>
+        <div className="text-[var(--ink)] font-bold text-sm mb-1">천장 / 바닥 설정</div>
+        <div className="text-[var(--muted)] text-xs mb-3">
           슬라이더로 포인트 클라우드를 회전해 천장/바닥이 수평이 되게 맞춘 뒤, <span style={{color:'#22d3ee'}}>천장선</span> / <span style={{color:'#92400e'}}>바닥선</span>을 드래그하세요.
         </div>
         <div className="flex gap-3">
           <div>
-            <div className="text-gray-500 text-[10px] mb-1 text-center">정면 (XY)</div>
+            <div className="text-[var(--muted)] text-[10px] mb-1 text-center">정면 (XY)</div>
             <canvas ref={xyRef} style={{ width: CW, height: CH }}
-              className="border border-gray-700 rounded cursor-ns-resize"
+              className="border border-[var(--rule)] rounded cursor-ns-resize"
               onMouseDown={handleMouseDown} onMouseMove={handleMouseMove}
               onMouseUp={handleMouseUp} onMouseLeave={handleMouseUp} />
             <div className="mt-2 flex items-center gap-2 text-xs">
-              <span className="text-gray-400 w-16">Z축 회전</span>
+              <span className="text-[var(--muted)] w-16">Z축 회전</span>
               <input ref={rotZSliderRef} type="range" min={-180} max={180} step={0.5}
                 defaultValue={((initialRotZ ?? 0) * 180) / Math.PI}
                 onInput={(e) => onRotZSlider(parseFloat((e.target as HTMLInputElement).value))}
                 className="flex-1" />
-              <span ref={rotZLabelRef} className="text-white font-mono w-12 text-right">
+              <span ref={rotZLabelRef} className="text-[var(--ink)] font-mono w-12 text-right">
                 {(((initialRotZ ?? 0) * 180) / Math.PI).toFixed(1)}°
               </span>
-              <button onClick={resetRotZ} className="text-gray-500 hover:text-white text-[10px]">리셋</button>
+              <button onClick={resetRotZ} className="text-[var(--muted)] hover:text-[var(--ink)] text-[10px]">리셋</button>
             </div>
           </div>
           <div>
-            <div className="text-gray-500 text-[10px] mb-1 text-center">측면 (ZY)</div>
+            <div className="text-[var(--muted)] text-[10px] mb-1 text-center">측면 (ZY)</div>
             <canvas ref={zyRef} style={{ width: CW, height: CH }}
-              className="border border-gray-700 rounded cursor-ns-resize"
+              className="border border-[var(--rule)] rounded cursor-ns-resize"
               onMouseDown={handleMouseDown} onMouseMove={handleMouseMove}
               onMouseUp={handleMouseUp} onMouseLeave={handleMouseUp} />
             <div className="mt-2 flex items-center gap-2 text-xs">
-              <span className="text-gray-400 w-16">X축 회전</span>
+              <span className="text-[var(--muted)] w-16">X축 회전</span>
               <input ref={rotXSliderRef} type="range" min={-180} max={180} step={0.5}
                 defaultValue={((initialRotX ?? 0) * 180) / Math.PI}
                 onInput={(e) => onRotXSlider(parseFloat((e.target as HTMLInputElement).value))}
                 className="flex-1" />
-              <span ref={rotXLabelRef} className="text-white font-mono w-12 text-right">
+              <span ref={rotXLabelRef} className="text-[var(--ink)] font-mono w-12 text-right">
                 {(((initialRotX ?? 0) * 180) / Math.PI).toFixed(1)}°
               </span>
-              <button onClick={resetRotX} className="text-gray-500 hover:text-white text-[10px]">리셋</button>
+              <button onClick={resetRotX} className="text-[var(--muted)] hover:text-[var(--ink)] text-[10px]">리셋</button>
             </div>
           </div>
         </div>
         <div className="flex items-center justify-between mt-4">
-          <div className="text-gray-500 text-xs">
+          <div className="text-[var(--muted)] text-xs">
             천장: <span ref={ceilingLabelRef} className="font-mono" style={{color:'#22d3ee'}}>{initLo.toFixed(2)}</span>
             {' '}바닥: <span ref={floorLabelRef} className="font-mono" style={{color:'#92400e'}}>{initHi.toFixed(2)}</span>
-            {' '}간격: <span ref={gapLabelRef} className="text-white font-mono">{(initHi - initLo).toFixed(2)}</span>
+            {' '}간격: <span ref={gapLabelRef} className="text-[var(--ink)] font-mono">{(initHi - initLo).toFixed(2)}</span>
           </div>
           <div className="flex gap-2">
             <button onClick={redetectPeaks}
-              className="px-3 py-2 bg-gray-700 hover:bg-gray-600 text-gray-300 rounded text-xs cursor-pointer">
+              className="px-3 py-2 bg-[var(--bg-soft)] hover:bg-[var(--rule)] text-[var(--ink-2)] rounded text-xs cursor-pointer">
               자동감지 재실행
             </button>
             <button onClick={onClose}
-              className="px-4 py-2 bg-gray-700 hover:bg-gray-600 text-gray-300 rounded text-sm cursor-pointer">
+              className="px-4 py-2 bg-[var(--bg-soft)] hover:bg-[var(--rule)] text-[var(--ink-2)] rounded text-sm cursor-pointer">
               취소
             </button>
             <button onClick={() => {
                 const a = lineARef.current, b = lineBRef.current;
                 onConfirm(Math.min(a, b), Math.max(a, b), rotXRef.current, rotZRef.current);
               }}
-              className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded text-sm cursor-pointer font-bold">
+              className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-[var(--ink)] rounded text-sm cursor-pointer font-bold">
               확인
             </button>
           </div>

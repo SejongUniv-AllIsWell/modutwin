@@ -47,14 +47,37 @@ const normalizePriorityText = (value: string) => (
     .toLowerCase()
 );
 
-const priorityNameTokens = sejongUniversityPlacePriority.addressPriority
-  .flatMap((entry) => [entry.name, ...(entry.aliases ?? [])])
-  .map(normalizePriorityText)
-  .filter((name) => name.length > 0);
+export interface CanonicalPlace {
+  canonicalName: string;
+  aliases: string[];
+}
 
-const matchesPriorityList = (placeName: string) => {
-  const normalizedPlaceName = normalizePriorityText(placeName);
-  return priorityNameTokens.some((name) => normalizedPlaceName === name);
+const canonicalPlaceByAlias = (() => {
+  const map = new Map<string, CanonicalPlace>();
+  for (const entry of sejongUniversityPlacePriority.addressPriority) {
+    const allNames = [entry.name, ...(entry.aliases ?? [])]
+      .map((name) => name.trim())
+      .filter(Boolean);
+    const info: CanonicalPlace = {
+      canonicalName: entry.name,
+      aliases: Array.from(new Set(allNames)),
+    };
+    for (const name of allNames) {
+      const normalized = normalizePriorityText(name);
+      if (normalized.length > 0) map.set(normalized, info);
+    }
+  }
+  return map;
+})();
+
+const matchesPriorityList = (placeName: string) => (
+  canonicalPlaceByAlias.has(normalizePriorityText(placeName))
+);
+
+export const resolveCanonicalPlace = (placeName: string): CanonicalPlace | null => {
+  const normalized = normalizePriorityText(placeName.trim());
+  if (!normalized) return null;
+  return canonicalPlaceByAlias.get(normalized) ?? null;
 };
 
 export const scorePriorityPlaceName = (placeName: string): PriorityPlaceScore => {

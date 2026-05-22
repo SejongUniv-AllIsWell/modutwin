@@ -9,6 +9,7 @@ import SplatViewerCore, { type SplatViewerCoreRef } from '@/components/viewer/Sp
 import { useAdditionalGsplats } from '@/components/viewer/tools/useAdditionalGsplats';
 import { useRefinedMeshLoader } from '@/components/viewer/tools/useRefinedMeshLoader';
 import { useToast } from '@/components/ui/Toast';
+import RoomWheelPicker, { roomNumberLabel } from '@/components/ui/RoomWheelPicker';
 
 type Vec3 = [number, number, number];
 type Quat = [number, number, number, number];
@@ -143,86 +144,6 @@ function FloorCompositeViewer({
   }, [remove]);
 
   return <SplatViewerCore ref={coreRef} sogUrl={primaryUrl} />;
-}
-
-const ROOM_PICKER_ITEM_HEIGHT = 44;
-const ROOM_PICKER_VISIBLE_PADDING = ROOM_PICKER_ITEM_HEIGHT * 2;
-
-function RoomWheelPicker({
-  floorNumber,
-  value,
-  onChange,
-}: {
-  floorNumber: number;
-  value: number;
-  onChange: (next: number) => void;
-}) {
-  const listRef = useRef<HTMLUListElement>(null);
-  const settleTimerRef = useRef<number | null>(null);
-  const items = Array.from({ length: 99 }, (_, i) => i + 1);
-
-  useEffect(() => {
-    if (listRef.current) {
-      listRef.current.scrollTop = (value - 1) * ROOM_PICKER_ITEM_HEIGHT;
-    }
-  }, []);
-
-  const handleScroll = () => {
-    if (!listRef.current) return;
-    if (settleTimerRef.current) window.clearTimeout(settleTimerRef.current);
-    settleTimerRef.current = window.setTimeout(() => {
-      if (!listRef.current) return;
-      const idx = Math.round(listRef.current.scrollTop / ROOM_PICKER_ITEM_HEIGHT);
-      const next = Math.max(1, Math.min(99, idx + 1));
-      if (next !== value) onChange(next);
-    }, 60);
-  };
-
-  return (
-    <div className="relative h-[220px] w-40 mx-auto select-none">
-      <div
-        className="pointer-events-none absolute inset-x-0 top-1/2 -translate-y-1/2 h-[44px] rounded-md border-y"
-        style={{ borderColor: 'var(--ink)', background: 'var(--bg-soft)' }}
-      />
-      <ul
-        ref={listRef}
-        onScroll={handleScroll}
-        className="h-full overflow-y-auto"
-        style={{
-          scrollSnapType: 'y mandatory',
-          scrollbarWidth: 'none',
-          paddingTop: ROOM_PICKER_VISIBLE_PADDING,
-          paddingBottom: ROOM_PICKER_VISIBLE_PADDING,
-        }}
-      >
-        {items.map((suffix) => {
-          const display = `${floorNumber}${String(suffix).padStart(2, '0')}호`;
-          const active = value === suffix;
-          return (
-            <li
-              key={suffix}
-              style={{ height: ROOM_PICKER_ITEM_HEIGHT, scrollSnapAlign: 'center' }}
-              className={`flex items-center justify-center text-lg transition ${
-                active ? 'text-[var(--ink)] font-bold' : 'text-[var(--muted)]'
-              }`}
-              onClick={() => {
-                listRef.current?.scrollTo({
-                  top: (suffix - 1) * ROOM_PICKER_ITEM_HEIGHT,
-                  behavior: 'smooth',
-                });
-              }}
-            >
-              {display}
-            </li>
-          );
-        })}
-      </ul>
-    </div>
-  );
-}
-
-function roomNumberLabel(floorNumber: number, suffix: number) {
-  return `${floorNumber}${String(suffix).padStart(2, '0')}호`;
 }
 
 function formatRegisteredAt(iso: string | null | undefined): string | null {

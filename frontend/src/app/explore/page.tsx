@@ -8,6 +8,7 @@ import { useAuth } from '@/lib/auth';
 import {
   comparePriorityPlaceCandidates,
   type PriorityCoordinateOverride,
+  resolveCanonicalPlace,
   scorePriorityPlaceName,
   sejongUniversityPlacePriority,
   type PriorityPlaceScore,
@@ -465,10 +466,13 @@ export default function ExplorePage() {
           showToast('선택한 건물의 좌표가 올바르지 않습니다.');
           return;
         }
-        showSelectedMarker(place.place_name, lat, lng);
-        showToast(`선택됨: ${place.place_name}`);
+        const canonical = resolveCanonicalPlace(place.place_name);
+        const displayName = canonical?.canonicalName ?? place.place_name;
+        showSelectedMarker(displayName, lat, lng);
+        showToast(`선택됨: ${displayName}`);
         await routeBuildingByLookup({
-          building_name: place.place_name,
+          building_name: displayName,
+          lookup_names: canonical?.aliases,
           place_id: place.id,
           address_name: place.address_name || null,
           road_address_name: place.road_address_name || null,
@@ -678,8 +682,10 @@ export default function ExplorePage() {
 
   const handlePlaceSelect = async (place: KakaoPlaceResult) => {
     try {
+      const canonical = resolveCanonicalPlace(place.place_name);
       await routeBuildingByLookup({
-        building_name: place.place_name,
+        building_name: canonical?.canonicalName ?? place.place_name,
+        lookup_names: canonical?.aliases,
         place_id: place.id,
         address_name: place.address_name || null,
         road_address_name: place.road_address_name || null,

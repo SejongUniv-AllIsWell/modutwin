@@ -4,9 +4,11 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useParams, useRouter, useSearchParams } from 'next/navigation';
 import { api } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
-import type { FloorOverviewManifest, FloorOverviewManifestEntry } from '@/types';
-import { floorLabel } from '@/lib/format/floor';
+import type { Floor, FloorOverviewManifest, FloorOverviewManifestEntry } from '@/types';
+import { floorLabel, floorLabelKo } from '@/lib/format/floor';
 import { useToast } from '@/components/ui/Toast';
+import RoomWheelPicker, { FloorWheelPicker, roomNumberLabel } from '@/components/ui/RoomWheelPicker';
+import type { Module } from '@/types';
 
 export default function BuildingOverviewPage() {
   const router = useRouter();
@@ -21,12 +23,21 @@ export default function BuildingOverviewPage() {
   const [hoveredFloorId, setHoveredFloorId] = useState<string | null>(null);
   const [brokenImageByFloorId, setBrokenImageByFloorId] = useState<Record<string, boolean>>({});
   const [openFloorMenuId, setOpenFloorMenuId] = useState<string | null>(null);
-  const [addMenuOpen, setAddMenuOpen] = useState(false);
-  const [registerPurpose, setRegisterPurpose] = useState<'basemap' | 'module' | null>(null);
-  const [registerFloor, setRegisterFloor] = useState<FloorOverviewManifestEntry | null>(null);
-  const [floorInputValue, setFloorInputValue] = useState('');
-  const [nameInputValue, setNameInputValue] = useState('');
-  const [floorInputError, setFloorInputError] = useState<string | null>(null);
+
+  // "+ 등록" — 층 추가 모달 (휠 피커)
+  const [addFloorOpen, setAddFloorOpen] = useState(false);
+  const [addFloorPick, setAddFloorPick] = useState(1);
+  const [addFloorError, setAddFloorError] = useState<string | null>(null);
+  const [addFloorBusy, setAddFloorBusy] = useState(false);
+
+  // 층 ⋮ → basemap/module 등록 모달
+  const [registerTarget, setRegisterTarget] = useState<{
+    floor: FloorOverviewManifestEntry;
+    purpose: 'basemap' | 'module';
+  } | null>(null);
+  const [pickerRoomSuffix, setPickerRoomSuffix] = useState(1);
+  const [registerNameError, setRegisterNameError] = useState<string | null>(null);
+  const [registerBusy, setRegisterBusy] = useState(false);
 
   const loadOverview = useCallback(() => {
     if (!buildingId) return;
@@ -53,69 +64,127 @@ export default function BuildingOverviewPage() {
     [manifest]
   );
 
-  const parseFloorNumber = (raw: string): number | null => {
-    const value = raw.trim();
-    if (!value) return null;
-    const basementMatch = value.match(/^B(\d+)$/i);
-    if (basementMatch) {
-      const n = Number(basementMatch[1]);
-      if (!Number.isInteger(n) || n <= 0) return null;
-      return -n;
-    }
-    const parsed = Number(value);
-    if (!Number.isInteger(parsed) || parsed === 0) return null;
-    return parsed;
+  const openAddFloor = () => {
+    setAddFloorOpen(true);
+    // 첫 표시 시 가장 작은 미사용 양수 층을 기본 선택지로.
+    const used = new Set(floors.map((f) => f.floor_number));
+    let candidate = 1;
+    while (used.has(candidate)) candidate += 1;
+    setAddFloorPick(candidate);
+    setAddFloorError(null);
   };
 
-  const ensureFloor = async (floorNumber: number): Promise<{ id?: string; floor_number: number }> => {
-    const existing = floors.find((f) => f.floor_number === floorNumber);
-    if (existing) return { id: existing.floor_id, floor_number: existing.floor_number };
-    return { floor_number: floorNumber };
+  const closeAddFloor = () => {
+    if (addFloorBusy) return;
+    setAddFloorOpen(false);
+    setAddFloorError(null);
+  };
+
+  const handleAddFloor = async () => {
+    const floorNumber = addFloorPick;
+    if (!Number.isInteger(floorNumber) || floorNumber === 0) {
+      setAddFloorError('유효한 층을 선택하세요.');
+      return;
+    }
+    if (floors.some((f) => f.floor_number === floorNumber)) {
+      setAddFloorError('이미 존재하는 층입니다.');
+      return;
+    }
+    setAddFloorBusy(true);
+    try {
+      if (isPendingBuilding) {
+        // 건물 자체가 아직 서버에 없음 — 로컬 manifest 에 임시 entry 만 추가.
+        // 실제 floor 레코드는 basemap/module 등록의 viewer 흐름에서 생성됨.
+        setManifest((prev) => prev && ({
+          ...prev,
+          floors: [
+            ...prev.floors,
+            {
+              floor_id: `pending-${floorNumber}`,
+              floor_number: floorNumber,
+              overview_dirty: false,
+              overview_version: null,
+              topdown_url: null,
+              meta_url: null,
+              module_count: 0,
+              has_active_basemap: false,
+            },
+          ],
+        }));
+      } else {
+        const created = await api.post<Floor>(`/buildings/${buildingId}/floors`, {
+          floor_number: floorNumber,
+        });
+        if (user?.role === 'admin') {
+          try { await api.put(`/admin/floors/${created.id}/confirm`); } catch { /* 확정 실패 무시 */ }
+        }
+        const refreshed = await api.get<FloorOverviewManifest>(
+          `/buildings/${buildingId}/floor-overview`,
+        );
+        setManifest(refreshed);
+      }
+      setAddFloorOpen(false);
+      setAddFloorError(null);
+    } catch (e: any) {
+      setAddFloorError(e?.message || '층 추가에 실패했습니다.');
+    } finally {
+      setAddFloorBusy(false);
+    }
+  };
+
+  const openRegisterModal = (floor: FloorOverviewManifestEntry, purpose: 'basemap' | 'module') => {
+    setOpenFloorMenuId(null);
+    setRegisterTarget({ floor, purpose });
+    setPickerRoomSuffix(1);
+    setRegisterNameError(null);
   };
 
   const closeRegisterModal = () => {
-    setRegisterPurpose(null);
-    setRegisterFloor(null);
-    setFloorInputValue('');
-    setNameInputValue('');
-    setFloorInputError(null);
+    if (registerBusy) return;
+    setRegisterTarget(null);
+    setPickerRoomSuffix(1);
+    setRegisterNameError(null);
   };
 
-  const openRegisterModal = (purpose: 'basemap' | 'module', floor?: FloorOverviewManifestEntry) => {
-    setAddMenuOpen(false);
-    setOpenFloorMenuId(null);
-    setRegisterPurpose(purpose);
-    setRegisterFloor(floor ?? null);
-    setFloorInputValue(floor ? floorLabel(floor.floor_number) : '');
-    setNameInputValue('');
-    setFloorInputError(null);
-  };
+  const handleRegister = async () => {
+    if (!registerTarget) return;
+    const { floor, purpose } = registerTarget;
+    // basemap 은 호수별 도어에 unitName 부여 — basemap 전체 이름 입력 불필요.
+    // module 은 휠 피커에서 선택한 호수가 이름이 됨 (예: 201호).
+    const registrationName =
+      purpose === 'basemap' ? '' : roomNumberLabel(floor.floor_number, pickerRoomSuffix);
 
-  const handleRegisterFromPlus = async () => {
-    if (!registerPurpose) return;
-    const floorNumber = registerFloor?.floor_number ?? parseFloorNumber(floorInputValue);
-    if (floorNumber === null) {
-      setFloorInputError('유효한 층 번호를 입력하세요. 예: 1, -1, B1');
-      return;
-    }
-    // basemap 등록은 호수별로 도어 unitName 부여 — basemap 전체 이름 입력 불필요. 빈 문자열로 진행.
-    const registrationName = registerPurpose === 'basemap' ? '' : nameInputValue.trim();
-    if (registerPurpose !== 'basemap' && !registrationName) {
-      setFloorInputError('모듈 이름을 입력하세요.');
-      return;
-    }
+    setRegisterBusy(true);
     try {
-      const floor = registerFloor
-        ? { id: registerFloor.floor_id, floor_number: registerFloor.floor_number }
-        : await ensureFloor(floorNumber);
+      // module 등록 — 동일 호수가 이미 있을 경우 사전 확인.
+      if (
+        purpose === 'module' &&
+        floor.floor_id &&
+        !floor.floor_id.startsWith('pending-')
+      ) {
+        const existing = await api.get<Array<Module>>(
+          `/floors/${floor.floor_id}/modules`,
+        );
+        if (existing.some((m) => m.name === registrationName)) {
+          const ok = window.confirm(
+            `${registrationName} 은(는) 이미 등록되어 있습니다.\n계속 진행하면 정합 완료 시 기존 작업물은 삭제되고 새 작업물로 교체됩니다.\n\n진행하시겠습니까?`,
+          );
+          if (!ok) {
+            setRegisterBusy(false);
+            return;
+          }
+        }
+      }
       const qs = new URLSearchParams({
-        purpose: registerPurpose,
+        purpose,
         building_name: manifest?.building_name ?? 'Building',
         floor_number: String(floor.floor_number),
         module_name: registrationName,
       });
       if (!isPendingBuilding) qs.set('building_id', buildingId);
-      if (floor.id) qs.set('floor_id', floor.id);
+      if (floor.floor_id && !floor.floor_id.startsWith('pending-')) {
+        qs.set('floor_id', floor.floor_id);
+      }
       if (isPendingBuilding) {
         const placeId = searchParams.get('place_id');
         const addressName = searchParams.get('address_name');
@@ -128,14 +197,38 @@ export default function BuildingOverviewPage() {
         if (lat) qs.set('lat', lat);
         if (lng) qs.set('lng', lng);
       }
-      closeRegisterModal();
+      setRegisterTarget(null);
+      setPickerRoomSuffix(1);
+      setRegisterNameError(null);
       router.push(`/viewer?${qs.toString()}`);
-    } catch (error: any) {
-      showToast(error?.message || '뷰어 이동에 실패했습니다.', 'error');
+    } catch (err: any) {
+      setRegisterNameError(err?.message || '뷰어 이동에 실패했습니다.');
+      setRegisterBusy(false);
+    }
+  };
+
+  const handleDeleteBasemap = async (floor: FloorOverviewManifestEntry) => {
+    setOpenFloorMenuId(null);
+    const ok = window.confirm(
+      `${floorLabel(floor.floor_number)} 의 활성 basemap 을 삭제하시겠습니까?\n` +
+      `해당 basemap 의 PLY/메시/도어 자산이 모두 사라지며, 이 층의 기존 정합된 모듈들은 부모 베이스맵을 잃습니다.`
+    );
+    if (!ok) return;
+    try {
+      const active = await api.get<{ basemap_id: string }>(
+        `/basemaps/active?floor_id=${floor.floor_id}`,
+      );
+      await api.delete(`/admin/basemaps/${active.basemap_id}`);
+      await loadOverview();
+    } catch (err: any) {
+      showToast(`basemap 삭제 실패: ${err?.message ?? err}`, 'error');
     }
   };
 
   if (loading) return null;
+
+  const addFloorDisabled =
+    !user || (!isPendingBuilding && user?.role !== 'admin' && !!manifest?.building_is_confirmed);
 
   return (
     <div
@@ -165,119 +258,87 @@ export default function BuildingOverviewPage() {
         </div>
 
         <div className="mt-4 flex-1 overflow-y-auto space-y-1">
-          {floors.map((floor) => (
-            <div
-              key={floor.floor_id}
-              className="rounded-sm border"
-              style={{ background: 'var(--bg)', borderColor: 'var(--rule)' }}
-            >
-              <div className="px-2 py-1.5 flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={() => router.push(`/buildings/${buildingId}/floors/${floor.floor_number}`)}
-                  className="flex-1 text-left text-sm hover:underline underline-offset-4"
-                  style={{ color: 'var(--ink)' }}
-                >
-                  {floorLabel(floor.floor_number)}
-                </button>
-                <div className="relative">
+          {floors.map((floor) => {
+            const isPendingFloor = floor.floor_id.startsWith('pending-');
+            return (
+              <div
+                key={floor.floor_id}
+                className="rounded-sm border"
+                style={{ background: 'var(--bg)', borderColor: 'var(--rule)' }}
+              >
+                <div className="px-2 py-1.5 flex items-center gap-2">
                   <button
                     type="button"
-                    onClick={() => setOpenFloorMenuId((prev) => (prev === floor.floor_id ? null : floor.floor_id))}
-                    className="w-7 h-7 flex items-center justify-center rounded-sm hover:bg-[var(--bg-soft)]"
-                    style={{ color: 'var(--muted)' }}
+                    onClick={() => {
+                      if (isPendingFloor) return;
+                      router.push(`/buildings/${buildingId}/floors/${floor.floor_number}`);
+                    }}
+                    disabled={isPendingFloor}
+                    className="flex-1 text-left text-sm hover:underline underline-offset-4 disabled:opacity-60 disabled:cursor-default disabled:hover:no-underline"
+                    style={{ color: 'var(--ink)' }}
                   >
-                    ⋮
+                    {floorLabel(floor.floor_number)}
                   </button>
-                  {openFloorMenuId === floor.floor_id && (
-                    <div
-                      className="absolute right-0 top-8 z-10 w-28 rounded-sm border shadow-lg p-1"
-                      style={{ background: 'var(--paper)', borderColor: 'var(--rule)' }}
+                  <div className="relative">
+                    <button
+                      type="button"
+                      onClick={() => setOpenFloorMenuId((prev) => (prev === floor.floor_id ? null : floor.floor_id))}
+                      className="w-7 h-7 flex items-center justify-center rounded-sm hover:bg-[var(--bg-soft)]"
+                      style={{ color: 'var(--muted)' }}
                     >
-                      {!floor.has_active_basemap && (
+                      ⋮
+                    </button>
+                    {openFloorMenuId === floor.floor_id && (
+                      <div
+                        className="absolute right-0 top-8 z-10 w-28 rounded-sm border shadow-lg p-1"
+                        style={{ background: 'var(--paper)', borderColor: 'var(--rule)' }}
+                      >
+                        {!floor.has_active_basemap && (
+                          <button
+                            type="button"
+                            onClick={() => openRegisterModal(floor, 'basemap')}
+                            className="w-full text-left text-xs px-2 py-1.5 rounded-sm hover:bg-[var(--bg-soft)]"
+                            style={{ color: 'var(--ink)' }}
+                          >
+                            basemap 등록
+                          </button>
+                        )}
+                        {floor.has_active_basemap && !isPendingFloor && (
+                          <button
+                            type="button"
+                            onClick={() => handleDeleteBasemap(floor)}
+                            className="w-full text-left text-xs px-2 py-1.5 rounded-sm hover:bg-red-500/10"
+                            style={{ color: '#b04646' }}
+                          >
+                            basemap 삭제
+                          </button>
+                        )}
                         <button
                           type="button"
-                          onClick={() => {
-                            openRegisterModal('basemap', floor);
-                          }}
+                          onClick={() => openRegisterModal(floor, 'module')}
                           className="w-full text-left text-xs px-2 py-1.5 rounded-sm hover:bg-[var(--bg-soft)]"
                           style={{ color: 'var(--ink)' }}
                         >
-                          basemap 등록
+                          module 등록
                         </button>
-                      )}
-                      {floor.has_active_basemap && (
-                        <button
-                          type="button"
-                          onClick={async () => {
-                            setOpenFloorMenuId(null);
-                            const ok = window.confirm(
-                              `${floorLabel(floor.floor_number)} 의 활성 basemap 을 삭제하시겠습니까?\n` +
-                              `해당 basemap 의 PLY/메시/도어 자산이 모두 사라지며, 이 층의 기존 정합된 모듈들은 부모 베이스맵을 잃습니다.`
-                            );
-                            if (!ok) return;
-                            try {
-                              const active = await api.get<{ basemap_id: string }>(
-                                `/basemaps/active?floor_id=${floor.floor_id}`,
-                              );
-                              await api.delete(`/admin/basemaps/${active.basemap_id}`);
-                              await loadOverview();
-                            } catch (err: any) {
-                              showToast(`basemap 삭제 실패: ${err?.message ?? err}`, 'error');
-                            }
-                          }}
-                          className="w-full text-left text-xs px-2 py-1.5 rounded-sm hover:bg-red-500/10"
-                          style={{ color: '#b04646' }}
-                        >
-                          basemap 삭제
-                        </button>
-                      )}
-                    </div>
-                  )}
+                      </div>
+                    )}
+                  </div>
                 </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
 
-          <div className="space-y-2">
-            <button
-              type="button"
-              disabled={manifest?.building_is_confirmed || !user}
-              onClick={() => setAddMenuOpen((prev) => !prev)}
-              title={!user ? '로그인 후 등록 가능합니다' : undefined}
-              className="w-full rounded-sm border px-3 py-2 text-sm text-left disabled:opacity-50 disabled:cursor-not-allowed hover:bg-[var(--bg-soft)]"
-              style={{ borderColor: 'var(--rule)', color: 'var(--ink)' }}
-            >
-              + 등록
-            </button>
-            {addMenuOpen && !manifest?.building_is_confirmed && user && (
-              <div
-                className="rounded-sm border p-1 space-y-1"
-                style={{ background: 'var(--paper)', borderColor: 'var(--rule)' }}
-              >
-                <button
-                  type="button"
-                  onClick={() => {
-                    openRegisterModal('basemap');
-                  }}
-                  className="w-full text-left text-xs px-2 py-1.5 rounded-sm hover:bg-[var(--bg-soft)]"
-                  style={{ color: 'var(--ink)' }}
-                >
-                  basemap 등록
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    openRegisterModal('module');
-                  }}
-                  className="w-full text-left text-xs px-2 py-1.5 rounded-sm hover:bg-[var(--bg-soft)]"
-                  style={{ color: 'var(--ink)' }}
-                >
-                  module 등록
-                </button>
-              </div>
-            )}
-          </div>
+          <button
+            type="button"
+            disabled={addFloorDisabled}
+            onClick={openAddFloor}
+            title={!user ? '로그인 후 등록 가능합니다' : undefined}
+            className="w-full rounded-sm border px-3 py-2 text-sm text-left disabled:opacity-50 disabled:cursor-not-allowed hover:bg-[var(--bg-soft)]"
+            style={{ borderColor: 'var(--rule)', color: 'var(--ink)' }}
+          >
+            + 등록
+          </button>
         </div>
       </aside>
 
@@ -286,11 +347,12 @@ export default function BuildingOverviewPage() {
         style={{ background: 'var(--bg)' }}
       >
         <div className="mx-auto max-w-5xl min-h-full pt-1 lg:pt-2 pr-1">
-          {floors.map((floor, idx) => {
+          {floors.map((floor) => {
             const hovered = hoveredFloorId === floor.floor_id;
             const dimmed = hoveredFloorId !== null && !hovered;
             const fallbackSample = floor.floor_number === 1 ? "/data/1.webp" : floor.floor_number === 2 ? "/data/2.webp" : null;
             const imageUrl = !brokenImageByFloorId[floor.floor_id] ? floor.topdown_url || fallbackSample : null;
+            const isPendingFloor = floor.floor_id.startsWith('pending-');
             return (
               <FloorSlab
                 key={floor.floor_id}
@@ -298,10 +360,14 @@ export default function BuildingOverviewPage() {
                 imageUrl={imageUrl}
                 hovered={hovered}
                 dimmed={dimmed}
+                interactive={!isPendingFloor}
                 onHover={() => setHoveredFloorId(floor.floor_id)}
                 onLeave={() => setHoveredFloorId(null)}
                 onImageError={() => setBrokenImageByFloorId((prev) => ({ ...prev, [floor.floor_id]: true }))}
-                onClick={() => router.push(`/buildings/${buildingId}/floors/${floor.floor_number}`)}
+                onClick={() => {
+                  if (isPendingFloor) return;
+                  router.push(`/buildings/${buildingId}/floors/${floor.floor_number}`);
+                }}
               />
             );
           })}
@@ -320,83 +386,134 @@ export default function BuildingOverviewPage() {
         </div>
       </main>
 
-      {registerPurpose && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4">
+      {addFloorOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm"
+          onClick={closeAddFloor}
+        >
           <div
-            className="w-full max-w-sm rounded-md border p-4 shadow-xl"
+            className="w-[320px] rounded-xl border p-5 shadow-2xl"
             style={{ background: 'var(--paper)', borderColor: 'var(--rule)' }}
+            onClick={(e) => e.stopPropagation()}
           >
-            <h2 className="text-sm font-semibold" style={{ color: 'var(--ink)' }}>
-              {registerPurpose === 'basemap' ? 'Basemap 등록 정보' : 'Module 등록 정보'}
+            <h2 className="text-base font-semibold text-center" style={{ color: 'var(--ink)' }}>
+              층을 선택하세요
             </h2>
-            <p className="mt-1 text-xs" style={{ color: 'var(--muted)' }}>
-              {registerFloor ? `${floorLabel(registerFloor.floor_number)}에 등록합니다.` : '층은 예: 1, -1, B1 형식으로 입력하세요.'}
+            <p className="text-xs text-center mt-1" style={{ color: 'var(--muted)' }}>
+              지하(B)와 지상(층) 모두 선택 가능합니다.
             </p>
-            <input
-              type="text"
-              value={floorInputValue}
-              onChange={(e) => {
-                setFloorInputValue(e.target.value);
-                if (floorInputError) setFloorInputError(null);
-              }}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') handleRegisterFromPlus();
-                if (e.key === 'Escape') closeRegisterModal();
-              }}
-              autoFocus={!registerFloor}
-              disabled={!!registerFloor}
-              className="mt-3 w-full rounded-sm border px-3 py-2 text-sm outline-none disabled:opacity-50"
-              style={{
-                background: 'var(--bg)',
-                borderColor: 'var(--rule)',
-                color: 'var(--ink)',
-              }}
-              placeholder="층 번호"
-            />
-            {/* basemap 등록은 호수별로 도어에 unitName 부여 — basemap 전체 이름 입력 불필요. */}
-            {registerPurpose !== 'basemap' && (
-              <input
-                type="text"
-                value={nameInputValue}
-                onChange={(e) => {
-                  setNameInputValue(e.target.value);
-                  if (floorInputError) setFloorInputError(null);
+            <div className="mt-4">
+              <FloorWheelPicker
+                value={addFloorPick}
+                onChange={(next) => {
+                  setAddFloorPick(next);
+                  setAddFloorError(null);
                 }}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') handleRegisterFromPlus();
-                  if (e.key === 'Escape') closeRegisterModal();
-                }}
-                autoFocus={!!registerFloor}
-                className="mt-2 w-full rounded-sm border px-3 py-2 text-sm outline-none"
-                style={{
-                  background: 'var(--bg)',
-                  borderColor: 'var(--rule)',
-                  color: 'var(--ink)',
-                }}
-                placeholder="모듈 이름"
               />
+            </div>
+
+            {addFloorError && (
+              <p className="mt-3 text-xs text-center" style={{ color: '#b04646' }}>{addFloorError}</p>
             )}
-            {floorInputError && <p className="mt-2 text-xs" style={{ color: '#b04646' }}>{floorInputError}</p>}
-            <div className="mt-4 flex items-center justify-end gap-2">
+
+            <div className="mt-5 flex gap-2">
               <button
                 type="button"
-                onClick={closeRegisterModal}
-                className="rounded-sm border px-3 py-1.5 text-xs hover:bg-[var(--bg-soft)]"
+                onClick={closeAddFloor}
+                disabled={addFloorBusy}
+                className="flex-1 rounded-sm border hover:bg-[var(--bg-soft)] disabled:opacity-50 py-2 text-sm"
                 style={{ borderColor: 'var(--rule)', color: 'var(--ink)' }}
               >
                 취소
               </button>
               <button
                 type="button"
-                onClick={handleRegisterFromPlus}
-                className="rounded-sm px-3 py-1.5 text-xs font-medium border"
+                onClick={handleAddFloor}
+                disabled={addFloorBusy}
+                className="flex-1 rounded-sm border disabled:opacity-60 py-2 text-sm font-semibold"
                 style={{
                   background: 'var(--ink)',
                   color: 'var(--bg)',
                   borderColor: 'var(--ink)',
                 }}
               >
-                확인
+                {addFloorBusy ? '추가 중...' : `${floorLabelKo(addFloorPick)} 추가`}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {registerTarget && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm"
+          onClick={closeRegisterModal}
+        >
+          <div
+            className="w-[320px] rounded-xl border p-5 shadow-2xl"
+            style={{ background: 'var(--paper)', borderColor: 'var(--rule)' }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            {registerTarget.purpose === 'module' ? (
+              <>
+                <h2 className="text-base font-semibold text-center" style={{ color: 'var(--ink)' }}>
+                  호수를 선택하세요
+                </h2>
+                <p className="text-xs text-center mt-1" style={{ color: 'var(--muted)' }}>
+                  Floor {registerTarget.floor.floor_number}
+                </p>
+                <div className="mt-4">
+                  <RoomWheelPicker
+                    floorNumber={registerTarget.floor.floor_number}
+                    value={pickerRoomSuffix}
+                    onChange={(next) => {
+                      setPickerRoomSuffix(next);
+                      setRegisterNameError(null);
+                    }}
+                  />
+                </div>
+              </>
+            ) : (
+              <>
+                <h2 className="text-base font-semibold text-center" style={{ color: 'var(--ink)' }}>
+                  Basemap 등록
+                </h2>
+                <p className="text-xs text-center mt-1" style={{ color: 'var(--muted)' }}>
+                  {floorLabel(registerTarget.floor.floor_number)}에 basemap 을 등록합니다.
+                </p>
+              </>
+            )}
+
+            {registerNameError && (
+              <p className="mt-3 text-xs text-center" style={{ color: '#b04646' }}>{registerNameError}</p>
+            )}
+
+            <div className="mt-5 flex gap-2">
+              <button
+                type="button"
+                disabled={registerBusy}
+                onClick={closeRegisterModal}
+                className="flex-1 rounded-sm border hover:bg-[var(--bg-soft)] disabled:opacity-50 py-2 text-sm"
+                style={{ borderColor: 'var(--rule)', color: 'var(--ink)' }}
+              >
+                취소
+              </button>
+              <button
+                type="button"
+                disabled={registerBusy}
+                onClick={handleRegister}
+                className="flex-1 rounded-sm border disabled:opacity-60 py-2 text-sm font-semibold"
+                style={{
+                  background: 'var(--ink)',
+                  color: 'var(--bg)',
+                  borderColor: 'var(--ink)',
+                }}
+              >
+                {registerBusy
+                  ? '확인 중...'
+                  : registerTarget.purpose === 'module'
+                  ? `${roomNumberLabel(registerTarget.floor.floor_number, pickerRoomSuffix)} 등록`
+                  : '확인'}
               </button>
             </div>
           </div>
@@ -411,6 +528,7 @@ function FloorSlab({
   imageUrl,
   hovered,
   dimmed,
+  interactive,
   onHover,
   onLeave,
   onImageError,
@@ -420,6 +538,7 @@ function FloorSlab({
   imageUrl: string | null;
   hovered: boolean;
   dimmed: boolean;
+  interactive: boolean;
   onHover: () => void;
   onLeave: () => void;
   onImageError: () => void;
@@ -431,13 +550,14 @@ function FloorSlab({
       onMouseEnter={onHover}
       onMouseLeave={onLeave}
       onClick={onClick}
+      disabled={!interactive}
       className={`group relative w-full h-28 lg:h-32 overflow-hidden text-left transition duration-200 ${
         imageUrl ? 'rounded-sm' : 'rounded-md border'
-      } ${dimmed ? 'opacity-40' : 'opacity-100'}`}
+      } ${dimmed ? 'opacity-40' : 'opacity-100'} ${!interactive ? 'cursor-default' : ''}`}
       style={{
-        borderColor: hovered ? 'var(--ink)' : imageUrl ? undefined : 'var(--rule)',
-        boxShadow: hovered ? '0 10px 24px -12px rgba(0,0,0,0.25)' : undefined,
-        outline: imageUrl ? (hovered ? '2px solid var(--ink)' : '1px solid var(--rule)') : undefined,
+        borderColor: hovered && interactive ? 'var(--ink)' : imageUrl ? undefined : 'var(--rule)',
+        boxShadow: hovered && interactive ? '0 10px 24px -12px rgba(0,0,0,0.25)' : undefined,
+        outline: imageUrl ? (hovered && interactive ? '2px solid var(--ink)' : '1px solid var(--rule)') : undefined,
         outlineOffset: imageUrl ? '-1px' : undefined,
       }}
     >

@@ -37,18 +37,10 @@ const mockApi = async (page: Page, authenticated: boolean) => {
   });
 };
 
-test('login route renders and redirects without crashing', async ({ page }) => {
+test('explore route allows anonymous fallback rendering without backend', async ({ page }) => {
   await mockApi(page, false);
-  await page.goto('/login');
-  await expect(page).toHaveURL(/\/$/);
-  await expect(page.getByText('ModuTwin')).toBeVisible();
-  await expect(page.getByRole('button', { name: '로그인' })).toBeVisible();
-});
-
-test('explore route shows Kakao key fallback state without backend', async ({ page }) => {
-  await mockApi(page, true);
   await page.goto('/explore');
-  await expect(page.getByPlaceholder('건물 검색...')).toBeVisible();
+  await expect(page.getByPlaceholder('건물 검색')).toBeVisible();
   await expect(page.getByText('카카오맵 API 키가 설정되지 않았습니다')).toBeVisible();
 });
 

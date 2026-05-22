@@ -341,10 +341,10 @@ async def list_uploads(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """내 업로드 목록 조회"""
+    """내 업로드 목록 조회 — 사용자가 직접 숨김 처리한 항목은 제외."""
     result = await db.execute(
         select(Upload)
-        .where(Upload.user_id == user.id)
+        .where(Upload.user_id == user.id, Upload.hidden_from_history.is_(False))
         .order_by(Upload.uploaded_at.desc())
     )
     uploads = result.scalars().all()
@@ -488,6 +488,44 @@ async def delete_upload(
     await db.commit()
 
     delete_storage_best_effort(get_minio_service(), prefixes, keys)
+
+    return None
+
+
+@router.post("/{upload_id}/hide", status_code=status.HTTP_204_NO_CONTENT)
+async def hide_upload(
+    upload_id: UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """basemap 으로 채택되어 삭제가 막힌 업로드를 내 업로드 내역에서만 숨김.
+
+    파일과 DB row 는 그대로 유지되며, /uploads 목록에서만 제외된다. basemap 의
+    원본으로 등록되지 않은 업로드는 일반 DELETE 로 완전 삭제하면 되므로 이
+    엔드포인트가 거부한다.
+    """
+    stmt = select(Upload).where(Upload.id == upload_id)
+    if user.role != UserRole.admin:
+        stmt = stmt.where(Upload.user_id == user.id)
+    upload = (await db.execute(stmt)).scalar_one_or_none()
+    if upload is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="업로드를 찾을 수 없습니다.",
+        )
+
+    basemap_exists = (await db.execute(
+        select(Basemap.id).where(Basemap.source_upload_id == upload.id).limit(1)
+    )).scalar_one_or_none()
+    if basemap_exists is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="basemap 원본이 아닌 업로드는 숨김 대신 삭제하세요.",
+        )
+
+    if not upload.hidden_from_history:
+        upload.hidden_from_history = True
+        await db.commit()
 
     return None
 

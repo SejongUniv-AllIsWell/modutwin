@@ -35,14 +35,14 @@ export default function Sam3PromptModal({ onStartAuto, onSkipToManual, onClose }
       onClick={onClose}
     >
       <div
-        className="bg-gray-900 border border-gray-700 rounded-xl shadow-2xl text-gray-200 w-[800px] max-w-[90vw] p-8 space-y-5"
+        className="bg-[var(--paper)] border border-[var(--rule)] rounded-xl shadow-2xl text-[var(--ink)] w-[800px] max-w-[90vw] p-8 space-y-5"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="text-2xl font-bold">문 자동 지정</div>
-        <div className="text-sm text-gray-400 leading-relaxed">
+        <div className="text-sm text-[var(--muted)] leading-relaxed">
           어떻게 생긴 문인지 설명해주세요.
           <br />
-          예: <span className="text-gray-300">"흰색 손잡이가 있는 갈색 나무 문"</span>
+          예: <span className="text-[var(--ink-2)]">"흰색 손잡이가 있는 갈색 나무 문"</span>
         </div>
         <textarea
           value={prompt}
@@ -50,7 +50,7 @@ export default function Sam3PromptModal({ onStartAuto, onSkipToManual, onClose }
           placeholder="문에 대한 설명 입력..."
           spellCheck={false}
           rows={4}
-          className="w-full bg-gray-800 border border-gray-600 rounded-lg px-3 py-2.5 text-sm resize-none focus:outline-none focus:border-indigo-500"
+          className="w-full bg-[var(--bg-soft)] border border-[var(--rule)] rounded-lg px-3 py-2.5 text-sm resize-none focus:outline-none focus:border-indigo-500"
         />
         <div className="flex gap-3 pt-1">
           <button
@@ -59,14 +59,14 @@ export default function Sam3PromptModal({ onStartAuto, onSkipToManual, onClose }
               const trimmed = prompt.trim();
               onStartAuto(trimmed || 'door');
             }}
-            className="flex-1 px-4 py-3 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg cursor-pointer text-sm font-bold"
+            className="flex-1 px-4 py-3 bg-indigo-600 hover:bg-indigo-500 text-[var(--ink)] rounded-lg cursor-pointer text-sm font-bold"
             title="입력한 설명 (또는 빈 입력 시 기본 'door' 프롬프트) 으로 자동 문 추출 시작"
           >
             자동 문 지정
           </button>
           <button
             onClick={onSkipToManual}
-            className="flex-1 px-4 py-3 bg-gray-700 hover:bg-gray-600 text-white rounded-lg cursor-pointer text-sm font-bold"
+            className="flex-1 px-4 py-3 bg-[var(--bg-soft)] hover:bg-[var(--rule)] text-[var(--ink)] rounded-lg cursor-pointer text-sm font-bold"
             title="자동 추출을 건너뛰고 4 꼭짓점을 직접 클릭해 지정"
           >
             문 수동 지정

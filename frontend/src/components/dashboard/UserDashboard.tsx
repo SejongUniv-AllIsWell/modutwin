@@ -132,14 +132,19 @@ export default function UserDashboard({ showHeader = true }: Props) {
 
   const handleDelete = async () => {
     if (!deleteTarget) return;
+    const isHide = !!deleteTarget.is_basemap_source;
     setDeleting(true);
     setDeleteError(null);
     try {
-      await api.delete(`/uploads/${deleteTarget.id}`);
+      if (isHide) {
+        await api.post(`/uploads/${deleteTarget.id}/hide`);
+      } else {
+        await api.delete(`/uploads/${deleteTarget.id}`);
+      }
       setUploads(prev => prev.filter(u => u.id !== deleteTarget.id));
       setDeleteTarget(null);
     } catch (e: any) {
-      setDeleteError(e?.message || '업로드 삭제 실패');
+      setDeleteError(e?.message || (isHide ? '업로드 숨김 실패' : '업로드 삭제 실패'));
     } finally {
       setDeleting(false);
     }
@@ -266,41 +271,35 @@ export default function UserDashboard({ showHeader = true }: Props) {
                               처리 중...
                             </Link>
                           )
-                        ) : isBasemap ? (
-                          <span className="relative inline-block group">
+                        ) : (
+                          <div className="inline-flex items-center justify-end gap-2">
+                            {canAlign && (
+                              <Link
+                                href={`/viewer?upload_id=${u.id}&mode=align`}
+                                className="inline-block px-3 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-[var(--ink)] text-xs font-bold"
+                                title={sam === 'done' ? 'SAM3 결과로 정합 시작' : '수동으로 문 꼭짓점을 지정해 정합'}
+                              >
+                                정합하기
+                              </Link>
+                            )}
                             <button
                               type="button"
-                              disabled
-                              aria-label="basemap에 등록된 파일은 삭제할 수 없습니다"
-                              className="w-6 h-6 inline-flex items-center justify-center text-[var(--muted-2)] rounded cursor-not-allowed"
+                              onClick={() => setDeleteTarget(u)}
+                              aria-label={
+                                isBasemap
+                                  ? `${u.original_filename} 업로드 내역에서 숨김`
+                                  : `${u.original_filename} 삭제`
+                              }
+                              title={
+                                isBasemap
+                                  ? '업로드 내역에서만 숨김 (basemap 원본은 보존)'
+                                  : `${u.original_filename} 삭제`
+                              }
+                              className="w-6 h-6 inline-flex items-center justify-center text-[var(--muted)] hover:text-[var(--ink)] hover:bg-red-600 rounded"
                             >
                               ×
                             </button>
-                            <span
-                              role="tooltip"
-                              className="pointer-events-none absolute right-0 top-full mt-1 z-10 whitespace-nowrap rounded bg-[var(--bg-soft)] px-2 py-1 text-[10px] text-[var(--ink)] opacity-0 group-hover:opacity-100 transition-opacity"
-                            >
-                              관리자에게 문의하세요
-                            </span>
-                          </span>
-                        ) : canAlign ? (
-                          <Link
-                            href={`/viewer?upload_id=${u.id}&mode=align`}
-                            className="inline-block px-3 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-[var(--ink)] text-xs font-bold"
-                            title={sam === 'done' ? 'SAM3 결과로 정합 시작' : '수동으로 문 꼭짓점을 지정해 정합'}
-                          >
-                            정합하기
-                          </Link>
-                        ) : (
-                          <button
-                            type="button"
-                            onClick={() => setDeleteTarget(u)}
-                            aria-label={`${u.original_filename} 삭제`}
-                            title={`${u.original_filename} 삭제`}
-                            className="w-6 h-6 inline-flex items-center justify-center text-[var(--muted)] hover:text-[var(--ink)] hover:bg-red-600 rounded"
-                          >
-                            ×
-                          </button>
+                          </div>
                         )}
                       </td>
                     </tr>
@@ -312,40 +311,49 @@ export default function UserDashboard({ showHeader = true }: Props) {
         )}
       </div>
 
-      {deleteTarget && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4">
-          <div className="w-full max-w-md rounded-lg border border-[var(--rule)] bg-[var(--paper)] p-5 shadow-xl">
-            <h3 className="text-base font-semibold text-[var(--ink)]">업로드 삭제</h3>
-            <p className="mt-3 text-sm text-red-300">
-              삭제 시 업로드한 파일과 관련된 모든 데이터가 삭제됩니다.
-            </p>
-            <p className="mt-2 text-sm text-[var(--ink-2)] truncate">
-              대상: {deleteTarget.original_filename}
-            </p>
-            {deleteError && (
-              <p className="mt-2 text-xs text-red-400">{deleteError}</p>
-            )}
-            <div className="mt-5 flex justify-end gap-2">
-              <button
-                type="button"
-                onClick={handleDelete}
-                disabled={deleting}
-                className="rounded bg-red-600 px-4 py-2 text-sm font-semibold text-[var(--ink)] hover:bg-red-700 disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)]"
-              >
-                {deleting ? '삭제 중...' : '삭제'}
-              </button>
-              <button
-                type="button"
-                onClick={() => { if (!deleting) { setDeleteTarget(null); setDeleteError(null); } }}
-                disabled={deleting}
-                className="rounded bg-[var(--bg-soft)] px-4 py-2 text-sm text-[var(--ink)] hover:bg-[var(--rule)] disabled:opacity-50"
-              >
-                취소
-              </button>
+      {deleteTarget && (() => {
+        const isHide = !!deleteTarget.is_basemap_source;
+        return (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4">
+            <div className="w-full max-w-md rounded-lg border border-[var(--rule)] bg-[var(--paper)] p-5 shadow-xl">
+              <h3 className="text-base font-semibold text-[var(--ink)]">
+                {isHide ? '업로드 내역에서 숨김' : '업로드 삭제'}
+              </h3>
+              <p className={`mt-3 text-sm ${isHide ? 'text-[var(--ink-2)]' : 'text-red-300'}`}>
+                {isHide
+                  ? 'basemap 원본 파일과 DB 는 그대로 보존되며, 내 업로드 내역에서만 숨김 처리됩니다.'
+                  : '삭제 시 업로드한 파일과 관련된 모든 데이터가 삭제됩니다.'}
+              </p>
+              <p className="mt-2 text-sm text-[var(--ink-2)] truncate">
+                대상: {deleteTarget.original_filename}
+              </p>
+              {deleteError && (
+                <p className="mt-2 text-xs text-red-400">{deleteError}</p>
+              )}
+              <div className="mt-5 flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={handleDelete}
+                  disabled={deleting}
+                  className={`rounded px-4 py-2 text-sm font-semibold text-[var(--ink)] disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] ${
+                    isHide ? 'bg-blue-600 hover:bg-blue-700' : 'bg-red-600 hover:bg-red-700'
+                  }`}
+                >
+                  {deleting ? (isHide ? '숨김 처리 중...' : '삭제 중...') : (isHide ? '숨김' : '삭제')}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { if (!deleting) { setDeleteTarget(null); setDeleteError(null); } }}
+                  disabled={deleting}
+                  className="rounded bg-[var(--bg-soft)] px-4 py-2 text-sm text-[var(--ink)] hover:bg-[var(--rule)] disabled:opacity-50"
+                >
+                  취소
+                </button>
+              </div>
             </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
     </div>
   );
 }
