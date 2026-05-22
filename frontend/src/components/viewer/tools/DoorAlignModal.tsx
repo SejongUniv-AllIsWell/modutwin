@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '@/lib/api';
 import { SplatViewerCoreRef } from '../SplatViewerCore';
 import { loadRefineState } from '@/lib/refine/persistence';
-import { getEditorRotation, rawToA, aToRaw, rawToAY, ayToRaw, type FrameRotation } from '@/lib/refine/coordFrames';
+import { getEditorRotation, rawToA, aToRaw, rawToAY, type FrameRotation } from '@/lib/refine/coordFrames';
 import { surfacePlanesFromRoom, type SurfacePlane } from '@/lib/gs/planes';
 import { useAdditionalGsplats, type AdditionalGsplatsApi } from './useAdditionalGsplats';
 import { useDoorLabels } from './useDoorLabels';
@@ -126,6 +126,7 @@ function normalizeDoorRect(
   corners: [Vec3, Vec3, Vec3, Vec3],
   plane: SurfacePlane,
   anchorIdx: number | null = null,
+  rotation: FrameRotation = { rotX: 0, rotZ: 0, wallAngleRad: 0 },
 ): [Vec3, Vec3, Vec3, Vec3] {
   const [nx, ny, nz] = plane.normal;
   // 벽이 아니면 (천장/바닥 normal.y=±1) 정규화 skip — 도어는 벽 위.
@@ -136,9 +137,13 @@ function normalizeDoorRect(
   const hzN = -nx / hxLen;
   const d = plane.d;
 
+  // corners 는 raw 프레임, plane 은 A' 프레임 — u/v 분해 + recon 은 A' 에서 일관 처리.
+  // 진입 시 raw → A' 변환, 반환 시 A' → raw 로 되돌려 caller 의 raw 컨벤션 유지.
+  const cornersA = corners.map(c => rawToA([c[0], c[1], c[2]] as Vec3, rotation)) as [Vec3, Vec3, Vec3, Vec3];
+
   // (u, v) decomposition: u = pos · h (horizontal on wall), v = pos.y.
-  const us = corners.map(c => c[0] * hxN + c[2] * hzN);
-  const vs = corners.map(c => c[1]);
+  const us = cornersA.map(c => c[0] * hxN + c[2] * hzN);
+  const vs = cornersA.map(c => c[1]);
 
   let u_left: number, u_right: number, v_top: number, v_bot: number;
 
@@ -163,19 +168,20 @@ function normalizeDoorRect(
   // 좌우가 바뀜. v_top<v_bot 또는 u_left>u_right 가 PLY 컨벤션에서 정상 상태라 swap 하면 인덱스 → 위치
   // 매핑이 깨져서 정합 시 상하/좌우 반전 발생. 사용자가 시계방향으로 픽한 ORIGINAL 인덱스 그대로 사용.
 
-  // 평면 위 점 P = d * n_xz + u * h + v * Y. (n.y = 0, h.y = 0 가정.)
+  // 평면 위 점 P = d * n_xz + u * h + v * Y. (n.y = 0, h.y = 0 가정.) — A' 프레임 산출.
   const recon = (u: number, v: number): Vec3 => [
     nx * d + hxN * u,
     v,
     nz * d + hzN * u,
   ];
-
-  return [
+  const reconA: [Vec3, Vec3, Vec3, Vec3] = [
     recon(u_left, v_top),
     recon(u_right, v_top),
     recon(u_right, v_bot),
     recon(u_left, v_bot),
   ];
+
+  return reconA.map(p => aToRaw(p, rotation)) as [Vec3, Vec3, Vec3, Vec3];
 }
 
 /**
@@ -260,26 +266,6 @@ export default function DoorAlignModal({
   // basemap 다중 도어 — 도어 X 삭제 시 wall 텍스처 alpha=0 punch 복원을 위해 cut.bbox + wallSurfaceId 도 함께 보관.
   const lastDoorMeshBboxRef = useRef<{ x: number; y: number; w: number; h: number } | null>(null);
   const lastDoorMeshWallSurfaceIdRef = useRef<string | null>(null);
-
-  // SAM3 자동 추출 완료 시 부모가 넘겨준 4 코너로 picked 초기 채움.
-  // doors.json contract = A'+Y frame (회전 베이크된 PLY 와 동일 frame). picked.pos contract = raw frame
-  // (raycastToPlanes 가 splatEntity 역변환으로 산출). 다듬기 직후 세션은 메모리 PLY 가 아직 raw 이고
-  // splatEntity 가 시각화 회전을 적용 중 → A'+Y → raw 역변환 필요.
-  // 재진입 세션은 베이크된 PLY 가 새 raw 로 로드되고 getCurrentBakedRotation 이 0 을 반환 → 항등 변환.
-  // 사용자가 이미 직접 픽한 코너가 있으면 덮어쓰지 않음. surfaceId 는 빈 문자열 — 후속 회전/저장 단계가
-  // raycast 로 보정.
-  useEffect(() => {
-    if (!autoExtractedCorners || autoExtractedCorners.length !== 4) return;
-    const r = getCurrentBakedRotation?.() ?? { rotX: 0, rotZ: 0, wallAngleRad: 0 };
-    setPicked(prev => {
-      const allEmpty = prev.every(p => p === null);
-      if (!allEmpty) return prev;
-      return autoExtractedCorners.map(c => ({
-        pos: ayToRaw([c[0], c[1], c[2]] as Vec3, r),
-        surfaceId: '',
-      }));
-    });
-  }, [autoExtractedCorners, getCurrentBakedRotation]);
 
   // 문 경계 (4 변 노란선 + 힌지 cylinder) 표시 토글. true 면 그리고, false 면 둘 다 숨김.
   const [boundaryVisible, setBoundaryVisible] = useState(true);
@@ -372,6 +358,36 @@ export default function DoorAlignModal({
     });
   }, [uploadId]);
   const showRefineGuide = !planes && !(basemapMode && view === 'setup');
+
+  // SAM3 자동 추출 완료 시 부모가 넘겨준 4 코너로 picked 초기 채움.
+  // autoExtractedCorners 는 raw 프레임 — UnifiedSplatEditor 가 SAM3 응답(A'+Y)에 ayToRaw 를 미리
+  // 적용해 메모리 컨벤션(raw)으로 통일한 뒤 전달. picked.pos contract 도 raw (raycastToPlanes 가
+  // splatEntity 역변환으로 산출) → 추가 변환 없이 그대로 대입.
+  // surfaceId 는 closest-plane 추정: picked.pos 가 raw 이고 planes 는 A' 프레임이라
+  // rawToA 로 lift 한 뒤 6면 중 |signed_distance| 최소 평면 선택. 4 코너는 모두 같은 벽 위라
+  // ref 한 점이면 충분. 추정한 surfaceId 가 비면 후속 applyDoorRefine/Rotation 의 wallPlane lookup
+  // 이 모두 실패 → 문 추출 mesh ops 와 문 열기 회전이 silent 로 무반응 되는 회귀를 차단.
+  useEffect(() => {
+    if (!autoExtractedCorners || autoExtractedCorners.length !== 4) return;
+    if (!planes) return;
+    setPicked(prev => {
+      const allEmpty = prev.every(p => p === null);
+      if (!allEmpty) return prev;
+      const r = getEditorRotation(uploadId);
+      const ref = autoExtractedCorners[0];
+      const refA = rawToA([ref[0], ref[1], ref[2]] as Vec3, r);
+      let bestSd = Infinity;
+      let bestId = '';
+      for (const p of planes) {
+        const sd = Math.abs(p.normal[0]*refA[0] + p.normal[1]*refA[1] + p.normal[2]*refA[2] - p.d);
+        if (sd < bestSd) { bestSd = sd; bestId = p.id; }
+      }
+      return autoExtractedCorners.map(c => ({
+        pos: [c[0], c[1], c[2]] as Vec3,
+        surfaceId: bestId,
+      }));
+    });
+  }, [autoExtractedCorners, planes, uploadId]);
 
   // ── ray-plane 교점 (raw 프레임) ──
   // 클릭은 "평면 위의 점" 으로만 떨어진다 (가우시안 위치가 아니라 수학적 평면 교점).
@@ -478,6 +494,7 @@ export default function DoorAlignModal({
               [next[0]!.pos, next[1]!.pos, next[2]!.pos, next[3]!.pos],
               wallPlane,
               null,
+              getEditorRotation(uploadId),
             );
             next = next.map((p, i) => p ? { pos: normalized[i], surfaceId: p.surfaceId } : null);
           }
@@ -717,6 +734,7 @@ export default function DoorAlignModal({
               [next[0]!.pos, next[1]!.pos, next[2]!.pos, next[3]!.pos],
               wallPlane,
               dragIdx,
+              getEditorRotation(uploadId),
             );
             next = next.map((p, i) => p ? { pos: normalized[i], surfaceId: p.surfaceId } : null);
           }
