@@ -251,10 +251,6 @@ export default function BuildingOverviewPage() {
           <h1 className="text-base font-semibold truncate" style={{ color: 'var(--ink)' }}>
             {manifest?.building_name ?? 'Building'}
           </h1>
-          <p className="mt-1 text-xs" style={{ color: 'var(--muted)' }}>Floors: {floors.length}</p>
-          <p className="mt-1 text-xs" style={{ color: 'var(--muted)' }}>
-            상태: {manifest?.building_is_confirmed ? '확정' : '미확정'}
-          </p>
         </div>
 
         <div className="mt-4 flex-1 overflow-y-auto space-y-1">
