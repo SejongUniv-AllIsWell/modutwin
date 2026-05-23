@@ -41,7 +41,7 @@ function CallbackHandler() {
     <div className="flex flex-col items-center justify-center min-h-[calc(100vh-56px)]">
       <div className="text-center">
         {status === 'processing' && <div className="w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full animate-spin mx-auto mb-4" />}
-        <p className={`text-lg ${status === 'error' ? 'text-red-400' : 'text-gray-300'}`}>{message}</p>
+        <p className={`text-lg ${status === 'error' ? 'text-red-400' : 'text-[var(--ink-2)]'}`}>{message}</p>
       </div>
     </div>
   );
@@ -49,7 +49,7 @@ function CallbackHandler() {
 
 export default function CallbackPage() {
   return (
-    <Suspense fallback={<div className="flex items-center justify-center min-h-[calc(100vh-56px)]"><p className="text-gray-400">로딩 중...</p></div>}>
+    <Suspense fallback={<div className="flex items-center justify-center min-h-[calc(100vh-56px)]"><p className="text-[var(--muted)]">로딩 중...</p></div>}>
       <CallbackHandler />
     </Suspense>
   );

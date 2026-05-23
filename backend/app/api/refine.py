@@ -9,6 +9,7 @@
 """
 
 import json
+import logging
 import math
 import os
 from typing import List, Optional
@@ -33,6 +34,7 @@ from app.services.storage_paths import (
 )
 
 router = APIRouter(prefix="/refine", tags=["refine"])
+logger = logging.getLogger(__name__)
 
 
 class RefinedUploadUrlRequest(BaseModel):
@@ -364,7 +366,7 @@ async def get_refined_bundle(
                         textures[surface_id] = minio.get_presigned_download_url(tex_key)
         except Exception as e:
             # mesh.json 파싱 실패해도 PLY 는 반환
-            print(f"[refined-bundle] mesh.json parse failed: {e}")
+            logger.exception(f"[refined-bundle] mesh.json parse failed: {e}")
 
     # doors.json 동반 로드 — basemap 다중 도어 자산 포함. scene.ply_path 는 `{refined}/{session}/final.ply`
     # 형식이라 doors.json 은 그 부모 (`{refined}/doors.json`) 에 위치.
@@ -413,7 +415,7 @@ async def get_refined_bundle(
                         }
                 doors_out.append(entry)
         except Exception as e:
-            print(f"[refined-bundle] doors.json parse failed: {e}")
+            logger.exception(f"[refined-bundle] doors.json parse failed: {e}")
 
     return RefinedBundleResponse(
         ply_url=ply_url,

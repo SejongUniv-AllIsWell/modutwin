@@ -18,6 +18,12 @@ from app.services.metadata_options import (
     parse_module_name_input,
     validate_floor_number as validate_floor_number_value,
 )
+from app.services.storage_access import (
+    add_storage_key,
+    delete_storage_best_effort,
+    safe_object_exists,
+    safe_presigned_download_url,
+)
 from app.services.storage_paths import module_base_path
 
 router = APIRouter(tags=["buildings"])
@@ -56,6 +62,13 @@ class BuildingResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class BuildingListItem(BuildingResponse):
+    """리스트 엔드포인트 응답. /buildings 의 결과를 클라이언트가 다시 N+1 fetch 해서
+    floor_count 를 채우던 패턴을 제거하기 위해 같이 묶어 내려준다."""
+
+    floor_count: int = 0
 
 
 class FloorCreate(BaseModel):
@@ -253,50 +266,14 @@ class AdminDeleteResponse(BaseModel):
     counts: dict[str, int]
 
 
-def _safe_object_exists(minio, key: str | None) -> bool:
-    if not key:
-        return False
-    try:
-        return bool(minio.object_exists(key))
-    except Exception:
-        return False
-
-
-def _safe_presigned_download_url(minio, key: str | None) -> str | None:
-    if not _safe_object_exists(minio, key):
-        return None
-    try:
-        return minio.get_presigned_download_url(key)
-    except Exception:
-        return None
-
-
 def _pick_scene_output_path(minio, scene: SceneOutput | None) -> str | None:
     if scene is None:
         return None
-    if _safe_object_exists(minio, scene.sog_path):
+    if safe_object_exists(minio, scene.sog_path):
         return scene.sog_path
-    if _safe_object_exists(minio, scene.ply_path):
+    if safe_object_exists(minio, scene.ply_path):
         return scene.ply_path
     return None
-
-
-def _add_key(keys: set[str], key: str | None) -> None:
-    if key:
-        normalized = key.strip()
-        if normalized:
-            keys.add(normalized)
-
-
-def _delete_storage_best_effort(prefixes: set[str], keys: set[str]) -> int:
-    minio = get_minio_service()
-    deleted = 0
-    for prefix in sorted(prefixes):
-        deleted += minio.delete_prefix(prefix)
-    for key in sorted(keys):
-        if minio.delete_object(key):
-            deleted += 1
-    return deleted
 
 
 async def _collect_delete_scope(
@@ -343,8 +320,8 @@ async def _collect_delete_scope(
             select(Floor.overview_image_path, Floor.overview_meta_path).where(Floor.id.in_(floor_ids))
         )
         for overview_image_path, overview_meta_path in overview_result.all():
-            _add_key(keys, overview_image_path)
-            _add_key(keys, overview_meta_path)
+            add_storage_key(keys, overview_image_path)
+            add_storage_key(keys, overview_meta_path)
 
     if module_ids:
         upload_result = await db.execute(
@@ -353,18 +330,18 @@ async def _collect_delete_scope(
         )
         for upload_id, minio_path, refined_ply_path, door_corners_json_path in upload_result.all():
             upload_ids.append(upload_id)
-            _add_key(keys, minio_path)
-            _add_key(keys, refined_ply_path)
-            _add_key(keys, door_corners_json_path)
+            add_storage_key(keys, minio_path)
+            add_storage_key(keys, refined_ply_path)
+            add_storage_key(keys, door_corners_json_path)
 
         scene_result = await db.execute(
             select(SceneOutput.ply_path, SceneOutput.sog_path, SceneOutput.metadata_path)
             .where(SceneOutput.module_id.in_(module_ids))
         )
         for ply_path, sog_path, metadata_path in scene_result.all():
-            _add_key(keys, ply_path)
-            _add_key(keys, sog_path)
-            _add_key(keys, metadata_path)
+            add_storage_key(keys, ply_path)
+            add_storage_key(keys, sog_path)
+            add_storage_key(keys, metadata_path)
 
     if upload_ids:
         task_result = await db.execute(select(Task.id).where(Task.upload_id.in_(upload_ids)))
@@ -381,7 +358,7 @@ async def _collect_delete_scope(
         )
         for bid, minio_path in basemap_result.all():
             basemap_ids.append(bid)
-            _add_key(keys, minio_path)
+            add_storage_key(keys, minio_path)
 
     scene_count = 0
     if module_ids:
@@ -445,7 +422,13 @@ async def _delete_hierarchy_scope(
         await db.execute(sa_delete(Building).where(Building.id == building_id))
 
     await db.commit()
-    deleted_files = _delete_storage_best_effort(prefixes, keys)
+    deleted_files = delete_storage_best_effort(
+        get_minio_service(),
+        prefixes,
+        keys,
+        sort_items=True,
+        suppress_errors=False,
+    )
 
     return AdminDeleteResponse(
         deleted_scope=scope,
@@ -457,7 +440,7 @@ async def _delete_hierarchy_scope(
 
 # ── Building endpoints ──
 
-@router.get("/buildings", response_model=list[BuildingResponse])
+@router.get("/buildings", response_model=list[BuildingListItem])
 async def list_buildings(
     has_output: bool = Query(False),
     include_hidden: bool = Query(False),
@@ -465,7 +448,19 @@ async def list_buildings(
     db: AsyncSession = Depends(get_db),
 ):
     show_hidden = include_hidden and user is not None and user.role == UserRole.admin
-    stmt = select(Building).order_by(Building.name)
+    # floor_count 는 visible floor 만 집계 — admin 으로 hidden 까지 보더라도
+    # explore 와 동일한 의미를 유지한다.
+    floor_count_subq = (
+        select(Floor.building_id, func.count(Floor.id).label("floor_count"))
+        .where(Floor.is_visible == True)
+        .group_by(Floor.building_id)
+        .subquery()
+    )
+    stmt = (
+        select(Building, func.coalesce(floor_count_subq.c.floor_count, 0))
+        .outerjoin(floor_count_subq, floor_count_subq.c.building_id == Building.id)
+        .order_by(Building.name)
+    )
     if not show_hidden:
         stmt = stmt.where(Building.is_visible == True)
     if has_output:
@@ -489,7 +484,13 @@ async def list_buildings(
             )
         )
     result = await db.execute(stmt)
-    return result.scalars().all()
+    return [
+        BuildingListItem(
+            **BuildingResponse.model_validate(building).model_dump(),
+            floor_count=int(floor_count),
+        )
+        for building, floor_count in result.all()
+    ]
 
 
 @router.post("/buildings", response_model=BuildingResponse, status_code=status.HTTP_201_CREATED)
@@ -514,7 +515,7 @@ async def create_building(
 async def lookup_building(
     kakao_place_id: str | None = Query(None),
     name: str | None = Query(None),
-    _: User = Depends(get_current_user),
+    user: User | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ):
     if not kakao_place_id and not name:
@@ -524,10 +525,16 @@ async def lookup_building(
 
     building: Building | None = None
     if kakao_place_id:
-        place_result = await db.execute(select(Building).where(Building.kakao_place_id == kakao_place_id))
+        place_stmt = select(Building).where(Building.kakao_place_id == kakao_place_id)
+        if user is None or user.role != UserRole.admin:
+            place_stmt = place_stmt.where(Building.is_visible == True)
+        place_result = await db.execute(place_stmt)
         building = place_result.scalar_one_or_none()
     if building is None and name:
-        name_result = await db.execute(select(Building).where(Building.name == name))
+        name_stmt = select(Building).where(Building.name == name)
+        if user is None or user.role != UserRole.admin:
+            name_stmt = name_stmt.where(Building.is_visible == True)
+        name_result = await db.execute(name_stmt)
         building = name_result.scalar_one_or_none()
 
     if building is None:
@@ -695,10 +702,13 @@ async def create_or_find_building_from_kakao(
 @router.get("/buildings/{building_id}", response_model=BuildingResponse)
 async def get_building(
     building_id: UUID,
-    _: User = Depends(get_current_user),
+    user: User | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(select(Building).where(Building.id == building_id))
+    stmt = select(Building).where(Building.id == building_id)
+    if user is None or user.role != UserRole.admin:
+        stmt = stmt.where(Building.is_visible == True)
+    result = await db.execute(stmt)
     building = result.scalar_one_or_none()
     if not building:
         raise HTTPException(status_code=404, detail="건물을 찾을 수 없습니다.")
@@ -814,7 +824,7 @@ class ExploreBuildingResponse(BaseModel):
 @router.get("/buildings/{building_id}/explore", response_model=ExploreBuildingResponse)
 async def explore_building(
     building_id: UUID,
-    _: User = Depends(get_current_user),
+    _: User | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ):
     """건물의 모든 층 → 활성 basemap + cross-user visible module 트리.
@@ -921,11 +931,12 @@ async def explore_building(
 @router.get("/buildings/{building_id}/floor-overview", response_model=FloorOverviewManifestResponse)
 async def get_floor_overview_manifest(
     building_id: UUID,
-    user: User = Depends(get_current_user),
+    user: User | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ):
     building_stmt = select(Building).where(Building.id == building_id)
-    if user.role != UserRole.admin:
+    is_admin = user is not None and user.role == UserRole.admin
+    if not is_admin:
         building_stmt = building_stmt.where(Building.is_visible == True)
     building_result = await db.execute(building_stmt)
     building = building_result.scalar_one_or_none()
@@ -937,7 +948,7 @@ async def get_floor_overview_manifest(
         .where(Floor.building_id == building_id)
         .order_by(Floor.floor_number.desc())
     )
-    if user.role != UserRole.admin:
+    if not is_admin:
         floor_stmt = floor_stmt.where(Floor.is_visible == True)
     floor_result = await db.execute(floor_stmt)
     floors = floor_result.scalars().all()
@@ -956,7 +967,7 @@ async def get_floor_overview_manifest(
         .where(Module.floor_id.in_(floor_ids))
         .group_by(Module.floor_id)
     )
-    if user.role != UserRole.admin:
+    if not is_admin:
         module_count_stmt = module_count_stmt.where(Module.is_visible == True)
     module_count_result = await db.execute(module_count_stmt)
     module_count_by_floor = {floor_id: count for floor_id, count in module_count_result.all()}
@@ -977,8 +988,8 @@ async def get_floor_overview_manifest(
             floor_number=floor.floor_number,
             overview_dirty=floor.overview_dirty,
             overview_version=floor.overview_version,
-            topdown_url=_safe_presigned_download_url(minio, floor.overview_image_path),
-            meta_url=_safe_presigned_download_url(minio, floor.overview_meta_path),
+            topdown_url=safe_presigned_download_url(minio, floor.overview_image_path),
+            meta_url=safe_presigned_download_url(minio, floor.overview_meta_path),
             module_count=int(module_count_by_floor.get(floor.id, 0)),
             has_active_basemap=floor.id in active_basemap_floor_ids,
         )
@@ -1001,11 +1012,12 @@ async def get_floor_overview_manifest(
 async def get_floor_detail_manifest(
     building_id: UUID,
     floor_number: int,
-    user: User = Depends(get_current_user),
+    user: User | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ):
     building_stmt = select(Building).where(Building.id == building_id)
-    if user.role != UserRole.admin:
+    is_admin = user is not None and user.role == UserRole.admin
+    if not is_admin:
         building_stmt = building_stmt.where(Building.is_visible == True)
     building_result = await db.execute(building_stmt)
     building = building_result.scalar_one_or_none()
@@ -1016,7 +1028,7 @@ async def get_floor_detail_manifest(
         Floor.building_id == building_id,
         Floor.floor_number == floor_number,
     )
-    if user.role != UserRole.admin:
+    if not is_admin:
         floor_stmt = floor_stmt.where(Floor.is_visible == True)
     floor_result = await db.execute(floor_stmt)
     floor = floor_result.scalar_one_or_none()
@@ -1047,7 +1059,7 @@ async def get_floor_detail_manifest(
             .limit(1)
         )
         has_pending_basemap = pending_check.scalar_one_or_none() is not None
-    basemap_url = _safe_presigned_download_url(minio, basemap.minio_path) if basemap else None
+    basemap_url = safe_presigned_download_url(minio, basemap.minio_path) if basemap else None
     basemap_entry = (
         DetailBasemapEntry(
             id=basemap.id,
@@ -1068,7 +1080,7 @@ async def get_floor_detail_manifest(
         .where(Module.name != "__basemap__")
         .order_by(Module.name)
     )
-    if user.role != UserRole.admin:
+    if not is_admin:
         module_stmt = module_stmt.where(Module.is_visible == True)
     module_result = await db.execute(module_stmt)
     module_rows = module_result.all()
@@ -1077,23 +1089,24 @@ async def get_floor_detail_manifest(
     latest_scene_by_module: dict[UUID, SceneOutput] = {}
     if module_ids:
         scene_stmt = select(SceneOutput).where(SceneOutput.module_id.in_(module_ids))
-        if user.role != UserRole.admin:
+        if not is_admin:
+            public_scene_filter = and_(
+                SceneOutput.is_aligned == True,
+                Module.is_visible == True,
+                Floor.is_visible == True,
+                Building.is_visible == True,
+            )
+            scene_visibility_filter = (
+                or_(SceneOutput.user_id == user.id, public_scene_filter)
+                if user is not None
+                else public_scene_filter
+            )
             scene_stmt = (
                 scene_stmt
                 .join(Module, SceneOutput.module_id == Module.id)
                 .join(Floor, Module.floor_id == Floor.id)
                 .join(Building, Floor.building_id == Building.id)
-                .where(
-                    or_(
-                        SceneOutput.user_id == user.id,
-                        and_(
-                            SceneOutput.is_aligned == True,
-                            Module.is_visible == True,
-                            Floor.is_visible == True,
-                            Building.is_visible == True,
-                        ),
-                    )
-                )
+                .where(scene_visibility_filter)
             )
         scene_result = await db.execute(
             scene_stmt.order_by(SceneOutput.module_id, SceneOutput.created_at.desc())
@@ -1135,13 +1148,17 @@ async def get_floor_detail_manifest(
 async def list_floors(
     building_id: UUID,
     include_hidden: bool = Query(False),
-    user: User = Depends(get_current_user),
+    user: User | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ):
-    show_hidden = include_hidden and user.role == UserRole.admin
-    stmt = select(Floor).where(Floor.building_id == building_id)
+    show_hidden = include_hidden and user is not None and user.role == UserRole.admin
+    stmt = (
+        select(Floor)
+        .join(Building, Floor.building_id == Building.id)
+        .where(Floor.building_id == building_id)
+    )
     if not show_hidden:
-        stmt = stmt.where(Floor.is_visible == True)
+        stmt = stmt.where(Building.is_visible == True, Floor.is_visible == True)
     stmt = stmt.order_by(Floor.floor_number)
     result = await db.execute(stmt)
     return result.scalars().all()

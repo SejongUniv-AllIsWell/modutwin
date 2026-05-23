@@ -1,8 +1,11 @@
-import json
 import logging
 import os
-import urllib.error
-import urllib.request
+import requests
+
+try:
+    from callback_http import post_json
+except ModuleNotFoundError:
+    from worker.callback_http import post_json
 
 logger = logging.getLogger(__name__)
 
@@ -23,35 +26,42 @@ def _post_callback(path: str, payload: dict) -> None:
         return
 
     callback_url = f"{_CALLBACK_BASE_URL.rstrip('/')}{path}"
-    body = json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(
-        callback_url,
-        data=body,
-        method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "X-Worker-Token": _CALLBACK_TOKEN,
-        },
-    )
-
     try:
-        with urllib.request.urlopen(request, timeout=_TIMEOUT_SECONDS) as response:
-            status_code = response.getcode()
-            if status_code >= 400:
-                response_body = response.read().decode("utf-8", errors="replace")
-                raise RuntimeError(f"Worker callback failed: HTTP {status_code} body={response_body[:300]}")
-    except urllib.error.HTTPError as exc:
-        response_body = exc.read().decode("utf-8", errors="replace")
+        post_json(
+            callback_url,
+            payload,
+            headers={
+                "Content-Type": "application/json",
+                "X-Worker-Token": _CALLBACK_TOKEN,
+            },
+            timeout=_TIMEOUT_SECONDS,
+        )
+    except RuntimeError as exc:
         logger.error(
             "Worker callback HTTP error to %s: %s body=%s",
             callback_url,
-            exc.code,
-            response_body[:300],
+            _extract_status_code(exc),
+            _extract_error_body(exc),
         )
         raise
-    except Exception:
+    except requests.RequestException:
         logger.exception("Worker callback request failed: %s", callback_url)
         raise
+
+
+def _extract_status_code(exc: RuntimeError) -> str:
+    message = str(exc)
+    if message.startswith("HTTP "):
+        return message.split(" ", 2)[1]
+    return "unknown"
+
+
+def _extract_error_body(exc: RuntimeError) -> str:
+    marker = "body="
+    message = str(exc)
+    if marker not in message:
+        return ""
+    return message.split(marker, 1)[1][:300]
 
 
 def notify_task_success(task_id: str, result_dict: dict) -> None:

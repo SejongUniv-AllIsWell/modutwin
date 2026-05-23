@@ -10,11 +10,25 @@ import os
 from typing import Optional
 
 import requests
+try:
+    from callback_http import post_json
+except ModuleNotFoundError:
+    from worker.callback_http import post_json
 
 logger = logging.getLogger(__name__)
 
 BACKEND_URL = os.environ.get("BACKEND_INTERNAL_URL", "http://localhost").rstrip("/")
 INTERNAL_TOKEN = os.environ.get("INTERNAL_API_TOKEN", "")
+
+
+def _parse_http_error(message: str) -> tuple[str, str]:
+    if not message.startswith("HTTP "):
+        return "unknown", message[:200]
+    code_and_rest = message[5:]
+    if " body=" not in code_and_rest:
+        return code_and_rest.strip() or "unknown", ""
+    code, body = code_and_rest.split(" body=", 1)
+    return code.strip() or "unknown", body[:200]
 
 
 def notify_upload_progress(
@@ -41,15 +55,17 @@ def notify_upload_progress(
         payload["error_message"] = error_message
 
     try:
-        resp = requests.post(
+        post_json(
             url,
-            json=payload,
-            headers={"X-Internal-Token": INTERNAL_TOKEN},
+            payload,
+            headers={
+                "X-Internal-Token": INTERNAL_TOKEN,
+            },
             timeout=10,
         )
-        if resp.status_code >= 400:
-            logger.error(f"[backend_callback] {url} -> {resp.status_code} {resp.text[:200]}")
-        else:
-            logger.info(f"[backend_callback] {stage} {status} 통지 완료 (upload_id={upload_id})")
+        logger.info(f"[backend_callback] {stage} {status} 통지 완료 (upload_id={upload_id})")
+    except RuntimeError as e:
+        status_code, response_body = _parse_http_error(str(e))
+        logger.error(f"[backend_callback] {url} -> {status_code} {response_body}")
     except requests.RequestException as e:
         logger.error(f"[backend_callback] {url} 요청 실패: {e}")

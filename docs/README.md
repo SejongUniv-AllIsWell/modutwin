@@ -13,6 +13,7 @@ plans were removed or merged.
 | `CODEBASE_REFERENCE.md` | Current architecture, runtime identity, main modules, data flows, and remaining risks. |
 | `DEVELOPMENT.md` | Local/prod-like startup, environment setup, migrations, validation, and GPU notes. |
 | `validation_and_qa.md` | Repeatable checks, smoke tests, manual QA matrix, and rollback notes. |
+| `frontend_pages.md` | Current frontend App Router pages and shared shell components. |
 | `refactoring_batches_roadmap.md` | Completed refactoring batch history and remaining refactoring opportunities. |
 | `codex_refactoring_plan.md` | Current refactoring intent and future work after completed batches. |
 | `sam3_worker_callback_plan.md` | Canonical SAM3 feature-flag, worker, callback, and manual fallback plan. |

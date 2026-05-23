@@ -24,6 +24,10 @@ export interface Building {
   created_at: string;
 }
 
+export interface BuildingListItem extends Building {
+  floor_count: number;
+}
+
 export interface Floor {
   id: string;
   building_id: string;

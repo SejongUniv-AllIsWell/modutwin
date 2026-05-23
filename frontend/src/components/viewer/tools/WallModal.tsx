@@ -717,9 +717,9 @@ export default function WallModal({
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70" onClick={onClose}>
-      <div className="bg-gray-900 border border-gray-700 rounded-lg p-5 shadow-2xl" onClick={e => e.stopPropagation()}>
-        <div className="text-white font-bold text-sm mb-1">벽면 설정</div>
-        <div className="text-gray-400 text-xs mb-3">
+      <div className="bg-[var(--paper)] border border-[var(--rule)] rounded-lg p-5 shadow-2xl" onClick={e => e.stopPropagation()}>
+        <div className="text-[var(--ink)] font-bold text-sm mb-1">벽면 설정</div>
+        <div className="text-[var(--muted)] text-xs mb-3">
           {mode === 'parallel' ? (
             <>
               선분을 클릭해 선택. 첫 선택 선분이 기준 각도, 나머지가 그에 평행해집니다.
@@ -735,17 +735,16 @@ export default function WallModal({
           )}
         </div>
         <div>
-          <div className="text-gray-500 text-[10px] mb-1 text-center">Top-down (XZ)</div>
+          <div className="text-[var(--muted)] text-[10px] mb-1 text-center">Top-down (XZ)</div>
           <canvas ref={xzRef} style={{ width: CW, height: CH, userSelect: 'none' }}
-            className={`border border-gray-700 rounded ${mode === 'parallel' ? 'cursor-pointer' : 'cursor-crosshair'}`}
+            className={`border border-[var(--rule)] rounded ${mode === 'parallel' ? 'cursor-pointer' : 'cursor-crosshair'}`}
             onMouseDown={handleMouseDown}
             onMouseMove={handleMouseMove}
             onContextMenu={handleContextMenu} />
         </div>
-        {/* 평행화 컨트롤 — cycle 형성 시 활성. 평행화 모드에서는 적용/선택 초기화 노출. */}
         <div className="flex items-center justify-between mt-3 gap-3">
           <div className="text-xs font-mono flex-1 min-w-0">
-            <div className="text-gray-500">{`점 ${pathPoints.length}개, 선 ${pathEdges.length}개`}</div>
+            <div className="text-[var(--muted)]">{`점 ${pathPoints.length}개, 선 ${pathEdges.length}개`}</div>
             <div className={`truncate ${derivedPolygon ? 'text-green-400' : 'text-amber-400'}`}>
               {cycleStatus}
             </div>
@@ -765,19 +764,19 @@ export default function WallModal({
                 <button
                   onClick={() => { parallelSelectedRef.current = []; setParallelSelected([]); }}
                   disabled={parallelSelected.length === 0}
-                  className="px-3 py-2 bg-gray-700 hover:bg-gray-600 disabled:bg-gray-800 disabled:text-gray-500 disabled:cursor-not-allowed text-gray-300 rounded text-xs cursor-pointer">
+                  className="px-3 py-2 bg-[var(--bg-soft)] hover:bg-[var(--rule)] disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] disabled:cursor-not-allowed text-[var(--ink-2)] rounded text-xs cursor-pointer">
                   선택 초기화
                 </button>
                 <button
                   onClick={() => applyParallel()}
                   disabled={parallelSelected.length < 2}
                   title={parallelSelected.length < 2 ? '기준 + 대상 선분 2개 이상 선택 필요' : ''}
-                  className="px-3 py-2 bg-cyan-600 hover:bg-cyan-500 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed text-white rounded text-xs cursor-pointer font-bold">
+                  className="px-3 py-2 bg-cyan-600 hover:bg-cyan-500 disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] disabled:cursor-not-allowed text-[var(--ink)] rounded text-xs cursor-pointer font-bold">
                   적용
                 </button>
                 <button
                   onClick={() => toggleParallelMode()}
-                  className="px-3 py-2 bg-amber-600 hover:bg-amber-500 text-white rounded text-xs cursor-pointer">
+                  className="px-3 py-2 bg-amber-600 hover:bg-amber-500 text-[var(--ink)] rounded text-xs cursor-pointer">
                   모드 해제
                 </button>
               </>
@@ -787,18 +786,18 @@ export default function WallModal({
                   onClick={() => toggleParallelMode()}
                   disabled={!derivedPolygon}
                   title={derivedPolygon ? '' : 'cycle 형성 후 사용 가능'}
-                  className="px-3 py-2 bg-cyan-700 hover:bg-cyan-600 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed text-white rounded text-xs cursor-pointer">
+                  className="px-3 py-2 bg-cyan-700 hover:bg-cyan-600 disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] disabled:cursor-not-allowed text-[var(--ink)] rounded text-xs cursor-pointer">
                   평행하게 만들기
                 </button>
                 <button onClick={onClose}
-                  className="px-4 py-2 bg-gray-700 hover:bg-gray-600 text-gray-300 rounded text-sm cursor-pointer">취소</button>
+                  className="px-4 py-2 bg-[var(--bg-soft)] hover:bg-[var(--rule)] text-[var(--ink-2)] rounded text-sm cursor-pointer">취소</button>
                 <button onClick={() => {
                   if (!derivedPolygon) return;
                   onConfirm(derivedPolygon.angleDeg, derivedPolygon.polygon);
                 }}
                   disabled={!derivedPolygon}
                   title={derivedPolygon ? '' : cycleStatus}
-                  className="px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed text-white rounded text-sm cursor-pointer font-bold">확인</button>
+                  className="px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] disabled:cursor-not-allowed text-[var(--ink)] rounded text-sm cursor-pointer font-bold">확인</button>
               </>
             )}
           </div>

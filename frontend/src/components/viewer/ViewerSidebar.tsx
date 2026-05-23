@@ -38,7 +38,7 @@ export default function ViewerSidebar({
       <button
         onClick={onCollapse}
         title="패널 숨기기"
-        className="flex items-center justify-center w-9 h-9 text-gray-300 hover:text-white hover:bg-gray-700/60 rounded transition cursor-pointer"
+        className="flex items-center justify-center w-9 h-9 text-[var(--ink-2)] hover:text-[var(--ink)] hover:bg-[var(--bg-soft)]/60 rounded transition cursor-pointer"
       >
         <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
@@ -56,7 +56,7 @@ export default function ViewerSidebar({
             ? lockedClass
             : !hasMain
               ? 'bg-indigo-500/25 text-indigo-300 cursor-pointer'
-              : 'text-gray-200 hover:bg-gray-700/60 cursor-pointer'
+              : 'text-[var(--ink)] hover:bg-[var(--bg-soft)]/60 cursor-pointer'
         }`}
       >
         <span className="text-[11px] leading-none">업로드</span>
@@ -71,7 +71,7 @@ export default function ViewerSidebar({
             ? lockedClass
             : hasMain && mode === 'refine'
               ? 'bg-indigo-500/25 text-indigo-300 cursor-pointer'
-              : 'text-gray-200 hover:bg-gray-700/60 cursor-pointer disabled:opacity-40'
+              : 'text-[var(--ink)] hover:bg-[var(--bg-soft)]/60 cursor-pointer disabled:opacity-40'
         }`}
       >
         <span className="text-[11px] leading-none">다듬기</span>
@@ -86,7 +86,7 @@ export default function ViewerSidebar({
             ? lockedClass
             : hasMain && mode === 'door'
               ? 'bg-indigo-500/25 text-indigo-300 cursor-pointer'
-              : 'text-gray-200 hover:bg-gray-700/60 cursor-pointer disabled:opacity-40'
+              : 'text-[var(--ink)] hover:bg-[var(--bg-soft)]/60 cursor-pointer disabled:opacity-40'
         }`}
       >
         <span className="text-[11px] leading-none">문 설정</span>
@@ -105,7 +105,7 @@ export default function ViewerSidebar({
         className={`flex flex-col items-center justify-center gap-0.5 w-14 h-9 rounded transition cursor-pointer disabled:cursor-not-allowed disabled:opacity-40 ${
           hasMain && mode === 'align'
             ? 'bg-indigo-500/25 text-indigo-300'
-            : 'text-gray-200 hover:bg-gray-700/60'
+            : 'text-[var(--ink)] hover:bg-[var(--bg-soft)]/60'
         }`}
       >
         <span className="text-[11px] leading-none">정합</span>

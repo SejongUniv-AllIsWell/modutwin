@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from typing import Literal
 
-from app.core.security import get_current_user
+from app.core.rate_limit import TokenBucketLimiter, rate_limited
 from app.models import User
 from app.services.kakao_local_service import (
     KAKAO_CATEGORY_SEARCH_URL,
@@ -11,6 +11,12 @@ from app.services.kakao_local_service import (
 )
 
 router = APIRouter(prefix="/kakao", tags=["kakao"])
+
+# Why: explore 페이지의 지도 클릭 1회로 최대 45 페이지를 fanout 할 수 있어
+#      카카오 무료 quota 를 빠르게 소진할 위험이 있다.
+#      30 토큰 + 초당 2 토큰 회복 = 정상 사용은 통과, 폭주는 차단.
+_kakao_limiter = TokenBucketLimiter(capacity=30, refill_per_second=2.0)
+kakao_rate_limit = rate_limited(_kakao_limiter, scope="kakao")
 
 KAKAO_SORT = Literal["accuracy", "distance"]
 
@@ -32,7 +38,7 @@ async def search_keyword(
     page: int = Query(1, ge=1, le=45),
     size: int = Query(10, ge=1, le=15),
     sort: KAKAO_SORT = "accuracy",
-    user: User = Depends(get_current_user),
+    user: User = Depends(kakao_rate_limit),
 ):
     _ = user
     trimmed_query = query.strip()
@@ -68,7 +74,7 @@ async def search_category(
     page: int = Query(1, ge=1, le=45),
     size: int = Query(15, ge=1, le=15),
     sort: KAKAO_SORT = "accuracy",
-    user: User = Depends(get_current_user),
+    user: User = Depends(kakao_rate_limit),
 ):
     _ = user
     _validate_sort_with_location(sort, x, y)
@@ -101,7 +107,7 @@ async def search_category(
 async def coord2address(
     x: float = Query(...),
     y: float = Query(...),
-    user: User = Depends(get_current_user),
+    user: User = Depends(kakao_rate_limit),
 ):
     _ = user
     params: dict[str, str | int | float] = {

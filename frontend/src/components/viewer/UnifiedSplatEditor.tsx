@@ -796,7 +796,7 @@ export default function UnifiedSplatEditor({
 
   // 신흐름(모듈 등록): uploadId 가 없는 게 정상이라 경고 안 띄움. 그 외(레거시) 만 경고.
   const alignPanel = mode === 'align' && currentUrl && !uploadId && !isModulePurpose ? (
-    <div className="bg-black/70 backdrop-blur-sm border border-white/10 text-gray-300 text-xs rounded-lg shadow-lg p-3 select-none w-72">
+    <div className="bg-black/70 backdrop-blur-sm border border-white/10 text-[var(--ink-2)] text-xs rounded-lg shadow-lg p-3 select-none w-72">
       <div className="text-[11px] text-amber-300 bg-amber-900/30 border border-amber-700 rounded px-2 py-1.5 leading-tight">
         업로드 등록이 필요합니다. 정합 모드를 잠깐 껐다 다시 켜서 메타데이터를 입력하세요.
       </div>
@@ -810,7 +810,7 @@ export default function UnifiedSplatEditor({
         <button
           onClick={handleExpandPanel}
           title="패널 보이기"
-          className="absolute top-3 left-3 z-50 flex items-center justify-center w-9 h-9 bg-black/70 backdrop-blur-sm border border-white/10 text-gray-300 hover:text-white hover:bg-gray-700/80 rounded-lg shadow-lg cursor-pointer"
+          className="absolute top-3 left-3 z-50 flex items-center justify-center w-9 h-9 bg-black/70 backdrop-blur-sm border border-white/10 text-[var(--ink-2)] hover:text-[var(--ink)] hover:bg-[var(--bg-soft)]/80 rounded-lg shadow-lg cursor-pointer"
         >
           <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
@@ -1103,7 +1103,7 @@ export default function UnifiedSplatEditor({
               </div>
             )}
             {currentUrl && (uploadId || isModulePurpose) && metadata && (
-              <Suspense fallback={<div className="text-xs text-gray-400 p-3">패널 로딩...</div>}>
+              <Suspense fallback={<div className="text-xs text-[var(--muted)] p-3">패널 로딩...</div>}>
                 <AlignPanel
                   coreRef={coreRef}
                   uploadId={uploadId ?? 'pending'}
@@ -1191,8 +1191,8 @@ export default function UnifiedSplatEditor({
       {!currentUrl && additional.items.length === 0 && (
         <div className="absolute inset-0 z-10 flex items-center justify-center pointer-events-none">
           <div className="bg-black/50 backdrop-blur-sm border border-white/10 rounded-lg px-6 py-4 text-center pointer-events-auto">
-            <p className="text-sm text-gray-300 mb-1">파일을 업로드하세요</p>
-            <p className="text-xs text-gray-500">왼쪽 <span className="text-blue-400">업로드</span> 버튼으로 .ply / .splat / .sog 선택</p>
+            <p className="text-sm text-[var(--ink-2)] mb-1">파일을 업로드하세요</p>
+            <p className="text-xs text-[var(--muted)]">왼쪽 <span className="text-blue-400">업로드</span> 버튼으로 .ply / .splat / .sog 선택</p>
           </div>
         </div>
       )}
@@ -1235,7 +1235,7 @@ export default function UnifiedSplatEditor({
       )}
       {basemapDone && (
         <div className="absolute inset-0 z-[70] bg-black/70 flex items-center justify-center">
-          <div className="text-center text-white text-xl font-bold">basemap 등록 신청이 완료되었습니다</div>
+          <div className="text-center text-[var(--ink)] text-xl font-bold">basemap 등록 신청이 완료되었습니다</div>
         </div>
       )}
     </SplatViewerCore>

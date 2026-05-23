@@ -8,6 +8,8 @@ import type { FloorDetailManifest, FloorDetailModuleEntry } from '@/types';
 import SplatViewerCore, { type SplatViewerCoreRef } from '@/components/viewer/SplatViewerCore';
 import { useAdditionalGsplats } from '@/components/viewer/tools/useAdditionalGsplats';
 import { useRefinedMeshLoader } from '@/components/viewer/tools/useRefinedMeshLoader';
+import { useToast } from '@/components/ui/Toast';
+import RoomWheelPicker, { roomNumberLabel } from '@/components/ui/RoomWheelPicker';
 
 type Vec3 = [number, number, number];
 type Quat = [number, number, number, number];
@@ -144,83 +146,6 @@ function FloorCompositeViewer({
   return <SplatViewerCore ref={coreRef} sogUrl={primaryUrl} />;
 }
 
-const ROOM_PICKER_ITEM_HEIGHT = 44;
-const ROOM_PICKER_VISIBLE_PADDING = ROOM_PICKER_ITEM_HEIGHT * 2;
-
-function RoomWheelPicker({
-  floorNumber,
-  value,
-  onChange,
-}: {
-  floorNumber: number;
-  value: number;
-  onChange: (next: number) => void;
-}) {
-  const listRef = useRef<HTMLUListElement>(null);
-  const settleTimerRef = useRef<number | null>(null);
-  const items = Array.from({ length: 99 }, (_, i) => i + 1);
-
-  useEffect(() => {
-    if (listRef.current) {
-      listRef.current.scrollTop = (value - 1) * ROOM_PICKER_ITEM_HEIGHT;
-    }
-  }, []);
-
-  const handleScroll = () => {
-    if (!listRef.current) return;
-    if (settleTimerRef.current) window.clearTimeout(settleTimerRef.current);
-    settleTimerRef.current = window.setTimeout(() => {
-      if (!listRef.current) return;
-      const idx = Math.round(listRef.current.scrollTop / ROOM_PICKER_ITEM_HEIGHT);
-      const next = Math.max(1, Math.min(99, idx + 1));
-      if (next !== value) onChange(next);
-    }, 60);
-  };
-
-  return (
-    <div className="relative h-[220px] w-40 mx-auto select-none">
-      <div className="pointer-events-none absolute inset-x-0 top-1/2 -translate-y-1/2 h-[44px] rounded-md border-y border-blue-500/60 bg-blue-500/10" />
-      <ul
-        ref={listRef}
-        onScroll={handleScroll}
-        className="h-full overflow-y-auto"
-        style={{
-          scrollSnapType: 'y mandatory',
-          scrollbarWidth: 'none',
-          paddingTop: ROOM_PICKER_VISIBLE_PADDING,
-          paddingBottom: ROOM_PICKER_VISIBLE_PADDING,
-        }}
-      >
-        {items.map((suffix) => {
-          const display = `${floorNumber}${String(suffix).padStart(2, '0')}호`;
-          const active = value === suffix;
-          return (
-            <li
-              key={suffix}
-              style={{ height: ROOM_PICKER_ITEM_HEIGHT, scrollSnapAlign: 'center' }}
-              className={`flex items-center justify-center text-lg transition ${
-                active ? 'text-white font-bold' : 'text-gray-500'
-              }`}
-              onClick={() => {
-                listRef.current?.scrollTo({
-                  top: (suffix - 1) * ROOM_PICKER_ITEM_HEIGHT,
-                  behavior: 'smooth',
-                });
-              }}
-            >
-              {display}
-            </li>
-          );
-        })}
-      </ul>
-    </div>
-  );
-}
-
-function roomNumberLabel(floorNumber: number, suffix: number) {
-  return `${floorNumber}${String(suffix).padStart(2, '0')}호`;
-}
-
 function formatRegisteredAt(iso: string | null | undefined): string | null {
   if (!iso) return null;
   const d = new Date(iso);
@@ -239,6 +164,7 @@ export default function FloorDetailPage() {
   const buildingId = params.name as string;
   const floorNumber = params.floorNumber as string;
   const { user, loading } = useAuth();
+  const { show: showToast } = useToast();
 
   const [manifest, setManifest] = useState<FloorDetailManifest | null>(null);
   const [primaryUrl, setPrimaryUrl] = useState<string | null>(null);
@@ -268,12 +194,6 @@ export default function FloorDetailPage() {
         setExpandedModuleNames(new Set());
       });
   };
-
-  useEffect(() => {
-    if (!loading && !user) {
-      router.push('/');
-    }
-  }, [user, loading, router]);
 
   useEffect(() => {
     reloadManifest();
@@ -335,19 +255,33 @@ export default function FloorDetailPage() {
   if (loading) return null;
 
   return (
-    <div className="h-[calc(100vh-56px)] bg-gray-950 text-gray-100 flex">
-      <aside className="w-80 border-r border-gray-800 bg-gray-900/70 p-4 flex flex-col shrink-0">
+    <div
+      className="h-[calc(100vh-56px)] flex"
+      style={{ background: 'var(--bg)', color: 'var(--ink)' }}
+    >
+      <aside
+        className="w-80 border-r p-4 flex flex-col shrink-0"
+        style={{ background: 'var(--paper)', borderColor: 'var(--rule)' }}
+      >
         <button
           type="button"
           onClick={() => router.push(`/buildings/${buildingId}`)}
-          className="text-sm text-gray-400 hover:text-white transition self-start"
+          className="text-sm transition self-start hover:underline underline-offset-4"
+          style={{ color: 'var(--muted)' }}
         >
           Back to Floors
         </button>
-        <h1 className="mt-4 text-base font-semibold truncate">{manifest?.building_name ?? 'Building'}</h1>
-        <p className="mt-1 text-xs text-gray-500">Floor {manifest?.floor_number ?? floorNumber}</p>
+        <h1 className="mt-4 text-base font-semibold truncate" style={{ color: 'var(--ink)' }}>
+          {manifest?.building_name ?? 'Building'}
+        </h1>
+        <p className="mt-1 text-xs" style={{ color: 'var(--muted)' }}>
+          Floor {manifest?.floor_number ?? floorNumber}
+        </p>
 
-        <div className="mt-4 text-[11px] font-semibold uppercase tracking-wider text-gray-400 shrink-0">
+        <div
+          className="mt-4 text-[11px] font-semibold uppercase tracking-wider shrink-0"
+          style={{ color: 'var(--muted)', fontFamily: 'ui-monospace, Menlo, monospace' }}
+        >
           Modules ({moduleGroups.length})
         </div>
         <div className="mt-3 space-y-2 overflow-y-auto flex-1 min-h-0 pr-1">
@@ -357,7 +291,7 @@ export default function FloorDetailPage() {
             const activeCount = mods.filter((m) => m.url).length;
             const totalCount = mods.length;
             return (
-              <div key={roomName} className="rounded-lg overflow-hidden">
+              <div key={roomName} className="rounded-md overflow-hidden">
                 <button
                   type="button"
                   onClick={() => {
@@ -368,25 +302,30 @@ export default function FloorDetailPage() {
                       return next;
                     });
                   }}
-                  className={`w-full px-4 py-3 text-left transition shadow-sm border-2 ${
-                    expanded ? 'rounded-t-lg' : 'rounded-lg'
-                  } ${
-                    anySelected
-                      ? 'border-blue-400 bg-blue-500/15 text-white'
-                      : 'border-gray-700 bg-gray-800/80 text-gray-100 hover:border-blue-400 hover:bg-gray-800'
-                  }`}
+                  className={`w-full px-4 py-3 text-left transition border ${
+                    expanded ? 'rounded-t-md' : 'rounded-md'
+                  } hover:bg-[var(--bg-soft)]`}
+                  style={{
+                    borderColor: anySelected ? 'var(--ink)' : 'var(--rule)',
+                    background: anySelected ? 'var(--bg-soft)' : 'var(--bg)',
+                    color: 'var(--ink)',
+                  }}
                 >
                   <div className="flex items-center gap-3">
                     <div className="flex-1 min-w-0">
                       <div className="text-base font-semibold truncate">{roomName}</div>
-                      <div className="text-[11px] text-gray-400 mt-0.5">
+                      <div
+                        className="text-[11px] mt-0.5"
+                        style={{ color: 'var(--muted)' }}
+                      >
                         {totalCount}개 등록 {activeCount < totalCount ? `· ${activeCount}개 활성` : ''}
                       </div>
                     </div>
                     <svg
-                      className={`w-4 h-4 text-gray-400 shrink-0 transition-transform ${
+                      className={`w-4 h-4 shrink-0 transition-transform ${
                         expanded ? 'rotate-90' : ''
                       }`}
+                      style={{ color: 'var(--muted)' }}
                       fill="none"
                       stroke="currentColor"
                       viewBox="0 0 24 24"
@@ -396,7 +335,13 @@ export default function FloorDetailPage() {
                   </div>
                 </button>
                 {expanded && (
-                  <div className="border-2 border-t-0 border-gray-700 rounded-b-lg bg-gray-900/60 divide-y divide-gray-800/80">
+                  <div
+                    className="border border-t-0 rounded-b-md divide-y"
+                    style={{
+                      borderColor: anySelected ? 'var(--ink)' : 'var(--rule)',
+                      background: 'var(--paper)',
+                    }}
+                  >
                     {mods.map((module) => {
                       const isSelected = selectedModuleId === module.id;
                       const disabled = !module.url;
@@ -404,13 +349,12 @@ export default function FloorDetailPage() {
                       return (
                         <div
                           key={module.id}
-                          className={`group flex items-stretch transition ${
-                            disabled
-                              ? 'text-gray-600'
-                              : isSelected
-                                ? 'bg-blue-500/15 text-white'
-                                : 'text-gray-200 hover:bg-gray-800/70'
-                          }`}
+                          className="group flex items-stretch transition"
+                          style={{
+                            background: isSelected ? 'var(--bg-soft)' : undefined,
+                            color: disabled ? 'var(--muted-2)' : 'var(--ink)',
+                            borderColor: 'var(--rule-soft)',
+                          }}
                         >
                           <button
                             type="button"
@@ -421,21 +365,25 @@ export default function FloorDetailPage() {
                               if (!hasBasemap) setPrimaryUrl(module.url);
                             }}
                             className={`flex-1 min-w-0 px-4 py-2.5 text-left ${
-                              disabled ? 'cursor-not-allowed' : ''
+                              disabled ? 'cursor-not-allowed' : 'hover:bg-[var(--bg-soft)]'
                             }`}
                           >
                             <div className="flex items-center gap-2">
-                              <span className="text-gray-500 text-xs">└</span>
+                              <span className="text-xs" style={{ color: 'var(--muted)' }}>└</span>
                               <div className="flex-1 min-w-0">
                                 <div className="text-sm font-medium truncate">{label}</div>
                                 {disabled ? (
-                                  <div className="text-[11px] text-gray-500 mt-0.5">Scene 없음</div>
+                                  <div className="text-[11px] mt-0.5" style={{ color: 'var(--muted)' }}>Scene 없음</div>
                                 ) : module.version ? (
-                                  <div className="text-[11px] text-gray-500 mt-0.5">{formatRegisteredAt(module.version) ?? module.version}</div>
+                                  <div className="text-[11px] mt-0.5" style={{ color: 'var(--muted)' }}>{formatRegisteredAt(module.version) ?? module.version}</div>
                                 ) : null}
                               </div>
                               {isSelected && (
-                                <svg className="w-4 h-4 text-blue-300 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <svg
+                                  className="w-4 h-4 shrink-0"
+                                  style={{ color: 'var(--ink)' }}
+                                  fill="none" stroke="currentColor" viewBox="0 0 24 24"
+                                >
                                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" />
                                 </svg>
                               )}
@@ -451,10 +399,11 @@ export default function FloorDetailPage() {
                                 await api.delete(`/admin/modules/${module.id}`);
                                 await reloadManifest();
                               } catch (err: any) {
-                                window.alert(`모듈 삭제 실패: ${err?.message ?? err}`);
+                                showToast(`모듈 삭제 실패: ${err?.message ?? err}`, 'error');
                               }
                             }}
-                            className="px-3 flex items-center text-gray-500 hover:text-red-400 hover:bg-red-500/10 transition opacity-60 group-hover:opacity-100"
+                            className="px-3 flex items-center transition opacity-60 group-hover:opacity-100 hover:bg-red-500/10"
+                            style={{ color: 'var(--muted)' }}
                             aria-label="모듈 삭제"
                             title="모듈 삭제"
                           >
@@ -471,7 +420,7 @@ export default function FloorDetailPage() {
             );
           })}
           {moduleGroups.length === 0 && (
-            <p className="text-sm text-gray-500 px-1">등록된 모듈이 없습니다.</p>
+            <p className="text-sm px-1" style={{ color: 'var(--muted)' }}>등록된 모듈이 없습니다.</p>
           )}
         </div>
 
@@ -482,11 +431,20 @@ export default function FloorDetailPage() {
             setPickerRoomSuffix(1);
             setShowAddModuleModal(true);
           }}
-          disabled={!manifest?.floor_id}
-          className="mt-4 shrink-0 w-full inline-flex items-center justify-center gap-2 rounded-lg bg-gradient-to-r from-blue-600 to-blue-500 hover:from-blue-500 hover:to-blue-400 disabled:from-gray-700 disabled:to-gray-700 disabled:cursor-not-allowed py-3 text-sm font-semibold text-white shadow-lg shadow-blue-500/30 hover:shadow-blue-500/50 transition active:scale-[0.98]"
+          disabled={!manifest?.floor_id || !user}
+          title={!user ? '로그인 후 등록 가능합니다' : undefined}
+          className="mt-4 shrink-0 w-full inline-flex items-center justify-center gap-2 rounded-sm border py-3 text-sm font-semibold transition active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed"
+          style={{
+            background: 'var(--ink)',
+            color: 'var(--bg)',
+            borderColor: 'var(--ink)',
+          }}
           aria-label="모듈 추가"
         >
-          <span className="inline-flex items-center justify-center w-6 h-6 rounded-full bg-white/20 text-lg leading-none font-bold">
+          <span
+            className="inline-flex items-center justify-center w-6 h-6 rounded-full text-lg leading-none font-bold"
+            style={{ background: 'rgba(255,255,255,0.15)' }}
+          >
             +
           </span>
           <span>모듈 추가</span>
@@ -495,17 +453,22 @@ export default function FloorDetailPage() {
 
       {showAddModuleModal && manifest && (
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm"
           onClick={() => {
             if (!creatingModule) setShowAddModuleModal(false);
           }}
         >
           <div
-            className="w-[320px] rounded-xl bg-gray-900 border border-gray-800 p-5 shadow-2xl"
+            className="w-[320px] rounded-xl border p-5 shadow-2xl"
+            style={{ background: 'var(--paper)', borderColor: 'var(--rule)' }}
             onClick={(e) => e.stopPropagation()}
           >
-            <h2 className="text-base font-semibold text-white text-center">호수를 선택하세요</h2>
-            <p className="text-xs text-gray-500 text-center mt-1">Floor {manifest.floor_number}</p>
+            <h2 className="text-base font-semibold text-center" style={{ color: 'var(--ink)' }}>
+              호수를 선택하세요
+            </h2>
+            <p className="text-xs text-center mt-1" style={{ color: 'var(--muted)' }}>
+              Floor {manifest.floor_number}
+            </p>
 
             <div className="mt-4">
               <RoomWheelPicker
@@ -519,7 +482,7 @@ export default function FloorDetailPage() {
             </div>
 
             {addModuleError && (
-              <p className="mt-3 text-xs text-red-400 text-center">{addModuleError}</p>
+              <p className="mt-3 text-xs text-center" style={{ color: '#b04646' }}>{addModuleError}</p>
             )}
 
             <div className="mt-5 flex gap-2">
@@ -527,7 +490,8 @@ export default function FloorDetailPage() {
                 type="button"
                 disabled={creatingModule}
                 onClick={() => setShowAddModuleModal(false)}
-                className="flex-1 rounded-md border border-gray-700 hover:bg-gray-800 disabled:opacity-50 py-2 text-sm text-gray-300"
+                className="flex-1 rounded-sm border hover:bg-[var(--bg-soft)] disabled:opacity-50 py-2 text-sm"
+                style={{ borderColor: 'var(--rule)', color: 'var(--ink)' }}
               >
                 취소
               </button>
@@ -569,7 +533,12 @@ export default function FloorDetailPage() {
                     setCreatingModule(false);
                   }
                 }}
-                className="flex-1 rounded-md bg-blue-600 hover:bg-blue-500 disabled:opacity-60 py-2 text-sm font-semibold text-white"
+                className="flex-1 rounded-sm border disabled:opacity-60 py-2 text-sm font-semibold"
+                style={{
+                  background: 'var(--ink)',
+                  color: 'var(--bg)',
+                  borderColor: 'var(--ink)',
+                }}
               >
                 {creatingModule ? '확인 중...' : `${roomNumberLabel(manifest.floor_number, pickerRoomSuffix)} 등록`}
               </button>
@@ -586,25 +555,34 @@ export default function FloorDetailPage() {
             moduleOverlays={moduleOverlays}
           />
         ) : manifest?.basemap_pending_approval ? (
-          <div className="h-full flex items-center justify-center px-6">
+          <div
+            className="h-full flex items-center justify-center px-6"
+            style={{ background: 'var(--bg)' }}
+          >
             <div className="max-w-md text-center">
-              <div className="inline-flex items-center justify-center w-14 h-14 rounded-full bg-yellow-500/10 border border-yellow-500/40 mb-4">
-                <svg className="w-7 h-7 text-yellow-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <div
+                className="inline-flex items-center justify-center w-14 h-14 rounded-full border mb-4"
+                style={{ background: '#f5ecd6', borderColor: '#c9a227' }}
+              >
+                <svg className="w-7 h-7" style={{ color: '#a07f1a' }} fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
                 </svg>
               </div>
-              <div className="text-base font-semibold text-yellow-300 mb-1">관리자 승인 대기중</div>
-              <p className="text-sm text-gray-400 leading-relaxed">
+              <div className="text-base font-semibold mb-1" style={{ color: '#a07f1a' }}>관리자 승인 대기중</div>
+              <p className="text-sm leading-relaxed" style={{ color: 'var(--ink-2)' }}>
                 이 층의 basemap 이 등록되었지만 아직 관리자 승인 전입니다.<br />
                 승인 완료 후 자동으로 표시됩니다.
               </p>
             </div>
           </div>
         ) : (
-          <div className="h-full flex items-center justify-center px-6">
+          <div
+            className="h-full flex items-center justify-center px-6"
+            style={{ background: 'var(--bg)' }}
+          >
             <div className="max-w-md text-center">
-              <div className="text-base font-semibold text-gray-300 mb-1">등록된 basemap 이 없습니다</div>
-              <p className="text-sm text-gray-500 mb-5">
+              <div className="text-base font-semibold mb-1" style={{ color: 'var(--ink)' }}>등록된 basemap 이 없습니다</div>
+              <p className="text-sm mb-5" style={{ color: 'var(--muted)' }}>
                 이 층에 표시할 basemap 이 아직 등록되지 않았습니다.
               </p>
               <button
@@ -620,7 +598,14 @@ export default function FloorDetailPage() {
                   });
                   router.push(`/viewer?${qs.toString()}`);
                 }}
-                className="inline-flex items-center gap-2 px-5 py-2.5 rounded-md bg-blue-600 hover:bg-blue-500 text-white text-sm font-semibold shadow-lg transition cursor-pointer"
+                disabled={!user}
+                title={!user ? '로그인 후 등록 가능합니다' : undefined}
+                className="inline-flex items-center gap-2 px-5 py-2.5 rounded-sm border text-sm font-semibold transition cursor-pointer disabled:cursor-not-allowed disabled:opacity-50"
+                style={{
+                  background: 'var(--ink)',
+                  color: 'var(--bg)',
+                  borderColor: 'var(--ink)',
+                }}
               >
                 <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />

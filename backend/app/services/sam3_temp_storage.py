@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 import uuid
 from pathlib import Path
@@ -19,6 +20,7 @@ from pathlib import Path
 TEMP_DIR = Path("/var/lib/sam3-temp")
 TTL_SECONDS = 30 * 60
 CLEANUP_INTERVAL_SECONDS = 5 * 60
+logger = logging.getLogger(__name__)
 
 
 def ensure_temp_dir() -> None:
@@ -77,7 +79,7 @@ async def cleanup_loop() -> None:
         try:
             deleted = cleanup_expired()
             if deleted:
-                print(f"[sam3_temp] cleaned up {deleted} expired temp PLYs")
+                logger.info(f"[sam3_temp] cleaned up {deleted} expired temp PLYs")
         except Exception as e:  # noqa: BLE001
-            print(f"[sam3_temp] cleanup error: {e}")
+            logger.exception(f"[sam3_temp] cleanup error: {e}")
         await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)

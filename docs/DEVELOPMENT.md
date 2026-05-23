@@ -72,15 +72,12 @@ Do not use `DEV_MODE=true` in shared or production-like environments.
 Default production-like stack:
 
 ```bash
-cd ~/refactored_modutwin
-docker compose up -d --build
-docker compose exec backend alembic upgrade head
+docker compose up -d --build && docker compose exec backend alembic upgrade head
 ```
 
 Local HTTP override:
 
 ```bash
-cd ~/refactored_modutwin
 docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build
 docker compose exec backend alembic upgrade head
 ```
