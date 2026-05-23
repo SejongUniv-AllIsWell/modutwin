@@ -18,7 +18,7 @@ export const PRIMARY_DOOR_ID = 'door_1';
 //   hingeEdge: 0..3 (P0→P1=0, P1→P2=1, P2→P3=2, P3→P0=3). null = 미설정.
 //   swing: 1 (방 안쪽) | -1 (방 바깥쪽).
 //   angleDeg: 열림 각도 (도).
-//   wallSurfaceId: 'w1a' | 'w1b' | 'w2a' | 'w2b' | 'ceiling' | 'floor'. 어느 면 도어인지.
+//   wallSurfaceId: 'ceiling' | 'floor' | `w${number}` (polygon i번째 변 = `w${i}`). 어느 면 도어인지.
 //   doorThickness: 슬랩 깊이 (m, 방 안쪽 단방향).
 //   boundarySplitEnabled: 경계 분할 ON/OFF.
 //   safetyMargin: 분할 안전 마진.

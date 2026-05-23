@@ -23,7 +23,7 @@ from typing import Optional
 from uuid import UUID, uuid4
 
 import httpx
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
 from pydantic import BaseModel
 from sqlalchemy import and_, delete as sa_delete, select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -199,12 +199,17 @@ class CommitFinalResponse(BaseModel):
     was_overwrite: bool
 
 
-# 다듬기/문 설정 시 베이크된 자산 파일명 (모듈 등록 흐름 전용)
-EXPECTED_TEXTURE_KEYS = ("ceiling", "floor", "w1a", "w1b", "w2a", "w2b")
+# N벽 일반화 — 텍스처 키는 ceiling/floor + 폴리곤 변 수만큼의 w0..w(N-1) (동적).
+# multipart form 에서 'tex_' prefix 의 모든 키를 동적으로 수집한다.
+import re as _re
+
+REQUIRED_TEXTURE_KEYS = ("ceiling", "floor")
+_WALL_KEY_RE = _re.compile(r"^w\d+$")
 
 
 @router.post("/commit-final", response_model=CommitFinalResponse)
 async def commit_final(
+    request: Request,
     building_id: UUID = Form(...),
     floor_id: UUID = Form(...),
     module_name: str = Form(...),
@@ -213,12 +218,6 @@ async def commit_final(
     final_ply: UploadFile = File(...),
     mesh_json: UploadFile = File(...),
     doors_json: UploadFile = File(...),
-    tex_ceiling: UploadFile = File(...),
-    tex_floor: UploadFile = File(...),
-    tex_w1a: UploadFile = File(...),
-    tex_w1b: UploadFile = File(...),
-    tex_w2a: UploadFile = File(...),
-    tex_w2b: UploadFile = File(...),
     sam3_session_id: str | None = Form(None),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -242,6 +241,25 @@ async def commit_final(
         raise HTTPException(status_code=400, detail=f"alignment_transform 형식 오류: {e}")
     if len(at.position) != 3 or len(at.rotation) != 4 or len(at.scale) != 3:
         raise HTTPException(status_code=400, detail="alignment_transform position/rotation/scale 형식 오류.")
+
+    # ── 동적 텍스처 키 수집 — 'tex_<surfaceId>' 패턴 ──
+    # ceiling/floor 필수 + w0..w(N-1) 폴리곤 변 수만큼. multipart form 한 번 읽음 (cached).
+    form = await request.form()
+    tex_uploads: dict[str, UploadFile] = {}
+    for key, value in form.multi_items():
+        if not key.startswith("tex_"):
+            continue
+        sid = key[len("tex_"):]
+        if not (sid in REQUIRED_TEXTURE_KEYS or _WALL_KEY_RE.match(sid)):
+            continue
+        if not hasattr(value, "read") or not hasattr(value, "filename"):
+            continue
+        tex_uploads[sid] = value  # type: ignore[assignment]
+    missing = [k for k in REQUIRED_TEXTURE_KEYS if k not in tex_uploads]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"필수 텍스처 누락: {missing}")
+    if not any(_WALL_KEY_RE.match(k) for k in tex_uploads):
+        raise HTTPException(status_code=400, detail="벽 텍스처(w0..) 가 하나 이상 필요합니다.")
 
     # 건물/층 검증 (building_id, floor_id 정합성)
     fres = await db.execute(
@@ -304,7 +322,7 @@ async def commit_final(
     final_ply_key = f"{refined_dir}/final.ply"
     mesh_key = f"{refined_dir}/mesh.json"
     doors_key = f"{base}/alignment/refined/doors.json"  # CLAUDE.md 규약과 일관 (doors 는 refined 디렉터리 직속)
-    tex_keys = {tid: f"{refined_dir}/tex_{tid}.png" for tid in EXPECTED_TEXTURE_KEYS}
+    tex_keys = {tid: f"{refined_dir}/tex_{tid}.png" for tid in tex_uploads.keys()}
 
     # ── Upload 행 생성 ──
     final_ply_bytes = await final_ply.read()
@@ -332,11 +350,7 @@ async def commit_final(
         doors_bytes = await doors_json.read()
         minio.put_object_bytes(doors_key, doors_bytes, "application/json")
 
-        tex_files = {
-            "ceiling": tex_ceiling, "floor": tex_floor,
-            "w1a": tex_w1a, "w1b": tex_w1b, "w2a": tex_w2a, "w2b": tex_w2b,
-        }
-        for tid, f in tex_files.items():
+        for tid, f in tex_uploads.items():
             data = await f.read()
             minio.put_object_bytes(tex_keys[tid], data, "image/png")
     except Exception as e:

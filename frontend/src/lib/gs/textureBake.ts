@@ -1,14 +1,20 @@
 import type { GaussianScene } from '../ply/types';
 import { compositeTextureGPU, type SplatGPU } from './textureBakeGPU';
+import type { PolygonPoint, SurfacePlane } from './planes';
 
 const SH0 = 0.28209479177387814;
 
 export type Vec3 = [number, number, number];
 
-/** 방 기하 — 벽4 거리, 회전각, 천장/바닥 Y. */
+/**
+ * 방 기하 — N벽 폴리곤 + 천장/바닥 Y.
+ *
+ * `surfacePlanes` 는 천장/바닥 + N벽 (`w0..w(N-1)`) 모두 포함된 SurfacePlane[].
+ * 보통 `surfacePlanesFromPolygon` 결과 그대로 전달. wall ID `wi` ↔ polygon i번째 변 매칭.
+ */
 export interface RoomGeometry {
-  angleDeg: number;
-  walls: [number, number, number, number];  // a1, b1, a2, b2
+  surfacePlanes: SurfacePlane[];
+  polygon: PolygonPoint[];
   ceilingY: number;
   floorY: number;
 }
@@ -64,6 +70,10 @@ export interface PlaneBakeInput {
   extendV0: number; extendV1: number;
   /** 메시 quad를 origin 으로부터 normal 방향으로 얼마나 떨어진 곳에 배치할지 (m). */
   meshOffset: number;
+  /** 천장/바닥 한정 — 픽셀의 world XZ 가 이 polygon 외부면 alpha=0 처리.
+   *  mesh quad 는 polygon bbox 직사각이지만 텍스처 알파로 polygon 모양 시각화.
+   *  벽 surface 는 undefined (직사각 그대로). */
+  polygonMaskXZ?: { x: number; z: number }[];
 }
 
 export interface TextureBakeResult {
@@ -80,6 +90,26 @@ export interface TextureBakeResult {
 
 function sigmoid(x: number): number {
   return 1 / (1 + Math.exp(-x));
+}
+
+/**
+ * point-in-polygon 테스트 (ray casting, XZ 평면).
+ *
+ * polygon 은 cycle 순서의 점 배열 (마지막→첫 점 자동 연결). polygon 변 위에 정확히 닿는 경계
+ * 점은 ray casting 의 동률 보정상 일부는 inside, 일부는 outside 로 잡힐 수 있음 — 텍스처 마스크
+ * 용도에서는 1픽셀 오차라 무방.
+ */
+function isPointInPolygonXZ(x: number, z: number, polygon: { x: number; z: number }[]): boolean {
+  let inside = false;
+  const N = polygon.length;
+  for (let i = 0, j = N - 1; i < N; j = i++) {
+    const xi = polygon[i].x, zi = polygon[i].z;
+    const xj = polygon[j].x, zj = polygon[j].z;
+    const intersect = ((zi > z) !== (zj > z)) &&
+      (x < (xj - xi) * (z - zi) / (zj - zi) + xi);
+    if (intersect) inside = !inside;
+  }
+  return inside;
 }
 
 function linToSrgb(c: number): number {
@@ -469,7 +499,13 @@ export async function bakeTextureForPlane(
     console.log(`[textureBake CPU] ${(performance.now() - tCpuStart).toFixed(0)}ms`);
   }
 
-  // ── 단계 4: 최종 RGBA8 (un-premultiply + sRGB encode + V flip) ──
+  // ── 단계 4: 최종 RGBA8 (un-premultiply + sRGB encode + V flip + polygon mask) ──
+  // polygon mask (ceiling/floor 한정): 픽셀의 world XZ 가 polygon 외부면 alpha=0.
+  // 픽셀 (xx, yy) → 베이크 (u_local, v_local) = ((xx+0.5)/tpm, (yy+0.5)/tpm)
+  //   → world: origin + u_local * uAxis + v_local * vAxis. y 성분은 평면에 의존하므로 무시 (XZ test).
+  const mask = input.polygonMaskXZ;
+  const useMask = !!mask && mask.length >= 3;
+  let maskedOut = 0;
   const rgba = new Uint8ClampedArray(width * height * 4);
   let nOpaque = 0;
   for (let yy = 0; yy < height; yy++) {
@@ -478,7 +514,22 @@ export async function bakeTextureForPlane(
       const finalAlpha = composited[srcIdx + 3];
       const imgRow = height - 1 - yy; // V 뒤집기
       const imgIdx = (imgRow * width + xx) * 4;
-      if (finalAlpha > 1e-3) {
+
+      let alphaPass = finalAlpha > 1e-3;
+      if (alphaPass && useMask) {
+        // textureBake 좌표계 — input.uMin/vMin 은 0 또는 음수일 수 있음.
+        // 픽셀 중심: (xx+0.5)/tpm + uMin = ... 이건 splat sampling 식과 일치.
+        const uLocal = input.uMin + (xx + 0.5) / tpm;
+        const vLocal = input.vMin + (yy + 0.5) / tpm;
+        const worldX = ox + uLocal * ux + vLocal * vx;
+        const worldZ = oz + uLocal * uz + vLocal * vz;
+        if (!isPointInPolygonXZ(worldX, worldZ, mask!)) {
+          alphaPass = false;
+          maskedOut++;
+        }
+      }
+
+      if (alphaPass) {
         const r = composited[srcIdx]     / finalAlpha;
         const g = composited[srcIdx + 1] / finalAlpha;
         const b = composited[srcIdx + 2] / finalAlpha;
@@ -494,6 +545,9 @@ export async function bakeTextureForPlane(
         rgba[imgIdx + 3] = 0;
       }
     }
+  }
+  if (useMask) {
+    console.log(`[textureBake] polygon mask: ${maskedOut}/${width * height} pixels masked out (${(100 * maskedOut / (width * height)).toFixed(1)}%)`);
   }
 
   // ── 코너: 메시는 베이크 범위보다 extend* 만큼 더 뻗음. ──
@@ -561,109 +615,81 @@ export async function bakeTextureForPlane(
  * - (u, v) 범위는 인접 면의 메시 오프셋 (= MESH_PLANE_INSET) 만큼 양쪽 확장 → 직육면체 코너에서
  *   메시들이 정확히 만남. 본 면의 메시 오프셋과 인접 면의 extend 가 같은 상수에서 파생되므로 항상 동기화.
  *
+ * N벽 일반화:
+ *   - wall surfaceId `wi` → 폴리곤 i 번째 변 (`polygon[i]` → `polygon[(i+1)%N]`).
+ *   - 변 방향이 uAxis, Y축이 vAxis. 변 길이가 uMax, 천장-바닥 높이가 vMax.
+ *   - ceiling/floor: 폴리곤 XZ bbox 로 직사각 quad. polygon 외부 픽셀은 빈 텍셀 (alpha=0).
+ *
  * 좌표 규약은 planes.ts와 동일 (raw PLY 프레임).
  */
 export function planeBakeInputForSurface(
   surfaceId: string,
   room: RoomGeometry,
 ): PlaneBakeInput {
-  const rad = (room.angleDeg * Math.PI) / 180;
-  const c = Math.cos(rad), s = Math.sin(rad);
-  const [a1, b1, a2, b2] = room.walls;
-  const { ceilingY: cy, floorY: fy } = room;
+  const { polygon, ceilingY: cy, floorY: fy, surfacePlanes } = room;
+  const N = polygon.length;
 
   // 모든 면의 메시 오프셋이 동일 (MESH_PLANE_INSET) → 인접 면 extend 도 그대로 이 값.
   // 본 면의 메시는 bakeTextureForPlane 안에서 `meshOffsetEff = MESH_PLANE_INSET` 으로 배치되므로,
-  // 여기서 같은 상수를 extend* 에 쓰면 직육면체 6면이 정확히 만남.
-  const offSelf = MESH_PLANE_INSET;
-  const oCeil = MESH_PLANE_INSET;
-  const oFloor = MESH_PLANE_INSET;
-  const oW1a = MESH_PLANE_INSET;
-  const oW1b = MESH_PLANE_INSET;
-  const oW2a = MESH_PLANE_INSET;
-  const oW2b = MESH_PLANE_INSET;
+  // 여기서 같은 상수를 extend* 에 쓰면 인접 면들이 정확히 만남.
+  const off = MESH_PLANE_INSET;
 
-  // 베이크 범위는 원래 방 범위 그대로. 메시는 인접 offset 만큼 extend (replicate padding).
-  switch (surfaceId) {
-    case 'ceiling': {
-      const normal: Vec3 = [0, 1, 0];
-      return {
-        origin: [c * a1 - s * a2, cy, s * a1 + c * a2],
-        uAxis: [c, 0, s],
-        vAxis: [-s, 0, c],
-        normal,
-        uMin: 0, uMax: b1 - a1, vMin: 0, vMax: b2 - a2,
-        extendU0: oW1a, extendU1: oW1b,
-        extendV0: oW2a, extendV1: oW2b,
-        meshOffset: offSelf,
-      };
+  if (surfaceId === 'ceiling' || surfaceId === 'floor') {
+    // 폴리곤 XZ bbox.
+    let mnX = Infinity, mxX = -Infinity, mnZ = Infinity, mxZ = -Infinity;
+    for (const p of polygon) {
+      if (p.x < mnX) mnX = p.x; if (p.x > mxX) mxX = p.x;
+      if (p.z < mnZ) mnZ = p.z; if (p.z > mxZ) mxZ = p.z;
     }
-    case 'floor': {
-      const normal: Vec3 = [0, -1, 0];
-      return {
-        origin: [c * a1 - s * a2, fy, s * a1 + c * a2],
-        uAxis: [c, 0, s],
-        vAxis: [-s, 0, c],
-        normal,
-        uMin: 0, uMax: b1 - a1, vMin: 0, vMax: b2 - a2,
-        extendU0: oW1a, extendU1: oW1b,
-        extendV0: oW2a, extendV1: oW2b,
-        meshOffset: offSelf,
-      };
-    }
-    case 'w1a': {
-      const normal: Vec3 = [-c, 0, -s];
-      return {
-        origin: [c * a1 - s * a2, fy, s * a1 + c * a2],
-        uAxis: [-s, 0, c],
-        vAxis: [0, 1, 0],
-        normal,
-        uMin: 0, uMax: b2 - a2, vMin: 0, vMax: cy - fy,
-        extendU0: oW2a, extendU1: oW2b,
-        extendV0: oFloor, extendV1: oCeil,
-        meshOffset: offSelf,
-      };
-    }
-    case 'w1b': {
-      const normal: Vec3 = [c, 0, s];
-      return {
-        origin: [c * b1 - s * a2, fy, s * b1 + c * a2],
-        uAxis: [-s, 0, c],
-        vAxis: [0, 1, 0],
-        normal,
-        uMin: 0, uMax: b2 - a2, vMin: 0, vMax: cy - fy,
-        extendU0: oW2a, extendU1: oW2b,
-        extendV0: oFloor, extendV1: oCeil,
-        meshOffset: offSelf,
-      };
-    }
-    case 'w2a': {
-      const normal: Vec3 = [s, 0, -c];
-      return {
-        origin: [c * a1 - s * a2, fy, s * a1 + c * a2],
-        uAxis: [c, 0, s],
-        vAxis: [0, 1, 0],
-        normal,
-        uMin: 0, uMax: b1 - a1, vMin: 0, vMax: cy - fy,
-        extendU0: oW1a, extendU1: oW1b,
-        extendV0: oFloor, extendV1: oCeil,
-        meshOffset: offSelf,
-      };
-    }
-    case 'w2b': {
-      const normal: Vec3 = [-s, 0, c];
-      return {
-        origin: [c * a1 - s * b2, fy, s * a1 + c * b2],
-        uAxis: [c, 0, s],
-        vAxis: [0, 1, 0],
-        normal,
-        uMin: 0, uMax: b1 - a1, vMin: 0, vMax: cy - fy,
-        extendU0: oW1a, extendU1: oW1b,
-        extendV0: oFloor, extendV1: oCeil,
-        meshOffset: offSelf,
-      };
-    }
-    default:
-      throw new Error(`planeBakeInputForSurface: unknown surfaceId "${surfaceId}"`);
+    const plane = surfacePlanes.find(p => p.id === surfaceId);
+    const normal: Vec3 = plane
+      ? [plane.normal[0], plane.normal[1], plane.normal[2]]
+      : (surfaceId === 'ceiling' ? [0, 1, 0] : [0, -1, 0]);
+    const yLevel = surfaceId === 'ceiling' ? cy : fy;
+    return {
+      origin: [mnX, yLevel, mnZ],
+      uAxis: [1, 0, 0],
+      vAxis: [0, 0, 1],
+      normal,
+      uMin: 0, uMax: mxX - mnX,
+      vMin: 0, vMax: mxZ - mnZ,
+      extendU0: off, extendU1: off,
+      extendV0: off, extendV1: off,
+      meshOffset: off,
+      // polygon 외부 픽셀 alpha=0 — quad 는 bbox 직사각, 텍스처 알파로 polygon 모양 시각화.
+      polygonMaskXZ: polygon.map(p => ({ x: p.x, z: p.z })),
+    };
   }
+
+  const m = /^w(\d+)$/.exec(surfaceId);
+  if (!m) throw new Error(`planeBakeInputForSurface: unknown surfaceId "${surfaceId}"`);
+  const i = parseInt(m[1], 10);
+  if (i < 0 || i >= N) throw new Error(`planeBakeInputForSurface: wall index ${i} out of range (N=${N})`);
+
+  const a = polygon[i];
+  const b = polygon[(i + 1) % N];
+  const dx = b.x - a.x;
+  const dz = b.z - a.z;
+  const len = Math.hypot(dx, dz);
+  if (len < 1e-9) throw new Error(`planeBakeInputForSurface: degenerate edge "${surfaceId}"`);
+
+  const plane = surfacePlanes.find(p => p.id === surfaceId);
+  if (!plane) throw new Error(`planeBakeInputForSurface: SurfacePlane "${surfaceId}" not in surfacePlanes`);
+  const normal: Vec3 = [plane.normal[0], plane.normal[1], plane.normal[2]];
+
+  // uAxis = 변 방향 (a→b 정규화). vAxis = Y up. 베이크 origin = floor 끝점 a.
+  // bakeTextureForPlane 안의 V flip 으로 vMax 가 텍스처 row 0 (이미지 상단) 이 됨.
+  const uAxis: Vec3 = [dx / len, 0, dz / len];
+  const vAxis: Vec3 = [0, 1, 0];
+  return {
+    origin: [a.x, fy, a.z],
+    uAxis,
+    vAxis,
+    normal,
+    uMin: 0, uMax: len,
+    vMin: 0, vMax: cy - fy,
+    extendU0: off, extendU1: off,
+    extendV0: off, extendV1: off,
+    meshOffset: off,
+  };
 }

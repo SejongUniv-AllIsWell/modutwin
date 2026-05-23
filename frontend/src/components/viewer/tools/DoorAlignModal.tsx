@@ -5,7 +5,7 @@ import { api } from '@/lib/api';
 import { SplatViewerCoreRef } from '../SplatViewerCore';
 import { loadRefineState } from '@/lib/refine/persistence';
 import { getEditorRotation, rawToA, aToRaw, rawToAY, type FrameRotation } from '@/lib/refine/coordFrames';
-import { surfacePlanesFromRoom, type SurfacePlane } from '@/lib/gs/planes';
+import { surfacePlanesFromPolygon, type SurfacePlane } from '@/lib/gs/planes';
 import { useAdditionalGsplats, type AdditionalGsplatsApi } from './useAdditionalGsplats';
 import { useDoorLabels } from './useDoorLabels';
 import type { GaussianScene } from '@/lib/ply/types';
@@ -344,15 +344,14 @@ export default function DoorAlignModal({
     });
   }, [coreRef]);
 
-  // ── 다듬기에서 저장한 벽/천장/바닥 → 6개 평면 ──
+  // ── 다듬기에서 저장한 벽/천장/바닥 → ceiling/floor + N벽 평면 ──
   const planes = useMemo<SurfacePlane[] | null>(() => {
     const st = loadRefineState(uploadId);
     if (!st) return null;
     if (!st.cfConfirmed || !st.wallConfirmed) return null;
-    if (st.wallAngle === null || !st.wallDistances) return null;
-    return surfacePlanesFromRoom({
-      angleDeg: st.wallAngle,
-      walls: st.wallDistances,
+    if (!st.wallPolygon) return null;
+    return surfacePlanesFromPolygon({
+      polygon: st.wallPolygon,
       ceilingY: st.ceilingY,
       floorY: st.floorY,
     });
@@ -392,12 +391,12 @@ export default function DoorAlignModal({
   // ── ray-plane 교점 (raw 프레임) ──
   // 클릭은 "평면 위의 점" 으로만 떨어진다 (가우시안 위치가 아니라 수학적 평면 교점).
   // forcePlaneId 가 주어지면 그 평면 하나에만 투영 — 4 코너가 같은 면 위에 있도록 보장.
-  // (없으면 6개 평면 중 ray 가 가장 먼저 만나는 평면 — 첫 코너 픽 용도.)
+  // (없으면 N+2 개 평면 중 ray 가 가장 먼저 만나는 평면 — 첫 코너 픽 용도.)
   //
   // 좌표 프레임 정합:
   //   `splatEntity.worldTransform` = Z-180 · Rz(rotZ) · Rx(rotX) (pendingRotation 포함).
-  //   inv 적용 결과는 raw 프레임 점/방향. surfacePlanesFromRoom 의 평면들은 A' 프레임 (= raw + pendingRotation) 에서 정의됨
-  //   (CeilingFloorModal 에서 잡은 ceilingY, WallModal 에서 잡은 wallAngle/walls 가 모두 A' 기준).
+  //   inv 적용 결과는 raw 프레임 점/방향. surfacePlanesFromPolygon 의 평면들은 A' 프레임 (= raw + pendingRotation) 에서 정의됨
+  //   (CeilingFloorModal 에서 잡은 ceilingY, WallModal 에서 잡은 wallPolygon 이 모두 A' 기준).
   //   따라서 평면 테스트 전에 ray O, D 를 pendingRotation 으로 다시 회전 (raw → A') 해 t 를 정확히 산출.
   //   최종 점은 raw 프레임으로 반환 — 다른 코드 (rendering, persist 등) 가 raw 가정.
   const raycastToPlanes = useCallback((mouseX: number, mouseY: number, forcePlaneId?: string): PickedCorner | null => {
@@ -978,8 +977,13 @@ export default function DoorAlignModal({
       return;
     }
 
-    // 1. Wall mesh 6개 저장
-    const surfaces = ['ceiling', 'floor', 'w1a', 'w1b', 'w2a', 'w2b'];
+    // 1. Wall mesh 저장 — ceiling/floor + 폴리곤 변 수만큼의 w0..w(N-1).
+    const surfaces: string[] = ['ceiling', 'floor'];
+    if (planes) {
+      for (const p of planes) {
+        if (/^w\d+$/.test(p.id)) surfaces.push(p.id);
+      }
+    }
     for (const sid of surfaces) {
       const ent = findEntityByName(app.root, `wallMesh_${sid}`);
       const tex = ent?.render?.meshInstances?.[0]?.material?.emissiveMap;

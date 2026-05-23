@@ -1158,9 +1158,10 @@ export default function UnifiedSplatEditor({
                     form.append('final_ply', new Blob([assets.plyBytes as unknown as BlobPart], { type: 'application/octet-stream' }), assets.plyFilename);
                     form.append('mesh_json', new Blob([assets.meshJson], { type: 'application/json' }), 'mesh.json');
                     form.append('doors_json', new Blob([doorsJson], { type: 'application/json' }), 'doors.json');
-                    for (const sid of ['ceiling', 'floor', 'w1a', 'w1b', 'w2a', 'w2b'] as const) {
+                    // ceiling/floor + 폴리곤 변 수만큼의 wN. assets.textures 에 들어있는 모든 surfaceId 전송.
+                    for (const sid of Array.from(assets.textures.keys())) {
                       const tex = assets.textures.get(sid);
-                      if (!tex) throw new Error(`텍스처 누락: ${sid} (다듬기 단계에서 6면 모두 베이크 필요)`);
+                      if (!tex) throw new Error(`텍스처 누락: ${sid} (다듬기 단계에서 모든 면 베이크 필요)`);
                       form.append(`tex_${sid}`, tex, `tex_${sid}.png`);
                     }
                     if (sam3PrepareSessionIdRef.current) {
