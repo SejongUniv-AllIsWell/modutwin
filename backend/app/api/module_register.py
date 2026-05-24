@@ -33,7 +33,7 @@ from app.core.database import get_db
 from app.core.security import get_current_user
 from app.models import (
     Building, Floor, Module, SceneOutput, Task, Upload, User, UserRole,
-    PlyTarget, UploadStatus, TaskType, TaskStatus, Sam3Status,
+    PlyTarget, UploadStatus, TaskType, TaskStatus,
 )
 from app.services.minio_service import get_minio_service
 from app.services.sam3_temp_storage import (
@@ -335,7 +335,7 @@ async def commit_final(
         minio_path=placeholder_key,
         ply_target=PlyTarget.alignment,
         status=UploadStatus.completed,
-        sam3_status=Sam3Status.disabled,  # 새 흐름에선 임시 검출이라 dispatch 안 함
+        sam3_status=None,  # 새 흐름에선 임시 검출이라 dispatch 안 함
     )
     db.add(upload)
     await db.flush()
