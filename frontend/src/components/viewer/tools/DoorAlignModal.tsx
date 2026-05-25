@@ -98,6 +98,21 @@ interface Props {
   sharedAdditional?: AdditionalGsplatsApi;
 }
 
+// XZ point-in-polygon (ray casting) — raycast 첫 코너 픽의 ceiling/floor 유효 범위 검사용.
+function isPointInPolygonXZ(x: number, z: number, polygon: { x: number; z: number }[]): boolean {
+  let inside = false;
+  const N = polygon.length;
+  for (let i = 0, j = N - 1; i < N; j = i++) {
+    const xi = polygon[i].x, zi = polygon[i].z;
+    const xj = polygon[j].x, zj = polygon[j].z;
+    if (((zi > z) !== (zj > z)) &&
+        (x < (xj - xi) * (z - zi) / ((zj - zi) || 1e-12) + xi)) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
 // 픽 / 영속화 / 다운스트림 기하 (Kabsch 등) 는 시계방향 (TL → TR → BR → BL) 인덱스 순서를 가정.
 // 이 배열 인덱스가 곧 picked[] 의 인덱스이며 절대 바꾸지 말 것.
 const CORNERS = [
@@ -344,18 +359,30 @@ export default function DoorAlignModal({
     });
   }, [coreRef]);
 
-  // ── 다듬기에서 저장한 벽/천장/바닥 → ceiling/floor + N벽 평면 ──
-  const planes = useMemo<SurfacePlane[] | null>(() => {
+  // ── 다듬기에서 저장한 벽/천장/바닥 → ceiling/floor + N벽 평면 + polygon 기하 ──
+  // planes 외에 polygon/ceilingY/floorY 도 함께 보관 — raycast 유효 범위 (벽 segment / polygon 내부) 검사용.
+  const planesData = useMemo<{
+    planes: SurfacePlane[];
+    polygon: { x: number; z: number }[];
+    ceilingY: number;
+    floorY: number;
+  } | null>(() => {
     const st = loadRefineState(uploadId);
     if (!st) return null;
     if (!st.cfConfirmed || !st.wallConfirmed) return null;
     if (!st.wallPolygon) return null;
-    return surfacePlanesFromPolygon({
+    return {
+      planes: surfacePlanesFromPolygon({
+        polygon: st.wallPolygon,
+        ceilingY: st.ceilingY,
+        floorY: st.floorY,
+      }),
       polygon: st.wallPolygon,
       ceilingY: st.ceilingY,
       floorY: st.floorY,
-    });
+    };
   }, [uploadId]);
+  const planes = planesData?.planes ?? null;
   const showRefineGuide = !planes && !(basemapMode && view === 'setup');
 
   // SAM3 자동 추출 완료 시 부모가 넘겨준 4 코너로 picked 초기 채움.
@@ -400,7 +427,7 @@ export default function DoorAlignModal({
   //   따라서 평면 테스트 전에 ray O, D 를 pendingRotation 으로 다시 회전 (raw → A') 해 t 를 정확히 산출.
   //   최종 점은 raw 프레임으로 반환 — 다른 코드 (rendering, persist 등) 가 raw 가정.
   const raycastToPlanes = useCallback((mouseX: number, mouseY: number, forcePlaneId?: string): PickedCorner | null => {
-    if (!planes) return null;
+    if (!planes || !planesData) return null;
     const core = coreRef.current;
     const cam = core?.getCamera()?.camera;
     const sd = core?.getSplatData();
@@ -442,8 +469,42 @@ export default function DoorAlignModal({
       return { pos, surfaceId: p.id };
     }
 
-    // 가장 작은 양수 t 채택 (첫 코너용)
-    let bestT = Infinity;
+    // 첫 코너용 — 가장 가까운 평면 중 "실제 벽/천장/바닥이 존재하는 유효 범위" 안의 교점만 채택.
+    //   각 plane 은 무한 평면이므로, 교점이 그 surface 의 실제 직사각(벽 segment × 높이) 또는
+    //   polygon 내부(천장/바닥) 안인지 A' 프레임에서 검사. 범위 밖이면 skip → 오목 공간에서 ray 가
+    //   먼저 만나는 다른 벽의 무한 연장 평면이 잘못 잡히는 문제 방지.
+    const { polygon, ceilingY, floorY } = planesData;
+    const MARGIN = 0.1; // 변 끝/높이 경계 10cm 여유 (코너가 모서리에 정확히 안 떨어져도 허용).
+    const isWithinSurface = (planeId: string, PxA: number, PyA: number, PzA: number): boolean => {
+      if (planeId === 'ceiling' || planeId === 'floor') {
+        return isPointInPolygonXZ(PxA, PzA, polygon);
+      }
+      const m = /^w(\d+)$/.exec(planeId);
+      if (!m) return false;
+      const i = parseInt(m[1], 10);
+      const N = polygon.length;
+      if (i < 0 || i >= N) return false;
+      const a = polygon[i];
+      const b = polygon[(i + 1) % N];
+      const abx = b.x - a.x, abz = b.z - a.z;
+      const len2 = abx * abx + abz * abz;
+      if (len2 < 1e-12) return false;
+      // 변 방향 투영 파라미터 t_edge ∈ [0,1] (± margin) → 변 양 끝점 사이.
+      const tEdge = ((PxA - a.x) * abx + (PzA - a.z) * abz) / len2;
+      const marginT = MARGIN / Math.sqrt(len2);
+      if (tEdge < -marginT || tEdge > 1 + marginT) return false;
+      // 높이 범위 (± margin).
+      const yLo = Math.min(ceilingY, floorY) - MARGIN;
+      const yHi = Math.max(ceilingY, floorY) + MARGIN;
+      if (PyA < yLo || PyA > yHi) return false;
+      return true;
+    };
+
+    // 유효 범위 안의 교점 중 "가장 뒤(가장 큰 t)" 채택 (첫 코너용).
+    //   카메라가 방 내부에서 문 벽을 바라보는 일반 패턴에서, 클릭한 벽은 ray 경로상 가장 먼 실제 벽.
+    //   오목(alcove) 공간: 입구 옆 벽이 ray 앞쪽을 가로질러도, 유효 평면 중 가장 뒤 = 안쪽 문 벽.
+    //   방 밖으로 뻗은 무한 연장 평면은 isWithinSurface 가 걸러내므로 가장 뒤가 방 밖으로 새지 않음.
+    let bestT = -Infinity;
     let bestId = '';
     let bestPoint: Vec3 | null = null;
     for (const p of planes) {
@@ -451,13 +512,16 @@ export default function DoorAlignModal({
       if (Math.abs(denom) < 1e-6) continue;
       const numer = p.d - (p.normal[0]*oxA + p.normal[1]*oyA + p.normal[2]*ozA);
       const t = numer / denom;
-      if (t <= 0 || t >= bestT) continue;
+      if (t <= 0 || t <= bestT) continue;
+      // A' 프레임 교점 — 유효 범위 검사.
+      const PxA = oxA + dxA*t, PyA = oyA + dyA*t, PzA = ozA + dzA*t;
+      if (!isWithinSurface(p.id, PxA, PyA, PzA)) continue;
       bestT = t; bestId = p.id;
       bestPoint = [ox + dx*t, oy + dy*t, oz + dz*t];
     }
     if (!bestPoint) return null;
     return { pos: bestPoint, surfaceId: bestId };
-  }, [coreRef, planes, uploadId]);
+  }, [coreRef, planes, planesData, uploadId]);
 
   // ── 순차 픽 클릭 + ESC 취소 (seqArmed 상태일 때만) ──
   // 픽 순서: CORNERS index 순 = TL(0) → TR(1) → BR(2) → BL(3) (시계방향).
