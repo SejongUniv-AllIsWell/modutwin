@@ -1,22 +1,26 @@
-# 원격 GPU 워커 전용 (DGX Spark 등 "별도" GPU 머신)
+# 원격 GPU 머신 전용 (DGX Spark 등 "별도" GPU 머신)
 # ===========================================================================
 # 브로커/스토리지(RabbitMQ·Redis·MinIO)와 백엔드는 PC(웹서버)에서 돌고,
-# 이 파일은 GPU 머신에서 worker 만 띄워 PC 를 PC_HOST_IP 로 바라본다.
+# 이 파일은 GPU 머신에서 worker + door-ml(SAM3) 을 띄운다.
+#   - worker  : celery training/alignment → PC 를 PC_HOST_IP 로 바라봄
+#   - door-ml : SAM3 문검출 HTTP 서버. PC 백엔드가 DGX:8000 으로 호출
 # (base docker-compose.yml 과 합치지 말고 이 파일 "단독"으로 실행할 것.)
 #
 # 사용법 (GPU 머신에서):
 #   docker compose -f docker-compose.gpu-remote.yml up -d --build
 #
 # 사전 조건:
-#   1) .env 에 PC_HOST_IP + 아래 비밀값이 PC 와 "동일"하게 설정돼 있을 것
+#   1) .env 에 PC_HOST_IP + 비밀값이 PC 와 "동일"하게, HF_TOKEN(SAM3 게이트 모델) 설정
 #      (docs/DEVELOPMENT.md: "keep secrets identical on both machines")
 #   2) PC 의 RabbitMQ(5673)/Redis(6379)/MinIO(9000) 가 PC_HOST_IP 로 접근 가능
 #        nc -zv $PC_HOST_IP 5673 && nc -zv $PC_HOST_IP 6379 && nc -zv $PC_HOST_IP 9000
 #   3) NVIDIA Container Toolkit 설치
 #
-# door-ml(SAM3) 은 SAM3 dispatch 가 켜질 때만 필요하므로 여기서는 제외했다.
-# 필요해지면 door-ml 서비스를 비슷하게 추가하고 호스트에 포트를 노출(예: 8000)
-# 해서 PC 백엔드가 접근하도록 한다.
+# ★ SAM3 를 실제로 쓰려면 PC 백엔드 .env 에서도:
+#     ENABLE_SAM3_DISPATCH=true
+#     DOOR_ML_URL=http://<이 DGX 의 IP>:8000   (예: Tailscale IP)
+#   를 설정하고 백엔드를 재시작해야 한다. (door-ml 은 celery 가 아니라 백엔드
+#   백그라운드 스레드가 HTTP 로 직접 호출한다.)
 # ===========================================================================
 
 services:
@@ -64,3 +68,31 @@ services:
               count: all
               capabilities: [gpu]
     restart: unless-stopped
+
+  # SAM3 문검출 HTTP 서버. PC 백엔드가 POST /detect 로 호출한다(celery 미사용).
+  door-ml:
+    build: ./door_ml
+    container_name: 3dgs-door-ml
+    ports:
+      # PC 백엔드가 DOOR_ML_URL=http://<DGX_IP>:8000 으로 접근. Tailscale 등
+      # 사설망만 열려 있도록 방화벽/ACL 로 제한 권장.
+      - "8000:8000"
+    volumes:
+      - ./core:/app/core:ro
+      - ./utilities:/app/utilities:ro
+      - hf_cache:/root/.cache/huggingface   # SAM3 체크포인트 캐시(재다운로드 방지)
+    environment:
+      - TORCH_CUDA_ARCH_LIST=12.1+PTX        # DGX Spark GB10 = sm_121
+      - HF_TOKEN=${HF_TOKEN}                 # facebook/sam3 gated 모델 접근 토큰
+      - HF_HUB_DISABLE_PROGRESS_BARS=1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
+volumes:
+  hf_cache:
