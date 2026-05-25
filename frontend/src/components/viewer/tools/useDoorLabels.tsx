@@ -6,14 +6,21 @@ import type { SplatViewerCoreRef } from '../SplatViewerCore';
 export interface DoorLabelEntry {
   id: string;
   unitName: string | null;       // null = 미설정 (회색 라벨로 "미설정" 표시)
-  corners: number[][];            // A'+Y 프레임 4 corners. centroid 로 라벨 위치 계산.
+  /**
+   * raw 프레임 4 corners. centroid 로 라벨 위치 계산.
+   * 매 프레임 splatEntity 의 worldTransform 을 적용해 world 좌표로 변환.
+   * (이전엔 A'+Y 프레임 + Z-180 가정이었으나 basemap 도어 설정 단계는 splatEntity 가
+   *  Z-180 + pendingRotation 만 적용된 상태 = wallAngle Y 미베이크 → 라벨이 wallAngle 만큼
+   *  어긋남. raw + worldTransform 사용 시 단계 무관하게 일관.)
+   */
+  corners: number[][];
 }
 
 /**
- * 도어 corners (A'+Y 프레임) 위에 말풍선 HTML 라벨 표시.
+ * 도어 corners (raw 프레임) 위에 말풍선 HTML 라벨 표시.
  * 매 프레임 카메라 worldToScreen 으로 화면 좌표 갱신.
  *
- * Z-180 viewer 컨벤션 가정 → world = (-x, -y, z).
+ * raw → world: splatEntity.getWorldTransform() 직접 사용 (단계별 변환 합성 가정 없음).
  */
 export function useDoorLabels(
   coreRef: RefObject<SplatViewerCoreRef | null>,
@@ -27,7 +34,6 @@ export function useDoorLabels(
     if (!enabled || doors.length === 0) return;
 
     let cancelled = false;
-    const labels: { el: HTMLDivElement; world: any }[] = [];
 
     (async () => {
       // splat 까지 마운트 대기.
@@ -51,12 +57,14 @@ export function useDoorLabels(
       parent.appendChild(overlay);
       overlayRef.current = overlay;
 
+      // raw centroid (각 도어). 매 프레임 splatEntity.worldTransform 으로 world 변환.
+      const labelMeta: Array<{ el: HTMLDivElement; rawCentroid: any }> = [];
       for (const door of doors) {
         if (!door.corners || door.corners.length === 0) continue;
         let cx = 0, cy = 0, cz = 0;
         for (const c of door.corners) { cx += c[0]; cy += c[1]; cz += c[2]; }
         cx /= door.corners.length; cy /= door.corners.length; cz /= door.corners.length;
-        const world = new pc.Vec3(-cx, -cy, cz);
+        const rawCentroid = new pc.Vec3(cx, cy, cz);
 
         const el = document.createElement('div');
         const hasName = !!door.unitName;
@@ -89,17 +97,21 @@ export function useDoorLabels(
         ].join(';');
         el.appendChild(tail);
         overlay.appendChild(el);
-        labels.push({ el, world });
+        labelMeta.push({ el, rawCentroid });
       }
 
       const camera = coreRef.current?.getCamera();
       const screenVec = new pc.Vec3();
+      const worldVec = new pc.Vec3();
       const tick = () => {
         if (cancelled) return;
         const cam = camera?.camera;
-        if (cam) {
-          for (const lb of labels) {
-            cam.worldToScreen(lb.world, screenVec);
+        const splatEnt = coreRef.current?.getSplatData()?.splatEntity;
+        if (cam && splatEnt) {
+          const wt = splatEnt.getWorldTransform();
+          for (const lb of labelMeta) {
+            wt.transformPoint(lb.rawCentroid, worldVec);
+            cam.worldToScreen(worldVec, screenVec);
             if (screenVec.z > 0) {
               lb.el.style.display = '';
               lb.el.style.left = `${screenVec.x}px`;

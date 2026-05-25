@@ -103,15 +103,17 @@ export default function WallModal({
 }: Props) {
   const xzRef = useRef<HTMLCanvasElement>(null);
 
-  // 천장/바닥 사이 가우시안만 필터 + XZ 가장자리 outlier 정리 + 샘플링 (60k 상한).
-  const { pts, n } = useMemo(() => {
+  // 천장/바닥 사이 가우시안만 필터 + 샘플링 (60k 상한).
+  // pts: 전체 점 (zoomout 시 outlier 도 보이게).
+  // bboxTrimmed: 초기 viewBounds 계산용 0.5%/99.5% percentile 박스 (멀리 떨어진 노이즈는 fit에서 배제).
+  const { pts, n, bboxTrimmed } = useMemo(() => {
     const yLo = Math.min(ceilingY, floorY);
     const yHi = Math.max(ceilingY, floorY);
     const valid: number[] = [];
     for (let i = 0; i < numSplats; i++) {
       if (posY[i] >= yLo && posY[i] <= yHi) valid.push(i);
     }
-    // 0.5%/99.5% percentile trim — 멀리 떨어진 노이즈만 제거 (방 경계는 보존).
+    // 초기 fit 용 percentile bbox 만 계산 (drawing 은 전체 점).
     const xs = new Float32Array(valid.length);
     const zs = new Float32Array(valid.length);
     for (let i = 0; i < valid.length; i++) { xs[i] = posX[valid[i]]; zs[i] = posZ[valid[i]]; }
@@ -122,20 +124,16 @@ export default function WallModal({
     const xHi = sortedX[Math.floor(valid.length * (1 - p))];
     const zLo = sortedZ[Math.floor(valid.length * p)];
     const zHi = sortedZ[Math.floor(valid.length * (1 - p))];
-    const trimmed: number[] = [];
-    for (const idx of valid) {
-      if (posX[idx] >= xLo && posX[idx] <= xHi && posZ[idx] >= zLo && posZ[idx] <= zHi) trimmed.push(idx);
-    }
     const max = 60000;
-    const stride = trimmed.length > max ? trimmed.length / max : 1;
-    const count = Math.min(trimmed.length, max);
+    const stride = valid.length > max ? valid.length / max : 1;
+    const count = Math.min(valid.length, max);
     const out = new Float32Array(count * 2);
     for (let i = 0; i < count; i++) {
-      const idx = trimmed[Math.floor(i * stride)];
+      const idx = valid[Math.floor(i * stride)];
       out[i * 2] = posX[idx];
       out[i * 2 + 1] = posZ[idx];
     }
-    return { pts: out, n: count };
+    return { pts: out, n: count, bboxTrimmed: { xLo, xHi, zLo, zHi } };
   }, [posX, posY, posZ, numSplats, ceilingY, floorY]);
 
   // 캔버스 backing 크기 — mount 시 한 번만.
@@ -143,23 +141,31 @@ export default function WallModal({
     if (xzRef.current) { xzRef.current.width = CW; xzRef.current.height = CH; }
   }, []);
 
-  // 캔버스 표시 영역 — pts XZ bbox + 5% 여백, 정사각 비율 유지.
-  const viewBounds = useMemo(() => {
-    let mnX = Infinity, mxX = -Infinity, mnZ = Infinity, mxZ = -Infinity;
-    for (let i = 0; i < n; i++) {
-      const x = pts[i * 2], z = pts[i * 2 + 1];
-      if (x < mnX) mnX = x; if (x > mxX) mxX = x;
-      if (z < mnZ) mnZ = z; if (z > mxZ) mxZ = z;
-    }
+  // 캔버스 표시 영역 — trimmed bbox(0.5%/99.5% percentile) + 5% 여백, 정사각 비율 유지.
+  // 전체 점 기준이면 멀리 떨어진 노이즈 1~2개로 화면이 휑해지므로 trim 사용. 줌아웃하면 전체 점 보임.
+  const dataBounds = useMemo(() => {
+    let mnX = bboxTrimmed.xLo, mxX = bboxTrimmed.xHi, mnZ = bboxTrimmed.zLo, mxZ = bboxTrimmed.zHi;
     const mx = (mxX - mnX) * 0.05, mz = (mxZ - mnZ) * 0.05;
     mnX -= mx; mxX += mx; mnZ -= mz; mxZ += mz;
     const rangeMax = Math.max(mxX - mnX, mxZ - mnZ);
     const cX = (mnX + mxX) / 2, cZ = (mnZ + mxZ) / 2;
+    // 데이터 가장자리에 찍은 path point/라벨이 frame 안쪽에 온전히 들어오도록
+    // 픽셀 기준 여유분(라벨 반경 11 + 여유 3)만큼 월드 단위로 추가 inset.
+    const plotPx = CW - PAD * 2;
+    const edgePx = 14;
+    const extra = (rangeMax * edgePx) / Math.max(1, plotPx - 2 * edgePx);
+    const half = rangeMax / 2 + extra;
     return {
-      mnR: cX - rangeMax / 2, mxR: cX + rangeMax / 2,
-      mnT: cZ - rangeMax / 2, mxT: cZ + rangeMax / 2,
+      mnR: cX - half, mxR: cX + half,
+      mnT: cZ - half, mxT: cZ + half,
     };
-  }, [pts, n]);
+  }, [bboxTrimmed]);
+
+  // 휠 줌/팬용 viewport — 초기엔 dataBounds, 사용자 휠로 변경 가능.
+  const [viewport, setViewport] = useState<typeof dataBounds | null>(null);
+  // pts 가 바뀌면 (모달 첫 마운트) viewport 초기화.
+  useEffect(() => { setViewport(null); }, [dataBounds]);
+  const viewBounds = viewport ?? dataBounds;
 
   const [pathPoints, setPathPoints] = useState<PathPoint[]>([]);
   const [pathEdges, setPathEdges] = useState<PathEdge[]>([]);
@@ -479,6 +485,45 @@ export default function WallModal({
     }
   }, [mouseToWorld, findPathPointHit]);
 
+  // 휠 줌 — 커서 위치 월드좌표 고정. 더블클릭으로 fit-to-data 복귀.
+  useEffect(() => {
+    const el = xzRef.current;
+    if (!el) return;
+    const onWheel = (ev: WheelEvent) => {
+      ev.preventDefault();
+      const rect = el.getBoundingClientRect();
+      const mx = (ev.clientX - rect.left) * (CW / rect.width);
+      const my = (ev.clientY - rect.top) * (CH / rect.height);
+      const plotW = CW - PAD * 2, plotH = CH - PAD * 2;
+      const b = viewport ?? dataBounds;
+      const wx = b.mnR + (mx - PAD) * (b.mxR - b.mnR) / plotW;
+      const wz = b.mnT + (my - PAD) * (b.mxT - b.mnT) / plotH;
+      const factor = ev.deltaY < 0 ? 0.85 : 1 / 0.85;
+      // 최소/최대 half-range clamp (5cm ~ dataBounds × 5).
+      const dataHalf = (dataBounds.mxR - dataBounds.mnR) / 2;
+      const curHalf = (b.mxR - b.mnR) / 2;
+      const nextHalf = Math.max(0.05, Math.min(dataHalf * 50, curHalf * factor));
+      const usedFactor = nextHalf / curHalf;
+      const halfX = (b.mxR - b.mnR) / 2 * usedFactor;
+      const halfZ = (b.mxT - b.mnT) / 2 * usedFactor;
+      const px = (mx - PAD) / plotW;
+      const py = (my - PAD) / plotH;
+      const newMnR = wx - halfX * 2 * px;
+      const newMnT = wz - halfZ * 2 * py;
+      setViewport({
+        mnR: newMnR, mxR: newMnR + halfX * 2,
+        mnT: newMnT, mxT: newMnT + halfZ * 2,
+      });
+    };
+    const onDblClick = () => setViewport(null);
+    el.addEventListener('wheel', onWheel, { passive: false });
+    el.addEventListener('dblclick', onDblClick);
+    return () => {
+      el.removeEventListener('wheel', onWheel);
+      el.removeEventListener('dblclick', onDblClick);
+    };
+  }, [viewport, dataBounds]);
+
   // 우클릭 — 마지막 조작 1단계 undo.
   const handleContextMenu = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     e.preventDefault();
@@ -730,7 +775,7 @@ export default function WallModal({
             <>
               좌클릭으로 점과 선을 추가, 기존 점은 드래그로 이동. 점을 클릭하면 직전에 선택한 점과 연결되고, 우클릭은 마지막 조작을 되돌립니다.
               <br />
-              모든 점이 닫힌 cycle 로 연결되어야 확인이 활성화됩니다.
+              모든 점이 닫힌 cycle 로 연결되어야 확인이 활성화됩니다. 마우스 휠로 줌, 더블클릭으로 초기화.
             </>
           )}
         </div>

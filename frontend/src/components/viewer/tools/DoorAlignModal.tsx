@@ -236,12 +236,13 @@ export default function DoorAlignModal({
   const inMemoryDoorsRef = useRef<InMemoryDoor[]>([]);
   useEffect(() => { inMemoryDoorsRef.current = inMemoryDoors; }, [inMemoryDoors]);
 
-  // 도어 추출 즉시 호수 라벨 (말풍선) 표시. cornersAY 사용 — Z-180 viewer 컨벤션과 일치.
+  // 도어 추출 즉시 호수 라벨 (말풍선) 표시. cornersRaw 사용 — useDoorLabels 가 splatEntity.worldTransform 으로
+  // 직접 world 변환 → 등록 단계 (Z-180 + pendingRotation, wallAngle 미베이크) 든 재진입 단계 (Z-180 만) 든 일관.
   const doorLabelEntries = useMemo(() => (
     basemapMode ? inMemoryDoors.map(d => ({
       id: d.doorId,
       unitName: d.unitName || null,
-      corners: d.cornersAY as number[][],
+      corners: d.cornersRaw as number[][],
     })) : []
   ), [basemapMode, inMemoryDoors]);
   useDoorLabels(coreRef, doorLabelEntries, basemapMode && view === 'setup');
@@ -350,11 +351,19 @@ export default function DoorAlignModal({
     if (!st) return null;
     if (!st.cfConfirmed || !st.wallConfirmed) return null;
     if (!st.wallPolygon) return null;
-    return surfacePlanesFromPolygon({
+    const out = surfacePlanesFromPolygon({
       polygon: st.wallPolygon,
       ceilingY: st.ceilingY,
       floorY: st.floorY,
     });
+    console.log(`[planes] polygon N=${st.wallPolygon.length}`);
+    for (const p of out) {
+      const segStr = p.segment
+        ? `seg=(${p.segment.a.x.toFixed(2)},${p.segment.a.z.toFixed(2)})→(${p.segment.b.x.toFixed(2)},${p.segment.b.z.toFixed(2)}) y[${p.segment.yMin.toFixed(2)},${p.segment.yMax.toFixed(2)}]`
+        : 'seg=none';
+      console.log(`  ${p.id.padEnd(8)} n=(${p.normal[0].toFixed(3)},${p.normal[1].toFixed(3)},${p.normal[2].toFixed(3)}) d=${p.d.toFixed(3)} ${segStr}`);
+    }
+    return out;
   }, [uploadId]);
   const showRefineGuide = !planes && !(basemapMode && view === 'setup');
 
@@ -442,18 +451,49 @@ export default function DoorAlignModal({
       return { pos, surfaceId: p.id };
     }
 
-    // 가장 작은 양수 t 채택 (첫 코너용)
+    // 가장 작은 양수 t 채택 (첫 코너용).
+    // ⚠ 벽 plane 은 무한 plane 이라 N-각형 (특히 비스듬한 벽 / concave) 에서 같은 ray 가 여러 벽 plane 을
+    // 양수 t 로 교차할 수 있다. 사용자가 보고 있지 않은 벽이 더 작은 t 로 채택되면 도어 코너가 잘못된
+    // 위치 (방 안쪽 / 다른 벽) 에 박힘. → 벽 plane 은 segment(edge 양 끝점 + ceiling/floor Y범위) 안에
+    // 교점이 들어올 때만 후보로 인정. 천장/바닥은 segment 없음 — 그대로 무한 plane 으로 처리 (polygon
+    // mask 가 외곽 처리). 픽 좌표는 raw 프레임이지만 segment 는 A' 프레임 기준 — 교점도 A' 로 변환.
     let bestT = Infinity;
     let bestId = '';
     let bestPoint: Vec3 | null = null;
+    const diag: Array<{ id: string; t: number; s?: number; sOK?: boolean; yOK?: boolean; iy?: number; reason: string }> = [];
     for (const p of planes) {
       const denom = p.normal[0]*dxA + p.normal[1]*dyA + p.normal[2]*dzA;
-      if (Math.abs(denom) < 1e-6) continue;
+      if (Math.abs(denom) < 1e-6) { diag.push({ id: p.id, t: NaN, reason: 'parallel' }); continue; }
       const numer = p.d - (p.normal[0]*oxA + p.normal[1]*oyA + p.normal[2]*ozA);
       const t = numer / denom;
-      if (t <= 0 || t >= bestT) continue;
+      if (t <= 0) { diag.push({ id: p.id, t, reason: 'behind' }); continue; }
+      // 벽 plane segment 체크: A' 프레임의 교점이 edge ab 의 길이방향 [0, 1] 안 + Y 가 ceiling/floor
+      // 사이에 있어야 그 벽이라고 인정. tolerance 5cm — picking 부정확성 흡수.
+      if (p.segment) {
+        const ix = oxA + dxA*t, iy = oyA + dyA*t, iz = ozA + dzA*t;
+        const ax = p.segment.a.x, az = p.segment.a.z;
+        const ex = p.segment.b.x - ax, ez = p.segment.b.z - az;
+        const eLen2 = ex*ex + ez*ez || 1;
+        const s = ((ix - ax)*ex + (iz - az)*ez) / eLen2;
+        // tolerance 없음 — 교점이 segment [0, 1] 안 + Y 가 [floor, ceiling] 안일 때만 그 벽 인정.
+        // (인접 벽 vertex 공유 corner 에서 옆 벽 plane 의 연장이 통과되는 것을 막기 위해 엄격하게 가져감.
+        //  vertex 정확히 클릭하는 케이스도 어느 한 벽으로 떨어지면 그쪽이 됨.)
+        const sOK = s >= 0 && s <= 1;
+        const yOK = iy >= p.segment.yMin && iy <= p.segment.yMax;
+        if (!sOK || !yOK) { diag.push({ id: p.id, t, s, sOK, yOK, iy, reason: !sOK ? 'seg-out' : 'y-out' }); continue; }
+        diag.push({ id: p.id, t, s, sOK, yOK, iy, reason: 'OK' });
+      } else {
+        diag.push({ id: p.id, t, reason: 'OK(no-seg)' });
+      }
+      if (t >= bestT) continue;
       bestT = t; bestId = p.id;
       bestPoint = [ox + dx*t, oy + dy*t, oz + dz*t];
+    }
+    console.log(`[raycastPick] → picked=${bestId} bestT=${bestT.toFixed(3)}`);
+    for (const d of diag) {
+      console.log(`  ${d.id.padEnd(8)} t=${isNaN(d.t)?'  NaN ':d.t.toFixed(3).padStart(7)}` +
+        (d.s !== undefined ? ` s=${d.s.toFixed(3).padStart(7)} sOK=${d.sOK?'Y':'N'} yOK=${d.yOK?'Y':'N'} iy=${d.iy!.toFixed(2)}` : '') +
+        ` reason=${d.reason}`);
     }
     if (!bestPoint) return null;
     return { pos: bestPoint, surfaceId: bestId };

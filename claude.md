@@ -122,7 +122,9 @@ localX = cross(localY, localZ)
 - basemap 은 고정. module 의 정합은 **4×4 rigid transform 행렬을 `modules.alignment_transform` 에 저장**. 뷰어가 렌더 시 transform 적용. `aligned.ply` 저장 X.
 - **rectFit** (`lib/alignment/rectFit.ts`) — 사용자 픽이 `normalizeDoorRect` 로 완벽한 직사각형이 보장되므로 SVD 기반 Kabsch 대신 두 사각형의 직교 basis 비교로 R, t 를 한 번에 산출. 180° 매칭 모호성 없음.
   - `dstForcedN` 옵션: dst basis 의 n 을 외부에서 지정 → cornerpick winding 무관하게 deterministic 결과. basemap door 의 `normalInward` 메타가 ground truth.
-- **gap 방향**: basemap 의 `normalInward` (= corridor 안쪽) 의 반대 방향 (= 모듈 방 안쪽) 으로 `gap = max(1.7cm, doorHeight × 2.3%)` 만큼 dst push. 모듈은 정확히 basemap_outward 위치에 정합.
+- **gap 의미**: basemap 도어와 module 도어는 **각자 자기 facade 위에 그대로** 위치해야 하고, 정합 후 두 facade 가 `gap = max(1.7cm, doorHeight × 2.3%)` 만큼 평행 이격됨. 그 사이 공간(= 벽/도어 두께) 은 `createDoorFrameMesh` ([AlignPanel.tsx](frontend/src/components/viewer/tools/AlignPanel.tsx)) 가 module 4코너 ↔ basemap 4코너를 잇는 4면 quad mesh 로 채움.
+  - 구현: rectFit 의 dst (basemap door corners, world) 를 `pushN = -dstN` (= basemap_outward = module 방 안쪽) 방향으로 `gap` 밀어 fit. 결과 transform 적용 시 module facade 가 basemap facade 로부터 `gap·pushN` 떨어진 평행 평면에 놓임. module door = module facade, basemap door = basemap facade, 두 도어 사이 4면 frame mesh 가 두께를 형성.
+  - frame mesh 는 `doorPivotGroup` 의 자식 — 도어 열기 슬라이더 회전 시 양 facade 도어 + frame 이 한 묶음으로 회전.
 - 자동 검출은 SAM3 (door-ml HTTP) — 모듈 흐름은 임시 PLY 보관 후 동기 forward (`POST /uploads/sam3/detect-temp`).
 - `DoorAlignModal` 의 "문 경계 정제하기" 토글: 4점 직사각형의 4 edge plane 에 걸친 가우시안을 boundary 위치 기준 분할 (`lib/gs/doorTrim.ts::decomposeBoundaryGaussians`) → 메인 PLY GPU 의 boundary slot 은 wall-side sub 로 in-place 갱신, door-side sub 들은 별도 GaussianScene → `useAdditionalGsplats` 추가 splat. wall mesh 의 도어 영역 텍셀은 alpha=0 punch, 도어 영역만 별도 베이크해서 도어 mesh 엔티티 생성. 슬라이더 변경 시 600ms 디바운스 자동 재적용.
 - `lib/alignment/` 에는 rectFit 외 RANSAC rigid(`ransacRigid`), 평면 RANSAC fit(`ransacPlaneFit`), OBB 4꼭짓점 추출(`fitOrientedRectangle`), Kabsch (보조) 등 유틸이 있음.

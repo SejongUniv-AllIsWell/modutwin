@@ -24,7 +24,7 @@ export default function ViewerSidebar({
   const refineLocked = lockedStages.has('refine');
   const doorLocked = lockedStages.has('door');
   const lockTitle = '이전 단계는 완료된 상태로 잠겼습니다. 되돌릴 수 없습니다.';
-  const lockedClass = 'opacity-40 cursor-not-allowed line-through decoration-gray-500';
+  const lockedClass = 'opacity-40 cursor-not-allowed';
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleFile = (e: React.ChangeEvent<HTMLInputElement>) => {

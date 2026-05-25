@@ -458,7 +458,7 @@ export default function UnifiedSplatEditor({
           id: string;
           corners: number[][];
           unitName?: string | null;
-          door_mesh?: { normalInward?: number[] };
+          doorMesh?: { normalInward?: number[] };
         }>;
       }>(
         `/basemaps/${bm.basemap_id}/doors`,
@@ -474,7 +474,7 @@ export default function UnifiedSplatEditor({
       }
       setBasemapDoorCorners(target.corners.map(c => [c[0], c[1], c[2]]) as Array<[number, number, number]>);
       setBasemapTargetDoorId(target.id);
-      const ni = target.door_mesh?.normalInward;
+      const ni = target.doorMesh?.normalInward;
       if (Array.isArray(ni) && ni.length === 3) {
         setBasemapTargetDoorNormalInward([ni[0], ni[1], ni[2]] as [number, number, number]);
       } else {

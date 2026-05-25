@@ -170,6 +170,9 @@ export default function CeilingFloorModal({
   });
   // Pre-allocated bounds (재사용)
   const boundsRef = useRef({ mnX: 0, mxX: 0, mnY: 0, mxY: 0, mnZ: 0, mxZ: 0 });
+  // 휠 줌 viewport — 캔버스별 독립. null = fit-to-data (boundsRef 사용).
+  type CanvasViewport = { minH: number; maxH: number; minY: number; maxY: number };
+  const viewportRef = useRef<{ xy: CanvasViewport | null; zy: CanvasViewport | null }>({ xy: null, zy: null });
 
   // Pre-allocated ImageData buffers (재사용, putImageData마다 새로 만들지 않음)
   const xyImgRef = useRef<ImageData | null>(null);
@@ -225,6 +228,7 @@ export default function CeilingFloorModal({
     img: ImageData | null,
     hArr: Float32Array,
     minH: number, maxH: number,
+    minY: number, maxY: number,
     hLabel: string,
     laVal: number, lbVal: number,
   ) => {
@@ -232,15 +236,14 @@ export default function CeilingFloorModal({
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    const b = boundsRef.current;
     const plotW = CW - PAD * 2;
     const plotH = CH - PAD * 2;
     const scH = plotW / (maxH - minH || 1);
-    const scV = plotH / (b.mxY - b.mnY || 1);
+    const scV = plotH / (maxY - minY || 1);
     const toX = (h: number) => PAD + (h - minH) * scH;
     // 3D 뷰어가 PLY를 180Z 회전으로 표시 → 뷰어의 "위쪽"은 raw Y가 작은 방향.
     // 모달도 동일 컨벤션: 작은 Y가 캔버스 위, 큰 Y가 아래.
-    const toY = (v: number) => PAD + (v - b.mnY) * scV;
+    const toY = (v: number) => PAD + (v - minY) * scV;
 
     // 1) 빠른 background 클리어 — pre-built blank을 .set()으로 memcpy
     const blank = blankBufRef.current;
@@ -308,8 +311,16 @@ export default function CeilingFloorModal({
       if (floorLabelRef.current) floorLabelRef.current.textContent = hi.toFixed(2);
       if (gapLabelRef.current) gapLabelRef.current.textContent = (hi - lo).toFixed(2);
     }
-    drawView(xyRef.current, xyImgRef.current, buf.x, b.mnX, b.mxX, 'X', la, lb);
-    drawView(zyRef.current, zyImgRef.current, buf.z, b.mnZ, b.mxZ, 'Z', la, lb);
+    const vxy = viewportRef.current.xy;
+    const vzy = viewportRef.current.zy;
+    drawView(xyRef.current, xyImgRef.current, buf.x,
+      vxy?.minH ?? b.mnX, vxy?.maxH ?? b.mxX,
+      vxy?.minY ?? b.mnY, vxy?.maxY ?? b.mxY,
+      'X', la, lb);
+    drawView(zyRef.current, zyImgRef.current, buf.z,
+      vzy?.minH ?? b.mnZ, vzy?.maxH ?? b.mxZ,
+      vzy?.minY ?? b.mnY, vzy?.maxY ?? b.mxY,
+      'Z', la, lb);
   }, [drawView, recomputeRotated]);
 
   // rAF 스케줄 (슬라이더 / 라인 변경 시)
@@ -347,31 +358,40 @@ export default function CeilingFloorModal({
     scheduleDraw();
   }, [recomputeRotated, updateInfoLabels, scheduleDraw]);
 
+  // 캔버스별 활성 Y 범위 (viewport 가 있으면 viewport, 없으면 raw bounds).
+  const activeYRange = useCallback((canvas: HTMLCanvasElement | null) => {
+    const key: 'xy' | 'zy' = canvas === xyRef.current ? 'xy' : 'zy';
+    const v = viewportRef.current[key];
+    const b = boundsRef.current;
+    return { minY: v?.minY ?? b.mnY, maxY: v?.maxY ?? b.mxY };
+  }, []);
+
   // toY와 동일 컨벤션: 캔버스 위쪽 = 작은 raw Y (= 뷰어의 천장 방향)
   const canvasToY = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     const rect = e.currentTarget.getBoundingClientRect();
     const mouseY = (e.clientY - rect.top) * (CH / rect.height);
-    const b = boundsRef.current;
+    const { minY, maxY } = activeYRange(e.currentTarget);
     const plotH = CH - PAD * 2;
-    const scV = plotH / (b.mxY - b.mnY || 1);
-    return b.mnY + (mouseY - PAD) / scV;
-  }, []);
+    const scV = plotH / (maxY - minY || 1);
+    return minY + (mouseY - PAD) / scV;
+  }, [activeYRange]);
 
   const handleMouseDown = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     const yVal = canvasToY(e);
     const dA = Math.abs(yVal - lineARef.current);
     const dB = Math.abs(yVal - lineBRef.current);
-    const b = boundsRef.current;
-    const range = b.mxY - b.mnY;
+    const { minY, maxY } = activeYRange(e.currentTarget);
+    const range = maxY - minY;
     const thresh = range * 0.03;
     if (dA < thresh && dA < dB) draggingRef.current = 'A';
     else if (dB < thresh) draggingRef.current = 'B';
-  }, [canvasToY]);
+  }, [canvasToY, activeYRange]);
 
   const handleMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     const drag = draggingRef.current;
     if (!drag) return;
     const yVal = canvasToY(e);
+    // 클램프는 raw bounds 로 — viewport 밖으로 라인을 빼는 게 정상 사용성.
     const b = boundsRef.current;
     const clamped = Math.max(b.mnY, Math.min(b.mxY, yVal));
     if (drag === 'A') lineARef.current = clamped;
@@ -382,15 +402,63 @@ export default function CeilingFloorModal({
 
   const handleMouseUp = useCallback(() => { draggingRef.current = null; }, []);
 
+  // 휠 줌 + 더블클릭 리셋. 캔버스 마운트/회전 변경 시 viewport 초기화.
+  useEffect(() => {
+    const attach = (canvas: HTMLCanvasElement | null, key: 'xy' | 'zy') => {
+      if (!canvas) return () => {};
+      const onWheel = (ev: WheelEvent) => {
+        ev.preventDefault();
+        const rect = canvas.getBoundingClientRect();
+        const mx = (ev.clientX - rect.left) * (CW / rect.width);
+        const my = (ev.clientY - rect.top) * (CH / rect.height);
+        const plotW = CW - PAD * 2, plotH = CH - PAD * 2;
+        const b = boundsRef.current;
+        const cur = viewportRef.current[key] ?? {
+          minH: key === 'xy' ? b.mnX : b.mnZ,
+          maxH: key === 'xy' ? b.mxX : b.mxZ,
+          minY: b.mnY, maxY: b.mxY,
+        };
+        const wH = cur.minH + (mx - PAD) * (cur.maxH - cur.minH) / plotW;
+        const wY = cur.minY + (my - PAD) * (cur.maxY - cur.minY) / plotH;
+        const factor = ev.deltaY < 0 ? 0.85 : 1 / 0.85;
+        const dataHalfH = ((key === 'xy' ? b.mxX - b.mnX : b.mxZ - b.mnZ)) / 2;
+        const curHalfH = (cur.maxH - cur.minH) / 2;
+        const nextHalfH = Math.max(0.05, Math.min(dataHalfH * 50, curHalfH * factor));
+        const used = nextHalfH / curHalfH;
+        const halfH = (cur.maxH - cur.minH) / 2 * used;
+        const halfY = (cur.maxY - cur.minY) / 2 * used;
+        const px = (mx - PAD) / plotW;
+        const py = (my - PAD) / plotH;
+        viewportRef.current[key] = {
+          minH: wH - halfH * 2 * px, maxH: wH - halfH * 2 * px + halfH * 2,
+          minY: wY - halfY * 2 * py, maxY: wY - halfY * 2 * py + halfY * 2,
+        };
+        scheduleDraw();
+      };
+      const onDbl = () => { viewportRef.current[key] = null; scheduleDraw(); };
+      canvas.addEventListener('wheel', onWheel, { passive: false });
+      canvas.addEventListener('dblclick', onDbl);
+      return () => {
+        canvas.removeEventListener('wheel', onWheel);
+        canvas.removeEventListener('dblclick', onDbl);
+      };
+    };
+    const off1 = attach(xyRef.current, 'xy');
+    const off2 = attach(zyRef.current, 'zy');
+    return () => { off1(); off2(); };
+  }, [scheduleDraw]);
+
   // 슬라이더 onChange — ref 업데이트 + DOM label 직접 갱신 (React 재렌더 0)
   const onRotZSlider = useCallback((deg: number) => {
     rotZRef.current = (deg * Math.PI) / 180;
     if (rotZLabelRef.current) rotZLabelRef.current.textContent = `${deg.toFixed(1)}°`;
+    viewportRef.current.xy = null; viewportRef.current.zy = null;
     scheduleDraw();
   }, [scheduleDraw]);
   const onRotXSlider = useCallback((deg: number) => {
     rotXRef.current = (deg * Math.PI) / 180;
     if (rotXLabelRef.current) rotXLabelRef.current.textContent = `${deg.toFixed(1)}°`;
+    viewportRef.current.xy = null; viewportRef.current.zy = null;
     scheduleDraw();
   }, [scheduleDraw]);
   // Reset 버튼 — slider DOM value도 동기화
@@ -412,7 +480,7 @@ export default function CeilingFloorModal({
       <div className="bg-[var(--paper)] border border-[var(--rule)] rounded-lg p-5 shadow-2xl" onClick={e => e.stopPropagation()}>
         <div className="text-[var(--ink)] font-bold text-sm mb-1">천장 / 바닥 설정</div>
         <div className="text-[var(--muted)] text-xs mb-3">
-          슬라이더로 포인트 클라우드를 회전해 천장/바닥이 수평이 되게 맞춘 뒤, <span style={{color:'#22d3ee'}}>천장선</span> / <span style={{color:'#92400e'}}>바닥선</span>을 드래그하세요.
+          슬라이더로 포인트 클라우드를 회전해 천장/바닥이 수평이 되게 맞춘 뒤, <span style={{color:'#22d3ee'}}>천장선</span> / <span style={{color:'#92400e'}}>바닥선</span>을 드래그하세요. 마우스 휠로 줌, 더블클릭으로 초기화.
         </div>
         <div className="flex gap-3">
           <div>

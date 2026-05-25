@@ -4,6 +4,20 @@ export interface SurfacePlane {
   id: string;
   normal: Vec3;
   d: number;
+  /**
+   * 벽 plane 한정 — 무한 plane 이 아닌 실제 segment 영역.
+   * 사용처: `raycastToPlanes` 첫 코너 픽에서 평면 교점이 이 segment 영역 안에 있을 때만 후보 인정.
+   * 그러지 않으면 N-각형(특히 비스듬한 벽이나 concave)에서 같은 ray 가 여러 벽 plane 을 양수 t 로
+   * 교차해 사용자가 보지 않는 다른 벽 plane 이 잘못 채택되는 문제 (수동 도어 픽이 안쪽으로 들어가
+   * 찍히거나 작게 쪼그라드는 증상) 발생.
+   * 천장/바닥은 polygon mask 가 별도로 처리하므로 여기선 미부여.
+   */
+  segment?: {
+    a: { x: number; z: number };  // edge 시작점 (polygon[i])
+    b: { x: number; z: number };  // edge 끝점 (polygon[(i+1)%N])
+    yMin: number;                  // floor y
+    yMax: number;                  // ceiling y
+  };
 }
 
 export interface PolygonPoint {
@@ -62,7 +76,15 @@ export function surfacePlanesFromPolygon(opts: {
     const nz = outwardSign * (-dx / len);
     // 평면 방정식: n·p = d, 한 점 a 가 평면 위.
     const d = nx * a.x + nz * a.z;
-    walls.push({ id: `w${i}`, normal: [nx, 0, nz], d });
+    walls.push({
+      id: `w${i}`, normal: [nx, 0, nz], d,
+      segment: {
+        a: { x: a.x, z: a.z },
+        b: { x: b.x, z: b.z },
+        yMin: Math.min(ceilingY, floorY),
+        yMax: Math.max(ceilingY, floorY),
+      },
+    });
   }
 
   return [
