@@ -2,19 +2,18 @@
 @tailwind components;
 @tailwind utilities;
 
-/* 랜딩 페이지의 종이 / 크림 팔레트를 사이트 전역 기본값으로. 3D 캔버스 영역 (viewer 등)은
-   각 페이지에서 별도로 어두운 배경을 지정해 splat 가시성을 유지한다. */
+/* Apple / SuperSplat 톤의 다크 팔레트 — OLED 친화 순흑 배경 + Apple 시스템 텍스트 그레이 */
 :root {
-  --bg: #f4f1ea;
-  --bg-soft: #ede9df;
-  --paper: #faf7f0;
-  --ink: #1a1a1a;
-  --ink-2: #2c2a26;
-  --muted: #6b665e;
-  --muted-2: #908a7e;
-  --rule: #d9d3c4;
-  --rule-soft: #e7e1d1;
-  --accent: #1a1a1a;
+  --bg: #000000;
+  --bg-soft: #0a0a0a;
+  --paper: #1c1c1e;
+  --ink: #f5f5f7;
+  --ink-2: #c7c7cc;
+  --muted: #86868b;
+  --muted-2: #6e6e73;
+  --rule: #38383a;
+  --rule-soft: #2c2c2e;
+  --accent: #f5f5f7;
 }
 
 /* 뷰어 영역: 어두운 캔버스 위에서 같은 토큰 이름을 쓰지만 색을 반전.

@@ -118,15 +118,6 @@ export default function AboutPage() {
     <div className="about min-h-screen bg-[var(--bg)] text-[var(--ink)]">
       <style jsx global>{`
         .about {
-          --bg: #f4f1ea;
-          --bg-soft: #ede9df;
-          --paper: #faf7f0;
-          --ink: #1a1a1a;
-          --ink-2: #2c2a26;
-          --muted: #6b665e;
-          --muted-2: #908a7e;
-          --rule: #d9d3c4;
-          --rule-soft: #e7e1d1;
           font-family: var(--font-noto-sans-kr), 'Noto Sans KR', Helvetica, 'Helvetica Neue', Arial, sans-serif;
           -webkit-font-smoothing: antialiased;
           text-rendering: optimizeLegibility;
@@ -260,7 +251,7 @@ export default function AboutPage() {
               <div
                 key={f.title}
                 className="p-7 rounded-xl"
-                style={{ background: '#ffffff', border: '1px solid var(--rule-soft)' }}
+                style={{ background: 'var(--paper)', border: '1px solid var(--rule-soft)' }}
               >
                 <div
                   className="serif italic text-[14px] mb-3"
@@ -322,7 +313,7 @@ export default function AboutPage() {
               <div
                 key={p.title}
                 className="p-7 rounded-xl"
-                style={{ background: '#ffffff', border: '1px solid var(--rule-soft)' }}
+                style={{ background: 'var(--paper)', border: '1px solid var(--rule-soft)' }}
               >
                 <h3
                   className="serif font-medium m-0 mb-3"
@@ -370,7 +361,7 @@ export default function AboutPage() {
                 key={s.numeral}
                 className="grid items-start gap-6 py-6 px-7 rounded-xl"
                 style={{
-                  background: '#ffffff',
+                  background: 'var(--paper)',
                   border: '1px solid var(--rule-soft)',
                   gridTemplateColumns: 'auto 1fr',
                 }}
