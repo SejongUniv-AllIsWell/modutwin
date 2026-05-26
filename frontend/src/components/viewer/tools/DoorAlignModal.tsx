@@ -1358,15 +1358,17 @@ export default function DoorAlignModal({
         await revertDoorRefine();
       }
 
-      // 2. 현재 sd 의 gsplatData 에서 GaussianScene 빌드. 매 apply 마다 새로 — cached scene 과
-      //    live sd 의 인덱스/scale 불일치 (재apply 시 메인 reload 로 sd 가 작아진 케이스) 회피.
-      //    sd 가 source of truth: posX/Y/Z, rot_*, scale_* 모두 현재 상태 (베이크/clipping 반영).
+      // 2. 현재 sd 의 gsplatData 에서 GaussianScene 빌드. 매 apply 마다 새로 — live sd 가 단일
+      //    source of truth: posX/Y/Z, rot_*, scale_* 모두 현재 상태 (베이크/clipping 반영).
+      //    PC GSplatData 의 속성 메타: elements[0].properties[].name + properties[].storage.
       const scene: GaussianScene = (() => {
         const g = sd.gsplatData;
-        const propertyOrder: string[] = [...(g?.propertyOrder || [])];
+        const vertexElement = g?.getElement?.('vertex');
+        const propertyOrder: string[] = (vertexElement?.properties ?? [])
+          .map((p: { name: string }) => p.name);
         const attrs = new Map<string, Float32Array>();
         for (const prop of propertyOrder) {
-          const a = g?.getProp(prop) as Float32Array | undefined;
+          const a = g?.getProp(prop);
           if (a) attrs.set(prop, new Float32Array(a));
         }
         // posX/Y/Z 는 splatData 의 별도 참조와 동일해야 함 — gsplatData 의 x/y/z 와 같은 버퍼.
