@@ -1,11 +1,11 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { useRouter } from 'next/navigation';
 import { useAuth } from '@/lib/auth';
 import { api } from '@/lib/api';
 import { floorLabel } from '@/lib/format/floor';
-import Earth3D, { type Earth3DHandle } from '@/components/landing/Earth3D';
+import Earth3D from '@/components/landing/Earth3D';
 
 interface StepsCard {
   numeral: string;
@@ -105,10 +105,55 @@ interface LandingFeed {
   popular: LandingEntry[];
 }
 
+// IntersectionObserver 기반 스크롤 페이드인. 화면에 들어올 때 opacity 0 → 1 + translateY 해제.
+// once-only — 한 번 보이면 disconnect.
+function ScrollReveal({
+  children,
+  delay = 0,
+  yOffset = 50,
+  duration = 750,
+}: {
+  children: ReactNode;
+  delay?: number;
+  yOffset?: number;
+  duration?: number;
+}) {
+  const ref = useRef<HTMLDivElement | null>(null);
+  const [visible, setVisible] = useState(false);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const obs = new IntersectionObserver(
+      ([entry]) => {
+        if (entry.isIntersecting) {
+          setVisible(true);
+          obs.disconnect();
+        }
+      },
+      { threshold: 0.12, rootMargin: '0px 0px -80px 0px' },
+    );
+    obs.observe(el);
+    return () => obs.disconnect();
+  }, []);
+  return (
+    <div
+      ref={ref}
+      style={{
+        opacity: visible ? 1 : 0,
+        transform: visible ? 'translateY(0)' : `translateY(${yOffset}px)`,
+        transition: `opacity ${duration}ms cubic-bezier(0.2, 0.7, 0.2, 1) ${delay}ms, transform ${duration}ms cubic-bezier(0.2, 0.7, 0.2, 1) ${delay}ms`,
+        willChange: 'opacity, transform',
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
 export default function LandingPage() {
   const router = useRouter();
   const { user, login } = useAuth();
-  const earthRef = useRef<Earth3DHandle | null>(null);
+  const globeWrapRef = useRef<HTMLDivElement | null>(null);
   const fadeRef = useRef<HTMLDivElement | null>(null);
   const isZoomingRef = useRef(false);
   const [stats, setStats] = useState<LandingStats | null>(null);
@@ -125,22 +170,36 @@ export default function LandingPage() {
   }, [user, login, goExplore]);
 
   const zoomAndGo = useCallback(() => {
+    const wrap = globeWrapRef.current;
     const fade = fadeRef.current;
-    const earth = earthRef.current;
-    if (!earth || !fade) {
+    if (!wrap || !fade) {
       goExplore();
       return;
     }
     if (isZoomingRef.current) return;
     isZoomingRef.current = true;
 
+    const rect = wrap.getBoundingClientRect();
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const cxScreen = rect.left + rect.width / 2;
+    const cyScreen = rect.top + rect.height / 2;
+    const dx = Math.max(cxScreen, vw - cxScreen);
+    const dy = Math.max(cyScreen, vh - cyScreen);
+    const maxDist = Math.hypot(dx, dy);
+    const scale = (maxDist * 2.2) / rect.width;
+    const tx = vw / 2 - cxScreen;
+    const ty = vh / 2 - cyScreen;
+
     window.scrollTo({ top: 0, behavior: 'smooth' });
 
-    // 회전 가속 + 카메라 dolly-in. 종료 직전 페이드 시작 → 라우팅.
-    earth.triggerZoom(() => {
+    wrap.style.transition = 'transform 900ms cubic-bezier(0.7, 0, 0.3, 1)';
+    wrap.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`;
+
+    window.setTimeout(() => fade.classList.add('opacity-100'), 350);
+    window.setTimeout(() => {
       router.push('/explore');
-    });
-    window.setTimeout(() => fade.classList.add('opacity-100'), 600);
+    }, 900);
   }, [goExplore, router]);
 
   useEffect(() => {
@@ -190,10 +249,19 @@ export default function LandingPage() {
           opacity: 0;
           pointer-events: none;
           z-index: 9999;
-          transition: opacity 700ms ease;
+          transition: opacity 500ms ease;
         }
         .landing-fade.opacity-100 {
           opacity: 1;
+        }
+        .globe-wrap {
+          position: relative;
+          width: 418px;
+          height: 418px;
+          cursor: pointer;
+          transition: transform 900ms cubic-bezier(0.7, 0, 0.3, 1);
+          transform-origin: center;
+          will-change: transform;
         }
       `}</style>
 
@@ -332,161 +400,166 @@ export default function LandingPage() {
           </div>
 
           <div className="flex items-center justify-center relative">
-            <Earth3D ref={earthRef} size={380} onClick={zoomAndGo} />
+            <div ref={globeWrapRef} className="globe-wrap" onClick={zoomAndGo}>
+              <Earth3D size={418} />
+            </div>
           </div>
         </div>
       </section>
 
       {SECTIONS.map((section, sectionIdx) => {
         return (
-          <section
-            key={section.slug}
-            id={section.slug}
-            style={{
-              paddingTop: sectionIdx === 0 ? 56 : 10,
-              paddingBottom: sectionIdx === SECTIONS.length - 1 ? 56 : 10,
-            }}
-          >
-            <div
-              className="max-w-[1200px] mx-auto px-7"
+          <ScrollReveal key={section.slug}>
+            <section
+              id={section.slug}
               style={{
-                background: 'var(--paper)',
-                border: '1px solid var(--rule)',
-                borderRadius: 20,
-                padding: '56px 48px',
+                paddingTop: sectionIdx === 0 ? 56 : 10,
+                paddingBottom: sectionIdx === SECTIONS.length - 1 ? 56 : 10,
               }}
             >
-              <div className="flex items-baseline justify-between gap-5 mb-9">
-                <span
-                  className="mono text-[11.5px] uppercase tracking-[0.14em]"
-                  style={{ color: 'var(--muted)' }}
-                >
-                  {section.eyebrow}
-                </span>
-                <h2
-                  className="serif font-medium tracking-tight m-0 text-balance min-h-[1.2em]"
-                  style={{
-                    fontSize: 'clamp(28px, 3vw, 40px)',
-                    color: 'var(--ink)',
-                  }}
-                >
-                  {section.title}
-                </h2>
-              </div>
-
-              {section.variant === 'steps' ? (
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-3.5">
-                  {section.cards.map((card, i) => (
-                    <div
-                      key={i}
-                      className="p-7 rounded-xl flex flex-col gap-3.5"
-                      style={{
-                        background: 'var(--paper)',
-                        border: '1px solid var(--rule-soft)',
-                      }}
-                    >
-                      <div
-                        className="serif italic text-[56px] leading-none"
-                        style={{ color: 'var(--ink)', letterSpacing: '-0.02em' }}
-                      >
-                        {card.numeral}
-                      </div>
-                      <h3
-                        className="serif font-medium m-0 min-h-[1.2em]"
-                        style={{ fontSize: 24, letterSpacing: '-0.01em' }}
-                      >
-                        {card.title}
-                      </h3>
-                      <p
-                        className="m-0 min-h-[1.4em]"
-                        style={{ color: 'var(--ink-2)' }}
-                      >
-                        {card.body}
-                      </p>
-                    </div>
-                  ))}
+              <div
+                className="max-w-[1200px] mx-auto px-7"
+                style={{
+                  background: 'var(--paper)',
+                  border: '1px solid var(--rule)',
+                  borderRadius: 20,
+                  padding: '56px 48px',
+                }}
+              >
+                <div className="flex items-baseline justify-between gap-5 mb-9">
+                  <span
+                    className="mono text-[11.5px] uppercase tracking-[0.14em]"
+                    style={{ color: 'var(--muted)' }}
+                  >
+                    {section.eyebrow}
+                  </span>
+                  <h2
+                    className="serif font-medium tracking-tight m-0 text-balance min-h-[1.2em]"
+                    style={{
+                      fontSize: 'clamp(28px, 3vw, 40px)',
+                      color: 'var(--ink)',
+                    }}
+                  >
+                    {section.title}
+                  </h2>
                 </div>
-              ) : (
-                <ul className="list-none p-0 m-0 grid gap-3">
-                  {Array.from({ length: section.cardCount }).map((_, i) => {
-                    const entries =
-                      section.entryLeading === 'rank' ? feed?.popular : feed?.recent;
-                    const entry = entries?.[i];
-                    const leading =
-                      section.entryLeading === 'rank'
-                        ? `#${i + 1}`
-                        : formatEntryDate(entry?.uploaded_at);
-                    const showTrailing = section.entryLeading === 'rank';
-                    return (
-                      <li
-                        key={i}
-                        onClick={() => {
-                          if (!entry) return;
-                          router.push(
-                            `/buildings/${entry.building_id}/floors/${entry.floor_number}`,
-                          );
-                        }}
-                        className={`grid items-start gap-[22px] py-[18px] px-[22px] rounded-xl transition ${entry ? 'cursor-pointer hover:bg-[var(--bg-soft)]' : ''
-                          }`}
-                        style={{
-                          background: 'var(--paper)',
-                          border: '1px solid var(--rule-soft)',
-                          gridTemplateColumns: showTrailing ? 'auto 1fr auto' : 'auto 1fr',
-                        }}
-                      >
-                        <span
-                          className="mono text-[11.5px] whitespace-nowrap pt-[5px]"
-                          style={{ color: 'var(--muted)', letterSpacing: '0.06em' }}
+
+                {section.variant === 'steps' ? (
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-3.5">
+                    {section.cards.map((card, i) => (
+                      <ScrollReveal key={i} delay={150 + i * 110} yOffset={30}>
+                        <div
+                          className="p-7 rounded-xl flex flex-col gap-3.5"
+                          style={{
+                            background: 'var(--paper)',
+                            border: '1px solid var(--rule-soft)',
+                          }}
                         >
-                          {leading}
-                        </span>
-                        <div className="min-w-0">
                           <div
-                            className="serif font-medium min-h-[1.2em] truncate"
-                            style={{
-                              fontSize: 19,
-                              color: 'var(--ink)',
-                              letterSpacing: '-0.005em',
-                            }}
+                            className="serif italic text-[56px] leading-none"
+                            style={{ color: 'var(--ink)', letterSpacing: '-0.02em' }}
                           >
-                            {entry?.building_name ?? ''}
+                            {card.numeral}
                           </div>
-                          <div
-                            className="mt-1 min-h-[1.4em] text-[14px] truncate"
+                          <h3
+                            className="serif font-medium m-0 min-h-[1.2em]"
+                            style={{ fontSize: 24, letterSpacing: '-0.01em' }}
+                          >
+                            {card.title}
+                          </h3>
+                          <p
+                            className="m-0 min-h-[1.4em]"
                             style={{ color: 'var(--ink-2)' }}
                           >
-                            {entry
-                              ? `${floorLabel(entry.floor_number)} · ${entry.module_name}`
-                              : ''}
-                          </div>
+                            {card.body}
+                          </p>
                         </div>
-                        {showTrailing && (
-                          <span
-                            className="mono text-[11px] inline-flex items-center gap-1 pt-[5px]"
-                            style={{ color: 'var(--ink)', letterSpacing: '0.02em' }}
+                      </ScrollReveal>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="grid gap-3">
+                    {Array.from({ length: section.cardCount }).map((_, i) => {
+                      const entries =
+                        section.entryLeading === 'rank' ? feed?.popular : feed?.recent;
+                      const entry = entries?.[i];
+                      const leading =
+                        section.entryLeading === 'rank'
+                          ? `#${i + 1}`
+                          : formatEntryDate(entry?.uploaded_at);
+                      const showTrailing = section.entryLeading === 'rank';
+                      return (
+                        <ScrollReveal key={i} delay={150 + i * 90} yOffset={24}>
+                          <div
+                            onClick={() => {
+                              if (!entry) return;
+                              router.push(
+                                `/buildings/${entry.building_id}/floors/${entry.floor_number}`,
+                              );
+                            }}
+                            className={`grid items-start gap-[22px] py-[18px] px-[22px] rounded-xl transition ${entry ? 'cursor-pointer hover:bg-[var(--bg-soft)]' : ''
+                              }`}
+                            style={{
+                              background: 'var(--paper)',
+                              border: '1px solid var(--rule-soft)',
+                              gridTemplateColumns: showTrailing ? 'auto 1fr auto' : 'auto 1fr',
+                            }}
                           >
-                            <svg
-                              viewBox="0 0 16 16"
-                              width="12"
-                              height="12"
-                              aria-hidden="true"
-                              style={{ color: '#c9a227' }}
+                            <span
+                              className="mono text-[11.5px] whitespace-nowrap pt-[5px]"
+                              style={{ color: 'var(--muted)', letterSpacing: '0.06em' }}
                             >
-                              <path
-                                fill="currentColor"
-                                d="M8 1.2 9.93 5.46l4.67.48-3.5 3.16.99 4.6L8 11.3l-4.09 2.4.99-4.6L1.4 5.94l4.67-.48L8 1.2z"
-                              />
-                            </svg>
-                            {entry?.star_count ?? 0}
-                          </span>
-                        )}
-                      </li>
-                    );
-                  })}
-                </ul>
-              )}
-            </div>
-          </section>
+                              {leading}
+                            </span>
+                            <div className="min-w-0">
+                              <div
+                                className="serif font-medium min-h-[1.2em] truncate"
+                                style={{
+                                  fontSize: 19,
+                                  color: 'var(--ink)',
+                                  letterSpacing: '-0.005em',
+                                }}
+                              >
+                                {entry?.building_name ?? ''}
+                              </div>
+                              <div
+                                className="mt-1 min-h-[1.4em] text-[14px] truncate"
+                                style={{ color: 'var(--ink-2)' }}
+                              >
+                                {entry
+                                  ? `${floorLabel(entry.floor_number)} · ${entry.module_name}`
+                                  : ''}
+                              </div>
+                            </div>
+                            {showTrailing && (
+                              <span
+                                className="mono text-[11px] inline-flex items-center gap-1 pt-[5px]"
+                                style={{ color: 'var(--ink)', letterSpacing: '0.02em' }}
+                              >
+                                <svg
+                                  viewBox="0 0 16 16"
+                                  width="12"
+                                  height="12"
+                                  aria-hidden="true"
+                                  style={{ color: '#c9a227' }}
+                                >
+                                  <path
+                                    fill="currentColor"
+                                    d="M8 1.2 9.93 5.46l4.67.48-3.5 3.16.99 4.6L8 11.3l-4.09 2.4.99-4.6L1.4 5.94l4.67-.48L8 1.2z"
+                                  />
+                                </svg>
+                                {entry?.star_count ?? 0}
+                              </span>
+                            )}
+                          </div>
+                        </ScrollReveal>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            </section>
+          </ScrollReveal>
         );
       })}
 
