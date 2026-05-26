@@ -4,10 +4,8 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { useAuth } from '@/lib/auth';
 import { api } from '@/lib/api';
-import { loadGlobeSdk } from '@/lib/landing/loadGlobeSdk';
 import { floorLabel } from '@/lib/format/floor';
-
-const WORLD_ATLAS_URL = 'https://unpkg.com/world-atlas@2.0.2/countries-110m.json';
+import Earth3D, { type Earth3DHandle } from '@/components/landing/Earth3D';
 
 interface StepsCard {
   numeral: string;
@@ -110,11 +108,8 @@ interface LandingFeed {
 export default function LandingPage() {
   const router = useRouter();
   const { user, login } = useAuth();
-  const monoCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const digitalCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const globeWrapRef = useRef<HTMLDivElement | null>(null);
+  const earthRef = useRef<Earth3DHandle | null>(null);
   const fadeRef = useRef<HTMLDivElement | null>(null);
-  const [isDigital, setIsDigital] = useState(false);
   const isZoomingRef = useRef(false);
   const [stats, setStats] = useState<LandingStats | null>(null);
   const [feed, setFeed] = useState<LandingFeed | null>(null);
@@ -130,37 +125,22 @@ export default function LandingPage() {
   }, [user, login, goExplore]);
 
   const zoomAndGo = useCallback(() => {
-    const wrap = globeWrapRef.current;
     const fade = fadeRef.current;
-    if (!wrap || !fade) {
+    const earth = earthRef.current;
+    if (!earth || !fade) {
       goExplore();
       return;
     }
     if (isZoomingRef.current) return;
     isZoomingRef.current = true;
-    setIsDigital(true);
-
-    const rect = wrap.getBoundingClientRect();
-    const vw = window.innerWidth;
-    const vh = window.innerHeight;
-    const cxScreen = rect.left + rect.width / 2;
-    const cyScreen = rect.top + rect.height / 2;
-    const dx = Math.max(cxScreen, vw - cxScreen);
-    const dy = Math.max(cyScreen, vh - cyScreen);
-    const maxDist = Math.hypot(dx, dy);
-    const scale = (maxDist * 2.2) / rect.width;
-    const tx = vw / 2 - cxScreen;
-    const ty = vh / 2 - cyScreen;
 
     window.scrollTo({ top: 0, behavior: 'smooth' });
 
-    wrap.style.transition = 'transform 900ms cubic-bezier(0.7, 0, 0.3, 1)';
-    wrap.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`;
-
-    window.setTimeout(() => fade.classList.add('opacity-100'), 350);
-    window.setTimeout(() => {
+    // 회전 가속 + 카메라 dolly-in. 종료 직전 페이드 시작 → 라우팅.
+    earth.triggerZoom(() => {
       router.push('/explore');
-    }, 900);
+    });
+    window.setTimeout(() => fade.classList.add('opacity-100'), 600);
   }, [goExplore, router]);
 
   useEffect(() => {
@@ -188,113 +168,6 @@ export default function LandingPage() {
     };
   }, []);
 
-  useEffect(() => {
-    let disposed = false;
-    let rafId = 0;
-    const monoCanvas = monoCanvasRef.current;
-    const digCanvas = digitalCanvasRef.current;
-    if (!monoCanvas || !digCanvas) return;
-
-    const CSS_SIZE = 320;
-    const BACKING = 640;
-    const R = (316 / 2) * (BACKING / CSS_SIZE);
-    const cx = BACKING / 2;
-    const cy = BACKING / 2;
-    const monoCtx = monoCanvas.getContext('2d');
-    const digCtx = digCanvas.getContext('2d');
-    if (!monoCtx || !digCtx) return;
-
-    (async () => {
-      try {
-        const { d3, topojson } = await loadGlobeSdk();
-        if (disposed) return;
-        const projection = d3
-          .geoOrthographic()
-          .scale(R)
-          .translate([cx, cy])
-          .clipAngle(90)
-          .rotate([0, -12, 0]);
-        const pathMono = d3.geoPath(projection, monoCtx);
-        const pathDig = d3.geoPath(projection, digCtx);
-        const world = await fetch(WORLD_ATLAS_URL).then((r) => r.json());
-        if (disposed) return;
-        const land = topojson.feature(world, world.objects.land);
-        const borderMesh = topojson.mesh(
-          world,
-          world.objects.countries,
-          (a: unknown, b: unknown) => a !== b,
-        );
-        const sphere = { type: 'Sphere' };
-
-        const drawMono = () => {
-          monoCtx.clearRect(0, 0, BACKING, BACKING);
-          monoCtx.beginPath();
-          pathMono(sphere);
-          monoCtx.fillStyle = 'rgba(0,0,0,0.03)';
-          monoCtx.fill();
-
-          monoCtx.beginPath();
-          pathMono(land);
-          monoCtx.fillStyle = '#1a1a1a';
-          monoCtx.fill();
-
-          monoCtx.beginPath();
-          pathMono(borderMesh);
-          monoCtx.lineWidth = 1.1;
-          monoCtx.strokeStyle = 'rgba(244,241,234,0.65)';
-          monoCtx.stroke();
-
-          monoCtx.beginPath();
-          pathMono(sphere);
-          monoCtx.lineWidth = 1.4;
-          monoCtx.strokeStyle = 'rgba(0,0,0,0.85)';
-          monoCtx.stroke();
-        };
-
-        const drawDigital = () => {
-          digCtx.clearRect(0, 0, BACKING, BACKING);
-          digCtx.beginPath();
-          pathDig(borderMesh);
-          digCtx.lineWidth = 1.1;
-          digCtx.strokeStyle = 'rgba(80,170,255,1)';
-          digCtx.stroke();
-
-          digCtx.beginPath();
-          pathDig(land);
-          digCtx.lineWidth = 1.4;
-          digCtx.strokeStyle = '#7ec8ff';
-          digCtx.stroke();
-
-          digCtx.beginPath();
-          pathDig(sphere);
-          digCtx.lineWidth = 1.4;
-          digCtx.strokeStyle = 'rgba(30,144,255,1)';
-          digCtx.stroke();
-        };
-
-        const t0 = performance.now();
-        const spinDegPerSec = 14;
-        const tick = (now: number) => {
-          if (disposed) return;
-          const dt = (now - t0) / 1000;
-          const lambda = -10 + dt * spinDegPerSec;
-          projection.rotate([lambda, -12, 0]);
-          drawMono();
-          drawDigital();
-          rafId = requestAnimationFrame(tick);
-        };
-        rafId = requestAnimationFrame(tick);
-      } catch {
-        // SDK 로드 실패는 무시 — 클릭은 여전히 작동
-      }
-    })();
-
-    return () => {
-      disposed = true;
-      if (rafId) cancelAnimationFrame(rafId);
-    };
-  }, []);
-
   const formatEntryDate = (iso: string | null | undefined): string => {
     if (!iso) return '';
     const d = new Date(iso);
@@ -306,20 +179,10 @@ export default function LandingPage() {
     <div className="landing min-h-screen bg-[var(--bg)] text-[var(--ink)]">
       <style jsx global>{`
         .landing {
-          --bg: #f4f1ea;
-          --bg-soft: #ede9df;
-          --paper: #faf7f0;
-          --ink: #1a1a1a;
-          --ink-2: #2c2a26;
-          --muted: #6b665e;
-          --muted-2: #908a7e;
-          --rule: #d9d3c4;
-          --rule-soft: #e7e1d1;
           font-family: var(--font-noto-sans-kr), 'Noto Sans KR', Helvetica, 'Helvetica Neue', Arial, sans-serif;
           -webkit-font-smoothing: antialiased;
           text-rendering: optimizeLegibility;
         }
-        /* .serif / .mono 는 globals.css 의 전역 정의(Source Serif 4 / JetBrains Mono)를 사용. */
         .landing-fade {
           position: fixed;
           inset: 0;
@@ -327,39 +190,9 @@ export default function LandingPage() {
           opacity: 0;
           pointer-events: none;
           z-index: 9999;
-          transition: opacity 500ms ease;
+          transition: opacity 700ms ease;
         }
         .landing-fade.opacity-100 {
-          opacity: 1;
-        }
-        .globe-wrap {
-          position: relative;
-          width: 320px;
-          height: 320px;
-          cursor: pointer;
-          transition: transform 700ms cubic-bezier(0.7, 0, 0.3, 1);
-          transform-origin: center;
-          will-change: transform;
-        }
-        .globe-wrap canvas {
-          position: absolute;
-          inset: 0;
-          width: 320px;
-          height: 320px;
-          transition: opacity 600ms ease, filter 600ms ease;
-        }
-        .globe-wrap canvas.mono {
-          opacity: 1;
-        }
-        .globe-wrap canvas.digital {
-          opacity: 0;
-          filter: drop-shadow(0 0 10px rgba(30, 144, 255, 0.85))
-            drop-shadow(0 0 2px rgba(30, 144, 255, 0.6));
-        }
-        .globe-wrap.is-digital canvas.mono {
-          opacity: 0;
-        }
-        .globe-wrap.is-digital canvas.digital {
           opacity: 1;
         }
       `}</style>
@@ -499,23 +332,7 @@ export default function LandingPage() {
           </div>
 
           <div className="flex items-center justify-center relative">
-            <div
-              ref={globeWrapRef}
-              className={`globe-wrap ${isDigital ? 'is-digital' : ''}`}
-              onMouseEnter={() => setIsDigital(true)}
-              onMouseLeave={() => {
-                if (!isZoomingRef.current) setIsDigital(false);
-              }}
-              onClick={zoomAndGo}
-            >
-              <canvas ref={monoCanvasRef} className="mono" width={640} height={640} />
-              <canvas
-                ref={digitalCanvasRef}
-                className="digital"
-                width={640}
-                height={640}
-              />
-            </div>
+            <Earth3D ref={earthRef} size={380} onClick={zoomAndGo} />
           </div>
         </div>
       </section>
@@ -564,7 +381,7 @@ export default function LandingPage() {
                       key={i}
                       className="p-7 rounded-xl flex flex-col gap-3.5"
                       style={{
-                        background: '#ffffff',
+                        background: 'var(--paper)',
                         border: '1px solid var(--rule-soft)',
                       }}
                     >
@@ -612,7 +429,7 @@ export default function LandingPage() {
                         className={`grid items-start gap-[22px] py-[18px] px-[22px] rounded-xl transition ${entry ? 'cursor-pointer hover:bg-[var(--bg-soft)]' : ''
                           }`}
                         style={{
-                          background: '#ffffff',
+                          background: 'var(--paper)',
                           border: '1px solid var(--rule-soft)',
                           gridTemplateColumns: showTrailing ? 'auto 1fr auto' : 'auto 1fr',
                         }}
