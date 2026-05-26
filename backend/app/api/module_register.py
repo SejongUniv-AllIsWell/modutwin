@@ -379,6 +379,9 @@ async def commit_final(
         user_id=user.id,
         module_id=module.id,
         ply_path=final_ply_key,
+        # SceneOutput.sog_path 는 NOT NULL — SOG 변환 결과가 없을 땐 PLY 키를 그대로 채워
+        # 뷰어 fallback (sog → ply) 가 동일 객체를 가리키게 한다 (refine.py 와 동일 관례).
+        sog_path=final_ply_key,
         is_aligned=True,
     )
     db.add(scene_output)
