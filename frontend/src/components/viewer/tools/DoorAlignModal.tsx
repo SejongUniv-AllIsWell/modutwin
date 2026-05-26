@@ -1864,6 +1864,35 @@ export default function DoorAlignModal({
       setDoorRefineActive(true);
       console.log('[DoorRefine] apply SUCCESS');
 
+      // [DEBUG-A2] 새 도어 entity (splat + mesh) 가시성 토글 — 콘솔 호출:
+      //   toggleNewDoorEntities()  → 둘 다 OFF, 도어 영역에 메인 PLY hide 가 100% 효과 있는지 확인.
+      //     - 영역 빈 공간 = hide 성공, 보이던 갈색 artifact 는 새 entity 에서 옴
+      //     - 잔재 가우시안 보임 = hide 실패, 그게 artifact 정체 (메인 일부라 회전 안 함)
+      //   toggleDoorSplat()  → splat 만 토글 (mesh 는 그대로)
+      // 검증 끝나면 이 블록 즉시 제거.
+      if (!basemapMode) {
+        (window as any).toggleDoorSplat = () => {
+          const id = doorSubGsplatIdRef.current;
+          const e = id ? additional.getEntity(id) : null;
+          if (e) {
+            e.enabled = !e.enabled;
+            console.log('[DEBUG-A2] doorSplat.enabled =', e.enabled);
+          } else {
+            console.log('[DEBUG-A2] no door splat entity');
+          }
+        };
+        (window as any).toggleNewDoorEntities = () => {
+          const id = doorSubGsplatIdRef.current;
+          const splatEnt = id ? additional.getEntity(id) : null;
+          const meshEnt = doorMeshEntityRef.current;
+          const splatNew = splatEnt ? !splatEnt.enabled : null;
+          const meshNew = meshEnt ? !meshEnt.enabled : null;
+          if (splatEnt) splatEnt.enabled = splatNew as boolean;
+          if (meshEnt) meshEnt.enabled = meshNew as boolean;
+          console.log('[DEBUG-A2] new door entities — splat.enabled=', splatNew, ', mesh.enabled=', meshNew);
+        };
+      }
+
       // basemap 다중 도어: 추출 성공 즉시 메모리 도어 리스트에 push.
       // 모듈 모드는 그대로 (기존 회전 메타 부여 후 정합 단계로 transition).
       if (basemapMode) {
@@ -2268,37 +2297,6 @@ export default function DoorAlignModal({
       if (pivot) {
         pivot.setLocalRotation(localRot.x, localRot.y, localRot.z, localRot.w);
         pivot.setLocalPosition(offsetWorld.x, offsetWorld.y, offsetWorld.z);
-      }
-
-      // 결정적 진단: PC 렌더가 사용하는 matrix_model 의 source 가 정확한지.
-      // meshInstance.node === splatEntity 여야 entity world transform 이 반영됨.
-      const a2 = doorAnimRef.current as any;
-      if (a2 && tNorm >= 1 && !a2._loggedNode) {
-        a2._loggedNode = true;
-        const splatId = doorSubGsplatIdRef.current;
-        const splatEnt = splatId ? additional.getEntity(splatId) : null;
-        const inst = (splatEnt as any)?.gsplat?.instance;
-        const mi = inst?.meshInstance;
-        if (mi && splatEnt) {
-          const miNodeName = mi.node?.name ?? 'null';
-          const sameAsEntity = mi.node === splatEnt;
-          const miWorld = mi.node?.getWorldTransform?.()?.data;
-          const entWorld = splatEnt.getWorldTransform?.()?.data;
-          const miPos = miWorld ? [miWorld[12], miWorld[13], miWorld[14]] : null;
-          const entPos = entWorld ? [entWorld[12], entWorld[13], entWorld[14]] : null;
-          console.log('[GSplatRender:diag]', {
-            miNodeName, sameAsEntity,
-            splatEntName: splatEnt.name,
-            miNodeWorldPos: miPos?.map(v => v.toFixed(3)),
-            entityWorldPos: entPos?.map(v => v.toFixed(3)),
-            visible: !!mi.visible,
-            visibleThisFrame: mi.visibleThisFrame,
-            instCameras: inst?.cameras?.length,
-            instMeshAabb: inst?.mesh?.aabb?.center,
-          });
-        } else {
-          console.log('[GSplatRender:diag] no meshInstance', { splatId, hasEnt: !!splatEnt, hasInst: !!inst });
-        }
       }
 
       if (tNorm >= 1) {
