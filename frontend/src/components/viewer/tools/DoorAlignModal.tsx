@@ -1358,37 +1358,27 @@ export default function DoorAlignModal({
         await revertDoorRefine();
       }
 
-      // 2. cachedScene 확보 (PLY parse 1회만). full N 유지 — 라이브 splatData 와 인덱스 정합 필요.
-      //    saveRefined() 시 splatData 에 베이크된 회전을 cachedScene 에도 적용해 동일 frame (A') 유지.
-      if (!cachedSceneRef.current) {
-        const { fetchAndParsePly } = await import('@/lib/ply');
-        cachedSceneRef.current = await fetchAndParsePly(currentUrl);
-        const bake = getRemainingRotationToAY?.() ?? { rotX: 0, rotZ: 0, wallAngleRad: 0 };
-        if (bake.rotX !== 0 || bake.rotZ !== 0) {
-          const { rotateScene } = await import('@/lib/gs');
-          rotateScene(cachedSceneRef.current, bake.rotX, bake.rotZ);
+      // 2. 현재 sd 의 gsplatData 에서 GaussianScene 빌드. 매 apply 마다 새로 — cached scene 과
+      //    live sd 의 인덱스/scale 불일치 (재apply 시 메인 reload 로 sd 가 작아진 케이스) 회피.
+      //    sd 가 source of truth: posX/Y/Z, rot_*, scale_* 모두 현재 상태 (베이크/clipping 반영).
+      const scene: GaussianScene = (() => {
+        const g = sd.gsplatData;
+        const propertyOrder: string[] = [...(g?.propertyOrder || [])];
+        const attrs = new Map<string, Float32Array>();
+        for (const prop of propertyOrder) {
+          const a = g?.getProp(prop) as Float32Array | undefined;
+          if (a) attrs.set(prop, new Float32Array(a));
         }
-      }
-      const scene = cachedSceneRef.current;
+        // posX/Y/Z 는 splatData 의 별도 참조와 동일해야 함 — gsplatData 의 x/y/z 와 같은 버퍼.
+        // 안전 보장으로 sd.posX/Y/Z 로 덮어씀.
+        if (sd.posX) attrs.set('x', new Float32Array(sd.posX));
+        if (sd.posY) attrs.set('y', new Float32Array(sd.posY));
+        if (sd.posZ) attrs.set('z', new Float32Array(sd.posZ));
+        return { numSplats: sd.numSplats, attrs, propertyOrder };
+      })();
       // 다듬기 단계의 keep mask (flatten/floater/brush 삭제). decomp 결과를 이걸로 거르면
       // 외부 가우시안이 도어 영역에서 부활하는 문제 방지.
       const keepMaskCurrent = getCurrentKeepMask?.() ?? null;
-
-      // 라이브 splatData 의 scale 이 cachedScene 과 다를 수 있다 (예: 다듬기 단계의 경계 Clipping
-      // 적용 후 정합으로 넘어온 경우 — 라이브에는 clip 된 scale, cachedScene 에는 PLY 원본 scale).
-      // decompose 는 scene.sc 를 분할 베이스로 쓰므로 동기화하지 않으면 boundary 가우시안의 clipping 이
-      // raw + split 으로 덮어써져 풀린다. 라이브 → cached 로 복사해 현재 상태를 분할 베이스로 사용.
-      {
-        const liveSc0 = sd.gsplatData?.getProp('scale_0') as Float32Array | undefined;
-        const liveSc1 = sd.gsplatData?.getProp('scale_1') as Float32Array | undefined;
-        const liveSc2 = sd.gsplatData?.getProp('scale_2') as Float32Array | undefined;
-        const cs0 = scene.attrs.get('scale_0') as Float32Array | undefined;
-        const cs1 = scene.attrs.get('scale_1') as Float32Array | undefined;
-        const cs2 = scene.attrs.get('scale_2') as Float32Array | undefined;
-        if (liveSc0 && liveSc1 && liveSc2 && cs0 && cs1 && cs2 && liveSc0.length === cs0.length) {
-          cs0.set(liveSc0); cs1.set(liveSc1); cs2.set(liveSc2);
-        }
-      }
 
       // 3. 분할 계산
       // 사용자가 픽한 4 점을 wall plane 으로 projection — visualization (setDoorInternalShowAsync) 도 같은

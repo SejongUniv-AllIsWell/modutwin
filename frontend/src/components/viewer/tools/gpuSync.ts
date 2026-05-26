@@ -1,112 +1,62 @@
 import { SplatData } from '../SplatViewerCore';
 
 /**
- * 가우시안 위치+쿼터니언 변경 후 GPU 텍스처 및 sorter를 동기화한다.
+ * gsplatData (x/y/z, rot_*, scale_*) 를 in-place 수정한 후 호출. PC 의 GSplat.updateTransformData 가
+ * gsplatData iter 로 pos+rot+scale 을 읽어 covariance (covA, covB) 를 계산하고 transformA/B 텍스처 전체를
+ * 정확히 재계산해 GPU 에 올린다.
  *
- * 호출 전에 splatData.posX/Y/Z와 gsplatData.rot_0~3이
- * 이미 새 값으로 업데이트되어 있어야 한다.
+ * transformA/B 의 슬롯은 raw pos/rot/scale 이 아니라 PC 가 미리 계산한 covariance 값이므로 직접 슬롯에
+ * write 하면 가우시안 모양/크기가 깨진다. 항상 이 함수로 위임.
+ *
+ * sorter centers + lastCameraPosition 도 reset → 카메라 정지 상태에서도 re-sort 트리거.
+ */
+export function refreshGPUFromSplatData(splatData: SplatData) {
+  const instance = (splatData.splatEntity as any)?.gsplat?.instance;
+  const splat = instance?.splat;
+  const gsplatData = splatData.gsplatData;
+  if (splat?.updateTransformData && gsplatData) {
+    splat.updateTransformData(gsplatData);
+  }
+  if (instance?.sorter) {
+    const centers = instance.sorter.centers;
+    if (centers && splatData.posX && splatData.posY && splatData.posZ) {
+      const N = splatData.numSplats;
+      for (let i = 0; i < N; i++) {
+        centers[i * 3 + 0] = splatData.posX[i];
+        centers[i * 3 + 1] = splatData.posY[i];
+        centers[i * 3 + 2] = splatData.posZ[i];
+      }
+      instance.sorter.setMapping(null);
+    }
+    instance.lastCameraPosition?.set(Infinity, Infinity, Infinity);
+  }
+}
+
+/**
+ * 가우시안 위치+쿼터니언 변경 후 GPU 동기화. PC GSplat.updateTransformData 를 호출 (covariance 정확 재계산).
+ * indices 인자는 무시됨 — PC API 가 partial 갱신을 지원하지 않아 전체 재계산.
  */
 export function syncGPU(
-  indices: number[],
+  _indices: number[],
   splatData: SplatData,
-  float2HalfFn: (v: number) => number,
+  _float2HalfFn: (v: number) => number,
 ) {
-  const transformA = splatData.transformATexture;
-  const transformB = splatData.transformBTexture;
-  const dataA = transformA?.lock();
-  const dataAF32 = dataA ? new Float32Array(dataA.buffer) : null;
-  const dataB = transformB?.lock();
-
-  const gsplatData = splatData.gsplatData;
-  const rot1 = gsplatData?.getProp('rot_1'); // x
-  const rot2 = gsplatData?.getProp('rot_2'); // y
-  const rot3 = gsplatData?.getProp('rot_3'); // z
-  // 스케일은 베이크 회전 등 전체 일괄 sync 시 transformB lock 이 zeroed buffer 를 반환하면
-  // slot 0~2 가 0 으로 덮여 exp(0)=1m 로 부풀므로, 회전 quat 옆에 항상 같이 써준다.
-  const sc0 = gsplatData?.getProp('scale_0');
-  const sc1 = gsplatData?.getProp('scale_1');
-  const sc2 = gsplatData?.getProp('scale_2');
-
-  for (const idx of indices) {
-    const nx = splatData.posX[idx];
-    const ny = splatData.posY[idx];
-    const nz = splatData.posZ[idx];
-    const qx = rot1?.[idx] ?? 0;
-    const qy = rot2?.[idx] ?? 0;
-    const qz = rot3?.[idx] ?? 0;
-
-    // transformA: [posX(f32), posY(f32), posZ(f32), rotXY(packed half)]
-    if (dataAF32 && dataA) {
-      dataAF32[idx * 4 + 0] = nx;
-      dataAF32[idx * 4 + 1] = ny;
-      dataAF32[idx * 4 + 2] = nz;
-      dataA[idx * 4 + 3] = float2HalfFn(qx) | (float2HalfFn(qy) << 16);
-    }
-
-    // transformB: [scaleX(half), scaleY(half), scaleZ(half), rotZ(half)]
-    if (dataB) {
-      if (sc0 && sc1 && sc2) {
-        dataB[idx * 4 + 0] = float2HalfFn(Math.exp(sc0[idx]));
-        dataB[idx * 4 + 1] = float2HalfFn(Math.exp(sc1[idx]));
-        dataB[idx * 4 + 2] = float2HalfFn(Math.exp(sc2[idx]));
-      }
-      dataB[idx * 4 + 3] = float2HalfFn(qz);
-    }
-  }
-
-  if (transformA) transformA.unlock();
-  if (transformB) transformB.unlock();
-
-  // sorter에 변경된 위치 전달
-  const splatInstance = (splatData.splatEntity as any)?.gsplat?.instance;
-  if (splatInstance?.sorter) {
-    const centers = splatInstance.sorter.centers;
-    if (centers) {
-      for (const idx of indices) {
-        centers[idx * 3 + 0] = splatData.posX[idx];
-        centers[idx * 3 + 1] = splatData.posY[idx];
-        centers[idx * 3 + 2] = splatData.posZ[idx];
-      }
-      splatInstance.sorter.setMapping(null);
-    }
-    splatInstance.lastCameraPosition.set(Infinity, Infinity, Infinity);
-  }
+  refreshGPUFromSplatData(splatData);
 }
 
 /**
- * 가우시안 scale (log-scale) 만 변경한 후 GPU 동기화. 위치/쿼터니언은 손대지 않음.
- *
- * 호출 전에 gsplatData.scale_0/1/2 가 새 log-scale 로 업데이트되어 있어야 한다.
- * (transformBTexture 의 scale 슬롯은 exp(log-scale) 의 half-float — 이 함수가 GPU 에 동기화.)
+ * 가우시안 scale 변경 후 GPU 동기화. PC GSplat.updateTransformData 호출 (위와 동일).
  */
 export function syncScalesGPU(
-  indices: number[],
+  _indices: number[],
   splatData: SplatData,
-  float2HalfFn: (v: number) => number,
+  _float2HalfFn: (v: number) => number,
 ) {
-  const transformB = splatData.transformBTexture;
-  const dataB = transformB?.lock();
-  const gsplatData = splatData.gsplatData;
-  const sc0 = gsplatData?.getProp('scale_0');
-  const sc1 = gsplatData?.getProp('scale_1');
-  const sc2 = gsplatData?.getProp('scale_2');
-  if (!sc0 || !sc1 || !sc2) {
-    if (transformB) transformB.unlock();
-    return;
-  }
-  if (dataB) {
-    for (const idx of indices) {
-      // transformB: [scaleX(half), scaleY(half), scaleZ(half), rotZ(half)]
-      dataB[idx * 4 + 0] = float2HalfFn(Math.exp(sc0[idx]));
-      dataB[idx * 4 + 1] = float2HalfFn(Math.exp(sc1[idx]));
-      dataB[idx * 4 + 2] = float2HalfFn(Math.exp(sc2[idx]));
-    }
-  }
-  if (transformB) transformB.unlock();
+  refreshGPUFromSplatData(splatData);
 }
 
 /**
- * gsplatData에서 인덱스 배열에 해당하는 위치+쿼터니언 원본을 저장한다.
+ * gsplatData 에서 인덱스 배열에 해당하는 위치+쿼터니언 원본을 저장한다.
  * positions: [x0,y0,z0, x1,y1,z1, ...]
  * quaternions: [w0,x0,y0,z0, w1,x1,y1,z1, ...]
  */
