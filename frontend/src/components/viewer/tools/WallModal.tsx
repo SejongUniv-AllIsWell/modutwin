@@ -402,6 +402,58 @@ export default function WallModal({
   // 좌클릭 — 기존 점 hit 면 선택/드래그, 빈 공간이면 새 점 추가 + 직전 선택점과 edge.
   // 점 드래그는 document mousemove/mouseup 으로 추적 — 캔버스 밖으로 나가도 끊기지 않음.
   const handleMouseDown = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    // 우클릭 — 평행화 모드에서 선분 수직(normal) 평행이동 드래그.
+    // (draw 모드 우클릭은 onContextMenu 의 undo 가 처리하므로 여기선 무시.)
+    if (e.button === 2) {
+      if (modeRef.current !== 'parallel') return;
+      const dp = derivedPolygonRef.current;
+      if (!dp) return;
+      e.preventDefault();
+      const { rx, rz } = mouseToWorld(e);
+      const segHit = findEdgeHitRef.current(rx, rz);
+      if (segHit < 0) return;
+      const { polygon, cycleOrder } = dp;
+      const N = polygon.length;
+      const a = polygon[segHit];
+      const b = polygon[(segHit + 1) % N];
+      const ex = b.x - a.x, ez = b.z - a.z;
+      const elen = Math.hypot(ex, ez) || 1;
+      // 선분 기울기의 수직 (XZ) 단위벡터. 부호는 무관 — 마우스 이동 투영이 양/음 결정.
+      const nx = ez / elen, nz = -ex / elen;
+      const aIdx = cycleOrder[segHit];
+      const bIdx = cycleOrder[(segHit + 1) % N];
+      const startSnapshot = pathPointsRef.current.map(p => ({ ...p }));
+      const startA = { ...startSnapshot[aIdx] };
+      const startB = { ...startSnapshot[bIdx] };
+      const startWx = rx, startWz = rz;
+      let moved = false;
+
+      const onMove = (ev: MouseEvent) => {
+        const r = nativeToWorld(ev);
+        if (!r) return;
+        // 마우스 이동량을 선분 normal 에 투영 → 그만큼만 수직 평행이동.
+        const proj = (r.rx - startWx) * nx + (r.rz - startWz) * nz;
+        if (!moved && Math.abs(proj) < 1e-4) return;
+        moved = true;
+        const next = pathPointsRef.current.map((p, i) => {
+          if (i === aIdx) return { x: startA.x + proj * nx, z: startA.z + proj * nz };
+          if (i === bIdx) return { x: startB.x + proj * nx, z: startB.z + proj * nz };
+          return p;
+        });
+        pathPointsRef.current = next;
+        setPathPoints(next);
+      };
+      const onUp = () => {
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+        // 실제 이동했을 때만 undo 스냅샷 기록 (parallel 액션과 동일 형식).
+        if (moved) pathActionsRef.current.push({ type: 'parallel', prevPoints: startSnapshot });
+      };
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', onUp);
+      return;
+    }
+
     if (e.button !== 0) return;
     e.preventDefault();
     const { rx, rz } = mouseToWorld(e);
@@ -524,9 +576,11 @@ export default function WallModal({
     };
   }, [viewport, dataBounds]);
 
-  // 우클릭 — 마지막 조작 1단계 undo.
+  // 우클릭 — draw 모드: 마지막 조작 1단계 undo. parallel 모드: 선분 수직 이동(handleMouseDown 처리)
+  // 이므로 컨텍스트 메뉴만 차단하고 undo 는 하지 않음 (이동 undo 는 draw 모드 복귀 후 우클릭).
   const handleContextMenu = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     e.preventDefault();
+    if (modeRef.current === 'parallel') return;
     const action = pathActionsRef.current.pop();
     if (!action) return;
 
@@ -767,9 +821,9 @@ export default function WallModal({
         <div className="text-[var(--muted)] text-xs mb-3">
           {mode === 'parallel' ? (
             <>
-              선분을 클릭해 선택. 첫 선택 선분이 기준 각도, 나머지가 그에 평행해집니다.
+              좌클릭으로 선분 선택. 첫 선택 선분이 기준 각도, 나머지가 그에 평행해집니다.
               <br />
-              우클릭으로 마지막 적용 되돌리기.
+              우클릭 드래그로 선분을 수직 방향으로 평행이동 (되돌리기는 모드 해제 후 우클릭).
             </>
           ) : (
             <>
