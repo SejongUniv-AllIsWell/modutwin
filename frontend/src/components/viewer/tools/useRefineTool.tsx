@@ -161,6 +161,10 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   // 베이크된 회전 — splatData 에 적용된 누적 회전. saveRefined() 시 pendingRotation 을 옮겨 받음.
   // 용도: 서버 PLY 저장 (raw 원본 + bakedRotation + wallAngle → A'+Y), 페이지 재로드 시 splatData 재베이크.
   const bakedRotationRef = useRef<{ rotX: number; rotZ: number }>({ rotX: 0, rotZ: 0 });
+  // 다음 splatLoad 콜백에서 bakedRotation 재적용 (re-bake) 을 건너뛰는 one-shot 플래그.
+  // 도어 추출이 메인 splat 을 PLY 재로드 방식으로 갱신할 때, 새 PLY 는 이미 A' 프레임으로 빌드되었기에
+  // onSplatLoaded 의 자동 re-bake 가 돌면 double rotation 발생 → 호출자가 reload 직전에 이 플래그를 set.
+  const skipNextSplatRebakeRef = useRef<boolean>(false);
   const [bakedRotation, setBakedRotation] = useState<{ rotX: number; rotZ: number }>({ rotX: 0, rotZ: 0 });
 
   // flatten 마스크: 1=삭제(현재 회전된 프레임 기준 평면 외부). null=아직 적용 안 됨.
@@ -2107,8 +2111,12 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     // (페이지 새로고침 후 persistence 복원이나 reset 후 등에서 호출됨)
     setTimeout(async () => {
       // bakedRotation 이 복원되었으면 splatData 에 다시 in-place 적용 → splatData = A' 상태 복원.
+      // 단 호출자가 명시적으로 skip 요청한 경우 (도어 추출의 PLY 재빌드 reload 처럼 새 PLY 가 이미 A')
+      // 한 번만 건너뜀.
+      const skipRebake = skipNextSplatRebakeRef.current;
+      if (skipRebake) skipNextSplatRebakeRef.current = false;
       const baked = bakedRotationRef.current;
-      if (baked.rotX !== 0 || baked.rotZ !== 0) {
+      if (!skipRebake && (baked.rotX !== 0 || baked.rotZ !== 0)) {
         const core = coreRef.current;
         const f2h = core?.float2Half;
         if (f2h && data.gsplatData) {
@@ -3585,5 +3593,10 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     return { rotX, rotZ, wallAngleRad: (wallAngleDeg * Math.PI) / 180 };
   }, []);
 
-  return { overlay, panel, modals, onSplatLoaded, planes, saveRefined, commitRefinedToServer, gatherRefinedAssets, getCurrentKeepMask, getBakeRgba, getRemainingRotationToAY };
+  // 도어 추출 같은 외부 호출자가 다음 splatLoad 에서 re-bake 를 건너뛰도록 신호.
+  const markNextSplatLoadSkipRebake = useCallback(() => {
+    skipNextSplatRebakeRef.current = true;
+  }, []);
+
+  return { overlay, panel, modals, onSplatLoaded, planes, saveRefined, commitRefinedToServer, gatherRefinedAssets, getCurrentKeepMask, getBakeRgba, getRemainingRotationToAY, markNextSplatLoadSkipRebake };
 }

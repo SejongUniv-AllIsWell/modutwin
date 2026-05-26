@@ -55,6 +55,8 @@ export interface SplatViewerCoreRef {
   exitAlignmentMode: () => void;
   /** 현재 alignmentGroup entity. 진입 안 했으면 null. */
   getAlignmentGroup: () => any | null;
+  /** 메인 splat 을 새 URL (blob URL 가능) 로 재로드. 카메라 보존 옵션 지원. asset.ready 까지 await. */
+  reloadSplatFromUrl: (url: string, opts?: { preserveCamera?: boolean }) => Promise<void>;
 }
 
 interface SplatViewerCoreProps {
@@ -96,7 +98,7 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
     const pcRef = useRef<any>(null);
     // splat 로드 인터페이스 — init 완료 후 첫 useEffect에서 채워짐.
     // 두 번째 useEffect (sogUrl 변경 트리거) 가 호출.
-    const loadSplatRef = useRef<((url: string) => void) | null>(null);
+    const loadSplatRef = useRef<((url: string, opts?: { preserveCamera?: boolean }) => Promise<void>) | null>(null);
     const clearSplatRef = useRef<(() => void) | null>(null);
     // 콜백 identity가 매 렌더마다 바뀌어도 effect가 재실행되지 않도록 ref로 보관
     const onSplatLoadedRef = useRef(onSplatLoaded);
@@ -188,6 +190,11 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
         alignmentGroupRef.current = null;
       },
       getAlignmentGroup: () => alignmentGroupRef.current,
+      reloadSplatFromUrl: (url: string, opts?: { preserveCamera?: boolean }) => {
+        const fn = loadSplatRef.current;
+        if (!fn) return Promise.reject(new Error('splat loader not ready'));
+        return fn(url, opts);
+      },
     }));
 
     // ── Shift 키 상태 추적 (이동속도 표시에 반영) ──
@@ -456,7 +463,7 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
 
           // ── splat 로드/교체 인터페이스 ──
           // 옛 entity는 새 asset이 ready된 시점에 destroy → 화면이 비는 순간이 없다.
-          const loadSplat = (url: string) => {
+          const loadSplat = (url: string, opts?: { preserveCamera?: boolean }): Promise<void> => {
             // 이전 진행 중 로드 취소 (asset.ready 콜백이 더 이상 entity를 만들지 않게 함)
             activeCancel?.();
 
@@ -466,19 +473,23 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
             setLoading(true);
             setError(null);
 
+            const preserveCamera = !!opts?.preserveCamera;
+
             // reorder=false: PlayCanvas 의 기본 Morton order 재배치 비활성. 활성 시 splatData 의
             // 인덱스가 원본 PLY 순서와 달라져 save 시 alpha mask 가 엉뚱한 splat 에 매핑됨.
             const asset = new pc.Asset('splat', 'gsplat', { url }, { reorder: false } as any);
             app.assets.add(asset);
 
+            return new Promise<void>((resolve, reject) => {
             asset.on('error', (_msg: string, err: Error) => {
               if (cancelled || destroyed) return;
               setError(`파일 로드 실패: ${err?.message ?? '알 수 없는 오류'}`);
               setLoading(false);
+              reject(err ?? new Error('splat load failed'));
             });
 
             asset.ready(() => {
-              if (cancelled || destroyed) return;
+              if (cancelled || destroyed) { resolve(); return; }
 
               // 이전 splat 제거 (이 시점에 이미 새 asset이 GPU에 올라왔으므로 화면이 비지 않음)
               if (splatEntityRef.current) {
@@ -497,20 +508,22 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
               app.root.addChild(splatEntity);
               splatEntityRef.current = splatEntity;
 
-              // 카메라 초기 위치
-              const mi = (splatEntity as any).gsplat?.meshInstance;
-              if (mi?.aabb) {
-                const aabb = mi.aabb;
-                const size = aabb.halfExtents.length();
-                if (cameraModeRef.current === 'fly') {
-                  camPos.set(aabb.center.x, aabb.center.y, aabb.center.z + size * 2.5);
-                } else {
-                  orbitRadius = size * 2.5;
-                  orbitTarget.copy(aabb.center);
+              // 카메라 초기 위치 — preserveCamera 면 기존 camPos/azim/elev 유지 (재로드 케이스).
+              if (!preserveCamera) {
+                const mi = (splatEntity as any).gsplat?.meshInstance;
+                if (mi?.aabb) {
+                  const aabb = mi.aabb;
+                  const size = aabb.halfExtents.length();
+                  if (cameraModeRef.current === 'fly') {
+                    camPos.set(aabb.center.x, aabb.center.y, aabb.center.z + size * 2.5);
+                  } else {
+                    orbitRadius = size * 2.5;
+                    orbitTarget.copy(aabb.center);
+                  }
+                  azim = 0;
+                  elev = 0;
+                  syncCamera();
                 }
-                azim = 0;
-                elev = 0;
-                syncCamera();
               }
 
               // PlayCanvas 2.x: gsplatData
@@ -552,9 +565,11 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
               }
 
               setLoading(false);
+              resolve();
             });
 
             app.assets.load(asset);
+            });
           };
 
           const clearSplat = () => {
@@ -617,7 +632,8 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
     useEffect(() => {
       if (!appReady) return;
       if (sogUrl) {
-        loadSplatRef.current?.(sogUrl);
+        // 초기 / sogUrl 변경 로드 — 카메라 fit. 실패는 setError 로 표시되므로 await 불필요.
+        void loadSplatRef.current?.(sogUrl);
       } else {
         clearSplatRef.current?.();
       }
