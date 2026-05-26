@@ -957,9 +957,8 @@ class DoorEntry(BaseModel):
     swing: int | None = None
     angleDeg: float | None = None
     wallSurfaceId: str | None = None
-    doorThickness: float | None = None
+    doorExtractionDepth: float | None = None
     boundarySplitEnabled: bool | None = None
-    safetyMargin: float | None = None
     # basemap 등록 시 각 문에 부여하는 호수 (예: "302호"). 정합 단계에서 모듈의
     # 호수 (Module.name) 와 매칭해 basemap 의 어느 문에 정합할지 결정. 모듈측에서는 비어있음.
     unitName: str | None = None
@@ -1015,9 +1014,8 @@ async def get_doors(
                 swing=d.get("swing") if isinstance(d.get("swing"), int) else None,
                 angleDeg=d.get("angleDeg") if isinstance(d.get("angleDeg"), (int, float)) else None,
                 wallSurfaceId=d.get("wallSurfaceId") if isinstance(d.get("wallSurfaceId"), str) else None,
-                doorThickness=d.get("doorThickness") if isinstance(d.get("doorThickness"), (int, float)) else None,
+                doorExtractionDepth=d.get("doorExtractionDepth") if isinstance(d.get("doorExtractionDepth"), (int, float)) else None,
                 boundarySplitEnabled=d.get("boundarySplitEnabled") if isinstance(d.get("boundarySplitEnabled"), bool) else None,
-                safetyMargin=d.get("safetyMargin") if isinstance(d.get("safetyMargin"), (int, float)) else None,
                 unitName=d.get("unitName") if isinstance(d.get("unitName"), str) else None,
             )
             # doorMesh / doorSplat — 옵션. Pydantic 가 형식 검증; 실패 시 그냥 패스 (corners 만으로 사용 가능).

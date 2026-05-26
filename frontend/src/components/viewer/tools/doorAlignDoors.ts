@@ -19,9 +19,8 @@ export const PRIMARY_DOOR_ID = 'door_1';
 //   swing: 1 (방 안쪽) | -1 (방 바깥쪽).
 //   angleDeg: 열림 각도 (도).
 //   wallSurfaceId: 'ceiling' | 'floor' | `w${number}` (polygon i번째 변 = `w${i}`). 어느 면 도어인지.
-//   doorThickness: 슬랩 깊이 (m, 방 안쪽 단방향).
+//   doorExtractionDepth: 슬랩 깊이 (m, 방 안쪽 단방향).
 //   boundarySplitEnabled: 경계 분할 ON/OFF.
-//   safetyMargin: 분할 안전 마진.
 export interface DoorMeshMeta {
   corners: number[][];      // 4 × 3 (A'+Y 프레임, z-fight 오프셋 적용)
   uvs: number[][];          // 4 × 2
@@ -43,9 +42,8 @@ interface DoorMeta {
   swing?: 1 | -1;
   angleDeg?: number;
   wallSurfaceId?: string;
-  doorThickness?: number;
+  doorExtractionDepth?: number;
   boundarySplitEnabled?: boolean;
-  safetyMargin?: number;
   doorMesh?: DoorMeshMeta;
   doorSplat?: DoorSplatMeta;
 }
@@ -64,9 +62,8 @@ export interface FetchedDoor {
   swing: 1 | -1;
   angleDeg: number;
   wallSurfaceId: string | null;
-  doorThickness: number | null;
+  doorExtractionDepth: number | null;
   boundarySplitEnabled: boolean | null;
-  safetyMargin: number | null;
 }
 
 export async function fetchDoorsFromServer(uploadId: string): Promise<FetchedDoor> {
@@ -76,9 +73,8 @@ export async function fetchDoorsFromServer(uploadId: string): Promise<FetchedDoo
     swing: 1,
     angleDeg: 75,
     wallSurfaceId: null,
-    doorThickness: null,
+    doorExtractionDepth: null,
     boundarySplitEnabled: null,
-    safetyMargin: null,
   };
   if (!uploadId.trim()) return empty;
   try {
@@ -93,9 +89,8 @@ export async function fetchDoorsFromServer(uploadId: string): Promise<FetchedDoo
       swing: target.swing === -1 ? -1 : 1,
       angleDeg: typeof target.angleDeg === 'number' ? target.angleDeg : 75,
       wallSurfaceId: surfaceId || null,
-      doorThickness: typeof target.doorThickness === 'number' ? target.doorThickness : null,
+      doorExtractionDepth: typeof target.doorExtractionDepth === 'number' ? target.doorExtractionDepth : null,
       boundarySplitEnabled: typeof target.boundarySplitEnabled === 'boolean' ? target.boundarySplitEnabled : null,
-      safetyMargin: typeof target.safetyMargin === 'number' ? target.safetyMargin : null,
     };
   } catch (e: any) {
     return empty;
@@ -110,9 +105,8 @@ export interface PersistOpts {
   swing?: 1 | -1;
   angleDeg?: number;
   wallSurfaceId?: string;
-  doorThickness?: number;
+  doorExtractionDepth?: number;
   boundarySplitEnabled?: boolean;
-  safetyMargin?: number;
   // basemap 의 다중 도어 영속화 — 각 도어의 mesh quad + door-side gaussian splat 자산 메타.
   // 별도로 PNG/PLY 를 MinIO 에 업로드한 후 그 파일명/메타를 doors.json 에 함께 저장.
   doorMesh?: DoorMeshMeta;
@@ -136,9 +130,8 @@ export async function persistDoorsToServer(
   if (opts.swing !== undefined) door.swing = opts.swing;
   if (opts.angleDeg !== undefined) door.angleDeg = opts.angleDeg;
   if (opts.wallSurfaceId !== undefined) door.wallSurfaceId = opts.wallSurfaceId;
-  if (opts.doorThickness !== undefined) door.doorThickness = opts.doorThickness;
+  if (opts.doorExtractionDepth !== undefined) door.doorExtractionDepth = opts.doorExtractionDepth;
   if (opts.boundarySplitEnabled !== undefined) door.boundarySplitEnabled = opts.boundarySplitEnabled;
-  if (opts.safetyMargin !== undefined) door.safetyMargin = opts.safetyMargin;
   if (opts.doorMesh !== undefined) door.doorMesh = opts.doorMesh;
   if (opts.doorSplat !== undefined) door.doorSplat = opts.doorSplat;
   try {
@@ -150,9 +143,8 @@ export async function persistDoorsToServer(
       if (door.swing === undefined && prev.swing !== undefined) door.swing = prev.swing;
       if (door.angleDeg === undefined && prev.angleDeg !== undefined) door.angleDeg = prev.angleDeg;
       if (door.wallSurfaceId === undefined && prev.wallSurfaceId !== undefined) door.wallSurfaceId = prev.wallSurfaceId;
-      if (door.doorThickness === undefined && prev.doorThickness !== undefined) door.doorThickness = prev.doorThickness;
+      if (door.doorExtractionDepth === undefined && prev.doorExtractionDepth !== undefined) door.doorExtractionDepth = prev.doorExtractionDepth;
       if (door.boundarySplitEnabled === undefined && prev.boundarySplitEnabled !== undefined) door.boundarySplitEnabled = prev.boundarySplitEnabled;
-      if (door.safetyMargin === undefined && prev.safetyMargin !== undefined) door.safetyMargin = prev.safetyMargin;
     }
     const others = opts.replaceExistingId === false
       ? (existing.doors ?? [])

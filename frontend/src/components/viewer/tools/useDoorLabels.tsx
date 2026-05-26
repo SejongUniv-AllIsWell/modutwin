@@ -6,21 +6,13 @@ import type { SplatViewerCoreRef } from '../SplatViewerCore';
 export interface DoorLabelEntry {
   id: string;
   unitName: string | null;       // null = 미설정 (회색 라벨로 "미설정" 표시)
-  /**
-   * raw 프레임 4 corners. centroid 로 라벨 위치 계산.
-   * 매 프레임 splatEntity 의 worldTransform 을 적용해 world 좌표로 변환.
-   * (이전엔 A'+Y 프레임 + Z-180 가정이었으나 basemap 도어 설정 단계는 splatEntity 가
-   *  Z-180 + pendingRotation 만 적용된 상태 = wallAngle Y 미베이크 → 라벨이 wallAngle 만큼
-   *  어긋남. raw + worldTransform 사용 시 단계 무관하게 일관.)
-   */
+  /** raw 프레임 4 corners. centroid 로 라벨 world 좌표 계산 (매 프레임 splatEntity.worldTransform 적용). */
   corners: number[][];
 }
 
 /**
  * 도어 corners (raw 프레임) 위에 말풍선 HTML 라벨 표시.
- * 매 프레임 카메라 worldToScreen 으로 화면 좌표 갱신.
- *
- * raw → world: splatEntity.getWorldTransform() 직접 사용 (단계별 변환 합성 가정 없음).
+ * 매 프레임 splatEntity.getWorldTransform() → world, 카메라 worldToScreen → 화면 좌표.
  */
 export function useDoorLabels(
   coreRef: RefObject<SplatViewerCoreRef | null>,

@@ -1,12 +1,6 @@
-// 직사각형 4점 → 직사각형 4점 rigid transform 직접 계산.
-//
-// normalizeDoorRect 로 src/dst 모두 완벽한 직사각형이 보장된 상태에서,
-// SVD 기반 Kabsch 대신 두 직사각형의 직교 basis 비교로 R, t 를 한 번에 산출.
-//
-// Kabsch 대비 이점:
-//  - 180° 매칭 모호성 (rect 의 mirror vs 180° 회전이 RMSD 동률) 제거.
-//  - dst basis 의 n 축 = 도어 평면 normal → gap push 방향이 deterministic.
-//  - SVD 없음 → 단순 빠름.
+// 직사각형 4점 ↔ 직사각형 4점 similarity transform (R, s, t) 산출.
+// 두 사각형의 직교 basis (e1, e2, n) 를 직접 비교해 R 계산. 180° 매칭 모호성 없음.
+// dst basis 의 n 축 = 도어 평면 normal → gap push 방향 deterministic.
 
 import type { Vec3 } from './mat3';
 
@@ -64,11 +58,13 @@ function buildBasisWithForcedNormal(p: Float64Array, nForced: V3): Basis {
 }
 
 export interface RectFitResult {
-  /** row-major 3×3 (9 elements) — kabsch 반환 형식과 동일. */
+  /** row-major 3×3 (9 elements) — kabsch 반환 형식과 동일. 회전 (det=+1) 부분. */
   R: number[];
-  /** 3 elements. */
+  /** uniform 스케일 — withScale=true 일 때 산출, 아니면 1. 최종 transform 은 (s · R, t). */
+  s: number;
+  /** 3 elements. translation. */
   t: number[];
-  /** 잔차 (perfect rect 가정 시 ≈ 0). 진단용. */
+  /** 잔차. perfect rect + 동일 크기 가정 시 ≈ 0. scale 미사용이면 크기 차이만큼 큼. */
   rmsd: number;
   /** dst 평면 normal in world (gap push 방향으로 사용 가능). dstOutwardWorld 가 지정되면 그것과 동일. */
   dstN: V3;
@@ -77,23 +73,39 @@ export interface RectFitResult {
 }
 
 /**
- * 직사각형 4점 ↔ 직사각형 4점 rigid fit.
+ * 직사각형 4점 ↔ 직사각형 4점 fit.
  *
  * @param src   module 측 4 corner world 좌표 (Float64Array length 12).
  * @param dst   basemap 측 4 corner world 좌표 (MIRROR_MAP 등 사전 매칭 적용 후).
  * @param opts.dstForcedN  지정 시 dst basis 의 n 을 이 방향으로 강제. cornerpick winding 무관 deterministic.
  *                         MIRROR_MAP 적용 후 dst 의 자연 cross-product 와 일치하는 방향으로 지정해야 R 이 올바름.
  *                         (typical: basemap door 의 경우 basemap room inward 방향.)
+ * @param opts.withScale   true 면 uniform 스케일도 계산 — module 도어가 basemap 도어 크기에 맞도록.
+ *                         최종 transform: p_dst' = s · R · p_src + t. 두 변(e1, e2) 길이비의 기하 평균.
  */
 export function rectFit(
   src: Float64Array,
   dst: Float64Array,
-  opts: { dstForcedN?: V3 } = {},
+  opts: { dstForcedN?: V3; withScale?: boolean } = {},
 ): RectFitResult {
   const Bs = buildBasisFromCorners(src);
   const Bd = opts.dstForcedN
     ? buildBasisWithForcedNormal(dst, opts.dstForcedN)
     : buildBasisFromCorners(dst);
+
+  // uniform scale — withScale=true 면 src 도어 크기를 dst 도어 크기에 맞춤.
+  //   s = sqrt((|e1d| / |e1s|) × (|e2d| / |e2s|))  (기하 평균)
+  // src/dst 가 정확히 같은 비율이면 두 비율 일치 → s 가 그 비율. 다른 비율이면 평균치.
+  let s = 1;
+  if (opts.withScale) {
+    const e1s_len = Math.hypot(src[3]-src[0], src[4]-src[1], src[5]-src[2]);
+    const e2s_len = Math.hypot(src[6]-src[3], src[7]-src[4], src[8]-src[5]);
+    const e1d_len = Math.hypot(dst[3]-dst[0], dst[4]-dst[1], dst[5]-dst[2]);
+    const e2d_len = Math.hypot(dst[6]-dst[3], dst[7]-dst[4], dst[8]-dst[5]);
+    if (e1s_len > 1e-9 && e2s_len > 1e-9) {
+      s = Math.sqrt((e1d_len / e1s_len) * (e2d_len / e2s_len));
+    }
+  }
 
   // R 은 src 의 basis 컬럼 (e1, e2, n) 을 dst 의 basis 컬럼으로 보내는 회전.
   //   R · [e1_s e2_s n_s] = [e1_d e2_d n_d]
@@ -126,22 +138,22 @@ export function rectFit(
     R = buildR([Bs.e1, e2Flipped, nFlipped], Bdcols);
   }
 
-  // t = c_dst - R · c_src
+  // t = c_dst - s · R · c_src   (similarity transform: p_dst = s · R · p_src + t)
   const Rcs: V3 = [
     R[0]*Bs.c[0] + R[1]*Bs.c[1] + R[2]*Bs.c[2],
     R[3]*Bs.c[0] + R[4]*Bs.c[1] + R[5]*Bs.c[2],
     R[6]*Bs.c[0] + R[7]*Bs.c[1] + R[8]*Bs.c[2],
   ];
-  const t = [Bd.c[0] - Rcs[0], Bd.c[1] - Rcs[1], Bd.c[2] - Rcs[2]];
+  const t = [Bd.c[0] - s*Rcs[0], Bd.c[1] - s*Rcs[1], Bd.c[2] - s*Rcs[2]];
 
-  // 잔차 계산 — perfect rect 가정 위반 정도 (사용자 픽 직사각화 후엔 ~0).
+  // 잔차 — perfect rect + scale 적용 시 ≈ 0.
   let sumSq = 0;
   for (let i = 0; i < 4; i++) {
     const sp = getP(src, i);
     const Rsp: V3 = [
-      R[0]*sp[0] + R[1]*sp[1] + R[2]*sp[2] + t[0],
-      R[3]*sp[0] + R[4]*sp[1] + R[5]*sp[2] + t[1],
-      R[6]*sp[0] + R[7]*sp[1] + R[8]*sp[2] + t[2],
+      s*(R[0]*sp[0] + R[1]*sp[1] + R[2]*sp[2]) + t[0],
+      s*(R[3]*sp[0] + R[4]*sp[1] + R[5]*sp[2]) + t[1],
+      s*(R[6]*sp[0] + R[7]*sp[1] + R[8]*sp[2]) + t[2],
     ];
     const dp = getP(dst, i);
     const dx = Rsp[0]-dp[0], dy = Rsp[1]-dp[1], dz = Rsp[2]-dp[2];
@@ -149,7 +161,7 @@ export function rectFit(
   }
   const rmsd = Math.sqrt(sumSq / 4);
 
-  return { R, t, rmsd, dstN: Bd.n, dstCenter: Bd.c };
+  return { R, s, t, rmsd, dstN: Bd.n, dstCenter: Bd.c };
 }
 
 export type { Vec3 };

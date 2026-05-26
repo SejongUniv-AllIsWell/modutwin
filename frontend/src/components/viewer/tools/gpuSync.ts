@@ -21,6 +21,11 @@ export function syncGPU(
   const rot1 = gsplatData?.getProp('rot_1'); // x
   const rot2 = gsplatData?.getProp('rot_2'); // y
   const rot3 = gsplatData?.getProp('rot_3'); // z
+  // 스케일은 베이크 회전 등 전체 일괄 sync 시 transformB lock 이 zeroed buffer 를 반환하면
+  // slot 0~2 가 0 으로 덮여 exp(0)=1m 로 부풀므로, 회전 quat 옆에 항상 같이 써준다.
+  const sc0 = gsplatData?.getProp('scale_0');
+  const sc1 = gsplatData?.getProp('scale_1');
+  const sc2 = gsplatData?.getProp('scale_2');
 
   for (const idx of indices) {
     const nx = splatData.posX[idx];
@@ -40,6 +45,11 @@ export function syncGPU(
 
     // transformB: [scaleX(half), scaleY(half), scaleZ(half), rotZ(half)]
     if (dataB) {
+      if (sc0 && sc1 && sc2) {
+        dataB[idx * 4 + 0] = float2HalfFn(Math.exp(sc0[idx]));
+        dataB[idx * 4 + 1] = float2HalfFn(Math.exp(sc1[idx]));
+        dataB[idx * 4 + 2] = float2HalfFn(Math.exp(sc2[idx]));
+      }
       dataB[idx * 4 + 3] = float2HalfFn(qz);
     }
   }

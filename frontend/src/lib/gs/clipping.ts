@@ -26,19 +26,29 @@ export interface ClipScaleUpdate {
 }
 
 export interface ClipOptions {
-  /** sigma 배수. extent = kSigma · σ. default 3. */
+  /**
+   * 법선 방향 mahalanobis cutoff (σ 배수). 가우시안의 normal 방향 kSigma·σ 점이 벽 평면에 닿게 강제.
+   *
+   * textureBake render cutoff:
+   *   - exponent (= -½·d²) < -6  →  d > √12 ≈ 3.46410σ  ← 하드 컷 (해당 splat-pixel 건너뜀)
+   *   - α_g (= opacity·exp(exp)) < 1e-3 → opacity=1 가정 d > √(2·ln 1000) ≈ 3.717σ (덜 엄격)
+   *   → 두 조건 중 먼저 걸리는 게 √12 ≈ 3.46410. 이 값보다 큰 σ 위치는 절대 렌더 안 됨.
+   *
+   * 따라서 kSigma > 3.46410 이면 렌더되는 모든 픽셀이 벽 평면 안에 있음 (= 닿지 않음).
+   * default = √12 + 1e-3 ≈ 3.4651 — 이론 최소값 + 1mm/m 안전 (float 정밀도 + 잠재 viewer 차이 흡수).
+   * 1m 벽 거리 기준 ≈ 0.3mm 여백, 1cm 벽 거리 기준 ≈ 3μm 여백 (사실상 0).
+   */
   kSigma?: number;
-  /** 평면 안쪽으로 살짝 당겨서 끊을 여유 거리 (m). default 0.001 (1mm). */
-  epsilon?: number;
 }
+
+export const RENDER_CUTOFF_SIGMA = Math.sqrt(12);  // = 3.4641016... (textureBake exponent<-6)
 
 export function computeBoundaryClipping(
   scene: GaussianScene,
   planes: SurfacePlane[],
   opts: ClipOptions = {},
 ): ClipScaleUpdate[] {
-  const kSigma = Math.max(1, opts.kSigma ?? 3);
-  const epsilon = Math.max(0, opts.epsilon ?? 0.001);
+  const kSigma = Math.max(1, opts.kSigma ?? (RENDER_CUTOFF_SIGMA + 1e-3));
   const kSq = kSigma * kSigma;
 
   const px = scene.attrs.get('x');
@@ -84,8 +94,7 @@ export function computeBoundaryClipping(
       if (sd > 0) continue; // center 가 평면 외부 → flatten 처리. clip 대상 아님.
 
       const absSd = -sd;
-      const target = Math.max(0, absSd - epsilon);
-      const T = (target * target) / kSq;
+      const T = (absSd * absSd) / kSq;
 
       const a0 = lx0*nx + lx1*ny + lx2*nz;
       const a1 = ly0*nx + ly1*ny + ly2*nz;

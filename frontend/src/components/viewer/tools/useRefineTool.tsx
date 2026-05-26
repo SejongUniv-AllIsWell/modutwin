@@ -152,9 +152,16 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   // 원본 PLY 파싱본 캐시 (A 좌표계, 불변). 첫 정제 작업 또는 저장 시 lazy 파싱.
   const originalSceneRef = useRef<GaussianScene | null>(null);
 
-  // 누적 회전 (rotX, rotZ) 라디안. CF 모달이 누적 입력. 옵션 A: 막 생성 후 lock.
+  // 누적 회전 (rotX, rotZ) 라디안. CF 모달이 누적 입력.
+  // 다듬기 단계 동안 살아있다가 saveRefined() 시 splatData 에 in-place 베이크 → 0 으로 리셋.
+  // 이후 모든 코드는 splatData = A' 가정 (entity Z-180 만, buildRotatedPositions 등 no-op).
   const pendingRotationRef = useRef<{ rotX: number; rotZ: number }>({ rotX: 0, rotZ: 0 });
   const [pendingRotation, setPendingRotation] = useState<{ rotX: number; rotZ: number }>({ rotX: 0, rotZ: 0 });
+
+  // 베이크된 회전 — splatData 에 적용된 누적 회전. saveRefined() 시 pendingRotation 을 옮겨 받음.
+  // 용도: 서버 PLY 저장 (raw 원본 + bakedRotation + wallAngle → A'+Y), 페이지 재로드 시 splatData 재베이크.
+  const bakedRotationRef = useRef<{ rotX: number; rotZ: number }>({ rotX: 0, rotZ: 0 });
+  const [bakedRotation, setBakedRotation] = useState<{ rotX: number; rotZ: number }>({ rotX: 0, rotZ: 0 });
 
   // flatten 마스크: 1=삭제(현재 회전된 프레임 기준 평면 외부). null=아직 적용 안 됨.
   const flattenMaskRef = useRef<Uint8Array | null>(null);
@@ -181,8 +188,6 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   const [clipping, setClipping] = useState(false); // 처리 중 플래그
   // snapshot: clip 적용된 splat 들의 원본 log-scale (idx 별).
   const clippingSnapshotRef = useRef<Array<{ idx: number; s0: number; s1: number; s2: number }>>([]);
-  // 평면 안쪽으로 끊어줄 여유 거리 (m). 사용자가 경험적으로 조절 후 적정값 찾으면 슬라이더 제거 예정.
-  const [clippingEpsilon, setClippingEpsilon] = useState(0.001);
 
   // ── Wall mesh test (texture-baked quad mesh, MVP)
   const [wallMeshActive, setWallMeshActive] = useState(false);
@@ -215,7 +220,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   // ── 안전거리 시각화 (화살표) ──
   const [safetyVizActive, setSafetyVizActive] = useState(false);
   // depthGate (방 안쪽 alpha blending start 경계). 사용자가 모달에서 정의한 경계면(sd=0) 에서 시작 →
-  // 막 위치 (MESH_PLANE_INSET=0) 와 정확히 일치 → "층 두 개" 잔상 제거. 0 으로 고정.
+  // 막 위치 (사용자 경계면 sd=0) 와 정확히 일치 → "층 두 개" 잔상 제거. 0 으로 고정.
   const bakeInnerGate = 0;
   const safetyVizEntityRef = useRef<any>(null);
 
@@ -651,7 +656,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       const cached = await ensureOriginalScene();
       const rotated = await buildRotatedScene(cached);
       const { computeBoundaryClipping } = await import('@/lib/gs/clipping');
-      const updates = computeBoundaryClipping(rotated, planes, { epsilon: clippingEpsilon });
+      const updates = computeBoundaryClipping(rotated, planes);
       console.log(`[Clipping] ${updates.length} / ${cached.numSplats} splats clipped.`);
 
       const cs0 = cached.attrs.get('scale_0') as Float32Array;
@@ -681,7 +686,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     } finally {
       setClipping(false);
     }
-  }, [coreRef, ensureOriginalScene, buildRotatedScene, wallMode, cfMode, clippingEpsilon, pushOp]);
+  }, [coreRef, ensureOriginalScene, buildRotatedScene, wallMode, cfMode, pushOp]);
 
   // ── applyFloater: 토글식. flatten(모듈 외부 제거) 활성 상태일 때만 호출 가능.
   // brush 삭제 ∪ flatten 마스크 = excludeMask. 남은 가우시안에 대해 voxel 카운트 + opacity 컷으로 floater 검출.
@@ -790,7 +795,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
 
     setWallMeshBaking(true);
     try {
-      const { bakeTextureForPlane, planeBakeInputForSurface, MESH_PLANE_INSET } = await import('@/lib/gs/textureBake');
+      const { bakeTextureForPlane, planeBakeInputForSurface } = await import('@/lib/gs/textureBake');
       const { createWallMeshEntity } = await import('@/lib/gs/wallMesh');
       const { filterScene } = await import('@/lib/ply');
 
@@ -858,9 +863,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         return;
       }
 
-      // 메시는 6면 모두 평면(sd=0) 에서 법선 방향(=방 바깥) 으로 MESH_PLANE_INSET (1mm) 들여놓음.
-      // planeBakeInputForSurface 안의 extend* 도 같은 상수에서 파생 → 직육면체 코너 자동 정합.
-      console.log(`[bakeWallMeshTest] mesh inset: ${(MESH_PLANE_INSET * 1000).toFixed(1)}mm (모든 면 동일)`);
+      // 메시는 사용자가 정의한 경계 평면(sd=0) 에 정확히 배치.
 
       lastBakesRef.current.clear();
       console.log(`[bakeWallMeshTest] CLICK — bakeInnerGate=${bakeInnerGate} (slider value at button click time)`);
@@ -1187,14 +1190,16 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     if (!saved) { loadedUploadIdRef.current = uid; return; }
 
     restoringRef.current = true;
-    // 천장/바닥 + pendingRotation
+    // 천장/바닥 + pendingRotation + bakedRotation
     if (saved.cfConfirmed) {
       setCeilingY(saved.ceilingY); setFloorY(saved.floorY);
       ceilingYRef.current = saved.ceilingY; floorYRef.current = saved.floorY;
       setCfMode('confirmed'); cfModeRef.current = 'confirmed';
       const rot = { rotX: saved.rotX ?? 0, rotZ: saved.rotZ ?? 0 };
       setPendingRotation(rot); pendingRotationRef.current = rot;
-      // entity 회전도 즉시 동기화 (다음 마운트 시 splatData 가 준비되면 자동 호출되지만 안전 차원).
+      const baked = { rotX: saved.bakedRotX ?? 0, rotZ: saved.bakedRotZ ?? 0 };
+      setBakedRotation(baked); bakedRotationRef.current = baked;
+      // bakedRotation 이 있으면 splatData 가 마운트된 후 in-place 재베이크 필요 (별도 useEffect 가 처리).
     }
     // 벽면
     if (saved.wallConfirmed && saved.wallAngle !== null && saved.wallPolygon) {
@@ -1223,6 +1228,8 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       cfConfirmed: cfMode === 'confirmed',
       ceilingY, floorY,
       rotX: pendingRotation.rotX, rotZ: pendingRotation.rotZ,
+      bakedRotX: bakedRotation.rotX,
+      bakedRotZ: bakedRotation.rotZ,
       wallConfirmed: wallMode === 'confirmed',
       wallAngle, wallPolygon,
       selectedSurfaces: Array.from(selectedSurfaces),
@@ -1232,6 +1239,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     options?.uploadId, undoDepth,
     cfMode, ceilingY, floorY,
     pendingRotation.rotX, pendingRotation.rotZ,
+    bakedRotation.rotX, bakedRotation.rotZ,
     wallMode, wallAngle, wallPolygon,
     selectedSurfaces, globalOffset, globalOffsetText,
   ]);
@@ -1522,6 +1530,48 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     planesRef.current = []; syncPlanes(); setSelectedPlane(-1); selectedPlaneRef.current = -1; setOutsideCount(0); setClosed(false);
   }, [coreRef, syncPlanes]);
 
+  // ── 다듬기 완료 시 splatData 회전 베이크 ──
+  // pendingRotation (CeilingFloor 단계에서 사용자가 설정한 X/Z 회전) 을 splatData posX/Y/Z + rot quat 에
+  // in-place 적용 후 GPU 텍스처 갱신. 이후 splatEntity local rotation = Z-180 만, splatData = A' 프레임.
+  // bakedRotationRef 에 적용된 회전값 보관 (서버 PLY 저장 시 raw 원본에 다시 적용해 A'+Y 만들기 위해).
+  const bakeSplatRotation = useCallback(async () => {
+    const data = splatDataRef.current;
+    const core = coreRef.current;
+    const float2Half = core?.float2Half;
+    if (!data || !data.gsplatData || !float2Half) return;
+    const { rotX, rotZ } = pendingRotationRef.current;
+    if (rotX === 0 && rotZ === 0) return;  // 이미 baked / no-op
+
+    const { rotateScene } = await import('@/lib/gs');
+    const { syncGPU } = await import('./gpuSync');
+
+    // splatData.posX/Y/Z 와 gsplatData.rot_0..3 은 같은 Float32Array 참조. wrapping scene 만들어 in-place 회전.
+    const sceneLike = {
+      numSplats: data.numSplats,
+      propertyOrder: ['x', 'y', 'z', 'rot_0', 'rot_1', 'rot_2', 'rot_3'],
+      attrs: new Map<string, Float32Array>(),
+    };
+    sceneLike.attrs.set('x', data.posX);
+    sceneLike.attrs.set('y', data.posY);
+    sceneLike.attrs.set('z', data.posZ);
+    for (const k of ['rot_0', 'rot_1', 'rot_2', 'rot_3'] as const) {
+      const a = data.gsplatData.getProp(k) as Float32Array | undefined;
+      if (a) sceneLike.attrs.set(k, a);
+    }
+    rotateScene(sceneLike as any, rotX, rotZ);
+
+    // 전체 splat 의 GPU 텍스처 (positions + rot quat) + sorter centers 갱신.
+    const allIndices = Array.from({ length: data.numSplats }, (_, i) => i);
+    syncGPU(allIndices, data, float2Half);
+
+    // 베이크 완료 — pendingRotation 0 으로 리셋, baked 에 옮김.
+    bakedRotationRef.current = { rotX, rotZ };
+    setBakedRotation({ rotX, rotZ });
+    pendingRotationRef.current = { rotX: 0, rotZ: 0 };
+    setPendingRotation({ rotX: 0, rotZ: 0 });
+    applyEntityRotation();  // entity = Z-180 only
+  }, [applyEntityRotation]);
+
   // ── 다듬기 완료 버튼 — 서버 통신 없음, 문 설정 단계로 transition 만. ──
   // 서버 영속 타이밍:
   //   - 모듈 등록 흐름: 정합 완료 시점 `commit-final` 일괄.
@@ -1534,9 +1584,11 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     // flatten preview 빨강도 해제
     setFlattenPreviewActive(false);
     flattenPreviewActiveRef.current = false;
+    // pendingRotation 을 splatData 에 in-place 베이크 → 이후 코드는 단일 frame (A') 가정.
+    await bakeSplatRotation();
     setSaved(true);
     options?.onSwitchToAlign?.();
-  }, [options]);
+  }, [options, bakeSplatRotation]);
 
   // 다듬기 결과 자산(PLY + mesh.json + tex_*.png) 을 메모리에서 빌드해 반환. 업로드 안 함.
   // 새 흐름(정합 완료 시 일괄 영속화) 의 commit-final 페이로드 작성용.
@@ -1572,11 +1624,13 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
 
     const wallAngleDeg = wallAngleRef.current ?? 0;
     const wallAngleRad = (wallAngleDeg * Math.PI) / 180;
-    const { rotX, rotZ } = pendingRotationRef.current;
-    const { rotateSceneY } = await import('@/lib/gs');
+    // saveRefined() 에서 splatData 에 bakedRotation 을 in-place 적용했지만 ensureOriginalScene 은
+    // 디스크의 raw PLY 를 반환 — 서버 저장본도 동일 변환 (raw → A'+Y) 필요.
+    const { rotX, rotZ } = bakedRotationRef.current;
+    const { rotateSceneY, rotateScene } = await import('@/lib/gs');
     let toRotate = original;
     if (rotX !== 0 || rotZ !== 0 || wallAngleRad !== 0) {
-      toRotate = await buildRotatedScene(original);
+      toRotate = await buildRotatedSceneForRotation(original, { rotX, rotZ });
       if (wallAngleRad !== 0) rotateSceneY(toRotate, wallAngleRad);
     }
     const baked = filterScene(toRotate, keep);
@@ -1695,20 +1749,19 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         }
       }
 
-      // 2) 필터링 + 회전 베이크 (원본 → 회전 적용 + 살릴 가우시안만)
-      // SPEC 변경: 다듬기 단계의 정렬 회전 (pendingRotation rotX/rotZ + wallAngle Y) 을 PLY 에 베이크.
-      //   사용자가 천장/바닥/벽면 모달로 잡은 정렬 상태가 그대로 final.ply 에 들어감 →
-      //   재진입 시 splatEntity 에 default Z-180 만 적용해도 정렬된 상태로 보임.
+      // 2) 필터링 + 회전 베이크 (원본 raw → bakedRotation + wallAngle 적용 = A'+Y, 살릴 가우시안만)
+      //   final.ply 가 A'+Y 프레임이라 재진입 시 splatEntity 에 Z-180 만 적용해도 정렬된 상태로 보임.
+      //   bakedRotation 은 saveRefined() 가 splatData 에 in-place 적용한 회전 — 원본 raw 에도 동일 적용 필요.
       //   mesh.json corners 도 같은 A'+Y 프레임 (planeBakeInputForSurface 가 wallAngle 반영) 이므로 일치.
       const wallAngleDeg = wallAngleRef.current ?? 0;
       const wallAngleRad = (wallAngleDeg * Math.PI) / 180;
-      const { rotX, rotZ } = pendingRotationRef.current;
+      const { rotX, rotZ } = bakedRotationRef.current;
 
       const { rotateSceneY } = await import('@/lib/gs');
       // original 은 reference 라 destructive rotateScene 호출 전에 cloned scene 사용.
       let toRotate = original;
       if (rotX !== 0 || rotZ !== 0 || wallAngleRad !== 0) {
-        toRotate = await buildRotatedScene(original);    // pendingRotation rotX/rotZ
+        toRotate = await buildRotatedSceneForRotation(original, { rotX, rotZ });
         if (wallAngleRad !== 0) rotateSceneY(toRotate, wallAngleRad);
       }
       const baked = filterScene(toRotate, keep);
@@ -1854,7 +1907,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         console.log(`[Save] no wall mesh baked — skipping mesh sidecar`);
       }
 
-      // 3.4) 백엔드에 SceneOutput 등록 (레거시 호환)
+      // 3.4) 백엔드 SceneOutput 등록 (`/refine/save`).
       const saveResp = await api.post<{ scene_id: string; message: string }>('/refine/save', {
         upload_id: activeUploadId,
         source_key: plyUrl.key,
@@ -1950,6 +2003,8 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     // 6) 정제 의도 초기화
     pendingRotationRef.current = { rotX: 0, rotZ: 0 };
     setPendingRotation({ rotX: 0, rotZ: 0 });
+    bakedRotationRef.current = { rotX: 0, rotZ: 0 };
+    setBakedRotation({ rotX: 0, rotZ: 0 });
     flattenMaskRef.current = null;
     flattenActiveRef.current = false; setFlattenActive(false);
     flattenVisibleRef.current = true; setFlattenVisible(true);
@@ -2050,7 +2105,32 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
 
     // 새 splatData 수신 시 누적 회전 / flatten 마스크가 있으면 즉시 시각 동기화
     // (페이지 새로고침 후 persistence 복원이나 reset 후 등에서 호출됨)
-    setTimeout(() => {
+    setTimeout(async () => {
+      // bakedRotation 이 복원되었으면 splatData 에 다시 in-place 적용 → splatData = A' 상태 복원.
+      const baked = bakedRotationRef.current;
+      if (baked.rotX !== 0 || baked.rotZ !== 0) {
+        const core = coreRef.current;
+        const f2h = core?.float2Half;
+        if (f2h && data.gsplatData) {
+          const { rotateScene } = await import('@/lib/gs');
+          const { syncGPU } = await import('./gpuSync');
+          const sceneLike = {
+            numSplats: data.numSplats,
+            propertyOrder: ['x', 'y', 'z', 'rot_0', 'rot_1', 'rot_2', 'rot_3'],
+            attrs: new Map<string, Float32Array>(),
+          };
+          sceneLike.attrs.set('x', data.posX);
+          sceneLike.attrs.set('y', data.posY);
+          sceneLike.attrs.set('z', data.posZ);
+          for (const k of ['rot_0', 'rot_1', 'rot_2', 'rot_3'] as const) {
+            const a = data.gsplatData.getProp(k) as Float32Array | undefined;
+            if (a) sceneLike.attrs.set(k, a);
+          }
+          rotateScene(sceneLike as any, baked.rotX, baked.rotZ);
+          const allIndices = Array.from({ length: data.numSplats }, (_, i) => i);
+          syncGPU(allIndices, data, f2h);
+        }
+      }
       applyEntityRotation();
       if (flattenActiveRef.current && flattenMaskRef.current) {
         // splatData가 새로 로드된 경우, 이전 마스크의 길이가 다를 수 있으니 검사
@@ -3131,18 +3211,6 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
               {/* 경계면 가우시안 다듬기 — 막 생성 후 사용 가능. */}
               <div className={`border-t border-gray-700 pt-2 mt-1 space-y-1.5 ${wallMeshActive ? '' : 'opacity-50 pointer-events-none'}`}>
                 <div className="text-[10px] text-gray-400 font-bold">경계면 가우시안 다듬기</div>
-                <div className="flex items-center gap-1.5 text-[10px]"
-                  title={`가우시안이 경계면에서 ${(clippingEpsilon * 1000).toFixed(1)}mm 여유를 가지고 다듬어집니다. 여유를 너무 줄이면 가우시안 줄무늬가 나타날 수 있습니다.`}>
-                  <span className="text-gray-400 w-14">다듬기 여유</span>
-                  <input type="range" min={0} max={0.05} step={0.0005}
-                    value={clippingEpsilon}
-                    disabled={clippingActive}
-                    onChange={(e) => setClippingEpsilon(parseFloat(e.target.value))}
-                    className="flex-1 accent-cyan-500 cursor-pointer disabled:cursor-not-allowed disabled:opacity-50" />
-                  <span className="text-white font-mono w-14 text-right">
-                    {(clippingEpsilon * 1000).toFixed(1)}mm
-                  </span>
-                </div>
                 <button onClick={() => applyClipping()}
                   disabled={!wallMeshActive || clipping}
                   title={!wallMeshActive ? '먼저 막을 생성하세요.' : ''}
@@ -3506,11 +3574,16 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   // commitRefinedToServer 가 서버 업로드 완료 후 반환하던 베이크 회전값을, 업로드 기다리지 않고
   // 동기적으로 얻어와서 doors corners 변환 등에 즉시 사용할 수 있게 한다.
   // (메모리 직주입 후 백그라운드 저장으로 흐름이 바뀌어 await 가 부담스러워졌기 때문.)
-  const getCurrentBakedRotation = useCallback((): { rotX: number; rotZ: number; wallAngleRad: number } => {
+  // "현재 splat 프레임 → A'+Y 로 변환하기 위해 추가로 적용할 회전" 반환.
+  //   - 다듬기 단계 (saveRefined 전): splat = raw. 추가 회전 = pendingRotation + wallAngle.
+  //   - 다듬기 완료 후 (saveRefined 후): splat = A'. pendingRotation 0. 추가 회전 = wallAngle 만.
+  // 호출자(DoorAlignModal `rotateForSave`, UnifiedSplatEditor `doorCornersAY` 변환)는 현재 splat 프레임의
+  // 코너를 A'+Y 로 옮기는 용도이므로 항상 "남은 미적용 회전" 이 필요.
+  const getRemainingRotationToAY = useCallback((): { rotX: number; rotZ: number; wallAngleRad: number } => {
     const { rotX, rotZ } = pendingRotationRef.current;
     const wallAngleDeg = wallAngleRef.current ?? 0;
     return { rotX, rotZ, wallAngleRad: (wallAngleDeg * Math.PI) / 180 };
   }, []);
 
-  return { overlay, panel, modals, onSplatLoaded, planes, saveRefined, commitRefinedToServer, gatherRefinedAssets, getCurrentKeepMask, getBakeRgba, getCurrentBakedRotation };
+  return { overlay, panel, modals, onSplatLoaded, planes, saveRefined, commitRefinedToServer, gatherRefinedAssets, getCurrentKeepMask, getBakeRgba, getRemainingRotationToAY };
 }

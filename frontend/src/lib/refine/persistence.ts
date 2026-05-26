@@ -3,9 +3,9 @@
 // 따라서 여기에는 PLY 참조 없이 사용자가 확정한 파라미터만 보관한다.
 // upload_id별로 독립된 엔트리.
 
-// v6: 4벽 wallDistances → N벽 wallPolygon (cycle 순서의 N개 점). 마이그레이션 미지원.
-const KEY_PREFIX = 'refine_state_v6_';
-const STATE_VERSION = 6;
+// v7: bakedRotation 추가 (다듬기 완료 시 splatData 에 in-place 적용된 회전 — 페이지 재로드 시 복원용).
+const KEY_PREFIX = 'refine_state_v7_';
+const STATE_VERSION = 7;
 
 // surfaceId 가 동적 (`w0..w(N-1)`) 이라 string. refineTypes.Surface 와 동일.
 export type Surface = string;
@@ -23,9 +23,12 @@ export interface PersistedRefineState {
   ceilingY: number;
   floorY: number;
   // pendingRotation (radians) — 천장/바닥 모달에서 잡은 X/Z 축 정렬.
-  // surfacePlanesFromPolygon 의 평면이 정의되는 A' 프레임을 표현.
+  // 다듬기 완료 (saveRefined) 시 splatData 에 in-place 적용 후 0 으로 리셋. 적용된 값은 bakedRotX/Z 에 옮김.
   rotX: number;
   rotZ: number;
+  // 다듬기 완료 시 splatData 에 in-place 적용된 회전 (radians). 페이지 재로드 시 splat 에 다시 적용해 복원.
+  bakedRotX: number;
+  bakedRotZ: number;
 
   wallConfirmed: boolean;
   // 벽 베이크용 Y회전 (도). 폴리곤의 PCA 또는 첫 변 방향 등에서 derive. 폴리곤 변경 시에도

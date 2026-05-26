@@ -11,7 +11,7 @@ interface Props {
   lockedStages: ReadonlySet<'upload' | 'refine' | 'door'>;
   onPickFiles: (files: File[]) => void;
   onToggleMode: (next: 'refine' | 'door' | 'align') => void;
-  /** 사이드바 + 레이어 + 툴 패널 전체를 왼쪽으로 밀어 숨긴다. (이전 onBack 자리). */
+  /** 사이드바 + 레이어 + 툴 패널 전체를 왼쪽으로 밀어 숨김. */
   onCollapse: () => void;
 }
 
@@ -24,7 +24,8 @@ export default function ViewerSidebar({
   const refineLocked = lockedStages.has('refine');
   const doorLocked = lockedStages.has('door');
   const lockTitle = '이전 단계는 완료된 상태로 잠겼습니다. 되돌릴 수 없습니다.';
-  const lockedClass = 'opacity-40 cursor-not-allowed';
+  // 잠긴 단계: 텍스트가 살짝 흐리되 확실히 읽히게 (검은 배경 기준 opacity-40 은 거의 안 보임).
+  const lockedClass = 'text-gray-500 cursor-not-allowed';
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleFile = (e: React.ChangeEvent<HTMLInputElement>) => {

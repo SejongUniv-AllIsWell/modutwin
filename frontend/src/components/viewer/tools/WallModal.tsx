@@ -311,30 +311,42 @@ export default function WallModal({
         ctx.lineTo(toX(b.x), toY(b.z));
         ctx.stroke();
       }
-      // 선택 edge — 첫 선택 (기준) 은 초록, 나머지는 주황.
+      // 선택 edge — 첫 선택 = 기준선 (밝은 시안, 두꺼움, "기준" 라벨), 나머지 = 평행화 대상 (주황, 번호).
       for (let k = 0; k < parallelSelected.length; k++) {
         const segIdx = parallelSelected[k];
         if (segIdx < 0 || segIdx >= N) continue;
         const a = polygon[segIdx];
         const b = polygon[(segIdx + 1) % N];
-        ctx.strokeStyle = k === 0 ? '#22c55e' : '#f59e0b';
-        ctx.lineWidth = 5;
+        const isBase = k === 0;
+        ctx.strokeStyle = isBase ? '#22d3ee' : '#f59e0b';
+        ctx.lineWidth = isBase ? 7 : 5;
         ctx.beginPath();
         ctx.moveTo(toX(a.x), toY(a.z));
         ctx.lineTo(toX(b.x), toY(b.z));
         ctx.stroke();
-        // 번호 라벨 (변 중점).
+        // 라벨 (변 중점) — 기준은 별 모양 + "기준", 대상은 원 + 번호.
         const mx = (a.x + b.x) / 2, mz = (a.z + b.z) / 2;
         const lx = toX(mx), ly = toY(mz);
-        ctx.fillStyle = k === 0 ? '#22c55e' : '#f59e0b';
-        ctx.beginPath();
-        ctx.arc(lx, ly, 11, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.fillStyle = '#0f172a';
-        ctx.font = 'bold 12px sans-serif';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillText(String(k + 1), lx, ly);
+        if (isBase) {
+          // 기준선 — 큰 사각형 배경 + "기준" 텍스트.
+          ctx.fillStyle = '#22d3ee';
+          ctx.fillRect(lx - 18, ly - 10, 36, 20);
+          ctx.fillStyle = '#0f172a';
+          ctx.font = 'bold 11px sans-serif';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText('기준', lx, ly);
+        } else {
+          ctx.fillStyle = '#f59e0b';
+          ctx.beginPath();
+          ctx.arc(lx, ly, 11, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.fillStyle = '#0f172a';
+          ctx.font = 'bold 12px sans-serif';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText(String(k), lx, ly);  // k=1,2,3... (기준이 0 이라 대상은 1부터)
+        }
       }
     }
 
@@ -821,9 +833,9 @@ export default function WallModal({
         <div className="text-[var(--muted)] text-xs mb-3">
           {mode === 'parallel' ? (
             <>
-              좌클릭으로 선분 선택. 첫 선택 선분이 기준 각도, 나머지가 그에 평행해집니다.
+              ① 좌클릭으로 <span style={{color:'#22d3ee', fontWeight:'bold'}}>기준 선분</span> 선택 → ② <span style={{color:'#f59e0b', fontWeight:'bold'}}>대상 선분</span>들을 순서대로 클릭으로 평행화.
               <br />
-              우클릭 드래그로 선분을 수직 방향으로 평행이동 (되돌리기는 모드 해제 후 우클릭).
+              우클릭 드래그로 선분 수직 평행이동 (되돌리기는 모드 해제 후 우클릭).
             </>
           ) : (
             <>

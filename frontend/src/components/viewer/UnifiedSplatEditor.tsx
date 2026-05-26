@@ -86,7 +86,7 @@ export default function UnifiedSplatEditor({
   const localFileSizeRef = useRef<number>(
     !initialUploadId && initialSogUrl && initialSogUrl.startsWith('blob:') ? (initialLocalFileSize || 0) : 0,
   );
-  // 신흐름(모듈 등록): 파일 선택 시 백그라운드로 PLY 를 백엔드 임시 보관소에 업로드 → 세션 ID 보관.
+  // 모듈 등록 흐름: 파일 선택 시 백그라운드로 PLY 를 백엔드 임시 보관소에 업로드 → 세션 ID 보관.
   // 자동 문 검출 시 이 세션 ID 만 보내면 됨. 30분 TTL.
   const sam3PrepareSessionIdRef = useRef<string | null>(null);
   const sam3PrepareInFlightRef = useRef<Promise<void> | null>(null);
@@ -142,7 +142,7 @@ export default function UnifiedSplatEditor({
   const [basemapMatchError, setBasemapMatchError] = useState<string | null>(null);
   // basemap 의 mesh.json + tex 를 로드하기 위한 source_upload_id (basemap PLY 자체와 별개).
   const [basemapSourceUploadId, setBasemapSourceUploadId] = useState<string | null>(null);
-  // 모듈측 (현재 작업 중인 모듈) 의 1차 도어 (door_1) 4 코너. 백엔드 doors.json 에서 가져옴 (A'+Y 프레임).
+  // 모듈측 (현재 작업 중인 모듈) 의 1차 도어 (door_1) 4 코너 (raw 프레임).
   const [moduleDoorCorners, setModuleDoorCorners] = useState<Array<[number, number, number]> | null>(null);
 
   const reloadWithUrl = useCallback((newUrl: string) => {
@@ -581,7 +581,7 @@ export default function UnifiedSplatEditor({
       setMode('refine');
       startIdx = 1;
 
-      // 신흐름: basemap 외 흐름(모듈 등록 / null purpose) 에서 백그라운드로 PLY 를 임시 보관소에 업로드.
+      // basemap 외 흐름(모듈 등록 / null purpose): 백그라운드로 PLY 를 임시 보관소에 업로드.
       // 다듬기 도중 자동 문 검출 누르면 세션 ID 만 보내 즉시 검출 시작.
       if (!isBasemapPurpose) {
         sam3PrepareSessionIdRef.current = null;
@@ -794,7 +794,7 @@ export default function UnifiedSplatEditor({
     );
   }, [initialRegistrationContext]);
 
-  // 신흐름(모듈 등록): uploadId 가 없는 게 정상이라 경고 안 띄움. 그 외(레거시) 만 경고.
+  // 모듈 등록: uploadId 없는 게 정상 (commit-final 시 발급) → 경고 안 띄움. 그 외 흐름만 경고.
   const alignPanel = mode === 'align' && currentUrl && !uploadId && !isModulePurpose ? (
     <div className="bg-black/70 backdrop-blur-sm border border-white/10 text-[var(--ink-2)] text-xs rounded-lg shadow-lg p-3 select-none w-72">
       <div className="text-[11px] text-amber-300 bg-amber-900/30 border border-amber-700 rounded px-2 py-1.5 leading-tight">
@@ -872,7 +872,6 @@ export default function UnifiedSplatEditor({
               currentUrl={currentUrl}
               onDone={(u) => { if (!isBasemapPurpose) { void handleToggleMode('align'); reloadWithUrl(u); } }}
               onClose={() => { if (!isBasemapPurpose) { void handleToggleMode('align'); } }}
-              view="setup"
               autoExtracting={autoExtracting}
               autoExtractedCorners={autoExtractedCorners}
               basemapMode={isBasemapPurpose}
@@ -893,7 +892,7 @@ export default function UnifiedSplatEditor({
               }}
               onManualPickStart={() => { setAutoExtracting(false); setSam3DispatchSent(false); setAutoExtractedCorners(null); }}
               ensureUploadId={async () => {
-                // 신흐름(모듈 등록): register-local 안 함. placeholder ID 반환.
+                // 모듈 등록 흐름: register-local 안 함. placeholder ID 반환.
                 // 정합 완료 시 commit-final 이 module/upload row 를 한 번에 생성.
                 if (isModulePurpose) {
                   // metadata 도 placeholder 로 채워둠 (requestMetadata 가 이미 했지만 안전망)
@@ -912,7 +911,7 @@ export default function UnifiedSplatEditor({
                   }
                   return 'pending';
                 }
-                // 등록 진입 시 받은 컨텍스트가 있으면 모달 없이 확정하고, 레거시 진입만 모달로 보완한다.
+                // 등록 컨텍스트 있으면 모달 없이 확정. 없으면 모달로 입력 받음.
                 if (isBasemapPurpose) {
                   const ensured = await ensureRegistrationContext(null);
                   const result: MetadataResult = {
@@ -991,11 +990,11 @@ export default function UnifiedSplatEditor({
               }}
               getCurrentKeepMask={() => refine.getCurrentKeepMask?.() ?? null}
               getBakeRgba={(sid) => refine.getBakeRgba?.(sid) ?? null}
-              getCurrentBakedRotation={() => refine.getCurrentBakedRotation?.() ?? { rotX: 0, rotZ: 0, wallAngleRad: 0 }}
+              getRemainingRotationToAY={() => refine.getRemainingRotationToAY?.() ?? { rotX: 0, rotZ: 0, wallAngleRad: 0 }}
               onSetupSaveDone={async (activeUploadId: string, doorCorners) => {
                 // 문 설정 완료 → 정합 단계 진입.
                 //   - 메모리에 자산 (PLY, wall mesh, doors) 이 이미 있어 서버 fetch 안 함.
-                //   - 모듈 도어 corners 는 모달이 인자로 전달 (`doorCorners`, A'+Y 프레임) → 즉시 주입.
+                //   - 모듈 도어 corners 는 모달이 인자로 전달 (raw 프레임) → 즉시 주입.
                 //   - basemap 흐름은 별도 분기 (commitRefinedToServer + /basemaps/register).
                 setMeshIsFreshInMemory(true);
                 setLockedStages(s => {
@@ -1045,7 +1044,7 @@ export default function UnifiedSplatEditor({
                 setAutoExtracting(true);
                 setSam3DispatchSent(false);
                 setAutoExtractedCorners(null);
-                // 신흐름: 백엔드 임시 보관 PLY 로 door-ml 직행. MinIO/DB 안 건드림.
+                // 백엔드 임시 보관 PLY 로 door-ml 직행. MinIO/DB 안 건드림.
                 // 백그라운드 업로드가 끝나기를 기다리고 detect-temp 호출.
                 (async () => {
                   try {
@@ -1057,7 +1056,7 @@ export default function UnifiedSplatEditor({
                       console.warn('[Sam3] 임시 PLY 세션 미확보 — 자동 검출 불가, 수동 지정으로 진행');
                       return;
                     }
-                    const bake = refine.getCurrentBakedRotation?.() ?? { rotX: 0, rotZ: 0, wallAngleRad: 0 };
+                    const bake = refine.getRemainingRotationToAY?.() ?? { rotX: 0, rotZ: 0, wallAngleRad: 0 };
                     const resp = await api.post<{ corners: { left_top: { x: number; y: number; z: number }; right_top: { x: number; y: number; z: number }; right_bottom: { x: number; y: number; z: number }; left_bottom: { x: number; y: number; z: number } } }>(
                       '/uploads/sam3/detect-temp',
                       { session_id: sid, prompt, bake_rotation: bake },
@@ -1093,7 +1092,7 @@ export default function UnifiedSplatEditor({
         {/* 정합 단계 — 새 AlignPanel (basemap 자동 매칭 + 슝 애니메이션 + 수동 핸들 + 4×4 저장). */}
         {mode === 'align' && !isBasemapPurpose && (
           <>
-            {/* 진단용: 어느 조건이 막고 있는지 표시. 신흐름(module)은 uploadId 미확보가 정상이라 제외. */}
+            {/* 진단용: 어느 조건이 막고 있는지 표시. 모듈 등록은 uploadId 미확보가 정상이라 제외. */}
             {(!currentUrl || (!uploadId && !isModulePurpose) || !metadata) && (
               <div className="bg-amber-900/80 border border-amber-600 rounded p-3 text-amber-100 text-xs space-y-1">
                 <div className="font-bold">정합 패널 미표시 — 누락 조건:</div>
@@ -1114,7 +1113,7 @@ export default function UnifiedSplatEditor({
                   basemapMatchError={basemapMatchError}
                   moduleDoorCorners={moduleDoorCorners}
                   onCommitFinal={isModulePurpose ? async ({ matrix4x4, position, rotation, scale, rmsd }) => {
-                    // 신흐름: 다듬기 결과 자산 + 정합 행렬을 commit-final 로 일괄 영속화.
+                    // 다듬기 결과 자산 + 정합 행렬을 commit-final 로 일괄 영속화.
                     if (!initialRegistrationContext?.building_id
                       || !initialRegistrationContext?.floor_id
                       || !initialRegistrationContext?.module_name?.trim()) {
@@ -1131,7 +1130,7 @@ export default function UnifiedSplatEditor({
                     }
                     // 런타임 (정합) 동안 corners 는 raw 프레임으로 다뤘으나 (모듈 entity 와 동일 프레임),
                     // 서버 저장 시점엔 baked PLY 와 일관되게 A'+Y 로 변환.
-                    const bake = refine.getCurrentBakedRotation?.() ?? { rotX: 0, rotZ: 0, wallAngleRad: 0 };
+                    const bake = refine.getRemainingRotationToAY?.() ?? { rotX: 0, rotZ: 0, wallAngleRad: 0 };
                     const doorCornersAY = doorCornersRaw.map(c => rawToAY(c as [number, number, number], bake as FrameRotation));
                     const doorsJson = JSON.stringify({
                       version: 1,

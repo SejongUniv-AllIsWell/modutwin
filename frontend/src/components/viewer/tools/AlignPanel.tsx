@@ -20,7 +20,7 @@ interface Props {
   /** 모듈측 (현재 작업 중인) 도어의 4 코너 (A'+Y 프레임). null 이면 정합 불가. */
   moduleDoorCorners: Array<[number, number, number]> | null;
   /**
-   * 신흐름(모듈 등록): 정합 완료 시 호출. 다듬기 결과 자산 + 정합 행렬을 일괄 영속화.
+   * 모듈 등록 흐름: 정합 완료 시 호출. 다듬기 결과 자산 + 정합 행렬을 일괄 영속화.
    * 제공되면 기존 saveResult (POST /uploads/{id}/alignment + PUT /modules/{id}/alignment-transform)
    * 대신 이 콜백 사용. UnifiedSplatEditor 가 gatherRefinedAssets + commit-final 호출.
    */
@@ -38,16 +38,15 @@ type ManualMode = 'translate' | 'rotate' | 'scale';
 const ANIM_MAX_MS = 2500;
 const ANIM_BASE_MS = 400;
 
-// 모듈/베이스맵 도어 corner pairing — 양측 모두 자연 CW 순서 [TL,TR,BR,BL] 로 픽한다는 가정 하에
-// identity 매핑. 이전엔 [1,0,3,2] mirror 였으나 실제 사용 데이터(같은 카메라 방향 픽)에선 양측 픽이
-// 동일 라벨링이라 mirror 가 도리어 좌우 반전을 만들어 정합이 깨졌음. 자연 픽으로 정합 가능하도록
-// identity 로 변경.
-const DOOR_CORNER_MIRROR_MAP = [0, 1, 2, 3] as const;
+// 모듈/베이스맵 도어 corner pairing — 양측이 각자 자기 방 안에서 도어를 보고 CW [TL,TR,BR,BL] 로 픽한다고
+// 가정. 두 방 사이 도어는 양쪽에서 좌우 반전되어 보이므로 mirror [1,0,3,2]:
+//   module TL ↔ basemap TR,  module TR ↔ basemap TL,  module BR ↔ basemap BL,  module BL ↔ basemap BR.
+const DOOR_CORNER_MIRROR_MAP = [1, 0, 3, 2] as const;
 
-// 벽 두께 gap — basemap mesh ↔ module mesh 가 정확히 겹치지 않게 띄움. door_height 비율 기반.
-// 표준문 (2.1m) 기준 ≈ 5cm. 한국 차음벽 200mm 보다 작지만 시각적 분리에 충분 + 자연스러움.
-const DOOR_GAP_RATIO = 0.023;
-const DOOR_GAP_MIN = 0.017;
+// 정합 문 두께 — basemap facade ↔ module facade 평행 간격. 두 facade 사이를 4면 frame mesh 가 채움.
+const DEFAULT_ALIGN_DOOR_THICKNESS = 0.05;  // 5cm
+const ALIGN_DOOR_THICKNESS_MIN = 0.001;     // 1mm — 0 이면 z-fight, 1mm 가 최소 분리.
+const ALIGN_DOOR_THICKNESS_MAX = 0.5;       // 50cm — 한국 차음벽 두께 200mm 의 두 배 까지.
 
 // 도어 frame mesh (모듈↔베이스맵 도어 사이 4면 측벽) 색상.
 // 광원 없는 가우시안 스플래팅 씬에선 emissive 채널만 보이므로, 그냥 "표시 색" 으로 사용.
@@ -92,12 +91,13 @@ function reparentPreserveWorld(pc: any, ent: any, newParent: any): void {
   ent.setLocalScale(s.x, s.y, s.z);
 }
 
-/** Kabsch row-major R(3×3) + t(3) → PlayCanvas Mat4 (column-major). */
-function rigidToMat4(pc: any, R: number[], t: number[]): any {
+/** Similarity transform (row-major R(3×3) · scalar s + t(3)) → PlayCanvas Mat4 (column-major).
+ *  적용: p' = s · R · p + t. s=1 이면 rigid. */
+function similarityToMat4(pc: any, R: number[], s: number, t: number[]): any {
   const m = new pc.Mat4();
-  m.data[0]  = R[0]; m.data[1]  = R[3]; m.data[2]  = R[6]; m.data[3]  = 0;
-  m.data[4]  = R[1]; m.data[5]  = R[4]; m.data[6]  = R[7]; m.data[7]  = 0;
-  m.data[8]  = R[2]; m.data[9]  = R[5]; m.data[10] = R[8]; m.data[11] = 0;
+  m.data[0]  = s*R[0]; m.data[1]  = s*R[3]; m.data[2]  = s*R[6]; m.data[3]  = 0;
+  m.data[4]  = s*R[1]; m.data[5]  = s*R[4]; m.data[6]  = s*R[7]; m.data[7]  = 0;
+  m.data[8]  = s*R[2]; m.data[9]  = s*R[5]; m.data[10] = s*R[8]; m.data[11] = 0;
   m.data[12] = t[0]; m.data[13] = t[1]; m.data[14] = t[2]; m.data[15] = 1;
   return m;
 }
@@ -157,6 +157,11 @@ export default function AlignPanel({
   const [manualMode, setManualMode] = useState<ManualMode>('translate');
   const [error, setError] = useState<string | null>(null);
   const [rmsd, setRmsd] = useState<number | null>(null);
+  // 정합 문 두께 — basemap facade ↔ module facade 사이 간격 (= frame mesh 두께).
+  // 사용자가 슬라이더로 직접 조절. ref 도 같이 두어 정합 동안 안정 참조.
+  const [alignDoorThickness, setAlignDoorThickness] = useState(DEFAULT_ALIGN_DOOR_THICKNESS);
+  const alignDoorThicknessRef = useRef(DEFAULT_ALIGN_DOOR_THICKNESS);
+  useEffect(() => { alignDoorThicknessRef.current = alignDoorThickness; }, [alignDoorThickness]);
 
   // 도어 frame mesh — 정합 후 모듈 도어 ↔ 베이스맵 도어 사이 공간을 4면 quad 로 둘러쌈.
   // 정합 다시 돌리면 destroy 후 재생성. 초기화 시 destroy.
@@ -165,6 +170,8 @@ export default function AlignPanel({
   // 도어 통합 그룹 (Phase 3) — 정합 후 양측 도어 (모듈 + basemap) + frame mesh 를 한 부모로 묶어
   // 슬라이더로 hinge 축 기준 회전. 정합 초기화 시 destroy + 원래 부모로 복원.
   const doorPivotGroupRef = useRef<any>(null);
+  // doorPivot 준비 상태 — UI 슬라이더 노출 조건. ref 만으론 re-render 트리거 안 되므로 별도 state.
+  const [doorPivotReady, setDoorPivotReady] = useState(false);
   // doorPivotGroup 에 reparent 된 entity 들의 원래 부모 정보 (revert 용).
   const doorPivotMembersRef = useRef<Array<{ ent: any; oldParent: any }>>([]);
   // hinge 회전 상태 (Phase 4).
@@ -254,20 +261,22 @@ export default function AlignPanel({
         console.warn(`[DoorSplat:SUMMARY] total add_splat_*: ${allDoorSplats.length}`, allDoorSplats);
       } catch {}
 
-      // rectFit — 사용자 픽은 normalizeDoorRect 로 정확한 직사각형이 보장됨.
-      // SVD-기반 Kabsch 대신 두 사각형의 직교 basis 비교로 R, t 를 한 번에 산출. 180° 매칭 모호성 없음.
+      // rectFit — 두 직사각형의 직교 basis 비교로 similarity transform (R, s, t) 산출.
       const { rectFit } = await import('@/lib/alignment');
-      // 모듈 측 코너는 A'+Y (저장 좌표) 프레임이지만, 화면에 보이는 alignmentGroup 의 자식
-      // (splatEntity, wall mesh, door mesh) 는 Z-180 viewer 컨벤션이 entity transform 으로 부여됨.
-      // → world 좌표로 변환 (Z-180 적용 후) 해 Kabsch 의 source 로 사용.
-      // alignmentGroup 의 현재 transform 도 같이 반영해야 정확.
-      const groupWorld = group.getWorldTransform();
+      // moduleDoorCorners 는 **raw 프레임** (DoorAlignModal `onSetupCornersFinalized` 가 picked.pos 그대로 전달).
+      //   raw → world 는 splatEntity.getWorldTransform() 이 Z-180 + pendingRotation + alignmentGroup 모두 합쳐 적용.
+      //   wallAngle Y 는 entity 에 안 들어가므로 raw 그대로 넘기는 것이 시각 위치와 일치.
+      const sdData = core.getSplatData();
+      if (!sdData?.splatEntity) {
+        setError('splatEntity 미준비');
+        setRunning(false);
+        return;
+      }
+      const splatWorld = sdData.splatEntity.getWorldTransform();
       const srcWorld: Array<[number, number, number]> = moduleDoorCorners.map(c => {
         const v = new pc.Vec3(c[0], c[1], c[2]);
-        // door corners 는 A'+Y 프레임 (raw 데이터). splatEntity 가 Z-180 회전을 부여하므로 (-x, -y, z) 로 변환.
-        const inEntityFrame = new pc.Vec3(-v.x, -v.y, v.z);
         const out = new pc.Vec3();
-        groupWorld.transformPoint(inEntityFrame, out);
+        splatWorld.transformPoint(v, out);
         return [out.x, out.y, out.z] as [number, number, number];
       });
 
@@ -290,12 +299,13 @@ export default function AlignPanel({
         dstForcedN = [-ni[0], -ni[1], ni[2]];  // basemap_inward in world
       }
       // gap 적용 전 fit 으로 R, dst plane normal 산출.
-      const preFit = rectFit(src, dst, dstForcedN ? { dstForcedN } : {});
+      const preFit = rectFit(src, dst, { ...(dstForcedN ? { dstForcedN } : {}), withScale: true });
 
-      // doorHeight 계산 — dst 의 e2 길이 = corner[2] - corner[1] 의 magnitude.
+      // doorHeight 계산 — dst 의 e2 길이 = corner[2] - corner[1] 의 magnitude. (진단 로그용)
       const dh_x = dst[6] - dst[3], dh_y = dst[7] - dst[4], dh_z = dst[8] - dst[5];
       const doorHeight = Math.hypot(dh_x, dh_y, dh_z);
-      const gap = Math.max(DOOR_GAP_MIN, doorHeight * DOOR_GAP_RATIO);
+      // 정합 문 두께 = 사용자 설정 슬라이더 값. basemap ↔ module facade 평행 간격.
+      const gap = alignDoorThicknessRef.current;
 
       // gap push 방향 = basemap_outward = -dstN (dstN 은 basemap_inward 로 강제됨).
       //   module 이 basemap 방 바깥쪽 (= module room 안쪽) 으로 gap 만큼 떨어진 위치에 도달.
@@ -305,9 +315,9 @@ export default function AlignPanel({
         dst[i*3+1] += pushN[1] * gap;
         dst[i*3+2] += pushN[2] * gap;
       }
-      const fit = rectFit(src, dst, dstForcedN ? { dstForcedN } : {});
+      const fit = rectFit(src, dst, { ...(dstForcedN ? { dstForcedN } : {}), withScale: true });
       setRmsd(fit.rmsd);
-      console.log(`[Align] RMSD=${fit.rmsd.toFixed(4)}m, gap=${gap.toFixed(3)}m, doorH=${doorHeight.toFixed(2)}m, ` +
+      console.log(`[Align] RMSD=${fit.rmsd.toFixed(4)}m, scale=${fit.s.toFixed(4)}, gap=${gap.toFixed(3)}m, doorH=${doorHeight.toFixed(2)}m, ` +
         `nSource=${dstForcedN ? 'normalInward' : 'cross-product'}`);
       if (DEBUG_ALIGN) {
         console.log('  alignmentGroup children:', Array.from(group.children ?? []).map((c: any) => c.name));
@@ -331,22 +341,28 @@ export default function AlignPanel({
         }
       }
 
-      // fit 은 src world → dst world 의 rigid transform.
-      // alignmentGroup 의 새 world transform 을 구하려면 fit 을 group 의 현재 world 에 left-multiply 한다.
-      // 즉 newGroupWorld = fit · oldGroupWorld.
-      // 하지만 group 의 부모는 app.root (identity) 이므로 newGroupLocal = newGroupWorld.
-      // PlayCanvas 의 setLocalPosition/Rotation 사용 위해 분해.
-
-      const fitMat = rigidToMat4(pc, fit.R as unknown as number[], fit.t as unknown as number[]);
-      const newGroupWorld = new pc.Mat4().mul2(fitMat, groupWorld);
+      // fit 은 src world → dst world 의 similarity transform (R, s, t).
+      // alignmentGroup 의 새 world = fit · 현재 group world. group 부모가 app.root (identity) 이라 local = world.
+      const fitMat = similarityToMat4(pc, fit.R as unknown as number[], fit.s, fit.t as unknown as number[]);
+      const newGroupWorld = new pc.Mat4().mul2(fitMat, group.getWorldTransform());
 
       // 분해: position + quaternion + scale.
+      // Quat.setFromMat4 는 orthonormal 회전 가정 — scale 이 1 이 아니면 columns 길이가 scale 만큼 늘어나 trace 계산이
+      // 비례적으로 틀어진다. scale 먼저 추출, 행렬 upper 3x3 의 각 column 을 scale 로 나눠 orthonormal 만든 후 quat 추출.
       const newPos = new pc.Vec3();
       const newRot = new pc.Quat();
       const newScale = new pc.Vec3();
       newGroupWorld.getTranslation(newPos);
-      newRot.setFromMat4(newGroupWorld);
       newGroupWorld.getScale(newScale);
+      const pureRotMat = new pc.Mat4();
+      const m = newGroupWorld.data;
+      const pr = pureRotMat.data;
+      const sx = newScale.x || 1, sy = newScale.y || 1, sz = newScale.z || 1;
+      pr[0]  = m[0]/sx; pr[1]  = m[1]/sx; pr[2]  = m[2]/sx;  pr[3]  = 0;
+      pr[4]  = m[4]/sy; pr[5]  = m[5]/sy; pr[6]  = m[6]/sy;  pr[7]  = 0;
+      pr[8]  = m[8]/sz; pr[9]  = m[9]/sz; pr[10] = m[10]/sz; pr[11] = 0;
+      pr[12] = 0;       pr[13] = 0;       pr[14] = 0;        pr[15] = 1;
+      newRot.setFromMat4(pureRotMat);
 
       // 거리 비례 애니메이션 시간 (max 2.5s).
       const fromPos: [number, number, number] = (() => {
@@ -413,6 +429,7 @@ export default function AlignPanel({
             axis: [ax / aLen, ay / aLen, az / aLen],
           };
           setDoorAngleDeg(0);
+          setDoorPivotReady(true);
           console.log(`[DoorPivot] grouped ${doorPivotMembersRef.current.length} entities under doorPivotGroup (post-animation)`);
         } catch (e) {
           console.warn('[DoorPivot] 생성 실패', e);
@@ -516,6 +533,7 @@ export default function AlignPanel({
       doorPivotGroupRef.current = null;
       doorHingeRef.current = null;
       setDoorAngleDeg(0);
+      setDoorPivotReady(false);
     }
     setAligned(false);
     setRmsd(null);
@@ -571,7 +589,7 @@ export default function AlignPanel({
       const q = group.getLocalRotation();
       const s = group.getLocalScale();
 
-      // 신흐름: onCommitFinal 제공 시 → 일괄 영속화 (다듬기 결과 자산 포함).
+      // onCommitFinal 제공 시 → 다듬기 결과 자산 + 정합 행렬 일괄 영속화.
       if (onCommitFinal) {
         try {
           await onCommitFinal({
@@ -661,6 +679,27 @@ export default function AlignPanel({
         <div className="text-[10px] text-[var(--muted)]">RMSD: {rmsd.toFixed(4)} m</div>
       )}
 
+      {/* 정합 문 두께 슬라이더 — basemap ↔ module facade 사이 간격 + frame mesh 두께.
+          정합 실행 후에 슬라이더 조정 시 다음 "정합" 클릭부터 반영. (실시간 재정합 X — 변경 시 사용자가 다시 누름) */}
+      <div className="border-t border-[var(--rule)] pt-2 space-y-1"
+        title="basemap 도어와 module 도어 사이 평행 간격. 그 사이는 4면 frame mesh 가 채움. 슬라이더 변경 후 '정합' 다시 누름.">
+        <div className="flex items-center gap-2 text-[10px]">
+          <span className="text-[var(--muted)] w-20">정합 문 두께</span>
+          <input
+            type="range"
+            min={ALIGN_DOOR_THICKNESS_MIN}
+            max={ALIGN_DOOR_THICKNESS_MAX}
+            step={0.001}
+            value={alignDoorThickness}
+            onChange={e => setAlignDoorThickness(parseFloat(e.target.value))}
+            className="flex-1 accent-cyan-500 cursor-pointer"
+          />
+          <span className="text-[var(--ink)] font-mono w-12 text-right">
+            {(alignDoorThickness * 100).toFixed(1)}cm
+          </span>
+        </div>
+      </div>
+
       {/* 자동 정합 1 회 후에만 수동 핸들 + 확정 저장 표시 */}
       {aligned && (
         <>
@@ -696,7 +735,7 @@ export default function AlignPanel({
           </div>
 
           {/* 도어 열기/닫기 슬라이더 — 정합 검증용. 모듈/베이스맵 도어 + frame 측벽 통합 회전. */}
-          {doorPivotGroupRef.current && (
+          {doorPivotReady && (
             <div className="border-t border-[var(--rule)] pt-2 space-y-1">
               <div className="flex items-center gap-2">
                 <div className="text-[11px] font-bold text-[var(--ink-2)] flex-1">도어 열기 (확인용)</div>

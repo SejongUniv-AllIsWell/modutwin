@@ -367,7 +367,7 @@ async def commit_final(
     task = Task(
         upload_id=upload.id,
         user_id=user.id,
-        task_type=TaskType.refine_save,
+        task_type=TaskType.door_alignment,
         status=TaskStatus.completed,
         completed_at=now,
     )

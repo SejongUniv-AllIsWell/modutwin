@@ -301,9 +301,8 @@ class RefinedBundleDoorEntry(BaseModel):
     swing: Optional[int] = None
     angleDeg: Optional[float] = None
     wallSurfaceId: Optional[str] = None
-    doorThickness: Optional[float] = None
+    doorExtractionDepth: Optional[float] = None
     boundarySplitEnabled: Optional[bool] = None
-    safetyMargin: Optional[float] = None
     # corners/uvs/normalInward + 텍스처 PNG presigned URL + 크기.
     door_mesh: Optional[dict] = None
     # 도어 splat (PLY) presigned URL.
@@ -390,9 +389,8 @@ async def get_refined_bundle(
                     swing=d.get("swing") if isinstance(d.get("swing"), int) else None,
                     angleDeg=d.get("angleDeg") if isinstance(d.get("angleDeg"), (int, float)) else None,
                     wallSurfaceId=d.get("wallSurfaceId") if isinstance(d.get("wallSurfaceId"), str) else None,
-                    doorThickness=d.get("doorThickness") if isinstance(d.get("doorThickness"), (int, float)) else None,
+                    doorExtractionDepth=d.get("doorExtractionDepth") if isinstance(d.get("doorExtractionDepth"), (int, float)) else None,
                     boundarySplitEnabled=d.get("boundarySplitEnabled") if isinstance(d.get("boundarySplitEnabled"), bool) else None,
-                    safetyMargin=d.get("safetyMargin") if isinstance(d.get("safetyMargin"), (int, float)) else None,
                 )
                 dm = d.get("doorMesh")
                 if isinstance(dm, dict):

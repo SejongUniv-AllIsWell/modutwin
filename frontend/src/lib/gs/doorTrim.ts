@@ -71,11 +71,6 @@ export function rectGeom(corners: [Vec3, Vec3, Vec3, Vec3]): RectGeom {
 
 export interface DecomposeOptions {
   /**
-   * 추가 안전 margin (0 ~ 0.3). 각 sub 의 scale 에 (1 − margin) 곱.
-   * boundary 에서 살짝 더 들여 자르기 — 0 이면 정확히 boundary 까지, 0.05 면 5% 더 들여 자름.
-   */
-  safetyMargin?: number;
-  /**
    * "boundary 에서 얼마나 떨어져야 fully inside/outside 로 판정하는지" 에 사용하는 σ 배수.
    * 기본 3 — 3DGS 렌더링이 2D projected footprint 를 3σ 에서 컷하므로 시각 한계 일치.
    * 코너 부근에서 드물게 새어나오는 경우 4 등으로 올려서 더 보수적 판정 가능.
@@ -83,12 +78,12 @@ export interface DecomposeOptions {
   sigmaMultiplier?: number;
   /**
    * 문 두께 (m). 벽 평면에서 **방 안쪽으로** 들어가는 단방향 깊이.
-   * 도어로 분류되려면 splat center 가 벽 평면 ~0 부터 -doorThickness 사이여야 함
+   * 도어로 분류되려면 splat center 가 벽 평면 ~0 부터 -doorExtractionDepth 사이여야 함
    * (방 바깥은 다듬기 단계에서 이미 alpha=0 처리되었으므로 슬랩이 비대칭).
-   * 손잡이/잠금처럼 벽에서 방 안쪽으로 돌출된 splat 도 doorThickness 이내면 도어로 잡힘.
+   * 손잡이/잠금처럼 벽에서 방 안쪽으로 돌출된 splat 도 doorExtractionDepth 이내면 도어로 잡힘.
    * 미지정 또는 0 이하 시 깊이 필터 없음.
    */
-  doorThickness?: number;
+  doorExtractionDepth?: number;
   /**
    * 벽 평면의 outward 방향 단위벡터 (방 바깥 방향). 슬랩의 비대칭 방향 결정에 사용.
    * `surfacePlanesFromPolygon` 의 wall plane.normal 을 그대로 넘기면 됨.
@@ -100,24 +95,25 @@ export interface DecomposeOptions {
 /**
  * splat center 가 도어 슬랩 안인지 판정 (decompose 와 페인트 분류가 같은 기준 사용 위해 export).
  *
- * 슬랩: 벽 평면에서 방 안쪽으로 doorThickness 깊이까지의 단방향 영역.
+ * 슬랩: 벽 평면에서 방 안쪽으로 doorExtractionDepth 깊이까지의 단방향 영역.
  * - sdOut = (c - pO) · wallOutward.  방 안쪽 → 음수, 방 바깥 → 양수.
- * - 허용: -doorThickness ≤ sdOut ≤ EPS_OUT (벽 바깥 미세 누출 1mm 까지만 허용).
+ * - 허용: -doorExtractionDepth ≤ sdOut ≤ 0.
+ *   다듬기 단계의 외부 가우시안 제거 (flatten) 가 이미 sd > 0 splat 을 모두 alpha=0 시켰으므로
+ *   엄격 컷 (0 강제) 으로 충분.
  *
- * doorThickness ≤ 0 이면 깊이 필터 없음 (true 항상).
+ * doorExtractionDepth ≤ 0 이면 깊이 필터 없음 (true 항상).
  */
 export function isInDoorSlab(
   cx: number, cy: number, cz: number,
   planeOrigin: Vec3,
   wallOutward: Vec3,
-  doorThickness: number,
+  doorExtractionDepth: number,
 ): boolean {
-  if (!(doorThickness > 0)) return true;
+  if (!(doorExtractionDepth > 0)) return true;
   const sdOut = (cx - planeOrigin[0]) * wallOutward[0]
               + (cy - planeOrigin[1]) * wallOutward[1]
               + (cz - planeOrigin[2]) * wallOutward[2];
-  const EPS_OUT = 1e-3; // 1mm — 부동소수 오차 허용.
-  return sdOut <= EPS_OUT && sdOut >= -doorThickness;
+  return sdOut <= 0 && sdOut >= -doorExtractionDepth;
 }
 
 export interface BoundarySubUpdate {
@@ -159,21 +155,20 @@ export interface DecomposeResult {
  *
  * @param scene 가우시안 씬 (raw PLY 프레임). corners 도 같은 프레임이어야 함.
  * @param rect 도어 직사각형.
- * @param opts safetyMargin 등.
+ * @param opts doorExtractionDepth 등 (DecomposeOptions 참조).
  */
 export function decomposeBoundaryGaussians(
   scene: GaussianScene,
   rect: DoorRectangle,
   opts: DecomposeOptions = {},
 ): DecomposeResult {
-  const safety = Math.max(0, Math.min(0.5, opts.safetyMargin ?? 0));
   const kSigma = Math.max(2, opts.sigmaMultiplier ?? 3);
-  const doorThickness = (opts.doorThickness !== undefined && opts.doorThickness > 0)
-    ? opts.doorThickness
+  const doorExtractionDepth = (opts.doorExtractionDepth !== undefined && opts.doorExtractionDepth > 0)
+    ? opts.doorExtractionDepth
     : 0; // 0 = 깊이 필터 비활성.
   const geom = rectGeom(rect.corners);
   const pO = geom.planeOrigin;
-  // 슬랩 방향: 명시된 wallOutwardNormal 우선. 없으면 rectGeom.planeNormal 부호를 임의로 사용 (구버전 호환).
+  // 슬랩 방향 = 명시된 wallOutwardNormal. 미지정이면 rectGeom.planeNormal (방향 보장 X — 호출자가 넘기는 게 정확).
   const wallOut: Vec3 = opts.wallOutwardNormal ?? geom.planeNormal;
   const px = scene.attrs.get('x');
   const py = scene.attrs.get('y');
@@ -250,7 +245,7 @@ export function decomposeBoundaryGaussians(
 
     // 벽 평면 깊이 필터 — 비대칭 슬랩 (방 안쪽 단방향). 슬랩 밖이면 도어 영역 X.
     // (이 필터 없이 boundary 로 분류되면 door-side sub 가 깊은 위치에서 도어와 함께 회전 → 시각 이상)
-    if (!isInDoorSlab(cx, cy, cz, pO, wallOut, doorThickness)) {
+    if (!isInDoorSlab(cx, cy, cz, pO, wallOut, doorExtractionDepth)) {
       continue;
     }
 
@@ -264,9 +259,9 @@ export function decomposeBoundaryGaussians(
     const sd = bestSd, ext = bestExt, n = bestN;
     const fIn  = (sd + ext) / (2 * ext);   // door-side scale ratio
     const fOut = (ext - sd) / (2 * ext);   // wall-side scale ratio
-    // 안전 margin 적용 (sub 가 boundary 에 살짝 못 미치도록)
-    const fInS  = Math.max(1e-6, fIn  * (1 - safety));
-    const fOutS = Math.max(1e-6, fOut * (1 - safety));
+    // 1e-6 floor — splat center 가 정확히 boundary 위인 edge case 에서 0 으로 떨어져 log(0) 나는 것 방지.
+    const fInS  = Math.max(1e-6, fIn);
+    const fOutS = Math.max(1e-6, fOut);
     const offsetIn  = (ext - sd) / 2;  // door-side: +n 방향
     const offsetOut = (ext + sd) / 2;  // wall-side: -n 방향
 
@@ -370,8 +365,6 @@ export function isInsideRect(point: Vec3, geom: RectGeom): boolean {
 /**
  * 도어 4꼭짓점 (CW: TL, TR, BR, BL) 으로 textureBake 의 PlaneBakeInput 구성.
  * normal 방향은 wallNormal 과 같은 방향 (방 바깥) 이 되도록 cross product 부호 보정.
- *
- * extends 0 — 도어는 인접 면이 wall 자신이라 padding 불필요. mesh quad 는 4꼭짓점 그대로.
  */
 export function doorPlaneBakeInput(
   corners: [Vec3, Vec3, Vec3, Vec3],
@@ -379,8 +372,6 @@ export function doorPlaneBakeInput(
 ): {
   origin: Vec3; uAxis: Vec3; vAxis: Vec3; normal: Vec3;
   uMin: number; uMax: number; vMin: number; vMax: number;
-  extendU0: number; extendU1: number; extendV0: number; extendV1: number;
-  meshOffset: number;
 } {
   const [TL, TR, , BL] = corners;
   const eU = vsub(TR, TL);
@@ -396,8 +387,6 @@ export function doorPlaneBakeInput(
     uAxis, vAxis, normal,
     uMin: 0, uMax: uLen,
     vMin: 0, vMax: vLen,
-    extendU0: 0, extendU1: 0, extendV0: 0, extendV1: 0,
-    meshOffset: 0,
   };
 }
 

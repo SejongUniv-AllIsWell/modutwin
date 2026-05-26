@@ -41,16 +41,6 @@ export const DEFAULT_TEXTURE_BAKE_OPTIONS: TextureBakeOptions = {
   autoMargin: 0.05,
 };
 
-/**
- * 텍스처 메시(quad)를 방 경계 평면(sd=0) 으로부터 법선 방향(=방 바깥쪽) 으로 얼마나 들여놓을지 (m).
- *
- * 0 = 사용자가 모달에서 정의한 경계면 위치에 정확히 막 배치 (사용자 요청).
- * 막 위치 + 텍스처 베이크 시작 위치가 모두 사용자 경계면(sd=0) 에 정렬됨 → "층 두 개" 잔상 최소화.
- * 메시 배치 위치(`bakeTextureForPlane` 안의 `meshOffsetEff`)와 코너 extend (`planeBakeInputForSurface`
- * 의 `extend*`) 가 모두 이 단일 상수에서 파생되므로 항상 동기화.
- */
-export const MESH_PLANE_INSET = 0;
-
 export interface PlaneBakeInput {
   /** 샘플링 평면의 한 점 (보통 벽 표면 sd=0). 가우시안 sd는 이 origin 기준. */
   origin: Vec3;
@@ -63,13 +53,6 @@ export interface PlaneBakeInput {
   /** 베이크(샘플링) 범위 — 텍스처 컨텐츠가 차지하는 (u, v) 영역. 원래 방 범위. */
   uMin: number; uMax: number;
   vMin: number; vMax: number;
-  /** 메시 quad는 베이크 범위보다 양쪽으로 이만큼 더 뻗는다 (m).
-   *  텍스처 자체는 늘어나지 않고, UV가 [0,1] 밖으로 나가 clamp-to-edge로 가장자리 픽셀이
-   *  복제됨 (replicate padding). 인접 면과 만나도록 직육면체 코너 닫는 용도. */
-  extendU0: number; extendU1: number;
-  extendV0: number; extendV1: number;
-  /** 메시 quad를 origin 으로부터 normal 방향으로 얼마나 떨어진 곳에 배치할지 (m). */
-  meshOffset: number;
   /** 천장/바닥 한정 — 픽셀의 world XZ 가 이 polygon 외부면 alpha=0 처리.
    *  mesh quad 는 polygon bbox 직사각이지만 텍스처 알파로 polygon 모양 시각화.
    *  벽 surface 는 undefined (직사각 그대로). */
@@ -300,7 +283,7 @@ export async function bakeTextureForPlane(
   const autoGate = autoMargin > 0
     ? Math.max(opts.depthGate, -Math.min(0, paintSd) + autoMargin)
     : opts.depthGate;
-  console.log(`[textureBake] paint peak: sd=${paintSd.toFixed(3)}m (weight=${peakW.toFixed(0)}) → autoGate=${autoGate.toFixed(3)}m (slider=${opts.depthGate.toFixed(3)}m, autoMargin=${autoMargin.toFixed(3)}m), mesh placed at sd=${MESH_PLANE_INSET.toFixed(3)}m (fixed)`);
+  console.log(`[textureBake] paint peak: sd=${paintSd.toFixed(3)}m (weight=${peakW.toFixed(0)}) → autoGate=${autoGate.toFixed(3)}m (slider=${opts.depthGate.toFixed(3)}m, autoMargin=${autoMargin.toFixed(3)}m), mesh placed at sd=0 (사용자 경계면)`);
   const dgateEff = autoGate;
 
   for (let i = 0; i < N; i++) {
@@ -550,43 +533,30 @@ export async function bakeTextureForPlane(
     console.log(`[textureBake] polygon mask: ${maskedOut}/${width * height} pixels masked out (${(100 * maskedOut / (width * height)).toFixed(1)}%)`);
   }
 
-  // ── 코너: 메시는 베이크 범위보다 extend* 만큼 더 뻗음. ──
-  // 메시 위치는 방 경계 평면(sd=0) 에서 법선 방향(=방 바깥) 으로 MESH_PLANE_INSET 들여놓음 (현재 0).
-  // 6 면 모두 동일한 오프셋이라 인접 면 extend 도 같은 값. 직육면체 코너에서 메시들이 정확히 만남.
-  // (paintSd 는 autoGate 산정용으로만 사용.)
-  const meshOffsetEff = MESH_PLANE_INSET;
-  const mox = ox + meshOffsetEff * nx;
-  const moy = oy + meshOffsetEff * ny;
-  const moz = oz + meshOffsetEff * nz;
-  const meshUMin = input.uMin - input.extendU0;
-  const meshUMax = input.uMax + input.extendU1;
-  const meshVMin = input.vMin - input.extendV0;
-  const meshVMax = input.vMax + input.extendV1;
-
+  // 메시 코너 = 베이크 origin 위치 (사용자가 정의한 경계 평면, sd=0) 에 정확히 배치.
   const corner = (uu: number, vv: number): Vec3 => [
-    mox + uu * ux + vv * vx,
-    moy + uu * uy + vv * vy,
-    moz + uu * uz + vv * vz,
+    ox + uu * ux + vv * vx,
+    oy + uu * uy + vv * vy,
+    oz + uu * uz + vv * vz,
   ];
   const corners: [Vec3, Vec3, Vec3, Vec3] = [
-    corner(meshUMin, meshVMax),  // TL
-    corner(meshUMax, meshVMax),  // TR
-    corner(meshUMax, meshVMin),  // BR
-    corner(meshUMin, meshVMin),  // BL
+    corner(input.uMin, input.vMax),  // TL
+    corner(input.uMax, input.vMax),  // TR
+    corner(input.uMax, input.vMin),  // BR
+    corner(input.uMin, input.vMin),  // BL
   ];
 
-  // UV 매핑: 텍스처 [0,1] 범위가 베이크 범위 [uMin, uMax] × [vMin, vMax] 에 대응.
-  // 메시 코너가 베이크 범위 밖이면 UV도 [0,1] 밖으로 나감 → clamp-to-edge로 가장자리 픽셀 복제.
+  // UV 매핑: 텍스처 [0,1] 범위가 베이크 범위 [uMin, uMax] × [vMin, vMax] 에 정확히 대응.
   // 이미지 row 0 = vMax (V flip 적용했으므로). 따라서 UV v = (vMax - world_v) / (vMax - vMin).
   const uvOf = (uu: number, vv: number): [number, number] => [
     (uu - input.uMin) / uW,
     (input.vMax - vv) / vH,
   ];
   const uvs: [[number, number], [number, number], [number, number], [number, number]] = [
-    uvOf(meshUMin, meshVMax),  // TL
-    uvOf(meshUMax, meshVMax),  // TR
-    uvOf(meshUMax, meshVMin),  // BR
-    uvOf(meshUMin, meshVMin),  // BL
+    uvOf(input.uMin, input.vMax),  // TL
+    uvOf(input.uMax, input.vMax),  // TR
+    uvOf(input.uMax, input.vMin),  // BR
+    uvOf(input.uMin, input.vMin),  // BL
   ];
 
   const tag = `[textureBake]`;
@@ -611,9 +581,7 @@ export async function bakeTextureForPlane(
  * 방 기하 + 면 ID → PlaneBakeInput.
  *
  * - 샘플 평면(origin) = **벽 표면 sd=0**. 벽 paint 가우시안을 그대로 샘플.
- * - 메시는 `bakeTextureForPlane` 에서 항상 `MESH_PLANE_INSET` 위치에 배치 (현재 0 = 사용자 경계면 sd=0).
- * - (u, v) 범위는 인접 면의 메시 오프셋 (= MESH_PLANE_INSET) 만큼 양쪽 확장 → 직육면체 코너에서
- *   메시들이 정확히 만남. 본 면의 메시 오프셋과 인접 면의 extend 가 같은 상수에서 파생되므로 항상 동기화.
+ * - 메시는 `bakeTextureForPlane` 에서 origin 위치(사용자 경계면, sd=0) 에 정확히 배치.
  *
  * N벽 일반화:
  *   - wall surfaceId `wi` → 폴리곤 i 번째 변 (`polygon[i]` → `polygon[(i+1)%N]`).
@@ -628,11 +596,6 @@ export function planeBakeInputForSurface(
 ): PlaneBakeInput {
   const { polygon, ceilingY: cy, floorY: fy, surfacePlanes } = room;
   const N = polygon.length;
-
-  // 모든 면의 메시 오프셋이 동일 (MESH_PLANE_INSET) → 인접 면 extend 도 그대로 이 값.
-  // 본 면의 메시는 bakeTextureForPlane 안에서 `meshOffsetEff = MESH_PLANE_INSET` 으로 배치되므로,
-  // 여기서 같은 상수를 extend* 에 쓰면 인접 면들이 정확히 만남.
-  const off = MESH_PLANE_INSET;
 
   if (surfaceId === 'ceiling' || surfaceId === 'floor') {
     // 폴리곤 XZ bbox.
@@ -653,9 +616,6 @@ export function planeBakeInputForSurface(
       normal,
       uMin: 0, uMax: mxX - mnX,
       vMin: 0, vMax: mxZ - mnZ,
-      extendU0: off, extendU1: off,
-      extendV0: off, extendV1: off,
-      meshOffset: off,
       // polygon 외부 픽셀 alpha=0 — quad 는 bbox 직사각, 텍스처 알파로 polygon 모양 시각화.
       polygonMaskXZ: polygon.map(p => ({ x: p.x, z: p.z })),
     };
@@ -688,8 +648,5 @@ export function planeBakeInputForSurface(
     normal,
     uMin: 0, uMax: len,
     vMin: 0, vMax: cy - fy,
-    extendU0: off, extendU1: off,
-    extendV0: off, extendV1: off,
-    meshOffset: off,
   };
 }
