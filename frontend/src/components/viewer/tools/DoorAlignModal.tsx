@@ -220,6 +220,7 @@ export default function DoorAlignModal({
   const inMemoryDoorsRef = useRef<InMemoryDoor[]>([]);
   useEffect(() => { inMemoryDoorsRef.current = inMemoryDoors; }, [inMemoryDoors]);
 
+
   // 도어 추출 즉시 호수 라벨 (말풍선) 표시. cornersRaw 사용 — useDoorLabels 가 splatEntity.worldTransform 으로
   // 직접 world 변환 → 등록 단계 (Z-180 + pendingRotation, wallAngle 미베이크) 든 재진입 단계 (Z-180 만) 든 일관.
   const doorLabelEntries = useMemo(() => (

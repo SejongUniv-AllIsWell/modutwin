@@ -672,8 +672,10 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
           </div>
         )}
 
-        {/* 도구 UI 슬롯 */}
-        {!loading && !error && children}
+        {/* 도구 UI 슬롯 — loading state 와 무관하게 항상 mount 유지.
+            (loading 조건에 묶이면 PLY reload 시 children 이 전부 unmount → 자식 컴포넌트 useState 초기화.
+             로딩 인디케이터는 위의 별도 overlay 가 시각적으로 가림.) */}
+        {!error && children}
 
         {/* 하단 카메라 컨트롤 */}
         {!loading && !error && (
