@@ -161,9 +161,8 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   // 베이크된 회전 — splatData 에 적용된 누적 회전. saveRefined() 시 pendingRotation 을 옮겨 받음.
   // 용도: 서버 PLY 저장 (raw 원본 + bakedRotation + wallAngle → A'+Y), 페이지 재로드 시 splatData 재베이크.
   const bakedRotationRef = useRef<{ rotX: number; rotZ: number }>({ rotX: 0, rotZ: 0 });
-  // 다음 splatLoad 콜백에서 bakedRotation 재적용 (re-bake) 을 건너뛰는 one-shot 플래그.
-  // 도어 추출이 메인 splat 을 PLY 재로드 방식으로 갱신할 때, 새 PLY 는 이미 A' 프레임으로 빌드되었기에
-  // onSplatLoaded 의 자동 re-bake 가 돌면 double rotation 발생 → 호출자가 reload 직전에 이 플래그를 set.
+  // 다음 splatLoad 콜백에서 bakedRotation 재적용 (re-bake) 을 한 번만 건너뛰는 플래그.
+  // 호출자가 이미 A' 프레임의 PLY 를 reload 하는 경우 (도어 추출 등) set 하면 onSplatLoaded 가 회전 안 건다.
   const skipNextSplatRebakeRef = useRef<boolean>(false);
   const [bakedRotation, setBakedRotation] = useState<{ rotX: number; rotZ: number }>({ rotX: 0, rotZ: 0 });
 
@@ -2110,9 +2109,8 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     // 새 splatData 수신 시 누적 회전 / flatten 마스크가 있으면 즉시 시각 동기화
     // (페이지 새로고침 후 persistence 복원이나 reset 후 등에서 호출됨)
     setTimeout(async () => {
-      // bakedRotation 이 복원되었으면 splatData 에 다시 in-place 적용 → splatData = A' 상태 복원.
-      // 단 호출자가 명시적으로 skip 요청한 경우 (도어 추출의 PLY 재빌드 reload 처럼 새 PLY 가 이미 A')
-      // 한 번만 건너뜀.
+      // bakedRotation 이 0 이 아니면 새 splatData 에 in-place 적용 → A' 상태로 정렬.
+      // skipNextSplatRebake 플래그가 set 이면 이번 한 번 건너뜀 (호출자가 이미 A' 의 PLY 를 reload).
       const skipRebake = skipNextSplatRebakeRef.current;
       if (skipRebake) skipNextSplatRebakeRef.current = false;
       const baked = bakedRotationRef.current;
@@ -3593,9 +3591,12 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     return { rotX, rotZ, wallAngleRad: (wallAngleDeg * Math.PI) / 180 };
   }, []);
 
-  // 도어 추출 같은 외부 호출자가 다음 splatLoad 에서 re-bake 를 건너뛰도록 신호.
+  // 외부 호출자가 다음 splatLoad 에서 re-bake 한 번 건너뛰도록 신호.
+  // 호출 후 정상 흐름에서는 onSplatLoaded 가 flag 를 clear. 호출자가 reload 까지 도달 못 하고 throw
+  // 한 케이스를 대비해 5초 후 자동 clear (dangling 상태로 다른 legitimate load 에 영향 주는 것 방지).
   const markNextSplatLoadSkipRebake = useCallback(() => {
     skipNextSplatRebakeRef.current = true;
+    setTimeout(() => { skipNextSplatRebakeRef.current = false; }, 5000);
   }, []);
 
   return { overlay, panel, modals, onSplatLoaded, planes, saveRefined, commitRefinedToServer, gatherRefinedAssets, getCurrentKeepMask, getBakeRgba, getRemainingRotationToAY, markNextSplatLoadSkipRebake };

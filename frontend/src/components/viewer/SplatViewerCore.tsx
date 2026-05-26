@@ -477,12 +477,18 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
 
             // reorder=false: PlayCanvas 의 기본 Morton order 재배치 비활성. 활성 시 splatData 의
             // 인덱스가 원본 PLY 순서와 달라져 save 시 alpha mask 가 엉뚱한 splat 에 매핑됨.
-            const asset = new pc.Asset('splat', 'gsplat', { url }, { reorder: false } as any);
+            // blob URL 은 확장자가 없어 PC parser 가 형식 판별을 못할 수 있어 filename 힌트 부여.
+            const ext = url.split('?')[0].split('.').pop()?.toLowerCase();
+            const isBlob = url.startsWith('blob:');
+            const filename = isBlob ? 'splat.ply' : (ext ?? 'ply');
+            console.log(`[loadSplat] url=${isBlob ? 'blob:' + url.slice(5, 20) + '...' : url.slice(0, 80)} preserveCamera=${preserveCamera} filename=${filename}`);
+            const asset = new pc.Asset('splat', 'gsplat', { url, filename }, { reorder: false } as any);
             app.assets.add(asset);
 
             return new Promise<void>((resolve, reject) => {
             asset.on('error', (_msg: string, err: Error) => {
               if (cancelled || destroyed) return;
+              console.error('[loadSplat] asset error:', err);
               setError(`파일 로드 실패: ${err?.message ?? '알 수 없는 오류'}`);
               setLoading(false);
               reject(err ?? new Error('splat load failed'));
@@ -508,7 +514,7 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
               app.root.addChild(splatEntity);
               splatEntityRef.current = splatEntity;
 
-              // 카메라 초기 위치 — preserveCamera 면 기존 camPos/azim/elev 유지 (재로드 케이스).
+              // preserveCamera 면 카메라 fit 건너뛰고 현재 위치 유지.
               if (!preserveCamera) {
                 const mi = (splatEntity as any).gsplat?.meshInstance;
                 if (mi?.aabb) {
@@ -632,7 +638,7 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
     useEffect(() => {
       if (!appReady) return;
       if (sogUrl) {
-        // 초기 / sogUrl 변경 로드 — 카메라 fit. 실패는 setError 로 표시되므로 await 불필요.
+        // sogUrl prop 변경 → 카메라 fit 모드로 로드. 에러는 내부 setError 가 처리.
         void loadSplatRef.current?.(sogUrl);
       } else {
         clearSplatRef.current?.();

@@ -154,7 +154,6 @@ export function useAdditionalGsplats(
   }, [coreRef]);
 
   const remove = useCallback((id: string) => {
-    console.warn(`[DoorSplat:REMOVE] id=${id} stack:`, new Error().stack);
     const cancel = cancelMapRef.current.get(id);
     if (cancel) { cancel(); cancelMapRef.current.delete(id); }
     const ent = entityMapRef.current.get(id);
