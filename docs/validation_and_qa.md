@@ -1,6 +1,6 @@
 # Validation and QA Guide
 
-Last updated: 2026-05-05
+Last updated: 2026-05-27
 
 This is the validation contract for the current codebase. It covers local
 checks, container smoke checks, and manual QA for the high-risk browser flows.
@@ -106,8 +106,11 @@ Required environment checks:
 | Upload | Multipart upload and local register flow work with cookie credentials. | Invalid size, missing metadata, foreign/invalid object keys. |
 | Viewer | Server scene and local file loading work. | Additional layer add/remove/promote, WebSocket ticket after login. |
 | Refine | Plane/wall/brush/bbox/transparent/refined save flows still work. | Refine brush must not affect door/alignment mode after stage transition. |
-| Door setup | Manual corner pick, save, reload, and partial door updates work. | No upload id yet, missing `doors.json`, invalid corners. |
-| Alignment | Refined bundle loads after align mode, basemap draft persists, transform saves. | Missing refined bundle, hidden building/floor/module, invalid basemap JSON. |
+| Basemap registration | Refine complete -> door setup -> door extraction -> registered doors save to `doors.json`; completion modal appears centered. | Missing `doors.json`, invalid corners, stale room picker state, backend restart during upload. |
+| Basemap edit | Existing registered doors hydrate without opening the room picker; extraction is disabled until four corners are picked; locked aligned rooms remain read-only. | Duplicate room labels from older bugs, deleting unaligned doors, CPU RGBA cache restoration for wall texture punch. |
+| Module registration | Refine complete bakes rotation/deletion into canonical in-memory PLY; door setup and alignment use that canonical scene. | Door extraction must not resurrect deleted splats or double-rotate the main splat. |
+| Alignment | Module align complete submits `final.ply`, `mesh.json`, wall textures, `doors.json`, and `alignment_transform` through `POST /uploads/commit-final`. | Missing refined bundle, hidden building/floor/module, invalid basemap JSON, `sog_path` nullable migration not applied. |
+| Floor overview | Active basemap plus aligned modules load together; wall mesh, door mesh/splat, and doorFrame are visible. | Multiple heavy modules may hit browser memory limits; see `ROADMAP.md` before changing load policy. |
 | SAM3 disabled | Feature flag OFF does not enqueue unusable SAM3 work; manual fallback remains possible. | User enters prompt, worker absent, no `doors.json`. |
 | Deployment | Nginx routes `/`, `/_next`, `/api`, `/api/ws`, and MinIO proxy paths. | Backend restart race may create a short 502; it should recover. |
 
@@ -130,6 +133,6 @@ discarding PostgreSQL, Redis, RabbitMQ, and MinIO data.
 
 - Frontend browser interaction tests are still manual.
 - OAuth callback requires live Google/browser QA.
-- SAM3 worker/callback is not implemented.
+- The legacy async SAM3 worker/callback path is disabled unless explicitly enabled.
 - GPU compose path is not part of default CI validation.
 - TLS/DNS/certificate correctness cannot be proven by compose config rendering.

@@ -103,7 +103,7 @@ localZ = -(target - pos),  localY = up,  localX = cross(localY, localZ)
   - `final.ply` — 정제 PLY (회전 + flatten/brush 마스크 적용).
   - `mesh.json` — wall mesh 메타 (corners, uvs, normalInward, textureFilename).
   - `tex_{surfaceId}.png` — 면별 베이크 텍스처 (ceiling/floor + `w0..w(N-1)`).
-- `refined/doors.json` — 도어 corners + 메타 + (basemap 한정) doorMesh/doorSplat 자산 참조.
+- `refined/doors.json` — 도어 corners + 메타 + doorFrame 직렬화 데이터 + (basemap 한정) doorMesh/doorSplat 자산 참조.
 - `refined/tex_<doorId>.png`, `<doorId>.ply` — basemap 도어별 mesh 텍스처 + 가우시안 PLY.
 
 업로드 정책:
@@ -192,7 +192,7 @@ wrapper.enabled 토글로 자식 mesh+splat 동시 hide/show.
 5. **다듬기 완료** → `bakeSplatRotation` 으로 `splatData` 메모리에 pendingRotation in-place 적용 (raw → A') 후 삭제 마스크까지 반영한 canonical PLY scene 을 만든다. 이후 문 설정/정합은 이 scene 을 기준으로 동작.
 6. **문 설정** (`DoorAlignModal`) — SAM3 또는 수동 4점 → 문 추출 (boundary split + wall mesh α punch + wall 텍스처 crop 으로 도어 mesh) → 회전축/각도/방향.
 7. **문 설정 완료** — 문 열린 상태였으면 자동 닫기 + `angleDeg=0` 강제. 모듈은 메모리 유지, 베이스맵은 백그라운드 일괄 업로드. 둘 다 정합 단계로 transition.
-8. **정합** (`AlignPanel`) — 4점 자동/수동 → `rectFit(withScale)` → similarity transform. 모듈은 wallAngle bake 보정이 반영된 transform, doorFrame mesh, refined bundle 을 `commit-final` 로 일괄 저장한다. 베이스맵은 해당 단계 없음.
+8. **정합** (`AlignPanel`) — 4점 자동/수동 → `rectFit(withScale)` → similarity transform. 모듈은 wallAngle bake 보정이 반영된 transform 과 refined bundle 을 `commit-final` 로 일괄 저장한다. `doorFrame` 은 별도 multipart field 가 아니라 `doors.json` 내부에 직렬화되어 함께 저장된다. 베이스맵은 해당 단계 없음.
 
 ### WallModal 폴리곤 모드
 N-각형 폴리곤 입력. 단일 cycle 완성 시 확인 활성. **평행화 모드**: 첫 선택 = 기준선 (시안 "기준" 라벨) → 이후 선택 = 평행화 대상 (주황 번호). 출력 `(angleDeg, polygon: PolygonPoint[])` — angleDeg 는 polygon PCA 주축 기반 베이크용 Y 회전.
