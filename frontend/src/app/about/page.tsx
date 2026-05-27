@@ -402,9 +402,9 @@ export default function AboutPage() {
               onClick={requireLoginThenExplore}
               className="inline-flex items-center gap-2 px-4 py-2.5 rounded-sm text-[13.5px] border"
               style={{
-                background: 'var(--ink)',
-                color: 'var(--bg)',
-                borderColor: 'var(--ink)',
+                background: 'var(--accent)',
+                color: '#04131f',
+                borderColor: 'var(--accent)',
               }}
             >
               지금 기여하기 →
@@ -414,9 +414,9 @@ export default function AboutPage() {
               onClick={goExplore}
               className="inline-flex items-center gap-2 px-4 py-2.5 rounded-sm text-[13.5px] border"
               style={{
-                background: 'transparent',
+                background: 'var(--accent-soft)',
                 color: 'var(--ink)',
-                borderColor: 'var(--rule)',
+                borderColor: 'rgba(56, 189, 248, 0.38)',
               }}
             >
               지도에서 둘러보기

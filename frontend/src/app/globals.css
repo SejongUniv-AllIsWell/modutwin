@@ -13,7 +13,9 @@
   --muted-2: #6e6e73;
   --rule: #38383a;
   --rule-soft: #2c2c2e;
-  --accent: #f5f5f7;
+  --accent: #38bdf8;
+  --accent-2: #8b5cf6;
+  --accent-soft: rgba(56, 189, 248, 0.16);
 }
 
 /* 뷰어 영역: 어두운 캔버스 위에서 같은 토큰 이름을 쓰지만 색을 반전.
@@ -28,6 +30,9 @@
   --muted-2: #8a8676;
   --rule: #3b3833;
   --rule-soft: #2a2824;
+  --accent: #38bdf8;
+  --accent-2: #8b5cf6;
+  --accent-soft: rgba(56, 189, 248, 0.16);
 }
 
 @layer base {

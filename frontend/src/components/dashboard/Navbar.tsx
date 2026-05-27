@@ -55,9 +55,9 @@ export default function Navbar() {
               onClick={login}
               className="text-sm px-4 py-1.5 rounded-sm whitespace-nowrap border"
               style={{
-                background: 'var(--ink)',
-                color: 'var(--bg)',
-                borderColor: 'var(--ink)',
+                background: 'var(--accent)',
+                color: '#04131f',
+                borderColor: 'var(--accent)',
               }}
             >
               로그인

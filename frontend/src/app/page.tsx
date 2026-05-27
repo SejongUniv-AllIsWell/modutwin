@@ -360,9 +360,9 @@ export default function LandingPage() {
                 onClick={zoomAndGo}
                 className="inline-flex items-center gap-2 px-4 py-2.5 rounded-sm text-[13.5px] border"
                 style={{
-                  background: 'var(--ink)',
-                  color: 'var(--bg)',
-                  borderColor: 'var(--ink)',
+                  background: 'var(--accent)',
+                  color: '#04131f',
+                  borderColor: 'var(--accent)',
                 }}
               >
                 Start now →
@@ -375,7 +375,7 @@ export default function LandingPage() {
               <div>
                 <b
                   className="mono font-semibold text-[14px]"
-                  style={{ color: 'var(--ink)', letterSpacing: 0 }}
+                  style={{ color: 'var(--accent)', letterSpacing: 0 }}
                 >
                   {stats ? stats.buildings.toLocaleString() : '—'}
                 </b>{' '}
@@ -384,7 +384,7 @@ export default function LandingPage() {
               <div>
                 <b
                   className="mono font-semibold text-[14px]"
-                  style={{ color: 'var(--ink)', letterSpacing: 0 }}
+                  style={{ color: 'var(--accent)', letterSpacing: 0 }}
                 >
                   {stats ? stats.modules.toLocaleString() : '—'}
                 </b>{' '}
@@ -393,7 +393,7 @@ export default function LandingPage() {
               <div>
                 <b
                   className="mono font-semibold text-[14px]"
-                  style={{ color: 'var(--ink)', letterSpacing: 0 }}
+                  style={{ color: 'var(--accent)', letterSpacing: 0 }}
                 >
                   {stats ? stats.contributors.toLocaleString() : '—'}
                 </b>{' '}
@@ -461,7 +461,7 @@ export default function LandingPage() {
                         >
                           <div
                             className="serif italic text-[56px] leading-none"
-                            style={{ color: 'var(--ink)', letterSpacing: 0 }}
+                            style={{ color: 'var(--accent)', letterSpacing: 0 }}
                           >
                             {card.numeral}
                           </div>
@@ -546,7 +546,7 @@ export default function LandingPage() {
                                   width="12"
                                   height="12"
                                   aria-hidden="true"
-                                  style={{ color: '#c9a227' }}
+                                  style={{ color: 'var(--accent)' }}
                                 >
                                   <path
                                     fill="currentColor"
