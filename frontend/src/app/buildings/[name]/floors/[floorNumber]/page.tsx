@@ -133,11 +133,6 @@ function averageImageColor(image: HTMLImageElement): [number, number, number] | 
   return n > 0 ? [r / (255 * n), g / (255 * n), b / (255 * n)] : null;
 }
 
-function isLegacyGreenFrameColor(color: [number, number, number] | undefined): boolean {
-  if (!color) return false;
-  return color[0] <= 0.05 && color[1] >= 0.95 && color[2] <= 0.05;
-}
-
 function createColoredMeshEntity(
   pc: any,
   app: any,
@@ -349,9 +344,7 @@ function FloorCompositeViewer({
 
             if (door.door_frame?.positions?.length && door.door_frame?.indices?.length) {
               const storedColor = door.door_frame.color;
-              const frameColor = isLegacyGreenFrameColor(storedColor)
-                ? (doorMeshAverageColor ?? DEFAULT_DOOR_FRAME_COLOR)
-                : (storedColor ?? doorMeshAverageColor ?? DEFAULT_DOOR_FRAME_COLOR);
+              const frameColor = storedColor ?? doorMeshAverageColor ?? DEFAULT_DOOR_FRAME_COLOR;
               const ent = createColoredMeshEntity(
                 pc,
                 app,
