@@ -101,7 +101,7 @@ async def init_upload(
             detail="building_id / floor_id / module_id 조합이 유효하지 않습니다.",
         )
 
-    # 업로드 서브폴더 결정
+    # 업로드 서브폴더 결정 — ply_target 기반. 예: "gsplat" → "gsplat_uploads/"
     subfolder = get_upload_subfolder(body.filename, body.ply_target or "gsplat")
 
     # MinIO 오브젝트 키 생성 — UUID 기반 (원본 파일명은 DB에만 저장)

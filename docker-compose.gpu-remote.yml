@@ -1,0 +1,98 @@
+# 원격 GPU 머신 전용 (DGX Spark 등 "별도" GPU 머신)
+# ===========================================================================
+# 브로커/스토리지(RabbitMQ·Redis·MinIO)와 백엔드는 PC(웹서버)에서 돌고,
+# 이 파일은 GPU 머신에서 worker + door-ml(SAM3) 을 띄운다.
+#   - worker  : celery training/alignment → PC 를 PC_HOST_IP 로 바라봄
+#   - door-ml : SAM3 문검출 HTTP 서버. PC 백엔드가 DGX:8000 으로 호출
+# (base docker-compose.yml 과 합치지 말고 이 파일 "단독"으로 실행할 것.)
+#
+# 사용법 (GPU 머신에서):
+#   docker compose -f docker-compose.gpu-remote.yml up -d --build
+#
+# 사전 조건:
+#   1) .env 에 PC_HOST_IP + 비밀값이 PC 와 "동일"하게, HF_TOKEN(SAM3 게이트 모델) 설정
+#      (docs/DEVELOPMENT.md: "keep secrets identical on both machines")
+#   2) PC 의 RabbitMQ(5673)/Redis(6379)/MinIO(9000) 가 PC_HOST_IP 로 접근 가능
+#        nc -zv $PC_HOST_IP 5673 && nc -zv $PC_HOST_IP 6379 && nc -zv $PC_HOST_IP 9000
+#   3) NVIDIA Container Toolkit 설치
+#
+# ★ SAM3 를 실제로 쓰려면 PC 백엔드 .env 에서도:
+#     ENABLE_SAM3_DISPATCH=true
+#     DOOR_ML_URL=http://<이 DGX 의 IP>:8000   (예: Tailscale IP)
+#   를 설정하고 백엔드를 재시작해야 한다. (door-ml 은 celery 가 아니라 백엔드
+#   백그라운드 스레드가 HTTP 로 직접 호출한다.)
+# ===========================================================================
+
+services:
+  worker:
+    build: ./worker
+    container_name: 3dgs-worker
+    # env_file 을 쓰지 않는다 — 웹서버용 비밀(JWT/Google/Postgres 등)을 GPU 머신에
+    # 노출하지 않기 위해 워커가 실제로 쓰는 변수만 아래에 명시한다 (최소 권한).
+    # ${VAR} 들은 프로젝트 .env 에서 보간되어 채워진다(컨테이너 주입은 이 목록만).
+    environment:
+      # 브로커/스토리지는 PC 를 PC_HOST_IP 로 가리킨다 (도커 서비스 이름 사용 X).
+      - RABBITMQ_URL=amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@${PC_HOST_IP}:5673//
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@${PC_HOST_IP}:6379/0
+      - MINIO_ENDPOINT=${PC_HOST_IP}:9000
+      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY}
+      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
+      - MINIO_BUCKET=${MINIO_BUCKET}
+      - MINIO_SECURE=false
+      # 백엔드 콜백도 PC 로. nginx 경유면 http://${PC_HOST_IP}, 8000 직노출이면 :8000.
+      - BACKEND_CALLBACK_URL=${BACKEND_CALLBACK_URL}
+      - WORKER_CALLBACK_TOKEN=${WORKER_CALLBACK_TOKEN}
+      # notify_upload_progress 용 (backend_callback.py). 미설정 시 BACKEND_CALLBACK_URL 재사용.
+      - BACKEND_INTERNAL_URL=${BACKEND_INTERNAL_URL:-${BACKEND_CALLBACK_URL}}
+      - INTERNAL_API_TOKEN=${INTERNAL_API_TOKEN:-}
+      # SOG 변환은 CPU 기본 (GPU 불필요).
+      - SOG_DEVICE=cpu
+      - SOG_ITERATIONS=${SOG_ITERATIONS:-10}
+      # gsplat 경로/스텝 (기본값은 DGX(imlabdgx1) 기준; 필요시 .env 로 오버라이드).
+      - GSPLAT_PYTHON=${GSPLAT_PYTHON:-/home/imlabdgx1/miniforge3/envs/gsplat/bin/python}
+      - GSPLAT_TRAINER=${GSPLAT_TRAINER:-/home/imlabdgx1/Development/gsplat/examples/simple_trainer.py}
+      - GSPLAT_MAX_STEPS=${GSPLAT_MAX_STEPS:-7000}
+    volumes:
+      - ./core:/app/core:ro
+      - ./utilities:/app/utilities:ro
+      # gsplat 학습은 gsplat_module.py 가 호스트 conda 환경/레포를 subprocess 로
+      # 호출한다. 컨테이너에서 그 경로가 보이도록 마운트한다 (DGX 사용자=imlabdgx1).
+      # 경로가 다르면 .env 의 GSPLAT_PYTHON / GSPLAT_TRAINER 로 오버라이드.
+      - /home/imlabdgx1/miniforge3:/home/imlabdgx1/miniforge3:ro
+      - /home/imlabdgx1/Development/gsplat:/home/imlabdgx1/Development/gsplat:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  # SAM3 문검출 HTTP 서버. PC 백엔드가 POST /detect 로 호출한다(celery 미사용).
+  door-ml:
+    build: ./door_ml
+    container_name: 3dgs-door-ml
+    ports:
+      # PC 백엔드가 DOOR_ML_URL=http://<DGX_IP>:8000 으로 접근. Tailscale 등
+      # 사설망만 열려 있도록 방화벽/ACL 로 제한 권장.
+      - "8000:8000"
+    volumes:
+      - ./core:/app/core:ro
+      - ./utilities:/app/utilities:ro
+      - hf_cache:/root/.cache/huggingface   # SAM3 체크포인트 캐시(재다운로드 방지)
+    environment:
+      - TORCH_CUDA_ARCH_LIST=12.1+PTX        # DGX Spark GB10 = sm_121
+      - HF_TOKEN=${HF_TOKEN}                 # facebook/sam3 gated 모델 접근 토큰
+      - HF_HUB_DISABLE_PROGRESS_BARS=1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
+volumes:
+  hf_cache:

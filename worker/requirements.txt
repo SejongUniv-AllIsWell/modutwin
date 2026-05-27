@@ -4,8 +4,7 @@ requests
 minio
 numpy
 plyfile
-requests
 # COLMAP 파이프라인
-pycolmap>=0.6.0
+# pycolmap, colmap(CLI) 은 Dockerfile 에서 conda-forge 로 설치 (arm64 pip 휠 부재).
 opencv-python-headless>=4.8.0
 ffmpeg-python>=0.2.0

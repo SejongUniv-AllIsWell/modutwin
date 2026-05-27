@@ -118,15 +118,6 @@ export default function AboutPage() {
     <div className="about min-h-screen bg-[var(--bg)] text-[var(--ink)]">
       <style jsx global>{`
         .about {
-          --bg: #f4f1ea;
-          --bg-soft: #ede9df;
-          --paper: #faf7f0;
-          --ink: #1a1a1a;
-          --ink-2: #2c2a26;
-          --muted: #6b665e;
-          --muted-2: #908a7e;
-          --rule: #d9d3c4;
-          --rule-soft: #e7e1d1;
           font-family: var(--font-noto-sans-kr), 'Noto Sans KR', Helvetica, 'Helvetica Neue', Arial, sans-serif;
           -webkit-font-smoothing: antialiased;
           text-rendering: optimizeLegibility;
@@ -141,7 +132,7 @@ export default function AboutPage() {
           <a
             href="/"
             className="flex items-baseline gap-[10px] no-underline serif font-semibold text-xl"
-            style={{ color: 'var(--ink)', letterSpacing: '-0.01em' }}
+            style={{ color: 'var(--ink)', letterSpacing: 0 }}
           >
             modu
             <span
@@ -207,7 +198,7 @@ export default function AboutPage() {
             About · ModuTwin
           </span>
           <h1
-            className="font-medium leading-[1.02] tracking-tight mb-6 text-balance"
+            className="font-medium leading-[1.02] mb-6 text-balance"
             style={{ fontSize: 'clamp(40px, 5.4vw, 58px)', color: 'var(--ink)' }}
           >
             영상 한 편을 걸어 다닐 수 있는 공간으로
@@ -230,8 +221,8 @@ export default function AboutPage() {
           style={{
             background: 'var(--paper)',
             border: '1px solid var(--rule)',
-            borderRadius: 20,
-            padding: '56px 48px',
+            borderRadius: 8,
+            padding: 'clamp(28px, 5vw, 56px) clamp(20px, 4vw, 48px)',
           }}
         >
           <div className="flex items-baseline justify-between gap-5 mb-9 flex-wrap">
@@ -242,7 +233,7 @@ export default function AboutPage() {
               01 · 3D Gaussian Splatting
             </span>
             <h2
-              className="serif font-medium tracking-tight m-0 text-balance"
+              className="serif font-medium m-0 text-balance"
               style={{ fontSize: 'clamp(28px, 3vw, 40px)', color: 'var(--ink)' }}
             >
               수백만 개의 작은 빛 덩어리
@@ -259,8 +250,8 @@ export default function AboutPage() {
             {GAUSSIAN_FEATURES.map((f) => (
               <div
                 key={f.title}
-                className="p-7 rounded-xl"
-                style={{ background: '#ffffff', border: '1px solid var(--rule-soft)' }}
+                className="p-7"
+                style={{ background: 'var(--paper)', border: '1px solid var(--rule-soft)', borderRadius: 8 }}
               >
                 <div
                   className="serif italic text-[14px] mb-3"
@@ -270,7 +261,7 @@ export default function AboutPage() {
                 </div>
                 <h3
                   className="serif font-medium m-0 mb-3"
-                  style={{ fontSize: 22, letterSpacing: '-0.01em' }}
+                  style={{ fontSize: 22, letterSpacing: 0 }}
                 >
                   {f.title}
                 </h3>
@@ -289,8 +280,8 @@ export default function AboutPage() {
           style={{
             background: 'var(--paper)',
             border: '1px solid var(--rule)',
-            borderRadius: 20,
-            padding: '56px 48px',
+            borderRadius: 8,
+            padding: 'clamp(28px, 5vw, 56px) clamp(20px, 4vw, 48px)',
           }}
         >
           <div className="flex items-baseline justify-between gap-5 mb-9 flex-wrap">
@@ -301,7 +292,7 @@ export default function AboutPage() {
               02 · The platform
             </span>
             <h2
-              className="serif font-medium tracking-tight m-0 text-balance"
+              className="serif font-medium m-0 text-balance"
               style={{ fontSize: 'clamp(28px, 3vw, 40px)', color: 'var(--ink)' }}
             >
               실내를 위한, 모두가 함께 쓰는 지도
@@ -321,12 +312,12 @@ export default function AboutPage() {
             {PLATFORM_POINTS.map((p) => (
               <div
                 key={p.title}
-                className="p-7 rounded-xl"
-                style={{ background: '#ffffff', border: '1px solid var(--rule-soft)' }}
+                className="p-7"
+                style={{ background: 'var(--paper)', border: '1px solid var(--rule-soft)', borderRadius: 8 }}
               >
                 <h3
                   className="serif font-medium m-0 mb-3"
-                  style={{ fontSize: 22, letterSpacing: '-0.01em' }}
+                  style={{ fontSize: 22, letterSpacing: 0 }}
                 >
                   {p.title}
                 </h3>
@@ -345,8 +336,8 @@ export default function AboutPage() {
           style={{
             background: 'var(--paper)',
             border: '1px solid var(--rule)',
-            borderRadius: 20,
-            padding: '56px 48px',
+            borderRadius: 8,
+            padding: 'clamp(28px, 5vw, 56px) clamp(20px, 4vw, 48px)',
           }}
         >
           <div className="flex items-baseline justify-between gap-5 mb-9 flex-wrap">
@@ -357,7 +348,7 @@ export default function AboutPage() {
               03 · From video to digital twin
             </span>
             <h2
-              className="serif font-medium tracking-tight m-0 text-balance"
+              className="serif font-medium m-0 text-balance"
               style={{ fontSize: 'clamp(28px, 3vw, 40px)', color: 'var(--ink)' }}
             >
               영상이 디지털 트윈이 되기까지
@@ -368,10 +359,11 @@ export default function AboutPage() {
             {PIPELINE_STEPS.map((s) => (
               <li
                 key={s.numeral}
-                className="grid items-start gap-6 py-6 px-7 rounded-xl"
+                className="grid items-start gap-6 py-6 px-7"
                 style={{
-                  background: '#ffffff',
+                  background: 'var(--paper)',
                   border: '1px solid var(--rule-soft)',
+                  borderRadius: 8,
                   gridTemplateColumns: 'auto 1fr',
                 }}
               >
@@ -380,7 +372,7 @@ export default function AboutPage() {
                   style={{
                     fontSize: 44,
                     color: 'var(--ink)',
-                    letterSpacing: '-0.02em',
+                    letterSpacing: 0,
                     minWidth: 56,
                   }}
                 >
@@ -389,7 +381,7 @@ export default function AboutPage() {
                 <div className="min-w-0">
                   <h3
                     className="serif font-medium m-0 mb-3"
-                    style={{ fontSize: 22, letterSpacing: '-0.01em' }}
+                    style={{ fontSize: 22, letterSpacing: 0 }}
                   >
                     {s.title}
                   </h3>

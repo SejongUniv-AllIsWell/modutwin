@@ -1,0 +1,183 @@
+import { randomBytes } from 'crypto';
+import { FileHandle, mkdir, open, rename, stat } from 'node:fs/promises';
+import { basename, dirname, join } from 'node:path';
+
+import {
+    BufferedReadStream,
+    ReadStream,
+    type FileSystem,
+    type ProgressCallback,
+    type ReadFileSystem,
+    type ReadSource,
+    type Writer
+} from '../lib';
+
+// ============================================================================
+// Read implementations
+// ============================================================================
+
+/**
+ * ReadStream implementation for reading from Node.js file handles.
+ */
+class NodeReadStream extends ReadStream {
+    private fileHandle: FileHandle;
+    private position: number;
+    private end: number;
+    private closed: boolean = false;
+    private progress: ProgressCallback | undefined;
+    private totalSize: number | undefined;
+
+    constructor(
+        fileHandle: FileHandle,
+        start: number,
+        end: number,
+        progress?: ProgressCallback,
+        totalSize?: number
+    ) {
+        super(end - start);
+        this.fileHandle = fileHandle;
+        this.position = start;
+        this.end = end;
+        this.progress = progress;
+        this.totalSize = totalSize;
+    }
+
+    async pull(target: Uint8Array): Promise<number> {
+        if (this.closed) {
+            return 0;
+        }
+
+        const remaining = this.end - this.position;
+        if (remaining <= 0) {
+            return 0;
+        }
+
+        const bytesToRead = Math.min(target.length, remaining);
+        const { bytesRead } = await this.fileHandle.read(target, 0, bytesToRead, this.position);
+
+        this.position += bytesRead;
+        this.bytesRead += bytesRead;
+
+        // Report progress
+        if (this.progress) {
+            this.progress(this.bytesRead, this.totalSize);
+        }
+
+        return bytesRead;
+    }
+
+    close(): void {
+        this.closed = true;
+    }
+}
+
+/**
+ * ReadSource implementation for Node.js file handles.
+ * Size is exact from stat(). Always seekable via positioned reads.
+ */
+class NodeReadSource implements ReadSource {
+    readonly size: number;
+    readonly seekable: boolean = true;
+
+    private fileHandle: FileHandle;
+    private closed: boolean = false;
+    private progress: ProgressCallback | undefined;
+
+    constructor(fileHandle: FileHandle, size: number, progress?: ProgressCallback) {
+        this.fileHandle = fileHandle;
+        this.size = size;
+        this.progress = progress;
+    }
+
+    read(start: number = 0, end: number = this.size): ReadStream {
+        if (this.closed) {
+            throw new Error('Source has been closed');
+        }
+
+        // Clamp range to valid bounds
+        const clampedStart = Math.max(0, Math.min(start, this.size));
+        const clampedEnd = Math.max(clampedStart, Math.min(end, this.size));
+
+        // Wrap with BufferedReadStream to reduce async overhead from file reads
+        const raw = new NodeReadStream(
+            this.fileHandle,
+            clampedStart,
+            clampedEnd,
+            this.progress,
+            this.size
+        );
+        return new BufferedReadStream(raw, 4 * 1024 * 1024);  // 4MB chunks
+    }
+
+    close(): void {
+        this.closed = true;
+        this.fileHandle.close();
+    }
+}
+
+/**
+ * ReadFileSystem for reading from the local filesystem using Node.js fs module.
+ */
+class NodeReadFileSystem implements ReadFileSystem {
+    async createSource(filename: string, progress?: ProgressCallback): Promise<ReadSource> {
+        const fileStats = await stat(filename);
+        const fileHandle = await open(filename, 'r');
+        progress?.(0, fileStats.size);
+        return new NodeReadSource(fileHandle, fileStats.size, progress);
+    }
+}
+
+// ============================================================================
+// Write implementations
+// ============================================================================
+
+/**
+ * Writer implementation for writing to Node.js file handles.
+ */
+class FileWriter implements Writer {
+    bytesWritten = 0;
+    write: (data: Uint8Array) => Promise<void>;
+    close: () => Promise<void>;
+
+    constructor(fileHandle: FileHandle, filename: string, tmpFilename: string) {
+        this.write = async (data: Uint8Array) => {
+            let offset = 0;
+            while (offset < data.byteLength) {
+                const { bytesWritten } = await fileHandle.write(data, offset, data.byteLength - offset);
+                if (bytesWritten === 0) {
+                    throw new Error('Failed to write all data to file.');
+                }
+                offset += bytesWritten;
+                this.bytesWritten += bytesWritten;
+            }
+        };
+
+        this.close = async () => {
+            // flush to disk
+            await fileHandle.sync();
+            // close the file
+            await fileHandle.close();
+            // atomically rename to target filename
+            await rename(tmpFilename, filename);
+        };
+    }
+}
+
+/**
+ * FileSystem for writing to the local filesystem using Node.js fs module.
+ */
+class NodeFileSystem implements FileSystem {
+    async createWriter(filename: string): Promise<Writer> {
+        // write to a temporary file
+        const tmpFilename = `.${basename(filename)}.${process.pid}.${Date.now()}.${randomBytes(6).toString('hex')}.tmp`;
+        const tmpPathname = join(dirname(filename), tmpFilename);
+        const fileHandle = await open(tmpPathname, 'wx');
+        return new FileWriter(fileHandle, filename, tmpPathname);
+    }
+
+    async mkdir(path: string): Promise<void> {
+        await mkdir(path, { recursive: true });
+    }
+}
+
+export { NodeReadFileSystem, NodeFileSystem };

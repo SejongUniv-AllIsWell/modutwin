@@ -8,6 +8,7 @@ from celery_app import app
 from minio_helper import download_file, upload_file
 from redis_helper import update_progress, clear_progress
 from callback_client import notify_task_failure, notify_task_success
+from pipeline.sog_converter import convert_to_sog
 
 logger = logging.getLogger(__name__)
 
@@ -66,9 +67,9 @@ def run_door_alignment(self, upload_id: str, user_id: str,
             logger.warning(f"[Task {task_id}] 정합 알고리즘 미구현. stub 복사합니다.")
             shutil.copy2(local_ply, aligned_ply)
 
-        # SOG 변환 (stub)
+        # SOG 변환
         update_progress(task_id, 60, "SOG 변환")
-        shutil.copy2(aligned_ply, aligned_sog)
+        convert_to_sog(aligned_ply, output_path=aligned_sog)
 
         # 4. alignment/ 에 업로드
         update_progress(task_id, 80, "업로드")

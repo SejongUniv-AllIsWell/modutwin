@@ -36,3 +36,5 @@ plans were removed or merged.
 | `refactoring_batches_roadmap.md` | Historical batch plan; current work lives in `ROADMAP.md`. |
 | `floor_overview_pipeline_plan.md` | Historical feature plan; implemented behavior is documented in `CODEBASE_REFERENCE.md`. |
 | `refactor-viewer-tools.md` | Historical implementation plan; current viewer structure is documented in `CODEBASE_REFERENCE.md`. |
+| `module_zip_upload_future.md` | Stale status note; current ZIP behavior is covered by `CODEBASE_REFERENCE.md` and `DEVELOPMENT.md`. |
+| `splat_wiki_floor_view_plan_EN.docx` | One-off design reference, not a current repository-facing document. |
