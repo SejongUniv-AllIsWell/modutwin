@@ -13,13 +13,13 @@ export default function Navbar() {
   return (
     <nav
       className="fixed top-0 left-0 right-0 z-50 border-b backdrop-blur-sm"
-      style={{ minWidth: '500px', background: 'var(--bg)', borderColor: 'var(--rule)' }}
+      style={{ minWidth: 0, background: 'var(--bg)', borderColor: 'var(--rule)' }}
     >
-      <div className="px-10 flex items-center justify-between h-14">
+      <div className="px-4 sm:px-10 flex items-center justify-between h-14 gap-4">
         <Link
           href="/"
           className="flex items-baseline gap-[10px] no-underline serif font-semibold text-xl whitespace-nowrap"
-          style={{ color: 'var(--ink)', letterSpacing: '-0.01em' }}
+          style={{ color: 'var(--ink)', letterSpacing: 0 }}
         >
           modu
           <span
