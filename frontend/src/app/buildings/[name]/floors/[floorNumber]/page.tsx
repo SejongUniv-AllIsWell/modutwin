@@ -18,12 +18,19 @@ type ModuleGroup = {
   name: string;
   modules: FloorDetailModuleEntry[];
 };
+type ModuleOverlayRecord = {
+  group: any | null;
+  splatLayerIds: string[];
+  meshEntities: any[];
+  cancelled: boolean;
+};
 
 const moduleNameCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
 const moduleTimeFormatter = new Intl.DateTimeFormat('ko-KR', {
   dateStyle: 'short',
   timeStyle: 'short',
 });
+const DEFAULT_DOOR_FRAME_COLOR: [number, number, number] = [0.72, 0.65, 0.53];
 
 function moduleVersionTime(value: string | null): number {
   if (!value) return Number.POSITIVE_INFINITY;
@@ -87,6 +94,79 @@ function parseAlignmentTransform(raw: Record<string, unknown> | null): { positio
   return { position, rotation, scale };
 }
 
+function loadHtmlImage(url: string): Promise<HTMLImageElement | null> {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => resolve(img);
+    img.onerror = () => resolve(null);
+    img.src = url;
+  });
+}
+
+function averageImageColor(image: HTMLImageElement): [number, number, number] | null {
+  const sourceWidth = image.naturalWidth || image.width;
+  const sourceHeight = image.naturalHeight || image.height;
+  if (!sourceWidth || !sourceHeight) return null;
+  const width = Math.max(1, Math.min(64, sourceWidth));
+  const height = Math.max(1, Math.min(64, sourceHeight));
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return null;
+  let data: Uint8ClampedArray;
+  try {
+    ctx.drawImage(image, 0, 0, width, height);
+    data = ctx.getImageData(0, 0, width, height).data;
+  } catch {
+    return null;
+  }
+  let r = 0, g = 0, b = 0, n = 0;
+  for (let i = 0; i < data.length; i += 4) {
+    if (data[i + 3] <= 0) continue;
+    r += data[i];
+    g += data[i + 1];
+    b += data[i + 2];
+    n++;
+  }
+  return n > 0 ? [r / (255 * n), g / (255 * n), b / (255 * n)] : null;
+}
+
+function isLegacyGreenFrameColor(color: [number, number, number] | undefined): boolean {
+  if (!color) return false;
+  return color[0] <= 0.05 && color[1] >= 0.95 && color[2] <= 0.05;
+}
+
+function createColoredMeshEntity(
+  pc: any,
+  app: any,
+  name: string,
+  positions: number[],
+  indices: number[],
+  color: [number, number, number] = DEFAULT_DOOR_FRAME_COLOR,
+): any {
+  const mesh = new pc.Mesh(app.graphicsDevice);
+  mesh.setPositions(positions);
+  mesh.setIndices(indices);
+  mesh.update(pc.PRIMITIVE_TRIANGLES);
+
+  const mat = new pc.StandardMaterial();
+  mat.emissive = new pc.Color(color[0], color[1], color[2]);
+  mat.useLighting = false;
+  mat.cull = pc.CULLFACE_NONE;
+  mat.update();
+
+  const ent = new pc.Entity(name);
+  ent.addComponent('render', { meshInstances: [new pc.MeshInstance(mesh, mat)] });
+  app.root.addChild(ent);
+  return ent;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function FloorCompositeViewer({
   primaryUrl,
   basemapSourceUploadId,
@@ -98,48 +178,241 @@ function FloorCompositeViewer({
 }) {
   const coreRef = useRef<SplatViewerCoreRef>(null);
   const additional = useAdditionalGsplats(coreRef);
-  const { add, getEntity, remove, setTransform } = additional;
-  const layerIdsRef = useRef<Map<string, string>>(new Map());
+  const { add, getEntity, remove } = additional;
+  const overlayRecordsRef = useRef<Map<string, ModuleOverlayRecord>>(new Map());
 
   // 베이스맵의 wall mesh + 텍스처(천장/바닥/벽) + 도어 splat 까지 같이 로드.
   // 4번째 인자 (additional) 가 있어야 도어 splat 도 씬에 add 됨.
-  useRefinedMeshLoader(coreRef, basemapSourceUploadId ?? undefined, !!basemapSourceUploadId, additional);
+  // 층 overview 는 보기 전용이므로 CPU ImageData 복사 없이 로드해 대형 텍스처 메모리 사용을 줄인다.
+  useRefinedMeshLoader(coreRef, basemapSourceUploadId ?? undefined, !!basemapSourceUploadId, additional, null, false);
 
   useEffect(() => {
+    const cleanupRecord = (record: ModuleOverlayRecord) => {
+      record.cancelled = true;
+      for (const layerId of record.splatLayerIds) {
+        try { remove(layerId); } catch {}
+      }
+      record.splatLayerIds = [];
+      for (const ent of record.meshEntities) {
+        try { ent.destroy(); } catch {}
+      }
+      record.meshEntities = [];
+      if (record.group) {
+        try { record.group.destroy(); } catch {}
+      }
+      record.group = null;
+    };
+
+    const applyGroupTransform = (group: any, t: { position: Vec3; rotation: Quat; scale: Scale3 }) => {
+      group.setLocalPosition(t.position[0], t.position[1], t.position[2]);
+      group.setLocalRotation(t.rotation[0], t.rotation[1], t.rotation[2], t.rotation[3]);
+      group.setLocalScale(t.scale[0], t.scale[1], t.scale[2]);
+    };
+
+    const resetPlyLocalFrame = (ent: any) => {
+      ent.setLocalPosition(0, 0, 0);
+      ent.setLocalEulerAngles(0, 0, 180);
+      ent.setLocalScale(1, 1, 1);
+    };
+
     const knownModuleIds = new Set(moduleOverlays.map((m) => m.id));
-    for (const [moduleId, layerId] of Array.from(layerIdsRef.current.entries())) {
+    for (const [moduleId, record] of Array.from(overlayRecordsRef.current.entries())) {
       if (!knownModuleIds.has(moduleId)) {
-        remove(layerId);
-        layerIdsRef.current.delete(moduleId);
+        cleanupRecord(record);
+        overlayRecordsRef.current.delete(moduleId);
       }
     }
 
-    moduleOverlays.forEach((module) => {
+    moduleOverlays.forEach((module, moduleIndex) => {
       if (!module.url) return;
-      const existing = layerIdsRef.current.get(module.id);
-      if (existing) return;
-      const { id, ready } = add(module.url, {
-        name: module.name,
-        source: 'server',
-        visible: true,
-      });
-      layerIdsRef.current.set(module.id, id);
-      ready
-        .then(() => {
-          const t = parseAlignmentTransform(module.alignment_transform);
-          if (!t) return;
-          setTransform(id, t.position, t.rotation);
-          const ent = getEntity(id);
-          if (ent) ent.setLocalScale(t.scale[0], t.scale[1], t.scale[2]);
-        })
-        .catch(() => {});
+      const t = parseAlignmentTransform(module.alignment_transform);
+      if (!t) return;
+      const existing = overlayRecordsRef.current.get(module.id);
+      if (existing) {
+        if (existing.group) applyGroupTransform(existing.group, t);
+        return;
+      }
+
+      const record: ModuleOverlayRecord = { group: null, splatLayerIds: [], meshEntities: [], cancelled: false };
+      overlayRecordsRef.current.set(module.id, record);
+
+      (async () => {
+        // 여러 개의 큰 PLY/텍스처를 동시에 올리면 브라우저 ArrayBuffer/GPU 메모리 피크가
+        // 급격히 커진다. 층 overview 는 초 단위 지연보다 안정적인 로딩이 중요하므로 순차에 가깝게 시작한다.
+        if (moduleIndex > 0) {
+          await delay(moduleIndex * 700);
+          if (record.cancelled) return;
+        }
+        let attempts = 0;
+        while (!record.cancelled && (!coreRef.current?.getApp() || !coreRef.current?.getPC()) && attempts < 80) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          attempts++;
+        }
+        if (record.cancelled) return;
+        const app = coreRef.current?.getApp();
+        const pc = coreRef.current?.getPC();
+        if (!app || !pc) return;
+
+        const group = new pc.Entity(`moduleOverlay_${module.id}`);
+        applyGroupTransform(group, t);
+        app.root.addChild(group);
+        record.group = group;
+
+        const splat = add(module.url!, {
+          name: module.name,
+          source: 'server',
+          visible: true,
+        });
+        record.splatLayerIds.push(splat.id);
+        splat.ready
+          .then(() => {
+            if (record.cancelled || !record.group) return;
+            const ent = getEntity(splat.id);
+            if (!ent) return;
+            record.group.addChild(ent);
+            resetPlyLocalFrame(ent);
+          })
+          .catch(() => {});
+
+        if (!module.source_upload_id) return;
+        try {
+          const bundle = await api.get<{
+            mesh_meta_url: string | null;
+            textures: Record<string, string>;
+            doors?: Array<{
+              id: string;
+              unitName?: string | null;
+              wallSurfaceId?: string | null;
+              door_mesh?: {
+                corners: number[][];
+                uvs: number[][];
+                normalInward: number[];
+                textureUrl: string;
+              } | null;
+              door_splat?: { url: string } | null;
+              door_frame?: {
+                positions?: number[];
+                indices?: number[];
+                color?: [number, number, number];
+              } | null;
+            }>;
+          }>(`/refine/refined-bundle?upload_id=${module.source_upload_id}`);
+          if (record.cancelled || !record.group) return;
+
+          const { createWallMeshFromPersisted } = await import('@/lib/gs/wallMesh');
+
+          if (bundle.mesh_meta_url) {
+            const metaResp = await fetch(bundle.mesh_meta_url);
+            if (metaResp.ok) {
+              const meta = await metaResp.json();
+              const surfaces = meta.surfaces ?? [];
+              const images = await Promise.all(
+                surfaces.map((surface: any) => {
+                  const url = bundle.textures[surface.surfaceId];
+                  return url ? loadHtmlImage(url) : Promise.resolve(null);
+                }),
+              );
+              if (record.cancelled || !record.group) return;
+              for (let i = 0; i < surfaces.length; i++) {
+                const surface = surfaces[i];
+                const img = images[i];
+                if (!img) continue;
+                const ent = createWallMeshFromPersisted(pc, app, {
+                  surfaceId: `module_${module.id}_${surface.surfaceId}`,
+                  corners: surface.corners,
+                  uvs: surface.uvs,
+                  normalInward: surface.normalInward,
+                  textureImage: img,
+                }, { mutableTexture: false });
+                record.group.addChild(ent);
+                resetPlyLocalFrame(ent);
+                record.meshEntities.push(ent);
+              }
+            }
+          }
+
+          for (const door of bundle.doors ?? []) {
+            if (record.cancelled || !record.group) return;
+            const wrapper = new pc.Entity(`moduleDoor_${module.id}_${door.id}`);
+            record.group.addChild(wrapper);
+            record.meshEntities.push(wrapper);
+
+            let doorMeshImage: HTMLImageElement | null = null;
+            let doorMeshAverageColor: [number, number, number] | null = null;
+            if (door.door_mesh) {
+              doorMeshImage = await loadHtmlImage(door.door_mesh.textureUrl);
+              if (record.cancelled || !record.group) return;
+              if (doorMeshImage) {
+                doorMeshAverageColor = averageImageColor(doorMeshImage);
+              }
+            }
+
+            if (door.door_frame?.positions?.length && door.door_frame?.indices?.length) {
+              const storedColor = door.door_frame.color;
+              const frameColor = isLegacyGreenFrameColor(storedColor)
+                ? (doorMeshAverageColor ?? DEFAULT_DOOR_FRAME_COLOR)
+                : (storedColor ?? doorMeshAverageColor ?? DEFAULT_DOOR_FRAME_COLOR);
+              const ent = createColoredMeshEntity(
+                pc,
+                app,
+                `moduleDoorFrame_${module.id}_${door.id}`,
+                door.door_frame.positions,
+                door.door_frame.indices,
+                frameColor,
+              );
+              record.meshEntities.push(ent);
+            }
+
+            if (door.door_mesh && doorMeshImage) {
+              const dm = door.door_mesh;
+              const ent = createWallMeshFromPersisted(pc, app, {
+                surfaceId: `module_door_${module.id}_${door.id}_${door.wallSurfaceId ?? 'w0'}`,
+                corners: dm.corners,
+                uvs: dm.uvs,
+                normalInward: dm.normalInward as [number, number, number],
+                textureImage: doorMeshImage,
+              }, { mutableTexture: false });
+              wrapper.addChild(ent);
+              resetPlyLocalFrame(ent);
+            }
+
+            if (door.door_splat?.url) {
+              const doorSplat = add(door.door_splat.url, {
+                name: `도어 영역 가우시안 (${door.unitName ?? module.name})`,
+                source: 'server',
+                visible: true,
+              });
+              record.splatLayerIds.push(doorSplat.id);
+              doorSplat.ready
+                .then(() => {
+                  if (record.cancelled) return;
+                  const ent = getEntity(doorSplat.id);
+                  if (!ent) return;
+                  wrapper.addChild(ent);
+                  resetPlyLocalFrame(ent);
+                })
+                .catch(() => {});
+            }
+          }
+        } catch (e) {
+          console.warn(`[FloorCompositeViewer] module refined assets load failed: ${module.name}`, e);
+        }
+      })();
     });
-  }, [add, getEntity, moduleOverlays, remove, setTransform]);
+  }, [add, getEntity, moduleOverlays, remove]);
 
   useEffect(() => {
     return () => {
-      for (const layerId of Array.from(layerIdsRef.current.values())) remove(layerId);
-      layerIdsRef.current.clear();
+      for (const record of Array.from(overlayRecordsRef.current.values())) {
+        record.cancelled = true;
+        for (const layerId of record.splatLayerIds) {
+          try { remove(layerId); } catch {}
+        }
+        if (record.group) {
+          try { record.group.destroy(); } catch {}
+        }
+      }
+      overlayRecordsRef.current.clear();
     };
   }, [remove]);
 
@@ -241,16 +514,10 @@ export default function FloorDetailPage() {
     () => moduleRows.filter((module) => module.url && module.is_visible !== false),
     [moduleRows],
   );
-  const selectedModule = useMemo(
-    () => renderableModules.find((module) => module.id === selectedModuleId) ?? null,
-    [renderableModules, selectedModuleId],
-  );
   const moduleOverlays = useMemo(() => {
-    if (!primaryUrl || !hasBasemap || !selectedModule?.url) return [];
-    if (selectedModule.url === primaryUrl) return [];
-    if (!selectedModule.alignment_transform) return [];
-    return [selectedModule];
-  }, [hasBasemap, primaryUrl, selectedModule]);
+    if (!primaryUrl || !hasBasemap) return [];
+    return renderableModules.filter((module) => module.url !== primaryUrl && module.alignment_transform);
+  }, [hasBasemap, primaryUrl, renderableModules]);
 
   if (loading) return null;
 
@@ -504,13 +771,13 @@ export default function FloorDetailPage() {
                   setCreatingModule(true);
                   setAddModuleError(null);
                   try {
-                    // 사전 확인: 같은 사용자가 같은 호수에 이미 등록한 모듈이 있는지 체크.
-                    // 있으면 사용자에게 덮어쓰기 의사 확인. 정합 완료 시 commit-final 이 기존 자산을 삭제하고 교체.
-                    const existing = await api.get<Array<{ id: string; name: string }>>(
+                    // 사전 확인: 같은 사용자가 같은 호수에 저장된 정합 작업물이 있는지 체크.
+                    // 단순 Module 슬롯만 있는 경우는 신규 저장으로 취급한다.
+                    const existing = await api.get<Array<{ id: string; name: string; alignment_transform?: unknown | null }>>(
                       `/floors/${manifest.floor_id}/modules`,
                     );
-                    const alreadyExists = existing.some((m) => m.name === name);
-                    if (alreadyExists) {
+                    const alreadyHasSavedWork = existing.some((m) => m.name === name && !!m.alignment_transform);
+                    if (alreadyHasSavedWork) {
                       const ok = window.confirm(
                         `${name} 은(는) 이미 등록되어 있습니다.\n계속 진행하면 정합 완료 시 기존 작업물은 삭제되고 새 작업물로 교체됩니다.\n\n진행하시겠습니까?`,
                       );

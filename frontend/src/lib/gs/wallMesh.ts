@@ -16,6 +16,19 @@ export interface WallMeshOptions {
   solidWhite?: boolean;
 }
 
+function averageOpaqueColor(rgba: Uint8ClampedArray | Uint8Array): [number, number, number] | null {
+  let r = 0, g = 0, b = 0, n = 0;
+  for (let i = 0; i < rgba.length; i += 4) {
+    const a = rgba[i + 3];
+    if (a <= 0) continue;
+    r += rgba[i];
+    g += rgba[i + 1];
+    b += rgba[i + 2];
+    n++;
+  }
+  return n > 0 ? [r / (255 * n), g / (255 * n), b / (255 * n)] : null;
+}
+
 export function createWallMeshEntity(
   pc: any,
   app: any,
@@ -66,15 +79,6 @@ export function createWallMeshEntity(
   }
   mat.update();
 
-  // 진단 로깅 — 텍스처 모드 시 alpha 분포 확인
-  if (!opts.solidWhite) {
-    let nOpaque = 0;
-    for (let i = 3; i < bake.rgba.length; i += 4) {
-      if (bake.rgba[i] > 0) nOpaque++;
-    }
-    console.log(`[wallMesh:${name}] tex ${bake.width}×${bake.height}, opaque texels: ${nOpaque} / ${bake.width * bake.height} (${(100 * nOpaque / (bake.width * bake.height)).toFixed(1)}%)`);
-  }
-
   // ── Quad 메시 ──
   // corners: TL, TR, BR, BL
   const [tl, tr, br, bl] = bake.corners;
@@ -115,6 +119,7 @@ export function createWallMeshEntity(
 
   const ent = new pc.Entity(name);
   ent.addComponent('render', { meshInstances: [meshInstance] });
+  (ent as any).__averageColor = opts.solidWhite ? [1, 1, 1] : averageOpaqueColor(bake.rgba);
   // Z-180만 직접 부여.
   ent.setLocalEulerAngles(0, 0, 180);
   app.root.addChild(ent);
@@ -141,6 +146,10 @@ export function createWallMeshFromPersisted(
   pc: any,
   app: any,
   data: PersistedMeshData,
+  opts: {
+    mutableTexture?: boolean;
+    onTextureData?: (texture: { rgba: Uint8ClampedArray; width: number; height: number }) => void;
+  } = {},
 ): any {
   const device = app.graphicsDevice;
   const name = `wallMesh_${data.surfaceId}`;
@@ -164,21 +173,28 @@ export function createWallMeshFromPersisted(
     minFilter: pc.FILTER_LINEAR,
     name,
   });
-  // 항상 canvas → ImageData → lock/set/unlock 경로 사용.
-  // setSource(img) 는 텍스처 _levels byte buffer 를 채우지 않아서, 도어 정합 단계에서
-  // tex.lock() 으로 RGBA 를 직접 수정할 때 변경이 GPU 로 반영되지 않음 (도어 영역
-  // alpha=0 punch 가 무효화됨). lvl.set(bytes) 로 _levels 를 명시 채우면 이후 lock/unlock
-  // 사이클이 정상 동작.
-  {
+  // 문 설정/정합 단계처럼 텍스처 alpha punch 를 수정해야 하는 화면은 mutableTexture=true
+  // 기본 경로를 사용한다. 층 overview 처럼 read-only 로 보기만 하는 화면은 setSource 로
+  // 업로드해 큰 ImageData 복사를 피한다.
+  let averageColor: [number, number, number] | null = null;
+  if (opts.mutableTexture !== false) {
     const canvas = document.createElement('canvas');
     canvas.width = data.textureImage.naturalWidth;
     canvas.height = data.textureImage.naturalHeight;
     const ctx = canvas.getContext('2d')!;
     ctx.drawImage(data.textureImage, 0, 0);
     const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    averageColor = averageOpaqueColor(imgData.data);
+    opts.onTextureData?.({
+      rgba: new Uint8ClampedArray(imgData.data),
+      width: canvas.width,
+      height: canvas.height,
+    });
     const lvl = tex.lock();
     lvl.set(imgData.data);
     tex.unlock();
+  } else if (typeof tex.setSource === 'function') {
+    tex.setSource(data.textureImage);
   }
 
   mat.emissive.set(1, 1, 1);
@@ -226,6 +242,7 @@ export function createWallMeshFromPersisted(
 
   const ent = new pc.Entity(name);
   ent.addComponent('render', { meshInstances: [meshInstance] });
+  (ent as any).__averageColor = averageColor;
   // Z-180 (저장된 corners 는 raw PLY 프레임 기준)
   ent.setLocalEulerAngles(0, 0, 180);
   app.root.addChild(ent);

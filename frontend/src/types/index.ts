@@ -57,6 +57,7 @@ export interface FloorOverviewManifestEntry {
   meta_url: string | null;
   module_count: number;
   has_active_basemap: boolean;
+  has_pending_basemap?: boolean;
 }
 
 export interface FloorOverviewManifest {
@@ -84,6 +85,7 @@ export interface FloorDetailModuleEntry {
   is_visible: boolean;
   version: string | null;
   url: string | null;
+  source_upload_id: string | null;
 }
 
 export interface FloorDetailManifest {

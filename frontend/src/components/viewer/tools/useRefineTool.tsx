@@ -28,6 +28,39 @@ import {
   type Plane,
   type Vec3,
 } from './refineMath';
+
+function buildFinalSurfacePlanes(
+  polygon: PolygonPoint[] | null,
+  ceilingY: number,
+  floorY: number,
+  wallAngleRad: number,
+): SurfacePlane[] {
+  if (!polygon || polygon.length < 3) return [];
+  const planes = surfacePlanesFromPolygon({ polygon, ceilingY, floorY });
+  if (wallAngleRad === 0) return planes;
+  const cy = Math.cos(wallAngleRad);
+  const sy = Math.sin(wallAngleRad);
+  const rotateY3 = (v: [number, number, number]): [number, number, number] => [
+    cy * v[0] + sy * v[2],
+    v[1],
+    -sy * v[0] + cy * v[2],
+  ];
+  const rotateXZ = (p: { x: number; z: number }) => {
+    const r = rotateY3([p.x, 0, p.z]);
+    return { x: r[0], z: r[2] };
+  };
+  return planes.map((plane) => ({
+    ...plane,
+    normal: rotateY3(plane.normal),
+    segment: plane.segment
+      ? {
+          ...plane.segment,
+          a: rotateXZ(plane.segment.a),
+          b: rotateXZ(plane.segment.b),
+        }
+      : undefined,
+  }));
+}
 import {
   CF_SURFACES,
   SELECT_SUB_MODES,
@@ -151,6 +184,8 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
 
   // 원본 PLY 파싱본 캐시 (A 좌표계, 불변). 첫 정제 작업 또는 저장 시 lazy 파싱.
   const originalSceneRef = useRef<GaussianScene | null>(null);
+  // 다듬기 완료 후 기준 PLY. 회전/삭제가 모두 반영된 A' 프레임이며 문 설정 이후 흐름의 canonical source.
+  const refinedCanonicalSceneRef = useRef<GaussianScene | null>(null);
 
   // 누적 회전 (rotX, rotZ) 라디안. CF 모달이 누적 입력.
   // 다듬기 단계 동안 살아있다가 saveRefined() 시 splatData 에 in-place 베이크 → 0 으로 리셋.
@@ -197,7 +232,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   const [wallMeshBaking, setWallMeshBaking] = useState(false);
   const [wallMeshDebugWhite, setWallMeshDebugWhite] = useState(false);
   const wallMeshEntitiesRef = useRef<any[]>([]);
-  // 가장 최근 베이크 결과 (디버그 다운로드 / 알파 그리드 진단 / 영속화용)
+  // 가장 최근 베이크 결과 (텍스처 다운로드 / 영속화용)
   const lastBakesRef = useRef<Map<string, {
     rgba: Uint8ClampedArray;
     width: number;
@@ -207,9 +242,6 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     uvs: import('@/lib/gs/textureBake').TextureBakeResult['uvs'];
   }>>(new Map());
 
-  // 알파 그리드 진단
-  const [alphaGridActive, setAlphaGridActive] = useState(false);
-  const alphaGridEntityRef = useRef<any>(null);
 
   // 디버그: 원본 splat 엔티티 숨기기 (메시 단독 확인용)
   const [splatHidden, setSplatHidden] = useState(false);
@@ -564,25 +596,21 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       const N = data.numSplats;
       const newMask = new Uint8Array(N);
       let deletedCount = 0;
-      const killStats = { ceiling: 0, floor: 0, wallOutside: 0 };
       for (let i = 0; i < N; i++) {
         const x = rotPos.x[i], y = rotPos.y[i], z = rotPos.z[i];
         let outside = false;
         // 천장 — selected 시 ceilingY 위쪽 (cutThreshold 확장) 제거.
-        if (selectsCeiling && y > cy + cutThreshold) { outside = true; killStats.ceiling++; }
+        if (selectsCeiling && y > cy + cutThreshold) outside = true;
         // 바닥 — selected 시 floorY 아래쪽 제거.
-        if (!outside && selectsFloor && y < fy - cutThreshold) { outside = true; killStats.floor++; }
+        if (!outside && selectsFloor && y < fy - cutThreshold) outside = true;
         // 벽 — wall 이 하나라도 선택되면 polygon 외부 전체 제거 (polygon signed distance > cutThreshold).
         //   각 wall 의 무한 평면 sd 가 아닌 polygon 경계 자체 기준 → polygon 변 segment 너머도 정확히 처리.
         if (!outside && selectsAnyWall && polygonSD) {
           const sd = polygonSD(x, z);
-          if (sd > cutThreshold) { outside = true; killStats.wallOutside++; }
+          if (sd > cutThreshold) outside = true;
         }
         if (outside) { newMask[i] = 1; deletedCount++; }
       }
-      console.log(`[Shell] flatten mask: ${deletedCount} / ${N} gaussians`);
-      console.log('[Shell] kill-stats:', killStats);
-      console.log('[Shell] params:', { cutThreshold, selectsCeiling, selectsFloor, selectsAnyWall, polygonReady, pendingRot: pendingRotationRef.current });
 
       // undo 기록 (이전 상태 = 비활성 + 마스크 없음)
       pushOp({ type: 'flatten', prevMask: null, prevActive: false });
@@ -660,7 +688,6 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       const rotated = await buildRotatedScene(cached);
       const { computeBoundaryClipping } = await import('@/lib/gs/clipping');
       const updates = computeBoundaryClipping(rotated, planes);
-      console.log(`[Clipping] ${updates.length} / ${cached.numSplats} splats clipped.`);
 
       const cs0 = cached.attrs.get('scale_0') as Float32Array;
       const cs1 = cached.attrs.get('scale_1') as Float32Array;
@@ -748,8 +775,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         throw new Error(`splatData(${N}) 와 original(${original.numSplats}) 입자 수 불일치`);
       }
 
-      const t0 = performance.now();
-      const { mask, deletedCount, aliveCount } = detectFloaters(
+      const { mask } = detectFloaters(
         original,
         {
           voxelSize: floaterVoxelSize,
@@ -758,14 +784,6 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         },
         exclude,
       );
-      const dt = performance.now() - t0;
-      console.log(`[Floater] alive=${aliveCount}/${N}, deleted=${deletedCount}, took ${dt.toFixed(1)}ms`);
-      console.log('[Floater] params:', {
-        voxelSize: floaterVoxelSize,
-        opacityCut: floaterOpacityCut,
-        minNeighbors: floaterMinNeighbors,
-      });
-
       pushOp({ type: 'floater', prevMask: null, prevActive: false });
       floaterMaskRef.current = mask;
       floaterActiveRef.current = true; setFloaterActive(true);
@@ -779,8 +797,8 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     }
   }, [floaterVoxelSize, floaterOpacityCut, floaterMinNeighbors, ensureOriginalScene, paintFlattenMask, pushOp]);
 
-  // ── Wall mesh test (MVP): 선택된 면을 텍스처 메시로 굽고 splat entity child로 추가
-  const bakeWallMeshTest = useCallback(async () => {
+  // ── Wall mesh: 선택된 면을 텍스처 메시로 굽고 scene 에 추가
+  const bakeWallMesh = useCallback(async () => {
     // 기존 메시는 항상 먼저 제거하고 (만약 면이 선택돼있으면) 새로 베이크.
     // 면이 0개면 그냥 제거만 (토글 OFF).
     if (wallMeshEntitiesRef.current.length > 0) {
@@ -819,7 +837,6 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         }
         if (kept < original.numSplats) {
           brushFilteredOriginal = filterScene(original, keep);
-          console.log(`[bakeWallMeshTest] 브러시/bbox 삭제 반영: ${original.numSplats - kept} 가우시안 제거 (남은 ${kept})`);
         }
       }
       const rotated = await buildRotatedScene(brushFilteredOriginal);
@@ -835,28 +852,6 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         floorY: fy,
       };
 
-      // 진단 로그 — polygon 점 좌표 + cycle 순서 + winding + 각 wall 의 변 양끝/길이/normal.
-      let signed2A = 0;
-      for (let i = 0; i < polygon.length; i++) {
-        const a = polygon[i];
-        const b = polygon[(i + 1) % polygon.length];
-        signed2A += a.x * b.z - b.x * a.z;
-      }
-      const winding = signed2A > 0 ? 'CCW' : (signed2A < 0 ? 'CW' : 'degenerate');
-      console.log(`[bakeWallMeshTest] polygon N=${polygon.length}, winding=${winding} (signed2A=${signed2A.toFixed(3)}), ceilingY=${cy.toFixed(3)}, floorY=${fy.toFixed(3)}`);
-      console.log(`[bakeWallMeshTest] polygon points (cycle order):`);
-      polygon.forEach((p, i) => console.log(`    [${i}] (${p.x.toFixed(3)}, ${p.z.toFixed(3)})`));
-      console.log(`[bakeWallMeshTest] wall edges (w_i 는 polygon[i] → polygon[(i+1)%N]):`);
-      for (let i = 0; i < polygon.length; i++) {
-        const a = polygon[i];
-        const b = polygon[(i + 1) % polygon.length];
-        const dx = b.x - a.x, dz = b.z - a.z;
-        const len = Math.hypot(dx, dz);
-        const plane = surfacePlanes.find(p => p.id === `w${i}`);
-        const nrm = plane ? `n=(${plane.normal[0].toFixed(3)}, ${plane.normal[2].toFixed(3)})` : 'plane MISSING';
-        console.log(`    w${i}: a=(${a.x.toFixed(3)}, ${a.z.toFixed(3)}) → b=(${b.x.toFixed(3)}, ${b.z.toFixed(3)}), len=${len.toFixed(3)}m, ${nrm}`);
-      }
-
       const core = coreRef.current;
       const splatData = core?.getSplatData();
       const app = core?.getApp();
@@ -869,10 +864,8 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       // 메시는 사용자가 정의한 경계 평면(sd=0) 에 정확히 배치.
 
       lastBakesRef.current.clear();
-      console.log(`[bakeWallMeshTest] CLICK — bakeInnerGate=${bakeInnerGate} (slider value at button click time)`);
       for (const surfaceId of Array.from(selectedSurfaces)) {
         const input = planeBakeInputForSurface(surfaceId, room);
-        console.log(`[bakeWallMeshTest] surface=${surfaceId} → calling bakeTextureForPlane with depthGate=${bakeInnerGate}`);
         // autoMargin: 0 → 사용자 경계면을 strict 하게 사용. paintSd 기반 자동 확장 비활성화.
         const bake = await bakeTextureForPlane(input, source, { depthGate: bakeInnerGate, autoMargin: 0 });
         const ent = createWallMeshEntity(
@@ -924,189 +917,6 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       }, 'image/png');
     });
   }, []);
-
-  // ── 알파 그리드 진단: 50cm 간격 그리드, 베이크 텍스처에서 알파 샘플링 ──
-  // 빨강(α=0) → 초록(α=1) 컬러 구. 콘솔에 모든 (surface, u, v, r, g, b, a) 덤프.
-  const toggleAlphaGrid = useCallback(() => {
-    // OFF
-    if (alphaGridActive) {
-      if (alphaGridEntityRef.current) {
-        try { alphaGridEntityRef.current.destroy(); } catch {}
-        alphaGridEntityRef.current = null;
-      }
-      setAlphaGridActive(false);
-      return;
-    }
-    // ON
-    const bakes = lastBakesRef.current;
-    if (bakes.size === 0) { alert('베이크 결과가 없습니다. 먼저 "막 생성하기" 실행.'); return; }
-    const core = coreRef.current;
-    const app = core?.getApp();
-    const pc = core?.getPC();
-    if (!app || !pc) return;
-
-    const parent = new pc.Entity('alphaGrid');
-    parent.setLocalEulerAngles(0, 0, 180);
-
-    const SPACING = 0.5; // 50cm
-    const LABEL_W = 0.25; // 25cm 폭 라벨
-    const LABEL_H = 0.12; // 12cm 높이
-    const rows: Array<{ surface: string; u: string; v: string; r: number; g: number; b: number; a: number }> = [];
-
-    // canvas → texture 헬퍼. 알파 값에 따라 배경/글자색 변경.
-    const makeLabelTex = (alpha: number): any => {
-      const W = 256, H = 128;
-      const canvas = document.createElement('canvas');
-      canvas.width = W; canvas.height = H;
-      const ctx = canvas.getContext('2d')!;
-      // 배경 — 알파 0이면 빨강, 1이면 초록 (가독성용 톤)
-      const bgR = Math.round((1 - alpha) * 180);
-      const bgG = Math.round(alpha * 180);
-      ctx.fillStyle = `rgba(${bgR}, ${bgG}, 30, 0.85)`;
-      ctx.fillRect(0, 0, W, H);
-      ctx.strokeStyle = 'rgba(255,255,255,0.6)';
-      ctx.lineWidth = 4;
-      ctx.strokeRect(2, 2, W - 4, H - 4);
-      ctx.fillStyle = '#fff';
-      ctx.font = 'bold 78px monospace';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(alpha.toFixed(2), W / 2, H / 2);
-
-      const fmt = pc.PIXELFORMAT_SRGBA8 ?? pc.PIXELFORMAT_RGBA8;
-      const tex = new pc.Texture(app.graphicsDevice, {
-        width: W, height: H, format: fmt,
-        mipmaps: false,
-        addressU: pc.ADDRESS_CLAMP_TO_EDGE,
-        addressV: pc.ADDRESS_CLAMP_TO_EDGE,
-        magFilter: pc.FILTER_LINEAR,
-        minFilter: pc.FILTER_LINEAR,
-        name: 'alphaLabel',
-      });
-      // canvas → texture
-      if (typeof tex.setSource === 'function') {
-        tex.setSource(canvas);
-      } else {
-        const lvl = tex.lock();
-        const imgData = ctx.getImageData(0, 0, W, H);
-        lvl.set(imgData.data);
-        tex.unlock();
-      }
-      return tex;
-    };
-
-    // dir(=면 normal의 반대, 방 안쪽) 방향이 quad의 +Z (앞면)을 향하도록 회전.
-    // PlayCanvas plane primitive: XZ 평면, normal=+Y. 우리는 XY 평면+normal=+Z 가 필요.
-    // 대신 자체 quad mesh를 만들어 normal을 +Z 로 두고 dir에 맞게 rotate.
-    const makeLabelEntity = (
-      world: [number, number, number],
-      dirInward: [number, number, number],
-      uAxis: [number, number, number],
-      vAxis: [number, number, number],
-      alpha: number,
-      name: string,
-    ): any => {
-      const tex = makeLabelTex(alpha);
-      const mat = new pc.StandardMaterial();
-      mat.useLighting = false;
-      mat.diffuse.set(0, 0, 0);
-      mat.emissive.set(1, 1, 1);
-      mat.emissiveMap = tex;
-      mat.cull = pc.CULLFACE_NONE;
-      mat.update();
-
-      // quad: TL, TR, BR, BL  in (uAxis, vAxis) 평면
-      const hw = LABEL_W / 2, hh = LABEL_H / 2;
-      const positions = [
-        -hw * uAxis[0] + hh * vAxis[0], -hw * uAxis[1] + hh * vAxis[1], -hw * uAxis[2] + hh * vAxis[2],
-         hw * uAxis[0] + hh * vAxis[0],  hw * uAxis[1] + hh * vAxis[1],  hw * uAxis[2] + hh * vAxis[2],
-         hw * uAxis[0] - hh * vAxis[0],  hw * uAxis[1] - hh * vAxis[1],  hw * uAxis[2] - hh * vAxis[2],
-        -hw * uAxis[0] - hh * vAxis[0], -hw * uAxis[1] - hh * vAxis[1], -hw * uAxis[2] - hh * vAxis[2],
-      ];
-      const uvs = [0, 1,  1, 1,  1, 0,  0, 0];
-      const normals = [
-        dirInward[0], dirInward[1], dirInward[2],
-        dirInward[0], dirInward[1], dirInward[2],
-        dirInward[0], dirInward[1], dirInward[2],
-        dirInward[0], dirInward[1], dirInward[2],
-      ];
-      const indices = [0, 1, 2, 0, 2, 3];
-
-      const mesh = new pc.Mesh(app.graphicsDevice);
-      mesh.setPositions(positions);
-      mesh.setUvs(0, uvs);
-      mesh.setNormals(normals);
-      mesh.setIndices(indices);
-      mesh.update();
-
-      const meshInst = new pc.MeshInstance(mesh, mat);
-      const ent = new pc.Entity(name);
-      ent.addComponent('render', { meshInstances: [meshInst] });
-      ent.setLocalPosition(world[0], world[1], world[2]);
-      return ent;
-    };
-
-    bakes.forEach((bake, surfaceId) => {
-      const inp = bake.input;
-      const tpm = bake.width / (inp.uMax - inp.uMin);
-      // 라벨이 표면에 너무 붙어 z-fighting 나지 않도록 살짝 안쪽으로 띄움
-      const LIFT = 0.02;
-      // 면 normal 의 반대 = 방 안쪽 방향 (라벨 정면이 이쪽을 향함)
-      const inward: [number, number, number] = [-inp.normal[0], -inp.normal[1], -inp.normal[2]];
-
-      // u, v 그리드 — bake 범위 내 SPACING 간격
-      const us: number[] = [];
-      for (let u = inp.uMin; u <= inp.uMax + 1e-6; u += SPACING) us.push(u);
-      const vs: number[] = [];
-      for (let v = inp.vMin; v <= inp.vMax + 1e-6; v += SPACING) vs.push(v);
-
-      for (const u of us) {
-        for (const v of vs) {
-          const tx = Math.floor((u - inp.uMin) * tpm);
-          const ty = Math.floor((inp.vMax - v) * tpm);
-          if (tx < 0 || tx >= bake.width || ty < 0 || ty >= bake.height) continue;
-
-          const idx = (ty * bake.width + tx) * 4;
-          const rB = bake.rgba[idx], gB = bake.rgba[idx + 1], bB = bake.rgba[idx + 2], aB = bake.rgba[idx + 3];
-          const alpha = aB / 255;
-
-          const wx = inp.origin[0] + u * inp.uAxis[0] + v * inp.vAxis[0] + LIFT * inward[0];
-          const wy = inp.origin[1] + u * inp.uAxis[1] + v * inp.vAxis[1] + LIFT * inward[1];
-          const wz = inp.origin[2] + u * inp.uAxis[2] + v * inp.vAxis[2] + LIFT * inward[2];
-
-          const ent = makeLabelEntity(
-            [wx, wy, wz],
-            inward,
-            [inp.uAxis[0], inp.uAxis[1], inp.uAxis[2]],
-            [inp.vAxis[0], inp.vAxis[1], inp.vAxis[2]],
-            alpha,
-            `lbl_${surfaceId}_${u.toFixed(2)}_${v.toFixed(2)}`,
-          );
-          parent.addChild(ent);
-
-          rows.push({
-            surface: surfaceId,
-            u: u.toFixed(3),
-            v: v.toFixed(3),
-            r: rB, g: gB, b: bB, a: aB,
-          });
-        }
-      }
-    });
-
-    app.root.addChild(parent);
-    alphaGridEntityRef.current = parent;
-    setAlphaGridActive(true);
-
-    console.log(`[alphaGrid] sampled ${rows.length} grid points across ${bakes.size} surfaces (50cm spacing)`);
-    console.table(rows);
-    // 알파 분포 요약
-    const aVals = rows.map(r => r.a / 255);
-    const nZero = aVals.filter(a => a < 0.05).length;
-    const nFull = aVals.filter(a => a > 0.95).length;
-    const aMean = aVals.reduce((s, a) => s + a, 0) / Math.max(1, aVals.length);
-    console.log(`[alphaGrid] alpha summary: mean=${aMean.toFixed(3)}, α<0.05: ${nZero}/${aVals.length}, α>0.95: ${nFull}/${aVals.length}`);
-  }, [alphaGridActive, coreRef]);
 
   // ── Brush/BBox state ──
   const [paintMode, setPaintMode] = useState<PaintMode>('union');
@@ -1181,6 +991,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   // (reloadWithUrl 후 SplatViewerCore는 unmount → 새 PLY 로드 전까지 ref가 무효)
   useEffect(() => {
     splatDataRef.current = null;
+    refinedCanonicalSceneRef.current = null;
     setSplatLoaded(false);
   }, [options?.currentUrl]);
 
@@ -1543,7 +1354,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     const float2Half = core?.float2Half;
     if (!data || !data.gsplatData || !float2Half) return;
     const { rotX, rotZ } = pendingRotationRef.current;
-    if (rotX === 0 && rotZ === 0) return;  // 이미 baked / no-op
+    if (rotX === 0 && rotZ === 0) return;
 
     const { rotateScene } = await import('@/lib/gs');
     const { syncGPU } = await import('./gpuSync');
@@ -1575,6 +1386,69 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     applyEntityRotation();  // entity = Z-180 only
   }, [applyEntityRotation]);
 
+  const buildSceneFromSplatData = useCallback((data: SplatData): GaussianScene => {
+    const vertexElement = data.gsplatData?.getElement?.('vertex');
+    const propertyOrder: string[] = (vertexElement?.properties ?? [])
+      .map((p: { name: string }) => p.name);
+    const attrs = new Map<string, Float32Array>();
+    for (const prop of propertyOrder) {
+      const a = data.gsplatData?.getProp(prop) as Float32Array | undefined;
+      if (a) attrs.set(prop, new Float32Array(a));
+    }
+    attrs.set('x', new Float32Array(data.posX));
+    attrs.set('y', new Float32Array(data.posY));
+    attrs.set('z', new Float32Array(data.posZ));
+    return { numSplats: data.numSplats, attrs, propertyOrder };
+  }, []);
+
+  const buildKeepMaskFromCurrentState = useCallback((data: SplatData, core: SplatViewerCoreRef): Uint8Array => {
+    const N = data.numSplats;
+    const keep = new Uint8Array(N).fill(1);
+    if (data.origColorData) {
+      const h2f = core.half2Float;
+      for (let i = 0; i < N; i++) {
+        const a = h2f(data.origColorData[i * 4 + 3]);
+        if (a < 1e-3) keep[i] = 0;
+      }
+    }
+    if (flattenMaskRef.current) {
+      for (let i = 0; i < N; i++) {
+        if (flattenMaskRef.current[i] && keep[i]) keep[i] = 0;
+      }
+    }
+    if (floaterActiveRef.current && floaterMaskRef.current) {
+      for (let i = 0; i < N; i++) {
+        if (floaterMaskRef.current[i] && keep[i]) keep[i] = 0;
+      }
+    }
+    return keep;
+  }, []);
+
+  const rebuildCanonicalPlyFromMemory = useCallback(async () => {
+    const data = splatDataRef.current;
+    const core = coreRef.current;
+    if (!data?.gsplatData || !core) return;
+    const { filterScene, serializePly } = await import('@/lib/ply');
+    const scene = buildSceneFromSplatData(data);
+    const keep = buildKeepMaskFromCurrentState(data, core);
+    const canonical = filterScene(scene, keep);
+    refinedCanonicalSceneRef.current = canonical;
+
+    const bytes = serializePly(canonical);
+    const blobUrl = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
+    skipNextSplatRebakeRef.current = true;
+    setTimeout(() => { skipNextSplatRebakeRef.current = false; }, 5000);
+    await core.reloadSplatFromUrl(blobUrl, { preserveCamera: true });
+
+    // 삭제는 canonical PLY geometry 에 반영됐으므로 이후 단계에서는 별도 mask 를 더 들고 가지 않는다.
+    flattenMaskRef.current = null;
+    flattenActiveRef.current = false;
+    setFlattenActive(false);
+    floaterMaskRef.current = null;
+    floaterActiveRef.current = false;
+    setFloaterActive(false);
+  }, [coreRef, buildSceneFromSplatData, buildKeepMaskFromCurrentState]);
+
   // ── 다듬기 완료 버튼 — 서버 통신 없음, 문 설정 단계로 transition 만. ──
   // 서버 영속 타이밍:
   //   - 모듈 등록 흐름: 정합 완료 시점 `commit-final` 일괄.
@@ -1589,9 +1463,90 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     flattenPreviewActiveRef.current = false;
     // pendingRotation 을 splatData 에 in-place 베이크 → 이후 코드는 단일 frame (A') 가정.
     await bakeSplatRotation();
+    await rebuildCanonicalPlyFromMemory();
     setSaved(true);
     options?.onSwitchToAlign?.();
-  }, [options, bakeSplatRotation]);
+  }, [options, bakeSplatRotation, rebuildCanonicalPlyFromMemory]);
+
+  const buildFinalPlyScene = useCallback(async (): Promise<{
+    baked: GaussianScene;
+    sourceCount: number;
+    brushDeleted: number;
+    flattenDeleted: number;
+    floaterDeleted: number;
+    rotX: number;
+    rotZ: number;
+    wallAngleDeg: number;
+    wallAngleRad: number;
+  }> => {
+    const { filterScene, cloneScene } = await import('@/lib/ply');
+    const { rotateSceneY } = await import('@/lib/gs');
+    const wallAngleDeg = wallAngleRef.current ?? 0;
+    const wallAngleRad = (wallAngleDeg * Math.PI) / 180;
+
+    const canonical = refinedCanonicalSceneRef.current;
+    if (canonical) {
+      const { rotX, rotZ } = bakedRotationRef.current;
+      const baked = cloneScene(canonical);
+      if (wallAngleRad !== 0) rotateSceneY(baked, wallAngleRad);
+      return {
+        baked,
+        sourceCount: canonical.numSplats,
+        brushDeleted: 0,
+        flattenDeleted: 0,
+        floaterDeleted: 0,
+        rotX,
+        rotZ,
+        wallAngleDeg,
+        wallAngleRad,
+      };
+    }
+
+    console.warn('[Refine] canonical scene is missing; rebuilding final PLY from original scene fallback');
+    const original = await ensureOriginalScene();
+    const N = original.numSplats;
+    const data = splatDataRef.current;
+    const core = coreRef.current;
+    const keep = new Uint8Array(N).fill(1);
+    let brushDeleted = 0;
+    if (data?.origColorData && core) {
+      const h2f = core.half2Float;
+      for (let i = 0; i < N; i++) {
+        const a = h2f(data.origColorData[i * 4 + 3]);
+        if (a < 1e-3) { keep[i] = 0; brushDeleted++; }
+      }
+    }
+    let flattenDeleted = 0;
+    if (flattenMaskRef.current) {
+      for (let i = 0; i < N; i++) {
+        if (flattenMaskRef.current[i] && keep[i]) { keep[i] = 0; flattenDeleted++; }
+      }
+    }
+    let floaterDeleted = 0;
+    if (floaterActiveRef.current && floaterMaskRef.current) {
+      for (let i = 0; i < N; i++) {
+        if (floaterMaskRef.current[i] && keep[i]) { keep[i] = 0; floaterDeleted++; }
+      }
+    }
+
+    const { rotX, rotZ } = bakedRotationRef.current;
+    let toRotate = original;
+    if (rotX !== 0 || rotZ !== 0 || wallAngleRad !== 0) {
+      toRotate = await buildRotatedSceneForRotation(original, { rotX, rotZ });
+      if (wallAngleRad !== 0) rotateSceneY(toRotate, wallAngleRad);
+    }
+    return {
+      baked: filterScene(toRotate, keep),
+      sourceCount: N,
+      brushDeleted,
+      flattenDeleted,
+      floaterDeleted,
+      rotX,
+      rotZ,
+      wallAngleDeg,
+      wallAngleRad,
+    };
+  }, [ensureOriginalScene]);
 
   // 다듬기 결과 자산(PLY + mesh.json + tex_*.png) 을 메모리에서 빌드해 반환. 업로드 안 함.
   // 새 흐름(정합 완료 시 일괄 영속화) 의 commit-final 페이로드 작성용.
@@ -1604,39 +1559,13 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     wallAngleRad: number;
     plyFilename: string;
   }> => {
-    const { serializePly, filterScene } = await import('@/lib/ply');
-    const original = await ensureOriginalScene();
-    const N = original.numSplats;
-    const data = splatDataRef.current;
-    const core = coreRef.current;
-
-    const keep = new Uint8Array(N).fill(1);
-    if (data?.origColorData && core) {
-      const h2f = core.half2Float;
-      for (let i = 0; i < N; i++) {
-        const a = h2f(data.origColorData[i * 4 + 3]);
-        if (a < 1e-3) keep[i] = 0;
-      }
-    }
-    if (flattenMaskRef.current) {
-      for (let i = 0; i < N; i++) if (flattenMaskRef.current[i] && keep[i]) keep[i] = 0;
-    }
-    if (floaterActiveRef.current && floaterMaskRef.current) {
-      for (let i = 0; i < N; i++) if (floaterMaskRef.current[i] && keep[i]) keep[i] = 0;
-    }
-
-    const wallAngleDeg = wallAngleRef.current ?? 0;
-    const wallAngleRad = (wallAngleDeg * Math.PI) / 180;
-    // saveRefined() 에서 splatData 에 bakedRotation 을 in-place 적용했지만 ensureOriginalScene 은
-    // 디스크의 raw PLY 를 반환 — 서버 저장본도 동일 변환 (raw → A'+Y) 필요.
-    const { rotX, rotZ } = bakedRotationRef.current;
-    const { rotateSceneY, rotateScene } = await import('@/lib/gs');
-    let toRotate = original;
-    if (rotX !== 0 || rotZ !== 0 || wallAngleRad !== 0) {
-      toRotate = await buildRotatedSceneForRotation(original, { rotX, rotZ });
-      if (wallAngleRad !== 0) rotateSceneY(toRotate, wallAngleRad);
-    }
-    const baked = filterScene(toRotate, keep);
+    const { serializePly } = await import('@/lib/ply');
+    const {
+      baked,
+      rotX,
+      rotZ,
+      wallAngleRad,
+    } = await buildFinalPlyScene();
     const plyBytes = serializePly(baked);
 
     const stripPrefix = (s: string) => s.startsWith('refined_') ? s.slice('refined_'.length) : s;
@@ -1700,10 +1629,11 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       version: 1,
       sessionId: `s${Date.now()}`,
       surfaces: meshSurfaces,
+      planes: buildFinalSurfacePlanes(wallPolygonRef.current, ceilingYRef.current, floorYRef.current, wallAngleRad),
     });
 
     return { plyBytes, meshJson, textures, rotX, rotZ, wallAngleRad, plyFilename };
-  }, [ensureOriginalScene, buildRotatedScene, options?.originalFilename]);
+  }, [buildFinalPlyScene, options?.originalFilename]);
 
   // 베이스맵 등록 흐름의 문 설정 완료 시점에 호출됨 — refined PLY + mesh.json + tex_*.png 일괄 업로드 + SceneOutput 등록.
   // 모듈 등록 흐름은 이 함수 안 부르고, 정합 완료 시 `gatherRefinedAssets` 결과를 `commit-final` 로 일괄 전송.
@@ -1719,61 +1649,12 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     setUploadProgressOpen(true);
     setUploadProgressMessage('정제된 PLY 준비 중...');
     try {
-      const { serializePly, filterScene } = await import('@/lib/ply');
+      const { serializePly } = await import('@/lib/ply');
       const { api } = await import('@/lib/api');
 
-      const original = await ensureOriginalScene();
-      const N = original.numSplats;
-      const data = splatDataRef.current;
-      const core = coreRef.current;
-
-      // 1) 통합 keep 마스크 빌드: 브러시 삭제(origColorData alpha=0) ∪ flatten 마스크
-      const keep = new Uint8Array(N).fill(1);
-      let brushDeleted = 0;
-      if (data?.origColorData && core) {
-        const h2f = core.half2Float;
-        for (let i = 0; i < N; i++) {
-          const a = h2f(data.origColorData[i * 4 + 3]);
-          if (a < 1e-3) { keep[i] = 0; brushDeleted++; }
-        }
-      }
-      let flattenDeleted = 0;
-      if (flattenMaskRef.current) {
-        for (let i = 0; i < N; i++) {
-          if (flattenMaskRef.current[i] && keep[i]) { keep[i] = 0; flattenDeleted++; }
-        }
-      } else if (flattenActiveRef.current === false && !data?.origColorData) {
-        console.warn('[Save] flatten 마스크가 없습니다 — 모듈 외부 복원 상태이거나 적용 안 함.');
-      }
-      let floaterDeleted = 0;
-      if (floaterActiveRef.current && floaterMaskRef.current) {
-        for (let i = 0; i < N; i++) {
-          if (floaterMaskRef.current[i] && keep[i]) { keep[i] = 0; floaterDeleted++; }
-        }
-      }
-
-      // 2) 필터링 + 회전 베이크 (원본 raw → bakedRotation + wallAngle 적용 = A'+Y, 살릴 가우시안만)
-      //   final.ply 가 A'+Y 프레임이라 재진입 시 splatEntity 에 Z-180 만 적용해도 정렬된 상태로 보임.
-      //   bakedRotation 은 saveRefined() 가 splatData 에 in-place 적용한 회전 — 원본 raw 에도 동일 적용 필요.
-      //   mesh.json corners 도 같은 A'+Y 프레임 (planeBakeInputForSurface 가 wallAngle 반영) 이므로 일치.
-      const wallAngleDeg = wallAngleRef.current ?? 0;
-      const wallAngleRad = (wallAngleDeg * Math.PI) / 180;
-      const { rotX, rotZ } = bakedRotationRef.current;
-
-      const { rotateSceneY } = await import('@/lib/gs');
-      // original 은 reference 라 destructive rotateScene 호출 전에 cloned scene 사용.
-      let toRotate = original;
-      if (rotX !== 0 || rotZ !== 0 || wallAngleRad !== 0) {
-        toRotate = await buildRotatedSceneForRotation(original, { rotX, rotZ });
-        if (wallAngleRad !== 0) rotateSceneY(toRotate, wallAngleRad);
-      }
-      const baked = filterScene(toRotate, keep);
-
-      console.log(`[Save] N=${N}, brush삭제=${brushDeleted}, flatten삭제=${flattenDeleted}, floater삭제=${floaterDeleted}, 살아남음=${baked.numSplats}. 베이크 회전 rotX=${rotX.toFixed(3)}, rotZ=${rotZ.toFixed(3)}, wallY=${wallAngleDeg.toFixed(2)}°.`);
-      console.log(`[Save] flattenActive=${flattenActiveRef.current}, flattenMask 존재=${!!flattenMaskRef.current}`);
+      const { baked, rotX, rotZ, wallAngleRad } = await buildFinalPlyScene();
 
       const bytes = serializePly(baked);
-      console.log(`[Save] PLY 크기 (정제 후): ${(bytes.byteLength / 1024 / 1024).toFixed(2)} MB`);
 
       // session_id: 한 번의 저장에서 PLY + mesh.json + tex_*.png 가 같은 디렉토리로 가도록.
       const sessionId = `s${Date.now()}`;
@@ -1894,6 +1775,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
           version: 1,
           sessionId,
           surfaces: meshSurfaces,
+          planes: buildFinalSurfacePlanes(wallPolygonRef.current, ceilingYRef.current, floorYRef.current, wallAngleRad),
         };
         const meshJson = JSON.stringify(meshMeta);
         const metaUrl = await api.post<{ put_url: string; key: string }>(
@@ -1905,17 +1787,13 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         });
         if (!metaResp.ok) throw new Error(`mesh.json PUT failed: ${metaResp.status}`);
 
-        console.log(`[Save] mesh sidecar uploaded — ${meshSurfaces.length} surfaces, session=${sessionId}`);
-      } else {
-        console.log(`[Save] no wall mesh baked — skipping mesh sidecar`);
       }
 
       // 3.4) 백엔드 SceneOutput 등록 (`/refine/save`).
-      const saveResp = await api.post<{ scene_id: string; message: string }>('/refine/save', {
+      await api.post<{ scene_id: string; message: string }>('/refine/save', {
         upload_id: activeUploadId,
         source_key: plyUrl.key,
       });
-      console.log(`[Save] SceneOutput 생성됨 — scene_id=${saveResp.scene_id}, ply_path=${plyUrl.key}`);
 
       // commit 완료 — 호출자(문 설정 완료) 가 다음 단계 (정합) 진입을 처리함.
       // 호출자가 doors corners 등을 같은 프레임으로 변환할 수 있도록 베이크된 회전값 + plyKey 반환.
@@ -1927,7 +1805,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       setSaving(false);
       setUploadProgressOpen(false);
     }
-  }, [options, ensureOriginalScene, coreRef, buildRotatedScene]);
+  }, [options, buildFinalPlyScene]);
 
   // ── Brush/BBox: delete selected (repeatable) ──
   const deleteSelected = useCallback(() => {
@@ -2008,6 +1886,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     setPendingRotation({ rotX: 0, rotZ: 0 });
     bakedRotationRef.current = { rotX: 0, rotZ: 0 };
     setBakedRotation({ rotX: 0, rotZ: 0 });
+    refinedCanonicalSceneRef.current = null;
     flattenMaskRef.current = null;
     flattenActiveRef.current = false; setFlattenActive(false);
     flattenVisibleRef.current = true; setFlattenVisible(true);
@@ -2622,17 +2501,13 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
               const camForward: Vec3 = [fwd.x, fwd.y, fwd.z];
 
               if (!hasDepth()) {
-                console.log('[DepthNormal] Computing depth map...');
                 const fov = cam.fov || 45;
                 await computeDepthMap(canvas, camRight, camUp, camForward, fov);
-                console.log('[DepthNormal] Depth map ready:', hasDepth());
               }
 
               let normal = getNormalAt(mx, my);
-              console.log('[DepthNormal] Depth-based normal:', normal);
               if (!normal) {
                 // Fallback to PCA
-                console.log('[DepthNormal] Falling back to PCA');
                 const radius = bboxSizeRef.current * 0.03;
                 const r2 = radius * radius;
                 const neighbors: Vec3[] = [];
@@ -3177,7 +3052,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
               {/* 막 생성하기 — 외부 가우시안 제거 활성 후 사용 가능 (의존성: flatten 적용 후 막 생성 의미). */}
               <div className={`border-t border-gray-700 pt-2 mt-1 space-y-1.5 ${flattenActive ? '' : 'opacity-50 pointer-events-none'}`}>
                 {!wallMeshActive ? (
-                  <button onClick={() => bakeWallMeshTest()}
+                  <button onClick={() => bakeWallMesh()}
                     disabled={!flattenActive || wallMeshBaking || selectedSurfaces.size === 0 || wallMode !== 'confirmed' || cfMode !== 'confirmed'}
                     title={
                       !flattenActive ? '먼저 외부 가우시안 제거를 적용하세요.'
@@ -3577,6 +3452,34 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     return { rgba: b.rgba, width: b.width, height: b.height };
   }, []);
 
+  const registerPersistedBake = useCallback((surface: {
+    surfaceId: string;
+    rgba: Uint8ClampedArray;
+    width: number;
+    height: number;
+    corners: number[][];
+    uvs: number[][];
+    normalInward: [number, number, number];
+  }) => {
+    const corners = surface.corners.map(c => [c[0], c[1], c[2]] as [number, number, number]);
+    const uvs = surface.uvs.map(u => [u[0], u[1]] as [number, number]);
+    if (corners.length !== 4 || uvs.length !== 4) return;
+    lastBakesRef.current.set(surface.surfaceId, {
+      rgba: surface.rgba,
+      width: surface.width,
+      height: surface.height,
+      input: {
+        normal: [
+          -surface.normalInward[0],
+          -surface.normalInward[1],
+          -surface.normalInward[2],
+        ],
+      } as import('@/lib/gs/textureBake').PlaneBakeInput,
+      corners: corners as [[number, number, number], [number, number, number], [number, number, number], [number, number, number]],
+      uvs: uvs as [[number, number], [number, number], [number, number], [number, number]],
+    });
+  }, []);
+
   // commitRefinedToServer 가 서버 업로드 완료 후 반환하던 베이크 회전값을, 업로드 기다리지 않고
   // 동기적으로 얻어와서 doors corners 변환 등에 즉시 사용할 수 있게 한다.
   // (메모리 직주입 후 백그라운드 저장으로 흐름이 바뀌어 await 가 부담스러워졌기 때문.)
@@ -3599,5 +3502,5 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     setTimeout(() => { skipNextSplatRebakeRef.current = false; }, 5000);
   }, []);
 
-  return { overlay, panel, modals, onSplatLoaded, planes, saveRefined, commitRefinedToServer, gatherRefinedAssets, getCurrentKeepMask, getBakeRgba, getRemainingRotationToAY, markNextSplatLoadSkipRebake };
+  return { overlay, panel, modals, onSplatLoaded, planes, saveRefined, commitRefinedToServer, gatherRefinedAssets, getCurrentKeepMask, getBakeRgba, registerPersistedBake, getRemainingRotationToAY, markNextSplatLoadSkipRebake };
 }

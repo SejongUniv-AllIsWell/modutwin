@@ -1,27 +1,25 @@
 # 3DGS Digital Twin Platform - Codebase Reference
 
-Last updated: 2026-05-05
-Canonical scope: `refactored_modutwin/`
+Last updated: 2026-05-27
+Canonical scope: `modutwin/`
 
-This document is the short architecture reference for the current refactored
-codebase. It replaces older review notes and duplicate references that
-described the pre-refactor state.
+This document is the short architecture reference for the current codebase.
 
 ## Current Runtime Identity
 
-- Compose project: `refactored_modutwin`
-- Working directory: `/home/pjhserver/refactored_modutwin`
+- Compose project: `modutwin` when the checkout directory is named `modutwin`
+- Working directory: `~/modutwin` or the local checkout path
 - Fixed container names remain `3dgs-*` because `container_name` is set in
   `docker-compose.yml`.
 - Active named volumes:
-  - `refactored_modutwin_pgdata`
-  - `refactored_modutwin_redisdata`
-  - `refactored_modutwin_rabbitmqdata`
-  - `refactored_modutwin_miniodata`
+  - `modutwin_pgdata`
+  - `modutwin_redisdata`
+  - `modutwin_rabbitmqdata`
+  - `modutwin_miniodata`
 - Standard startup command:
 
 ```bash
-cd ~/refactored_modutwin
+cd ~/modutwin
 docker compose up -d --build
 docker compose exec backend alembic upgrade head
 ```
@@ -103,7 +101,8 @@ Key refactor results:
   prefixes.
 - Refine save validates that `source_key` is under the owning upload's refined
   prefix.
-- SAM3 dispatch is protected by `ENABLE_SAM3_DISPATCH=false` by default.
+- The viewer's automatic door designation uses the SAM3/door-ml HTTP path when
+  the service is available, and falls back to manual door picking on failure.
 
 Backend validation:
 
@@ -126,7 +125,7 @@ python -m pytest -q
 6. `POST /api/auth/ws-ticket` issues short-lived WebSocket tickets.
 
 Login sessions are reset whenever the PostgreSQL volume is recreated. Users
-must log in again after a fresh `refactored_modutwin_pgdata` volume is created.
+must log in again after a fresh PostgreSQL volume is created.
 
 ### Upload / Register Local
 
@@ -162,21 +161,25 @@ Important stability fixes:
   `404`s.
 - Refine brush/rect/transparent handlers are disabled outside refine mode.
 
-## SAM3 Status
+## Automatic Door Detection
 
-SAM3 is not a completed production worker path yet.
+The viewer-facing automatic door designation path is:
 
-Current safe state:
+```text
+Sam3PromptModal -> /api/uploads/sam3/prepare -> /api/uploads/sam3/detect-temp -> door-ml
+```
 
-- Backend API and DB columns exist.
-- Feature flag defaults to `ENABLE_SAM3_DISPATCH=false`.
-- When disabled, the system should fall back to manual door selection/alignment.
-- `worker/` currently has `training` and `alignment` tasks, but no
-  `worker/tasks/sam3.py`.
-- `door_ml/` is not present, so `docker-compose.gpu.yml` is not a default
-  deploy target.
+The backend stores the picked file temporarily for SAM3 forwarding. The final
+module assets are still committed only at alignment completion through
+`POST /api/uploads/commit-final`.
 
-Canonical SAM3 details are in `docs/sam3_worker_callback_plan.md`.
+`core/door_detection` is the SAM3-based detection pipeline used by the door-ml
+side of this feature. It should not be treated as an unrelated experiment.
+
+`/api/uploads/{upload_id}/sam3/start` is the older async worker-style path. Keep
+that path documented separately from the current viewer flow so future changes
+do not mix callback-worker assumptions into the synchronous module registration
+flow. Details are in `docs/sam3_worker_callback_plan.md`.
 
 ## Storage Layout
 

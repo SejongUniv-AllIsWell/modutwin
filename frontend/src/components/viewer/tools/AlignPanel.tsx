@@ -30,6 +30,11 @@ interface Props {
     rotation: [number, number, number, number];
     scale: [number, number, number];
     rmsd: number | null;
+    doorFrame: {
+      positions: number[];
+      indices: number[];
+      color: [number, number, number];
+    } | null;
   }) => Promise<void>;
 }
 
@@ -48,13 +53,7 @@ const DEFAULT_ALIGN_DOOR_THICKNESS = 0.05;  // 5cm
 const ALIGN_DOOR_THICKNESS_MIN = 0.001;     // 1mm — 0 이면 z-fight, 1mm 가 최소 분리.
 const ALIGN_DOOR_THICKNESS_MAX = 0.5;       // 50cm — 한국 차음벽 두께 200mm 의 두 배 까지.
 
-// 도어 frame mesh (모듈↔베이스맵 도어 사이 4면 측벽) 색상.
-// 광원 없는 가우시안 스플래팅 씬에선 emissive 채널만 보이므로, 그냥 "표시 색" 으로 사용.
-// 디버깅용 초록색 — 정합 후 frame 위치/크기 확인 명확히. 추후 도어 텍스처 median 색으로 교체 예정.
-const FRAME_COLOR: [number, number, number] = [0.0, 1.0, 0.0];
-
-// AlignPanel 진단 로그 토글. 디버깅 시에만 true.
-const DEBUG_ALIGN = false;
+const DEFAULT_FRAME_COLOR: [number, number, number] = [0.72, 0.65, 0.53];
 
 function easeInOutCubic(t: number): number {
   return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
@@ -112,6 +111,7 @@ function createDoorFrameMesh(
   app: any,
   moduleWorld: Array<[number, number, number]>,
   basemapWorld: Array<[number, number, number]>,
+  color: [number, number, number],
 ): any {
   const positions: number[] = [];
   const indices: number[] = [];
@@ -136,15 +136,60 @@ function createDoorFrameMesh(
 
   // 광원 없는 씬 → emissive 채널이 곧 표시 색.
   const mat = new pc.StandardMaterial();
-  mat.emissive = new pc.Color(FRAME_COLOR[0], FRAME_COLOR[1], FRAME_COLOR[2]);
+  mat.emissive = new pc.Color(color[0], color[1], color[2]);
   mat.useLighting = false;
   mat.cull = pc.CULLFACE_NONE;
   mat.update();
 
   const ent = new pc.Entity('doorFrame');
   ent.addComponent('render', { meshInstances: [new pc.MeshInstance(mesh, mat)] });
+  (ent as any).__doorFramePositions = positions;
+  (ent as any).__doorFrameIndices = indices;
+  (ent as any).__doorFrameColor = color;
   app.root.addChild(ent);
   return ent;
+}
+
+function extractDoorFrameWorld(pc: any, ent: any): {
+  positions: number[];
+  indices: number[];
+  color: [number, number, number];
+} | null {
+  if (!ent?.__doorFramePositions || !ent?.__doorFrameIndices) return null;
+  const local: number[] = ent.__doorFramePositions;
+  const world: number[] = [];
+  const mat = ent.getWorldTransform();
+  const src = new pc.Vec3();
+  const dst = new pc.Vec3();
+  for (let i = 0; i < local.length; i += 3) {
+    src.set(local[i], local[i + 1], local[i + 2]);
+    mat.transformPoint(src, dst);
+    world.push(dst.x, dst.y, dst.z);
+  }
+  return {
+    positions: world,
+    indices: Array.from(ent.__doorFrameIndices),
+    color: (ent as any).__doorFrameColor ?? DEFAULT_FRAME_COLOR,
+  };
+}
+
+function findAverageDoorMeshColor(root: any): [number, number, number] | null {
+  const stack = [...(root?.children ?? [])];
+  while (stack.length > 0) {
+    const ent = stack.pop();
+    if (!ent) continue;
+    const name = String(ent.name ?? '');
+    const color = ent.__averageColor;
+    if (name.startsWith('doorMesh') && Array.isArray(color) && color.length === 3) {
+      return [
+        Math.max(0, Math.min(1, Number(color[0]))),
+        Math.max(0, Math.min(1, Number(color[1]))),
+        Math.max(0, Math.min(1, Number(color[2]))),
+      ];
+    }
+    stack.push(...(ent.children ?? []));
+  }
+  return null;
 }
 
 export default function AlignPanel({
@@ -240,27 +285,6 @@ export default function AlignPanel({
       // 정합 직전 — alignmentGroup 에 누락된 child 가 있는지 다시 한 번 reparent.
       // (예: 도어 sub-splat 의 asset.ready 가 enterAlignmentMode 이후 fire 된 case)
       core.enterAlignmentMode?.();
-      // 진단: app.root 와 alignmentGroup 의 모든 children 출력 — 어느 entity 가 어디 있는지 확인.
-      try {
-        const app = core.getApp();
-        const formatChild = (c: any) => {
-          const pos = c.getLocalPosition?.() ?? { x: 0, y: 0, z: 0 };
-          const tags = c.tags ? Array.from(c.tags._list || []) : [];
-          return {
-            name: c.name,
-            tags: tags.join(','),
-            pos: `(${pos.x.toFixed(2)},${pos.y.toFixed(2)},${pos.z.toFixed(2)})`,
-          };
-        };
-        const rootKids = Array.from(app.root.children ?? []).map(formatChild);
-        const groupKids = Array.from(group.children ?? []).map(formatChild);
-        console.log('[Align] app.root children:', rootKids);
-        console.log('[Align] alignmentGroup children:', groupKids);
-        // 도어 splat (add_splat_*) 개수 + 위치 별도 출력 — 복제 추적용.
-        const allDoorSplats = [...rootKids, ...groupKids].filter(k => k.name.startsWith('add_splat_'));
-        console.warn(`[DoorSplat:SUMMARY] total add_splat_*: ${allDoorSplats.length}`, allDoorSplats);
-      } catch {}
-
       // rectFit — 두 직사각형의 직교 basis 비교로 similarity transform (R, s, t) 산출.
       const { rectFit } = await import('@/lib/alignment');
       // moduleDoorCorners 는 **raw 프레임** (DoorAlignModal `onSetupCornersFinalized` 가 picked.pos 그대로 전달).
@@ -301,9 +325,6 @@ export default function AlignPanel({
       // gap 적용 전 fit 으로 R, dst plane normal 산출.
       const preFit = rectFit(src, dst, { ...(dstForcedN ? { dstForcedN } : {}), withScale: true });
 
-      // doorHeight 계산 — dst 의 e2 길이 = corner[2] - corner[1] 의 magnitude. (진단 로그용)
-      const dh_x = dst[6] - dst[3], dh_y = dst[7] - dst[4], dh_z = dst[8] - dst[5];
-      const doorHeight = Math.hypot(dh_x, dh_y, dh_z);
       // 정합 문 두께 = 사용자 설정 슬라이더 값. basemap ↔ module facade 평행 간격.
       const gap = alignDoorThicknessRef.current;
 
@@ -317,30 +338,6 @@ export default function AlignPanel({
       }
       const fit = rectFit(src, dst, { ...(dstForcedN ? { dstForcedN } : {}), withScale: true });
       setRmsd(fit.rmsd);
-      console.log(`[Align] RMSD=${fit.rmsd.toFixed(4)}m, scale=${fit.s.toFixed(4)}, gap=${gap.toFixed(3)}m, doorH=${doorHeight.toFixed(2)}m, ` +
-        `nSource=${dstForcedN ? 'normalInward' : 'cross-product'}`);
-      if (DEBUG_ALIGN) {
-        console.log('  alignmentGroup children:', Array.from(group.children ?? []).map((c: any) => c.name));
-        console.log('  MIRROR_MAP =', Array.from(DOOR_CORNER_MIRROR_MAP), '(module[i] ↔ basemap[mirror[i]])');
-        console.log('  --- moduleDoorCorners (A\'+Y, server convention) ---');
-        for (let i = 0; i < 4; i++) {
-          const c = moduleDoorCorners[i];
-          console.log(`    module[${i}]=(${c[0].toFixed(3)}, ${c[1].toFixed(3)}, ${c[2].toFixed(3)})`);
-        }
-        console.log('  --- basemapDoorCorners (A\'+Y, server convention) ---');
-        for (let i = 0; i < 4; i++) {
-          const c = basemapDoorCorners[i];
-          console.log(`    basemap[${i}]=(${c[0].toFixed(3)}, ${c[1].toFixed(3)}, ${c[2].toFixed(3)})`);
-        }
-        console.log('  --- src/dst (world, gap-pushed) ---');
-        for (let i = 0; i < 4; i++) {
-          const m = DOOR_CORNER_MIRROR_MAP[i];
-          console.log(`  i=${i} (module[${i}] → basemap[${m}]) ` +
-            `src=(${src[i*3].toFixed(3)}, ${src[i*3+1].toFixed(3)}, ${src[i*3+2].toFixed(3)}) ` +
-            `dst=(${dst[i*3].toFixed(3)}, ${dst[i*3+1].toFixed(3)}, ${dst[i*3+2].toFixed(3)})`);
-        }
-      }
-
       // fit 은 src world → dst world 의 similarity transform (R, s, t).
       // alignmentGroup 의 새 world = fit · 현재 group world. group 부모가 app.root (identity) 이라 local = world.
       const fitMat = similarityToMat4(pc, fit.R as unknown as number[], fit.s, fit.t as unknown as number[]);
@@ -430,7 +427,6 @@ export default function AlignPanel({
           };
           setDoorAngleDeg(0);
           setDoorPivotReady(true);
-          console.log(`[DoorPivot] grouped ${doorPivotMembersRef.current.length} entities under doorPivotGroup (post-animation)`);
         } catch (e) {
           console.warn('[DoorPivot] 생성 실패', e);
         }
@@ -459,7 +455,8 @@ export default function AlignPanel({
         for (let i = 0; i < 4; i++) {
           moduleWorld.push([dst[i*3], dst[i*3+1], dst[i*3+2]]);
         }
-        frameEntityRef.current = createDoorFrameMesh(pc, core.getApp(), moduleWorld, basemapWorld);
+        const frameColor = findAverageDoorMeshColor(core.getApp().root) ?? DEFAULT_FRAME_COLOR;
+        frameEntityRef.current = createDoorFrameMesh(pc, core.getApp(), moduleWorld, basemapWorld, frameColor);
       } catch (e) {
         console.warn('[Align] door frame 생성 실패', e);
       }
@@ -588,6 +585,10 @@ export default function AlignPanel({
       const p = group.getLocalPosition();
       const q = group.getLocalRotation();
       const s = group.getLocalScale();
+      const pc = core?.getPC?.();
+      const doorFrame = pc && frameEntityRef.current
+        ? extractDoorFrameWorld(pc, frameEntityRef.current)
+        : null;
 
       // onCommitFinal 제공 시 → 다듬기 결과 자산 + 정합 행렬 일괄 영속화.
       if (onCommitFinal) {
@@ -598,6 +599,7 @@ export default function AlignPanel({
             rotation: [q.x, q.y, q.z, q.w],
             scale: [s.x, s.y, s.z],
             rmsd,
+            doorFrame,
           });
           setError('정합 완료 ✓');
         } catch (e: any) {

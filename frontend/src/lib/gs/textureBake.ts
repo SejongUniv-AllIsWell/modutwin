@@ -190,7 +190,6 @@ export async function bakeTextureForPlane(
   options: Partial<TextureBakeOptions> = {},
 ): Promise<TextureBakeResult> {
   const opts = { ...DEFAULT_TEXTURE_BAKE_OPTIONS, ...options };
-  console.log(`[bakeTextureForPlane] ENTER — received options=${JSON.stringify(options)}, merged opts=${JSON.stringify(opts)}`);
 
   const uW = input.uMax - input.uMin;
   const vH = input.vMax - input.vMin;
@@ -229,35 +228,19 @@ export async function bakeTextureForPlane(
 
   // ── 단계 1: 필터 + 투영 + 2D covariance ──
   const splats: SplatInfo[] = [];
-  let candCount = 0;
-  // 진단 카운터
-  let rejSdInner = 0;     // sd < -dgate (방 안쪽 너무 깊음)
-  let rejDet = 0;         // 2D 공분산 degenerate
-  let rejBigBB = 0;       // bbR > maxBB (스카이/노이즈)
-  let rejTinyBB = 0;      // bbR < 0.3 (너무 작음)
-  let rejOutOfRange = 0;  // 큰 텍스처에서 픽셀 범위 밖
 
   // ── 사전 패스: opacity-가중 sd 히스토그램으로 paint plane 자동 검출 ──
   //  - 1cm 빈, ±2m 범위 (200 + 200 = 400 빈)
   //  - 빈마다 sigmoid(opacity) 합산 — opacity 높은 가우시안일수록 가중
   //  - sd=0 부근 ±50cm 에서 peak 찾기 → 거기가 실제 paint plane
   //  - 자동 게이트 = max(slider, |peak sd| + 5cm 마진) 으로 paint 포함 보장
-  // 부수: 진단용 통계도 같이 계산.
   const HIST_BINS = 400;
   const HIST_RANGE = 2.0;
   const HIST_RES = (2 * HIST_RANGE) / HIST_BINS; // 0.01 m
   const wHist = new Float32Array(HIST_BINS);
-  let sdMin = Infinity, sdMax = -Infinity, sdSum = 0;
-  const sdHist = new Int32Array(40); // 진단용 10cm 빈 (±2m)
   for (let i = 0; i < N; i++) {
     const dx = px[i] - ox, dy = py[i] - oy, dz = pz[i] - oz;
     const sd0 = dx * nx + dy * ny + dz * nz;
-    if (sd0 < sdMin) sdMin = sd0;
-    if (sd0 > sdMax) sdMax = sd0;
-    sdSum += sd0;
-    // 10cm 빈 (진단용)
-    const dbin = Math.floor((sd0 + 2) / 0.1);
-    if (dbin >= 0 && dbin < 40) sdHist[dbin]++;
     // 1cm 빈 (auto-gate 용, opacity 가중)
     const fbin = Math.floor((sd0 + HIST_RANGE) / HIST_RES);
     if (fbin >= 0 && fbin < HIST_BINS) {
@@ -265,8 +248,6 @@ export async function bakeTextureForPlane(
       wHist[fbin] += w;
     }
   }
-  const sdMean = sdSum / Math.max(1, N);
-
   // sd=0 ±50cm 범위에서 paint peak 검출
   const SEARCH_RANGE = 0.5;
   const centerBin = Math.floor(HIST_RANGE / HIST_RES);
@@ -283,7 +264,6 @@ export async function bakeTextureForPlane(
   const autoGate = autoMargin > 0
     ? Math.max(opts.depthGate, -Math.min(0, paintSd) + autoMargin)
     : opts.depthGate;
-  console.log(`[textureBake] paint peak: sd=${paintSd.toFixed(3)}m (weight=${peakW.toFixed(0)}) → autoGate=${autoGate.toFixed(3)}m (slider=${opts.depthGate.toFixed(3)}m, autoMargin=${autoMargin.toFixed(3)}m), mesh placed at sd=0 (사용자 경계면)`);
   const dgateEff = autoGate;
 
   for (let i = 0; i < N; i++) {
@@ -291,10 +271,9 @@ export async function bakeTextureForPlane(
     const sd = dx * nx + dy * ny + dz * nz;
     // 적응형 깊이: 안쪽 경계만 차단, 바깥쪽은 무한대까지 허용. 픽셀별 T saturate 로 자동 종료.
     // dgateEff = max(슬라이더, paint peak 안쪽 + 5cm). 자동 검출이라 사용자 입력 0.5cm 도 OK.
-    if (sd < -dgateEff) { rejSdInner++; continue; }
+    if (sd < -dgateEff) continue;
     const u = dx * ux + dy * uy + dz * uz;
     const v = dx * vx + dy * vy + dz * vz;
-    candCount++;
 
     // 쿼터니언 정규화 + 회전 행렬
     const qw0 = r0[i], qx0 = r1[i], qy0 = r2[i], qz0 = r3[i];
@@ -330,7 +309,7 @@ export async function bakeTextureForPlane(
     const p11 = c11 * tpm2;
 
     const det = p00 * p11 - p01 * p01;
-    if (det < 1e-10) { rejDet++; continue; } // degenerate
+    if (det < 1e-10) continue; // degenerate
 
     const inv00 = p11 / det;
     const inv01 = -p01 / det;
@@ -340,14 +319,14 @@ export async function bakeTextureForPlane(
     const sigU = Math.sqrt(p00);
     const sigV = Math.sqrt(p11);
     const bbR = 3 * Math.max(sigU, sigV);
-    if (bbR > maxBB) { rejBigBB++; continue; } // 너무 큰 가우시안 (스카이 등)
-    if (bbR < 0.3) { rejTinyBB++; continue; }  // 너무 작은 가우시안
+    if (bbR > maxBB) continue; // 너무 큰 가우시안 (스카이 등)
+    if (bbR < 0.3) continue;  // 너무 작은 가우시안
 
     // 픽셀 좌표계 중심
     const tu = (u - input.uMin) * tpm;
     const tv = (v - input.vMin) * tpm;
-    if (tu < -bbR || tu > width + bbR) { rejOutOfRange++; continue; }
-    if (tv < -bbR || tv > height + bbR) { rejOutOfRange++; continue; }
+    if (tu < -bbR || tu > width + bbR) continue;
+    if (tv < -bbR || tv > height + bbR) continue;
 
     const r = Math.max(0, Math.min(1, 0.5 + SH0 * f0[i]));
     const g = Math.max(0, Math.min(1, 0.5 + SH0 * f1[i]));
@@ -368,8 +347,6 @@ export async function bakeTextureForPlane(
   const tilesPerRow = Math.ceil(width / TILE);
   const tilesPerCol = Math.ceil(height / TILE);
   const numTiles = tilesPerRow * tilesPerCol;
-
-  const tBinStart = performance.now();
 
   // Pass 1: count entries per tile
   const tileCounts = new Uint32Array(numTiles);
@@ -417,10 +394,6 @@ export async function bakeTextureForPlane(
     }
   }
 
-  let maxTileCount = 0;
-  for (let t = 0; t < numTiles; t++) if (tileCounts[t] > maxTileCount) maxTileCount = tileCounts[t];
-  console.log(`[textureBake] tile binning: ${numTiles} tiles (${tilesPerRow}×${tilesPerCol}), ${totalEntries} entries (avg ${(totalEntries / Math.max(1, numTiles)).toFixed(1)}/tile, max ${maxTileCount}/tile) → ${(performance.now() - tBinStart).toFixed(0)}ms`);
-
   // ── 단계 3: alpha compositing — GPU 우선, CPU 폴백 ──
   // 둘 다 결과: width*height*4 의 Float32Array [r_premult, g_premult, b_premult, alpha]
   let composited: Float32Array | null = null;
@@ -440,7 +413,6 @@ export async function bakeTextureForPlane(
 
   if (!composited) {
     // CPU 폴백
-    const tCpuStart = performance.now();
     composited = new Float32Array(width * height * 4);
     const T = new Float32Array(width * height);
     T.fill(1.0);
@@ -479,7 +451,6 @@ export async function bakeTextureForPlane(
     for (let i = 0; i < width * height; i++) {
       composited[i * 4 + 3] = 1 - T[i];
     }
-    console.log(`[textureBake CPU] ${(performance.now() - tCpuStart).toFixed(0)}ms`);
   }
 
   // ── 단계 4: 최종 RGBA8 (un-premultiply + sRGB encode + V flip + polygon mask) ──
@@ -488,9 +459,7 @@ export async function bakeTextureForPlane(
   //   → world: origin + u_local * uAxis + v_local * vAxis. y 성분은 평면에 의존하므로 무시 (XZ test).
   const mask = input.polygonMaskXZ;
   const useMask = !!mask && mask.length >= 3;
-  let maskedOut = 0;
   const rgba = new Uint8ClampedArray(width * height * 4);
-  let nOpaque = 0;
   for (let yy = 0; yy < height; yy++) {
     for (let xx = 0; xx < width; xx++) {
       const srcIdx = (yy * width + xx) * 4;
@@ -508,7 +477,6 @@ export async function bakeTextureForPlane(
         const worldZ = oz + uLocal * uz + vLocal * vz;
         if (!isPointInPolygonXZ(worldX, worldZ, mask!)) {
           alphaPass = false;
-          maskedOut++;
         }
       }
 
@@ -520,7 +488,6 @@ export async function bakeTextureForPlane(
         rgba[imgIdx + 1] = Math.round(linToSrgb(g) * 255);
         rgba[imgIdx + 2] = Math.round(linToSrgb(b) * 255);
         rgba[imgIdx + 3] = Math.round(finalAlpha * 255);
-        nOpaque++;
       } else {
         rgba[imgIdx] = 0;
         rgba[imgIdx + 1] = 0;
@@ -529,10 +496,6 @@ export async function bakeTextureForPlane(
       }
     }
   }
-  if (useMask) {
-    console.log(`[textureBake] polygon mask: ${maskedOut}/${width * height} pixels masked out (${(100 * maskedOut / (width * height)).toFixed(1)}%)`);
-  }
-
   // 메시 코너 = 베이크 origin 위치 (사용자가 정의한 경계 평면, sd=0) 에 정확히 배치.
   const corner = (uu: number, vv: number): Vec3 => [
     ox + uu * ux + vv * vx,
@@ -558,21 +521,6 @@ export async function bakeTextureForPlane(
     uvOf(input.uMax, input.vMin),  // BR
     uvOf(input.uMin, input.vMin),  // BL
   ];
-
-  const tag = `[textureBake]`;
-  console.log(`${tag} ${width}×${height}, candidates ${candCount}, splats ${splats.length}, opaque texels ${nOpaque}/${width * height} (${(100 * nOpaque / (width * height)).toFixed(1)}%)`);
-  console.log(`${tag} sd dist: min=${sdMin.toFixed(3)} max=${sdMax.toFixed(3)} mean=${sdMean.toFixed(3)} (m), dgateEff=-${dgateEff.toFixed(3)} (slider=${dgate.toFixed(3)}, autoGate=${autoGate.toFixed(3)})`);
-  console.log(`${tag} reject: sdInner=${rejSdInner} (sd<-dgate), det=${rejDet}, bigBB=${rejBigBB}, tinyBB=${rejTinyBB}, outRange=${rejOutOfRange}`);
-  // sd 히스토그램 — -2..+2m, 10cm 빈. paint peak 위치 확인용.
-  const histLines: string[] = [];
-  for (let i = 0; i < 40; i++) {
-    if (sdHist[i] > 0) {
-      const lo = (-2 + i * 0.1).toFixed(2);
-      const hi = (-2 + (i + 1) * 0.1).toFixed(2);
-      histLines.push(`  [${lo}..${hi}] = ${sdHist[i]}`);
-    }
-  }
-  console.log(`${tag} sd histogram (10cm bins, only nonzero):\n${histLines.join('\n')}`);
 
   return { rgba, width, height, corners, uvs, input };
 }

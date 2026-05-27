@@ -160,7 +160,7 @@ app.root
 wrapper.enabled 토글로 자식 mesh+splat 동시 hide/show.
 
 ### Basemap
-관리자 생성, 불변. 변경 시 전역 변환 행렬로 정합된 모듈에 전파 (구현 예정 — `TODOLIST.md`).
+관리자 생성, 불변. 변경 시 전역 변환 행렬로 정합된 모듈에 전파 (구현 예정 — `docs/ROADMAP.md`).
 
 ### Notifications
 온라인 = WebSocket (Redis `ws:online:{user_id}`). 오프라인 = PostgreSQL `notifications` → 재접속 시 전달.
@@ -176,7 +176,7 @@ wrapper.enabled 토글로 자식 mesh+splat 동시 hide/show.
 이탈 보호 (`refine`/`door` 모드): `beforeunload` 경고 + 탭 변경 confirm. 완료 버튼 (force=true) 만 bypass.
 
 서버 영속 타이밍:
-- **모듈**: 다듬기·문 설정 메모리. 다듬기 완료 시 `register-local` (uploadId 발급). 정합 완료 시 `POST /uploads/commit-final` atomic 일괄. SAM3 자동 검출은 백그라운드 임시 PLY.
+- **모듈**: 다듬기·문 설정 메모리. 다듬기 완료 시 회전/삭제를 canonical PLY 메모리에 반영한다. 정합 완료 시 `POST /uploads/commit-final` 로 upload/module row, PLY, mesh, door, alignment 를 atomic 일괄 저장한다. SAM3 자동 검출은 백그라운드 임시 PLY.
 - **베이스맵**: 다듬기 단계 localStorage `refine_state_v7_{uploadId}` (pendingRotation + bakedRotation + wallPolygon 등). "Basemap 등록 완료" 시 PLY + mesh + tex + doors + 도어 자산 + `/basemaps/register` 일괄. 정합 단계 없음.
 
 자세한 함수 호출 순서는 `UnifiedSplatEditor.autoFinalizeFromContext` (모듈) / `DoorAlignModal` 의 `inMemoryDoors` commit (베이스맵) 참조.
@@ -189,10 +189,10 @@ wrapper.enabled 토글로 자식 mesh+splat 동시 hide/show.
 2. **외부 가우시안 제거** (`lib/gs/floaters.ts`) — 경계면 바깥 가우시안 삭제.
 3. **Wall mesh + 텍스처 베이크** (`lib/gs/textureBake.ts`, `textureBakeGPU.ts`, `wallMesh.ts`) — 정사영 + alpha 컴포지팅. 메시는 사용자 경계 평면 (sd=0) 에 정확히 배치. GPU 컴퓨트 + 타일 binning, WebGPU 실패 시 CPU 폴백.
 4. **경계면 정제** (`lib/gs/clipping.ts`) — 가우시안 scale shrink. **법선 방향 mahalanobis `kSigma · σ` 가 평면 안에 들어오게** 강제. default `kSigma = √12 + 0.001 ≈ 3.4651` — textureBake render hard cutoff (exponent<-6 → √12 ≈ 3.464σ) 보다 살짝 큼. 결과: 렌더 픽셀이 벽 평면을 안 넘음.
-5. **다듬기 완료** → `bakeSplatRotation` 으로 `splatData` 메모리에 pendingRotation in-place 적용 (raw → A'). 이후 모든 코드가 단일 A' 프레임에서 동작. 문 설정 단계로 transition.
+5. **다듬기 완료** → `bakeSplatRotation` 으로 `splatData` 메모리에 pendingRotation in-place 적용 (raw → A') 후 삭제 마스크까지 반영한 canonical PLY scene 을 만든다. 이후 문 설정/정합은 이 scene 을 기준으로 동작.
 6. **문 설정** (`DoorAlignModal`) — SAM3 또는 수동 4점 → 문 추출 (boundary split + wall mesh α punch + wall 텍스처 crop 으로 도어 mesh) → 회전축/각도/방향.
 7. **문 설정 완료** — 문 열린 상태였으면 자동 닫기 + `angleDeg=0` 강제. 모듈은 메모리 유지, 베이스맵은 백그라운드 일괄 업로드. 둘 다 정합 단계로 transition.
-8. **정합** (`AlignPanel`) — 4점 자동/수동 → `rectFit(withScale)` → similarity transform → 모듈은 `commit-final` 일괄, 베이스맵은 해당 단계 없음.
+8. **정합** (`AlignPanel`) — 4점 자동/수동 → `rectFit(withScale)` → similarity transform. 모듈은 wallAngle bake 보정이 반영된 transform, doorFrame mesh, refined bundle 을 `commit-final` 로 일괄 저장한다. 베이스맵은 해당 단계 없음.
 
 ### WallModal 폴리곤 모드
 N-각형 폴리곤 입력. 단일 cycle 완성 시 확인 활성. **평행화 모드**: 첫 선택 = 기준선 (시안 "기준" 라벨) → 이후 선택 = 평행화 대상 (주황 번호). 출력 `(angleDeg, polygon: PolygonPoint[])` — angleDeg 는 polygon PCA 주축 기반 베이크용 Y 회전.
@@ -208,4 +208,4 @@ docker-compose exec backend pytest                    # Backend tests
 docker-compose exec frontend npm test                 # Frontend tests
 ```
 
-향후 작업 목록은 [TODOLIST.md](TODOLIST.md) 참고.
+향후 작업 목록은 [docs/ROADMAP.md](docs/ROADMAP.md) 참고.

@@ -1,10 +1,8 @@
 # Development and Deployment Guide
 
-Last updated: 2026-05-05
+Last updated: 2026-05-27
 
-This guide is for running the refactored codebase from
-`/home/pjhserver/refactored_modutwin`. The old `modutwin` compose project and
-old volumes are no longer the expected runtime baseline.
+This guide is for running the `modutwin` repository.
 
 ## Requirements
 
@@ -19,7 +17,7 @@ old volumes are no longer the expected runtime baseline.
 Create `.env` from the example:
 
 ```bash
-cd ~/refactored_modutwin
+cd ~/modutwin
 cp .env.example .env
 ```
 
@@ -86,32 +84,32 @@ The local override mounts `nginx/nginx.local.conf`, which listens on HTTP and
 allows local API docs access. Because Compose merges `ports`, the `443` mapping
 from the base file may still appear, but the local nginx config serves HTTP.
 
-Do not add `-p modutwin` unless you intentionally want to reuse the old compose
-project name. The expected project name for this folder is `refactored_modutwin`.
+Compose derives the project name from the checkout directory by default. Keep the
+directory name as `modutwin`, or pass `-p modutwin` intentionally when a stable
+project name is required.
 
 ## Fresh Volumes
 
 If you intentionally reset all local service data:
 
 ```bash
-cd ~/refactored_modutwin
+cd ~/modutwin
 docker compose down -v
 docker compose up -d --build
 docker compose exec backend alembic upgrade head
 docker exec 3dgs-backend python -c "from app.services.minio_service import get_minio_service; get_minio_service().ensure_bucket()"
 ```
 
-This deletes PostgreSQL, Redis, RabbitMQ, and MinIO data for the
-`refactored_modutwin` project. Browser sessions will be invalid and users must
-log in again.
+This deletes PostgreSQL, Redis, RabbitMQ, and MinIO data for the active Compose
+project. Browser sessions will be invalid and users must log in again.
 
 Expected active volumes:
 
 ```text
-refactored_modutwin_pgdata
-refactored_modutwin_redisdata
-refactored_modutwin_rabbitmqdata
-refactored_modutwin_miniodata
+modutwin_pgdata
+modutwin_redisdata
+modutwin_rabbitmqdata
+modutwin_miniodata
 ```
 
 ## Access URLs
@@ -176,10 +174,12 @@ The default web stack does not require the GPU worker.
 Current status:
 
 - `worker/` contains `training` and `alignment` Celery tasks.
-- SAM3 dispatch is disabled by default with `ENABLE_SAM3_DISPATCH=false`.
-- `worker/tasks/sam3.py` does not exist yet.
-- `door_ml/` does not exist in the current repository, so
-  `docker-compose.gpu.yml` is not considered a ready default deployment file.
+- Viewer automatic door designation uses the door-ml/SAM3 HTTP path when the
+  service is available.
+- `core/door_detection` contains the SAM3-based door detection pipeline used by
+  the door-ml side of the feature.
+- The older async worker/callback SAM3 path remains optional; keep
+  `ENABLE_SAM3_DISPATCH=false` unless that path is intentionally deployed.
 
 If a separate GPU machine is prepared later, expose Redis/RabbitMQ/MinIO through
 `PC_HOST_IP` on a private interface such as Tailscale, keep secrets identical on

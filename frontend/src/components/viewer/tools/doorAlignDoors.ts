@@ -3,7 +3,9 @@ import { api } from '@/lib/api';
 export type Vec3 = [number, number, number];
 
 export interface PickedCorner {
-  pos: Vec3; // raw splat frame
+  // 현재 로드된 PLY의 local frame. 신규 등록 중에는 raw/A' 계산을 거치고,
+  // 저장된 basemap 재진입 시에는 final PLY와 같은 정렬 좌표계다.
+  pos: Vec3;
   surfaceId: string; // 어느 면(벽/천장/바닥)에 떨어졌는지
 }
 
@@ -22,7 +24,7 @@ export const PRIMARY_DOOR_ID = 'door_1';
 //   doorExtractionDepth: 슬랩 깊이 (m, 방 안쪽 단방향).
 //   boundarySplitEnabled: 경계 분할 ON/OFF.
 export interface DoorMeshMeta {
-  corners: number[][];      // 4 × 3 (A'+Y 프레임, z-fight 오프셋 적용)
+  corners: number[][];      // 4 × 3 (final PLY 좌표계, z-fight 오프셋 적용)
   uvs: number[][];          // 4 × 2
   normalInward: number[];   // [x, y, z]
   textureFilename: string;  // "tex_door_<doorId>.png"
@@ -34,7 +36,7 @@ export interface DoorSplatMeta {
   filename: string;         // "door_<doorId>.ply"
 }
 
-interface DoorMeta {
+export interface DoorMeta {
   id: string;
   corners: number[][];
   unitName?: string;
@@ -48,7 +50,7 @@ interface DoorMeta {
   doorSplat?: DoorSplatMeta;
 }
 
-interface DoorsJson {
+export interface DoorsJson {
   doors: DoorMeta[];
 }
 

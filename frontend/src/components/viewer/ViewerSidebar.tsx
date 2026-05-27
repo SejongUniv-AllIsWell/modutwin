@@ -11,6 +11,8 @@ interface Props {
   lockedStages: ReadonlySet<'upload' | 'refine' | 'door'>;
   onPickFiles: (files: File[]) => void;
   onToggleMode: (next: 'refine' | 'door' | 'align') => void;
+  /** Basemap 등록/수정은 모듈 정합 단계가 없으므로 정합 탭을 숨긴다. */
+  hideAlign?: boolean;
   /** 사이드바 + 레이어 + 툴 패널 전체를 왼쪽으로 밀어 숨김. */
   onCollapse: () => void;
 }
@@ -18,7 +20,7 @@ interface Props {
 const ACCEPT = '.ply,.splat,.sog';
 
 export default function ViewerSidebar({
-  mode, hasMain, hasMetadata, lockedStages, onPickFiles, onToggleMode, onCollapse,
+  mode, hasMain, hasMetadata, lockedStages, onPickFiles, onToggleMode, hideAlign = false, onCollapse,
 }: Props) {
   const uploadLocked = lockedStages.has('upload');
   const refineLocked = lockedStages.has('refine');
@@ -93,24 +95,26 @@ export default function ViewerSidebar({
         <span className="text-[11px] leading-none">문 설정</span>
       </button>
 
-      <button
-        onClick={() => onToggleMode('align')}
-        disabled={!hasMain}
-        title={
-          !hasMain
-            ? '먼저 파일을 불러오세요'
-            : !hasMetadata && mode !== 'align'
-              ? '정합 시작 시 건물/층/모듈 정보가 필요합니다'
-              : '정합'
-        }
-        className={`flex flex-col items-center justify-center gap-0.5 w-14 h-9 rounded transition cursor-pointer disabled:cursor-not-allowed disabled:opacity-40 ${
-          hasMain && mode === 'align'
-            ? 'bg-indigo-500/25 text-indigo-300'
-            : 'text-[var(--ink)] hover:bg-[var(--bg-soft)]/60'
-        }`}
-      >
-        <span className="text-[11px] leading-none">정합</span>
-      </button>
+      {!hideAlign && (
+        <button
+          onClick={() => onToggleMode('align')}
+          disabled={!hasMain}
+          title={
+            !hasMain
+              ? '먼저 파일을 불러오세요'
+              : !hasMetadata && mode !== 'align'
+                ? '정합 시작 시 건물/층/모듈 정보가 필요합니다'
+                : '정합'
+          }
+          className={`flex flex-col items-center justify-center gap-0.5 w-14 h-9 rounded transition cursor-pointer disabled:cursor-not-allowed disabled:opacity-40 ${
+            hasMain && mode === 'align'
+              ? 'bg-indigo-500/25 text-indigo-300'
+              : 'text-[var(--ink)] hover:bg-[var(--bg-soft)]/60'
+          }`}
+        >
+          <span className="text-[11px] leading-none">정합</span>
+        </button>
+      )}
 
       <input
         ref={fileInputRef}

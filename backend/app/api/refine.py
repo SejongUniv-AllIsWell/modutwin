@@ -267,7 +267,9 @@ async def save_refined(
         user_id=user.id,
         module_id=upload.module_id,
         ply_path=source_key,
-        sog_path=source_key,   # PLY도 뷰어에서 로드 가능
+        # Refine saves the canonical PLY directly; SOG may be produced later by a
+        # worker, so this column intentionally stays nullable.
+        sog_path=None,
         is_aligned=False,
     )
     db.add(scene)
@@ -307,6 +309,8 @@ class RefinedBundleDoorEntry(BaseModel):
     door_mesh: Optional[dict] = None
     # 도어 splat (PLY) presigned URL.
     door_splat: Optional[dict] = None
+    # 정합 단계에서 만든 문 옆면/두께 frame mesh. 이미 floor world 좌표계.
+    door_frame: Optional[dict] = None
 
 
 class RefinedBundleResponse(BaseModel):
@@ -411,6 +415,9 @@ async def get_refined_bundle(
                         entry.door_splat = {
                             "url": minio.get_presigned_download_url(splat_key),
                         }
+                df = d.get("doorFrame")
+                if isinstance(df, dict):
+                    entry.door_frame = df
                 doors_out.append(entry)
         except Exception as e:
             logger.exception(f"[refined-bundle] doors.json parse failed: {e}")

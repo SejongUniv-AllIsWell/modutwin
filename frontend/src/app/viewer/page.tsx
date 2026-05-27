@@ -44,6 +44,8 @@ function ViewerContent() {
   }, []);
 
   const uploadId = searchParams.get('upload_id') ?? undefined;
+  const basemapEditMode = searchParams.get('basemap_edit') === '1';
+  const basemapId = searchParams.get('basemap_id') ?? undefined;
 
   // 등록 컨텍스트: 로컬 핸드오프가 있으면 그것을 우선, 없으면 URL 쿼리 파라미터 (서버 진입용) 사용.
   const initialRegistrationContext: RegistrationContext | null = useMemo(() => {
@@ -99,7 +101,7 @@ function ViewerContent() {
     }
     setResolving(true);
     setResolveError(null);
-    const variant = initialMode === 'align' ? 'refined' : '';
+    const variant = initialMode === 'align' || initialMode === 'door' ? 'refined' : '';
     const qs = variant ? `?variant=${variant}` : '';
     api.get<{ url: string; filename: string; variant?: string }>(`/uploads/${uploadId}/presigned-url${qs}`)
       .then(data => {
@@ -154,6 +156,8 @@ function ViewerContent() {
         initialMode={initialMode}
         initialRegistrationContext={initialRegistrationContext}
         initialLocalFileSize={pendingLocal?.fileSize ?? 0}
+        initialBasemapEditMode={basemapEditMode}
+        initialBasemapId={basemapId}
       />
     </div>
   );

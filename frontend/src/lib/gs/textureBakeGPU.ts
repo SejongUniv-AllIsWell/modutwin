@@ -106,7 +106,6 @@ async function getDevice(): Promise<GPUDevice | null> {
     console.warn('[textureBakeGPU] requestDevice with raised limits failed, falling back to defaults:', e);
     device = await adapter.requestDevice();
   }
-  console.log(`[textureBakeGPU] device limits: maxStorageBufferBindingSize=${device.limits.maxStorageBufferBindingSize}, maxBufferSize=${device.limits.maxBufferSize}`);
   device.lost.then((info) => {
     console.error('[textureBakeGPU] device lost:', info);
     cachedDevice = null;
@@ -164,8 +163,6 @@ export async function compositeTextureGPU(
   if (tileOffsets.length !== numTiles + 1) {
     throw new Error(`compositeTextureGPU: tileOffsets length ${tileOffsets.length} != numTiles+1 ${numTiles + 1}`);
   }
-
-  const t0 = performance.now();
 
   // Pack splats: 12 floats per splat (48 bytes, vec4 aligned)
   const splatArr = new Float32Array(Math.max(12, M * 12));
@@ -257,8 +254,6 @@ export async function compositeTextureGPU(
 
   [splatGpu, outGpu, paramsGpu, readBuf, tileOffsetsGpu, tileListGpu].forEach(b => b.destroy());
 
-  const totalEntries = tileSplatList.length;
-  console.log(`[textureBakeGPU] ${width}×${height}, ${M} splats, ${numTiles} tiles, ${totalEntries} tile-entries (avg ${(totalEntries / Math.max(1, numTiles)).toFixed(1)}/tile) → ${(performance.now() - t0).toFixed(0)}ms`);
   return result;
 }
 

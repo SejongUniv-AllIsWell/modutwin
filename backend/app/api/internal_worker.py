@@ -140,6 +140,8 @@ async def worker_task_success(
             user_id=task.user_id,
             module_id=upload.module_id,
             ply_path=ply_key,
+            # Worker completion is the path that can provide the optional
+            # viewer-optimized SOG alongside the canonical PLY.
             sog_path=sog_key,
             metadata_path=metadata_key,
             is_aligned=(task.task_type == TaskType.door_alignment),

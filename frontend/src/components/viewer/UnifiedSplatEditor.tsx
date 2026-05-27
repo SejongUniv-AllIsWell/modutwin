@@ -1,6 +1,7 @@
 'use client';
 
 import { useRef, useState, useCallback, useEffect, useMemo, Suspense, lazy } from 'react';
+import { createPortal } from 'react-dom';
 import SplatViewerCore, { SplatViewerCoreRef, SplatData } from './SplatViewerCore';
 import ViewerSidebar from './ViewerSidebar';
 import LayerPanel from './LayerPanel';
@@ -45,6 +46,9 @@ interface Props {
   /** /upload 페이지에서 blob URL 핸드오프로 들어온 로컬 파일의 원본 크기.
    *  blob URL 자체로는 size 를 알 수 없어 register-local 의 quota 계산에 필요. */
   initialLocalFileSize?: number;
+  /** 활성 basemap 의 등록된 문 정보만 수정하는 진입. */
+  initialBasemapEditMode?: boolean;
+  initialBasemapId?: string;
 }
 
 interface EnsureRegistrationContextResponse {
@@ -63,11 +67,14 @@ export default function UnifiedSplatEditor({
   initialMode = null,
   initialRegistrationContext = null,
   initialLocalFileSize = 0,
+  initialBasemapEditMode = false,
+  initialBasemapId,
 }: Props) {
   const router = useRouter();
   const coreRef = useRef<SplatViewerCoreRef>(null);
   const isBasemapPurpose = initialRegistrationContext?.purpose === 'basemap';
   const isModulePurpose = initialRegistrationContext?.purpose === 'module';
+  const isBasemapEditMode = isBasemapPurpose && initialBasemapEditMode;
 
   // ── 메인 splat 상태 ──
   // currentUrl만 바뀌어도 SplatViewerCore가 entity만 in-place 교체하므로 reloadKey 같은
@@ -530,9 +537,19 @@ export default function UnifiedSplatEditor({
 
   // 정제된 wall mesh + 텍스처 자동 로드 (저장된 mesh.json + tex_*.png).
   // 비활성 조건 두 가지:
-  //   - door 단계: register-local 로 uploadId 가 먼저 생기고 refined save 가 뒤따라 /refine/refined-bundle 이 404 를 낼 수 있음.
+  //   - door 단계: 문 설정이 끝나기 전이라 서버 refined bundle 이 아직 없을 수 있음.
   //   - meshIsFreshInMemory: 문 설정 완료 직후 정합 진입 시 메모리에 이미 punch 된 텍스처 + 메시가 있어 서버 fetch 가 덮어쓰면 안 됨.
-  useRefinedMeshLoader(coreRef, uploadId, Boolean(uploadId) && mode !== 'door' && !meshIsFreshInMemory);
+  // basemap 수정 모드는 등록된 도어 splat 을 별도 레이어로 올리지 않는다. 여러 gsplat entity 가 겹치면
+  // 시점별 정렬 아티팩트가 생기므로, 등록된 문은 mesh/라벨/목록으로만 표시한다.
+  useRefinedMeshLoader(
+    coreRef,
+    uploadId,
+    Boolean(uploadId) && (mode !== 'door' || isBasemapEditMode) && !meshIsFreshInMemory,
+    undefined,
+    null,
+    true,
+    isBasemapEditMode ? refine.registerPersistedBake : undefined,
+  );
   // basemap 의 wall mesh + 텍스처 + 도어 (다중) 자산 로드. source_upload_id 가 채워졌을 때만 동작.
   // additional 인스턴스 전달 → 도어 splat 들이 basemap 소속 추가 레이어로 등록됨.
   // 정합 단계에서 매칭된 호수의 도어만 로드 — 다른 호수의 basemapDoor_* wrapper/splat/라벨이 안 생김.
@@ -593,7 +610,6 @@ export default function UnifiedSplatEditor({
               '/uploads/sam3/prepare', form,
             );
             sam3PrepareSessionIdRef.current = data.session_id;
-            console.log(`[sam3-prepare] session=${data.session_id} size=${data.size}`);
           } catch (e: any) {
             console.warn('[sam3-prepare] 백그라운드 업로드 실패 (자동 문 검출 비활성):', e?.message || e);
           }
@@ -831,6 +847,7 @@ export default function UnifiedSplatEditor({
           lockedStages={lockedStages}
           onPickFiles={handlePickFiles}
           onToggleMode={handleToggleMode}
+          hideAlign={isBasemapPurpose}
           onCollapse={handleCollapsePanel}
         />
 
@@ -875,7 +892,10 @@ export default function UnifiedSplatEditor({
               autoExtracting={autoExtracting}
               autoExtractedCorners={autoExtractedCorners}
               basemapMode={isBasemapPurpose}
+              basemapEditMode={isBasemapEditMode}
+              basemapId={isBasemapEditMode ? initialBasemapId : undefined}
               basemapUnitName={isBasemapPurpose ? initialRegistrationContext?.module_name : undefined}
+              basemapFloorId={isBasemapPurpose ? initialRegistrationContext?.floor_id : undefined}
               basemapFloorNumber={isBasemapPurpose ? initialRegistrationContext?.floor_number : undefined}
               onBasemapDone={isBasemapPurpose ? (dest) => {
                 if (dest === 'main') router.push('/explore');
@@ -1113,7 +1133,7 @@ export default function UnifiedSplatEditor({
                   basemapTargetDoorNormalInward={basemapTargetDoorNormalInward}
                   basemapMatchError={basemapMatchError}
                   moduleDoorCorners={moduleDoorCorners}
-                  onCommitFinal={isModulePurpose ? async ({ matrix4x4, position, rotation, scale, rmsd }) => {
+                  onCommitFinal={isModulePurpose ? async ({ matrix4x4, position, rotation, scale, rmsd, doorFrame }) => {
                     // 다듬기 결과 자산 + 정합 행렬을 commit-final 로 일괄 영속화.
                     if (!initialRegistrationContext?.building_id
                       || !initialRegistrationContext?.floor_id
@@ -1122,6 +1142,40 @@ export default function UnifiedSplatEditor({
                     }
                     // 1) 다듬기 결과 자산 빌드 (메모리)
                     const assets = await refine.gatherRefinedAssets();
+                    const pc = coreRef.current?.getPC?.();
+                    let transformPosition = position;
+                    let transformRotation = rotation;
+                    let transformScale = scale;
+                    if (pc) {
+                      const zero = new pc.Vec3(0, 0, 0);
+                      const one = new pc.Vec3(1, 1, 1);
+                      const alignMat = new pc.Mat4();
+                      alignMat.data.set(matrix4x4);
+                      const zq = new pc.Quat();
+                      zq.setFromEulerAngles(0, 0, 180);
+                      const yq = new pc.Quat();
+                      yq.setFromEulerAngles(0, -(assets.wallAngleRad * 180) / Math.PI, 0);
+                      const z180 = new pc.Mat4().setTRS(zero, zq, one);
+                      const invWall = new pc.Mat4().setTRS(zero, yq, one);
+                      const correction = new pc.Mat4().mul2(z180, invWall);
+                      correction.mul(z180);
+                      const finalMat = new pc.Mat4().mul2(alignMat, correction);
+                      const p = new pc.Vec3();
+                      const q = new pc.Quat();
+                      const s = new pc.Vec3();
+                      finalMat.getTranslation(p);
+                      finalMat.getScale(s);
+                      const pureRotMat = finalMat.clone();
+                      const m = pureRotMat.data;
+                      const sx = s.x || 1, sy = s.y || 1, sz = s.z || 1;
+                      m[0] /= sx; m[1] /= sx; m[2] /= sx;
+                      m[4] /= sy; m[5] /= sy; m[6] /= sy;
+                      m[8] /= sz; m[9] /= sz; m[10] /= sz;
+                      q.setFromMat4(pureRotMat);
+                      transformPosition = [p.x, p.y, p.z];
+                      transformRotation = [q.x, q.y, q.z, q.w];
+                      transformScale = [s.x, s.y, s.z];
+                    }
 
                     // 2) doors.json — DoorAlignModal 이 문 설정 완료 시 onSetupCornersFinalized 콜백으로
                     //    넘긴 최종 4 corners (자동/수동 무관 동일 경로). 폴백으로 autoExtractedCorners.
@@ -1139,6 +1193,7 @@ export default function UnifiedSplatEditor({
                         id: 'door_1',
                         corners: doorCornersAY,
                         unitName: initialRegistrationContext.module_name.trim(),
+                        ...(doorFrame ? { doorFrame } : {}),
                       }],
                     });
 
@@ -1153,7 +1208,16 @@ export default function UnifiedSplatEditor({
                     form.append('module_name', initialRegistrationContext.module_name.trim());
                     form.append('original_filename', displayName ?? 'local.ply');
                     form.append('alignment_transform_json', JSON.stringify({
-                      position, rotation, scale, rmsd, matches: [{ module_door_id: 'door_1', basemap_id: 'auto' }],
+                      position: transformPosition,
+                      rotation: transformRotation,
+                      scale: transformScale,
+                      rmsd,
+                      matches: [{ module_door_id: 'door_1', basemap_id: 'auto' }],
+                      bake_rotation: {
+                        rotX: assets.rotX,
+                        rotZ: assets.rotZ,
+                        wallAngleRad: assets.wallAngleRad,
+                      },
                     }));
                     form.append('final_ply', new Blob([assets.plyBytes as unknown as BlobPart], { type: 'application/octet-stream' }), assets.plyFilename);
                     form.append('mesh_json', new Blob([assets.meshJson], { type: 'application/json' }), 'mesh.json');
@@ -1171,7 +1235,6 @@ export default function UnifiedSplatEditor({
                     const resp = await api.postForm<{ module_id: string; upload_id: string; scene_output_id: string; was_overwrite: boolean }>(
                       '/uploads/commit-final', form,
                     );
-                    console.log('[commit-final] 성공:', resp);
                     if (resp.was_overwrite) {
                       alert('기존 등록을 덮어쓰고 새 작업물을 저장했습니다.');
                     }
@@ -1233,11 +1296,41 @@ export default function UnifiedSplatEditor({
           onClose={handleMetadataClose}
         />
       )}
-      {basemapDone && (
-        <div className="absolute inset-0 z-[70] bg-black/70 flex items-center justify-center">
-          <div className="text-center text-[var(--ink)] text-xl font-bold">basemap 등록 신청이 완료되었습니다</div>
+      {basemapDone && typeof document !== 'undefined' && createPortal((
+        <div className="fixed inset-0 z-[70] bg-black/75 backdrop-blur-sm flex items-center justify-center">
+          <div className="bg-black/85 border border-white/10 rounded-2xl px-10 py-9 w-full max-w-2xl shadow-2xl">
+            <div className="flex items-center justify-center mb-5">
+              <div className="w-16 h-16 rounded-full bg-green-500/15 border border-green-500/50 flex items-center justify-center">
+                <svg className="w-9 h-9 text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" />
+                </svg>
+              </div>
+            </div>
+            <h3 className="text-2xl font-bold text-white text-center">Basemap 등록이 완료되었습니다</h3>
+            <p className="mt-3 text-base text-white/75 text-center">이동할 페이지를 선택해주세요</p>
+            <div className="mt-8 flex items-center gap-3">
+              <button
+                type="button"
+                onClick={() => {
+                  if (initialRegistrationContext?.building_id) router.push(`/buildings/${initialRegistrationContext.building_id}`);
+                  else router.push('/dashboard');
+                }}
+                className="flex-1 px-4 py-4 rounded-xl bg-blue-600 hover:bg-blue-500 text-[var(--ink)] text-base font-bold transition"
+              >건물 페이지</button>
+              <button
+                type="button"
+                onClick={() => router.push('/dashboard')}
+                className="flex-1 px-4 py-4 rounded-xl bg-blue-600 hover:bg-blue-500 text-[var(--ink)] text-base font-bold transition"
+              >대시보드</button>
+              <button
+                type="button"
+                onClick={() => setBasemapDone(false)}
+                className="flex-1 px-4 py-4 rounded-xl bg-[var(--bg-soft)] hover:bg-[var(--rule)] text-[var(--ink)] text-base font-bold transition"
+              >계속 작업</button>
+            </div>
+          </div>
         </div>
-      )}
+      ), document.body)}
     </SplatViewerCore>
   );
 }

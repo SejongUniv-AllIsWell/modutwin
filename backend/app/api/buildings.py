@@ -151,6 +151,7 @@ class FloorOverviewManifestEntry(BaseModel):
     meta_url: str | None
     module_count: int
     has_active_basemap: bool
+    has_pending_basemap: bool = False
 
 
 class FloorOverviewManifestResponse(BaseModel):
@@ -239,6 +240,7 @@ class DetailModuleEntry(BaseModel):
     is_visible: bool
     version: datetime | None
     url: str | None
+    source_upload_id: UUID | None = None
 
 
 class FloorDetailManifestResponse(BaseModel):
@@ -269,7 +271,7 @@ class AdminDeleteResponse(BaseModel):
 def _pick_scene_output_path(minio, scene: SceneOutput | None) -> str | None:
     if scene is None:
         return None
-    if safe_object_exists(minio, scene.sog_path):
+    if scene.sog_path and safe_object_exists(minio, scene.sog_path):
         return scene.sog_path
     if safe_object_exists(minio, scene.ply_path):
         return scene.ply_path
@@ -964,11 +966,13 @@ async def get_floor_overview_manifest(
     floor_ids = [floor.id for floor in floors]
     module_count_stmt = (
         select(Module.floor_id, func.count(Module.id))
-        .where(Module.floor_id.in_(floor_ids))
+        .where(
+            Module.floor_id.in_(floor_ids),
+            Module.is_visible == True,
+            Module.name != "__basemap__",
+        )
         .group_by(Module.floor_id)
     )
-    if not is_admin:
-        module_count_stmt = module_count_stmt.where(Module.is_visible == True)
     module_count_result = await db.execute(module_count_stmt)
     module_count_by_floor = {floor_id: count for floor_id, count in module_count_result.all()}
 
@@ -981,6 +985,16 @@ async def get_floor_overview_manifest(
     )
     active_basemap_floor_ids = {floor_id for (floor_id,) in active_basemap_result.all()}
 
+    pending_basemap_result = await db.execute(
+        select(Basemap.floor_id)
+        .where(
+            Basemap.floor_id.in_(floor_ids),
+            Basemap.status == BasemapStatus.pending,
+            Basemap.is_active == False,
+        )
+    )
+    pending_basemap_floor_ids = {floor_id for (floor_id,) in pending_basemap_result.all()}
+
     minio = get_minio_service()
     entries = [
         FloorOverviewManifestEntry(
@@ -992,6 +1006,7 @@ async def get_floor_overview_manifest(
             meta_url=safe_presigned_download_url(minio, floor.overview_meta_path),
             module_count=int(module_count_by_floor.get(floor.id, 0)),
             has_active_basemap=floor.id in active_basemap_floor_ids,
+            has_pending_basemap=floor.id in pending_basemap_floor_ids,
         )
         for floor in floors
     ]
@@ -1087,6 +1102,7 @@ async def get_floor_detail_manifest(
 
     module_ids = [module.id for module, _ in module_rows]
     latest_scene_by_module: dict[UUID, SceneOutput] = {}
+    upload_id_by_task: dict[UUID, UUID] = {}
     if module_ids:
         scene_stmt = select(SceneOutput).where(SceneOutput.module_id.in_(module_ids))
         if not is_admin:
@@ -1111,8 +1127,13 @@ async def get_floor_detail_manifest(
         scene_result = await db.execute(
             scene_stmt.order_by(SceneOutput.module_id, SceneOutput.created_at.desc())
         )
-        for scene in scene_result.scalars().all():
+        latest_scenes = scene_result.scalars().all()
+        for scene in latest_scenes:
             latest_scene_by_module.setdefault(scene.module_id, scene)
+        task_ids = [scene.task_id for scene in latest_scene_by_module.values()]
+        if task_ids:
+            task_result = await db.execute(select(Task.id, Task.upload_id).where(Task.id.in_(task_ids)))
+            upload_id_by_task = {task_id: upload_id for task_id, upload_id in task_result.all()}
 
     module_entries: list[DetailModuleEntry] = []
     for module, uploader_name in module_rows:
@@ -1128,6 +1149,7 @@ async def get_floor_detail_manifest(
                 is_visible=module.is_visible,
                 version=latest_scene.created_at if latest_scene else None,
                 url=minio.get_presigned_download_url(path) if path else None,
+                source_upload_id=upload_id_by_task.get(latest_scene.task_id) if latest_scene else None,
             )
         )
 

@@ -244,7 +244,7 @@ class SceneOutput(Base):
     user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     module_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("modules.id"), nullable=False)
     ply_path: Mapped[str] = mapped_column(String(1000), nullable=False)
-    sog_path: Mapped[str] = mapped_column(String(1000), nullable=False)
+    sog_path: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     metadata_path: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     is_aligned: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -283,5 +283,4 @@ class Notification(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     user: Mapped["User"] = relationship(back_populates="notifications")
-
 

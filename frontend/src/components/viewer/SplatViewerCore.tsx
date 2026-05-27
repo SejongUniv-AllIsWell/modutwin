@@ -376,7 +376,23 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
 
           // ── Update loop ──
           app.on('update', (dt: number) => {
-            // 기즈모
+            // WASD
+            if (keys.size) {
+              const speed = moveSpeedRef.current * 3 * dt * (keys.has('ShiftLeft') || keys.has('ShiftRight') ? 5 : 1);
+              const look = getLookDir(azim, elev);
+              const right = getRightDir(azim);
+              const t = cameraModeRef.current === 'fly' ? camPos : orbitTarget;
+              if (keys.has('KeyW')) { t.x += look.x * speed; t.y += look.y * speed; t.z += look.z * speed; }
+              if (keys.has('KeyS')) { t.x -= look.x * speed; t.y -= look.y * speed; t.z -= look.z * speed; }
+              if (keys.has('KeyD')) { t.x += right.x * speed; t.z += right.z * speed; }
+              if (keys.has('KeyA')) { t.x -= right.x * speed; t.z -= right.z * speed; }
+              if (keys.has('KeyE')) { t.y += speed; }
+              if (keys.has('KeyQ')) { t.y -= speed; }
+              syncCamera();
+            }
+
+            // 기즈모는 화면 좌하단에 고정한다. 카메라 이동을 먼저 반영한 뒤 현재 카메라 기준으로
+            // screenToWorld 를 계산해야 WASD 이동 중 이전 프레임 위치로 끌려가며 떨리지 않는다.
             {
               const cam = cameraEntity.camera!;
               const gizmoScreenX = 60;
@@ -403,21 +419,6 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
               labelY.style.left = `${scrPos.x + 4}px`; labelY.style.top = `${scrPos.y - 6}px`;
               cam.worldToScreen(tipZ, scrPos);
               labelZ.style.left = `${scrPos.x + 4}px`; labelZ.style.top = `${scrPos.y - 6}px`;
-            }
-
-            // WASD
-            if (keys.size) {
-              const speed = moveSpeedRef.current * 3 * dt * (keys.has('ShiftLeft') || keys.has('ShiftRight') ? 5 : 1);
-              const look = getLookDir(azim, elev);
-              const right = getRightDir(azim);
-              const t = cameraModeRef.current === 'fly' ? camPos : orbitTarget;
-              if (keys.has('KeyW')) { t.x += look.x * speed; t.y += look.y * speed; t.z += look.z * speed; }
-              if (keys.has('KeyS')) { t.x -= look.x * speed; t.y -= look.y * speed; t.z -= look.z * speed; }
-              if (keys.has('KeyD')) { t.x += right.x * speed; t.z += right.z * speed; }
-              if (keys.has('KeyA')) { t.x -= right.x * speed; t.z -= right.z * speed; }
-              if (keys.has('KeyE')) { t.y += speed; }
-              if (keys.has('KeyQ')) { t.y -= speed; }
-              syncCamera();
             }
 
             // 외부 등록 콜백
@@ -481,7 +482,6 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
             const ext = url.split('?')[0].split('.').pop()?.toLowerCase();
             const isBlob = url.startsWith('blob:');
             const filename = isBlob ? 'splat.ply' : (ext ?? 'ply');
-            console.log(`[loadSplat] url=${isBlob ? 'blob:' + url.slice(5, 20) + '...' : url.slice(0, 80)} preserveCamera=${preserveCamera} filename=${filename}`);
             const asset = new pc.Asset('splat', 'gsplat', { url, filename }, { reorder: false } as any);
             app.assets.add(asset);
 
@@ -540,7 +540,6 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
                 const posX = gsplatData.getProp('x') as Float32Array;
                 const posY = gsplatData.getProp('y') as Float32Array;
                 const posZ = gsplatData.getProp('z') as Float32Array;
-
                 const colorTex = resource?.streams?.textures?.get('splatColor') ?? null;
                 let origColorData: Uint16Array | null = null;
                 if (colorTex) {

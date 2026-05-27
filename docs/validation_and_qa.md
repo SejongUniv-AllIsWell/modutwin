@@ -2,7 +2,7 @@
 
 Last updated: 2026-05-05
 
-This is the validation contract for the refactored codebase. It covers local
+This is the validation contract for the current codebase. It covers local
 checks, container smoke checks, and manual QA for the high-risk browser flows.
 
 ## Automated Checks
@@ -19,12 +19,12 @@ python -m pytest -q
 Container fallback:
 
 ```bash
-docker build -t refactored_modutwin-backend ./backend
+docker build -t modutwin-backend ./backend
 docker run --rm --env-file .env \
   -v "$PWD/backend:/app" \
   -v "$PWD/core:/app/core:ro" \
   -v "$PWD/utilities:/app/utilities:ro" \
-  refactored_modutwin-backend python -m pytest -q
+  modutwin-backend python -m pytest -q
 ```
 
 ### Frontend
@@ -43,7 +43,8 @@ browser interaction coverage.
 
 ### Compose
 
-The normal project name is the directory-derived `refactored_modutwin`.
+The normal project name is the directory-derived `modutwin` when the checkout
+directory is named `modutwin`.
 
 ```bash
 docker compose config
@@ -82,13 +83,14 @@ Expected fresh-state results:
 | Local HTTP | `docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build` | Uses `nginx.local.conf`; run migrations after startup. |
 | Production-like | `docker compose up -d --build` | Uses base compose and `.env` values such as `PUBLIC_BASE_URL`. |
 | Backend isolated test | `docker run --rm --env-file .env ... python -m pytest -q` | Useful when host Python lacks pytest. |
-| GPU worker | `docker compose -f docker-compose.gpu.yml config` | Future/optional only; current repo lacks `door_ml/` and SAM3 consumer. |
+| GPU worker | `docker compose -f docker-compose.gpu.yml config` | Optional; used for GPU/door-ml related services. |
 
 Required environment checks:
 
 - `PUBLIC_BASE_URL` matches externally visible scheme and host.
 - `DEV_MODE=false` outside isolated development.
-- `ENABLE_SAM3_DISPATCH=false` until the SAM3 worker/callback path exists.
+- Keep `ENABLE_SAM3_DISPATCH=false` unless the legacy async SAM3 worker/callback
+  path is intentionally deployed.
 - Redis/RabbitMQ/MinIO host bindings stay scoped to `PC_HOST_IP`.
 - New DB volumes always receive `alembic upgrade head`.
 

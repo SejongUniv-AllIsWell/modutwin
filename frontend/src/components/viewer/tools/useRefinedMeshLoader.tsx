@@ -5,14 +5,14 @@ import type { SplatViewerCoreRef } from '../SplatViewerCore';
 import type { AdditionalGsplatsApi } from './useAdditionalGsplats';
 
 /**
- * 정합/베이스 뷰어용: upload_id 의 정제 결과 (mesh.json + 텍스처 PNGs) 를 자동 로드해
- * wall mesh 엔티티를 씬에 추가한다.
+ * 정합/베이스 뷰어용: upload_id 의 정제 결과를 자동 로드해 door 자산과 wall mesh 를 씬에 추가한다.
  *
  * 로드 흐름:
  *  1. /refine/refined-bundle 호출 → presigned URLs 받음.
- *  2. mesh.json fetch → 메시 메타데이터 파싱.
- *  3. 텍스처 PNG 들을 HTMLImageElement 로 로드.
- *  4. 각 surface 마다 createWallMeshFromPersisted 호출 → 엔티티 생성.
+ *  2. door mesh/splat 을 먼저 시작해 정합 단계에서 대상 문이 빠르게 보이게 함.
+ *  3. mesh.json fetch → 메시 메타데이터 파싱.
+ *  4. 텍스처 PNG 들을 HTMLImageElement 로 로드.
+ *  5. 각 surface 마다 createWallMeshFromPersisted 호출 → 엔티티 생성.
  *
  * 정제된 결과가 없거나 mesh.json 이 없으면 조용히 무시 (PLY 만 표시되는 정상 동작).
  */
@@ -31,11 +31,32 @@ export function useRefinedMeshLoader(
    * 씬에 안 나타나도록 필터링. 미지정이면 모든 도어 로드 (전체 뷰어 기본 동작).
    */
   onlyDoorUnitName?: string | null,
+  /**
+   * true: 텍스처를 CPU ImageData 로 복사해 이후 alpha punch 같은 편집이 가능하게 로드.
+   * false: 보기 전용 화면에서 GPU texture source 로 바로 올려 큰 메모리 복사를 피함.
+   */
+  mutableTextures = true,
+  /**
+   * mutable texture 로드 시 복원한 CPU RGBA 를 호출자 cache 에 등록한다.
+   * basemap 수정 모드에서 DoorRefine alpha punch 가 서버 저장 PNG 에도 반영되도록 사용.
+   */
+  onWallTextureData?: (surface: {
+    surfaceId: string;
+    rgba: Uint8ClampedArray;
+    width: number;
+    height: number;
+    corners: number[][];
+    uvs: number[][];
+    normalInward: [number, number, number];
+  }) => void,
 ): void {
   const entitiesRef = useRef<any[]>([]);
   const doorSplatIdsRef = useRef<string[]>([]);
   const labelOverlayRef = useRef<HTMLDivElement | null>(null);
   const labelRafRef = useRef<number>(0);
+  const addDoorSplat = additionalForDoorSplats?.add;
+  const removeDoorSplat = additionalForDoorSplats?.remove;
+  const getDoorSplatEntity = additionalForDoorSplats?.getEntity;
 
   useEffect(() => {
     if (!enabled || !uploadId) return;
@@ -47,9 +68,9 @@ export function useRefinedMeshLoader(
       }
       entitiesRef.current = [];
       // 도어 splat 도 정리 (해당 시점).
-      if (additionalForDoorSplats) {
+      if (removeDoorSplat) {
         for (const id of doorSplatIdsRef.current) {
-          try { additionalForDoorSplats.remove(id); } catch {}
+          try { removeDoorSplat(id); } catch {}
         }
       }
       doorSplatIdsRef.current = [];
@@ -88,17 +109,6 @@ export function useRefinedMeshLoader(
           }>;
         }>(`/refine/refined-bundle?upload_id=${uploadId}`);
 
-        if (cancelled) return;
-        if (!bundle.mesh_meta_url) {
-          console.log('[useRefinedMeshLoader] no mesh sidecar — skipping mesh load');
-          return;
-        }
-
-        const metaResp = await fetch(bundle.mesh_meta_url);
-        if (!metaResp.ok) throw new Error(`mesh.json fetch failed: ${metaResp.status}`);
-        const meta = await metaResp.json();
-        if (cancelled) return;
-
         // splatLoaded 까지 대기 — coreRef 의 PC/app 사용해야 하므로 splatEntity 가 살아있을 때 처리.
         let attempts = 0;
         while (!coreRef.current?.getApp() && attempts < 50) {
@@ -116,49 +126,17 @@ export function useRefinedMeshLoader(
 
         const { createWallMeshFromPersisted } = await import('@/lib/gs/wallMesh');
 
-        // 텍스처 PNG 로드 (병렬)
-        const surfaces = meta.surfaces ?? [];
-        const imgPromises = surfaces.map((surface: any) => {
-          const surfaceId = surface.surfaceId;
-          const url = bundle.textures[surfaceId];
-          if (!url) return Promise.resolve(null);
-          return new Promise<HTMLImageElement | null>((res) => {
-            const img = new Image();
-            img.crossOrigin = 'anonymous';
-            img.onload = () => res(img);
-            img.onerror = () => { console.warn(`[useRefinedMeshLoader] image load failed: ${surfaceId}`); res(null); };
-            img.src = url;
-          });
+        const doorsToLoad = (bundle.doors ?? []).filter((door) => {
+          if (!onlyDoorUnitName) return true;
+          return door.unitName === onlyDoorUnitName;
         });
-        const images = await Promise.all(imgPromises);
-        if (cancelled) return;
-
-        for (let i = 0; i < surfaces.length; i++) {
-          const surface = surfaces[i];
-          const img = images[i];
-          if (!img) continue;
-          const ent = createWallMeshFromPersisted(pc, app, {
-            surfaceId: surface.surfaceId,
-            corners: surface.corners,
-            uvs: surface.uvs,
-            normalInward: surface.normalInward,
-            textureImage: img,
-          });
-          // basemap 자산 — enterAlignmentMode 가 module-side 와 구분해서 reparent 안 하도록 tag.
-          try { ent.tags?.add?.('basemap'); } catch {}
-          entitiesRef.current.push(ent);
-        }
-        console.log(`[useRefinedMeshLoader] loaded ${entitiesRef.current.length} wall mesh entities`);
 
         // 도어 자산 — 각 도어마다 BasemapDoor wrapper entity 생성 후 mesh + splat 을 자식으로 reparent.
         //   계층 구조: app.root → basemapDoor_${id} (wrapper) → { door mesh, door splat }
         //   wrapper.enabled 토글 한 번에 자식 mesh + splat 동시 hide/show.
         //   정합 시 Door (doorPivotGroup) 의 자식으로 reparent → 통합 회전.
-        for (const door of bundle.doors ?? []) {
+        for (const door of doorsToLoad) {
           if (cancelled) return;
-          // 정합 단계 필터: onlyDoorUnitName 이 지정되면 매칭 안 되는 도어는 레이어 패널에서만 숨김 (디스플레이는 유지).
-          //   splat layer 의 meta.hiddenInPanel 로 LayerPanel 이 필터링.
-          const hideInPanel = !!(onlyDoorUnitName && door.unitName !== onlyDoorUnitName);
           const basemapDoorWrapper = new pc.Entity(`basemapDoor_${door.id}`);
           try { basemapDoorWrapper.tags?.add?.('basemap'); } catch {}
           app.root.addChild(basemapDoorWrapper);
@@ -185,7 +163,7 @@ export function useRefinedMeshLoader(
                   uvs: dm.uvs,
                   normalInward: dm.normalInward as [number, number, number],
                   textureImage: img,
-                });
+                }, { mutableTexture: mutableTextures });
                 try { ent.tags?.add?.('basemap'); } catch {}
                 // createWallMeshFromPersisted 가 app.root 에 add — wrapper 자식으로 reparent (둘 다 root 부모라 transform 변동 없음).
                 basemapDoorWrapper.addChild(ent);
@@ -195,17 +173,15 @@ export function useRefinedMeshLoader(
             }
           }
           // 2) 도어 splat (가우시안 입자) → wrapper 자식으로 (asset.ready 후 reparent)
-          if (door.door_splat && additionalForDoorSplats) {
+          if (door.door_splat && addDoorSplat) {
             try {
-              const { id, ready } = additionalForDoorSplats.add(door.door_splat.url, {
+              const { id, ready } = addDoorSplat(door.door_splat.url, {
                 name: `도어 영역 가우시안 (${door.unitName ?? door.id})`,
                 source: 'basemap',
-                meta: hideInPanel ? { hiddenInPanel: true } : undefined,
               });
               doorSplatIdsRef.current.push(id);
-              console.log(`[DoorSplatLoad] add door=${door.id} id=${id}`);
               ready.then(() => {
-                const ent = additionalForDoorSplats.getEntity?.(id);
+                const ent = getDoorSplatEntity?.(id);
                 if (!ent) { console.warn(`[DoorSplatLoad] entity not found for id=${id}`); return; }
                 try { basemapDoorWrapper.addChild(ent); } catch (e) { console.warn(`[DoorSplatLoad] reparent failed:`, e); }
               }).catch((e: any) => {
@@ -216,14 +192,61 @@ export function useRefinedMeshLoader(
             }
           }
         }
-        if ((bundle.doors ?? []).length > 0) {
-          console.log(`[useRefinedMeshLoader] loaded ${bundle.doors!.length} doors (mesh + splat)`);
-        }
 
+        if (bundle.mesh_meta_url) {
+          const metaResp = await fetch(bundle.mesh_meta_url);
+          if (!metaResp.ok) throw new Error(`mesh.json fetch failed: ${metaResp.status}`);
+          const meta = await metaResp.json();
+          if (cancelled) return;
+
+          // 텍스처 PNG 로드 (병렬)
+          const surfaces = meta.surfaces ?? [];
+          const imgPromises = surfaces.map((surface: any) => {
+            const surfaceId = surface.surfaceId;
+            const url = bundle.textures[surfaceId];
+            if (!url) return Promise.resolve(null);
+            return new Promise<HTMLImageElement | null>((res) => {
+              const img = new Image();
+              img.crossOrigin = 'anonymous';
+              img.onload = () => res(img);
+              img.onerror = () => { console.warn(`[useRefinedMeshLoader] image load failed: ${surfaceId}`); res(null); };
+              img.src = url;
+            });
+          });
+          const images = await Promise.all(imgPromises);
+          if (cancelled) return;
+
+          for (let i = 0; i < surfaces.length; i++) {
+            const surface = surfaces[i];
+            const img = images[i];
+            if (!img) continue;
+            const ent = createWallMeshFromPersisted(pc, app, {
+              surfaceId: surface.surfaceId,
+              corners: surface.corners,
+              uvs: surface.uvs,
+              normalInward: surface.normalInward,
+              textureImage: img,
+            }, {
+              mutableTexture: mutableTextures,
+              onTextureData: (texture) => onWallTextureData?.({
+                surfaceId: surface.surfaceId,
+                rgba: texture.rgba,
+                width: texture.width,
+                height: texture.height,
+                corners: surface.corners,
+                uvs: surface.uvs,
+                normalInward: surface.normalInward,
+              }),
+            });
+            // basemap 자산 — enterAlignmentMode 가 module-side 와 구분해서 reparent 안 하도록 tag.
+            try { ent.tags?.add?.('basemap'); } catch {}
+            entitiesRef.current.push(ent);
+          }
+        }
         // 도어 호수 라벨 — 말풍선 HTML overlay. 도어 corners 는 A'+Y 프레임이므로
         // Z-180 적용 후 world 좌표 = (-x, -y, z). 카메라 worldToScreen 으로 매 프레임 투영.
         // 라벨은 정합 단계에서도 다른 호수 도어를 보여주는 게 자연스러움 (디스플레이는 살아있으니).
-        const labeledDoors = (bundle.doors ?? []).filter(d => d.unitName && d.corners?.length);
+        const labeledDoors = doorsToLoad.filter(d => d.unitName && d.corners?.length);
         if (labeledDoors.length > 0) {
           const canvas: HTMLCanvasElement | undefined = (app as any).graphicsDevice?.canvas;
           const parent = canvas?.parentElement;
@@ -306,5 +329,15 @@ export function useRefinedMeshLoader(
     })();
 
     return () => { cancelled = true; cleanup(); };
-  }, [coreRef, uploadId, enabled, onlyDoorUnitName]);
+  }, [
+    coreRef,
+    uploadId,
+    enabled,
+    addDoorSplat,
+    removeDoorSplat,
+    getDoorSplatEntity,
+    onlyDoorUnitName,
+    mutableTextures,
+    onWallTextureData,
+  ]);
 }

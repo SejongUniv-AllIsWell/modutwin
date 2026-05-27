@@ -94,7 +94,6 @@ export default function SplatViewer({ sogUrl, mode, uploadId, onSelectionDone }:
       if (fp) {
         setFloorplan(fp);
         firstBakeRef.current = false;
-        console.log(`[SplatViewer] floorplan baked (cutoff=${(floorplanCutoff*100).toFixed(0)}cm): ${fp.width}×${fp.height} @ ${fp.ppm.toFixed(1)} px/m`);
       } else {
         console.warn('[SplatViewer] floorplan bake returned null');
       }

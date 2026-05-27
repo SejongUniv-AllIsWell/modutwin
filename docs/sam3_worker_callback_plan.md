@@ -1,35 +1,29 @@
-# SAM3 Door Detection and Callback Plan
+# SAM3 Door Detection
 
-Last updated: 2026-05-13
+Last updated: 2026-05-27
 Status:
-- **Module registration flow (new, since 2026-05-13)**: synchronous via
-  `POST /uploads/sam3/detect-temp`. No Celery, no callback, no MinIO writes for
-  the source PLY. PLY pre-uploaded to `/var/lib/sam3-temp` at file pick.
-- **Basemap registration flow (legacy)**: still uses the Celery/dispatch pipeline
-  described below. Feature flag `ENABLE_SAM3` gates dispatch.
-
-This document describes the legacy dispatch pipeline. For module-registration
-specifics see `CLAUDE.md` 의 모듈 등록 흐름 + `backend/app/api/module_register.py`.
+- **Viewer automatic door designation**: synchronous via
+  `POST /uploads/sam3/detect-temp`, which forwards the temporary PLY to
+  `door-ml` (`POST /detect`).
+- **door-ml implementation**: `door_ml/main.py` calls
+  `core.door_detection.pipeline`.
+- **Legacy async worker path**: `/uploads/{upload_id}/sam3/start` remains
+  optional and should stay disabled unless intentionally deployed.
 
 ## Current Runtime State
 
 Implemented:
 
-- DB columns for refined/SAM3 state.
-- Backend endpoints for starting SAM3, polling status, reading/writing
-  `doors.json`, and saving alignment.
 - Frontend prompt/manual door setup flow.
-- Feature flag default: `ENABLE_SAM3_DISPATCH=false`.
+- Temporary PLY preparation at `/uploads/sam3/prepare`.
+- Synchronous detection at `/uploads/sam3/detect-temp`.
+- `door_ml/` FastAPI service with `POST /detect`.
+- `core/door_detection` SAM3-based detection pipeline.
+- DB columns and endpoints for the older async SAM3 state.
 
-Not implemented:
-
-- `worker/tasks/sam3.py`
-- a running `sam3` Celery consumer
-- backend callback endpoints for worker success/failure
-- `door_ml/` service directory
-
-Safe operating rule: keep `ENABLE_SAM3_DISPATCH=false` until the worker and
-callback/polling state transition path exists.
+Safe operating rule: the current viewer path does not require Celery callbacks.
+Keep `ENABLE_SAM3_DISPATCH=false` unless the legacy async worker/callback path
+is intentionally deployed.
 
 ## Intended Product Flow
 
@@ -39,20 +33,39 @@ The user flow should remain a single path:
 refine -> door setup -> alignment
 ```
 
-SAM3, when available, only pre-populates module door corners. It should not
-create a separate automatic-vs-manual alignment mode. If SAM3 is unavailable or
-fails, the user manually picks door corners and proceeds.
+SAM3, when available, pre-populates door corners. It should not create a
+separate automatic-vs-manual alignment mode. If SAM3 is unavailable or fails,
+the user manually picks door corners and proceeds.
 
-## Current Refine Save Sequence
+## Current Viewer Detection Sequence
 
-When the user completes door setup, the frontend performs these operations:
+1. User selects a local PLY in the viewer.
+2. Frontend uploads the file to a temporary backend path through
+   `POST /api/uploads/sam3/prepare`.
+3. User asks for automatic door designation from the door setup UI.
+4. Frontend calls `POST /api/uploads/sam3/detect-temp`.
+5. Backend forwards the temporary PLY to `door-ml` `POST /detect`.
+6. `door-ml` runs `core.door_detection.pipeline` and returns four door corners.
+7. Frontend lets the user confirm or manually correct the corners.
 
-1. Optional local-file registration through `POST /api/uploads/register-local`.
-2. Presigned upload URL requests through `POST /api/refine/refined-upload-url`.
-3. Browser uploads refined PLY, `mesh.json`, and `tex_*.png` directly to MinIO.
-4. Backend scene output registration through `POST /api/refine/save`.
-5. Door JSON persistence through `PUT /api/uploads/{upload_id}/doors`.
-6. Alignment later reads refined sidecars through
+The temporary PLY is only for detection. Final module assets are written later
+through `POST /api/uploads/commit-final`.
+
+## Refine Save Sequence
+
+Module registration:
+
+1. Refine completion bakes rotation/deletion into the canonical in-memory PLY.
+2. Door setup keeps door corners and extracted door assets in memory.
+3. Alignment completion submits PLY, mesh sidecars, textures, doors, doorFrame,
+   and alignment transform through `POST /api/uploads/commit-final`.
+
+Basemap registration:
+
+1. Door setup writes basemap door metadata and refined assets.
+2. Browser uploads refined PLY, `mesh.json`, `tex_*.png`, and door assets to
+   MinIO through presigned URLs.
+3. Alignment later reads refined sidecars through
    `GET /api/refine/refined-bundle?upload_id=...`.
 
 Important current behavior:
@@ -67,6 +80,8 @@ Current relevant endpoints:
 
 | Endpoint | Purpose |
 | --- | --- |
+| `POST /api/uploads/sam3/prepare` | Store temporary local PLY for automatic door detection. |
+| `POST /api/uploads/sam3/detect-temp` | Run synchronous door-ml detection for the temporary PLY. |
 | `POST /api/uploads/{upload_id}/sam3/start` | Start SAM3 dispatch if enabled. |
 | `GET /api/uploads/{upload_id}/sam3` | Return DB-backed SAM3 status. |
 | `GET /api/uploads/{upload_id}/doors` | Read `doors.json`. |
@@ -90,7 +105,7 @@ Current relevant endpoints:
 `tasks` stores async task tracking. For future SAM3 work, use
 `task_type=sam3_door_detection`.
 
-## Future Worker Task Contract
+## Legacy Worker Task Contract
 
 Celery task:
 
@@ -113,7 +128,7 @@ module_id
 module_name
 ```
 
-Recommended future change: move to kwargs with `schema_version` to avoid order
+If this path is revived, move to kwargs with `schema_version` to avoid order
 dependency.
 
 Worker responsibilities:
@@ -138,9 +153,9 @@ Suggested `doors.json` shape:
 }
 ```
 
-## Future Callback API
+## Legacy Callback API
 
-Recommended endpoints:
+Suggested endpoints if the legacy async path is revived:
 
 - `POST /internal/sam3/callback/success`
 - `POST /internal/sam3/callback/failure`
@@ -176,9 +191,9 @@ On failure:
 
 ## GPU Worker Deployment Notes
 
-Current default stack does not start a GPU worker.
+The default web stack does not require the GPU worker.
 
-If implementing the future GPU worker:
+If deploying GPU-side services:
 
 - Use a private network path such as Tailscale for Redis/RabbitMQ/MinIO.
 - Keep `.env` secrets identical between web server and GPU worker.
@@ -190,8 +205,8 @@ nc -zv <PC_HOST_IP> 6379
 nc -zv <PC_HOST_IP> 9000
 ```
 
-Current `docker-compose.gpu.yml` should be treated as a future draft because it
-references `./door_ml`, which is not present in the repository.
+`docker-compose.gpu.yml` is optional and should be validated for the target GPU
+machine before use.
 
 ## Interim QA
 
@@ -207,7 +222,8 @@ With `ENABLE_SAM3_DISPATCH=false`:
 
 ## Future QA
 
-With worker/callback implemented and `ENABLE_SAM3_DISPATCH=true`:
+With the legacy worker/callback path intentionally deployed and
+`ENABLE_SAM3_DISPATCH=true`:
 
 1. `sam3/start` creates a `tasks.sam3_door_detection` row.
 2. Worker logs show receipt of `tasks.sam3.run_door_detection`.

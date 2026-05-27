@@ -190,6 +190,7 @@ class AlignmentTransformDTO(BaseModel):
     scale: list[float] = [1.0, 1.0, 1.0]
     rmsd: float | None = None
     matches: list[dict] | None = None
+    bake_rotation: dict | None = None
 
 
 class CommitFinalResponse(BaseModel):
@@ -278,7 +279,17 @@ async def commit_final(
         )
     )
     existing_module: Module | None = mres.scalar_one_or_none()
-    was_overwrite = existing_module is not None
+    was_overwrite = False
+    if existing_module is not None:
+        old_output = await db.execute(
+            select(SceneOutput.id)
+            .where(SceneOutput.module_id == existing_module.id)
+            .limit(1)
+        )
+        was_overwrite = (
+            existing_module.alignment_transform is not None
+            or old_output.scalar_one_or_none() is not None
+        )
 
     minio = get_minio_service()
 
@@ -379,6 +390,9 @@ async def commit_final(
         user_id=user.id,
         module_id=module.id,
         ply_path=final_ply_key,
+        # SOG is an optional viewer-optimized derivative. The canonical persisted
+        # module output for this flow is final.ply.
+        sog_path=None,
         is_aligned=True,
     )
     db.add(scene_output)
@@ -393,6 +407,7 @@ async def commit_final(
         },
         "rmsd": at.rmsd,
         "matches": at.matches or [],
+        "bake_rotation": at.bake_rotation,
         "saved_at": now.isoformat(),
     }
     module.is_confirmed = True
@@ -411,6 +426,7 @@ async def commit_final(
         },
         "rmsd": at.rmsd,
         "matches": at.matches or [],
+        "bake_rotation": at.bake_rotation,
         "saved_at": now.isoformat(),
     }
 
