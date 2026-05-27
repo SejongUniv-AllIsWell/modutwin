@@ -417,19 +417,6 @@ async def commit_final(
         sa_update(Floor).where(Floor.id == floor_id).values(overview_dirty=True)
     )
 
-    # Upload 행에 정합 정보 저장 (DoorAlignModal.applyAndSave 의 기존 /uploads/{id}/alignment 와 동등)
-    upload.alignment_transform = {
-        "transform": {
-            "position": at.position,
-            "rotation": at.rotation,
-            "scale": at.scale,
-        },
-        "rmsd": at.rmsd,
-        "matches": at.matches or [],
-        "bake_rotation": at.bake_rotation,
-        "saved_at": now.isoformat(),
-    }
-
     await db.commit()
 
     # SAM3 임시 PLY 삭제 (있으면)

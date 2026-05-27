@@ -204,7 +204,6 @@ class Upload(Base):
         Enum(Sam3Status, name="sam3status"), nullable=True,
     )
     sam3_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
-    alignment_transform: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
     # basemap 으로 채택되어 삭제가 막힌 업로드를 사용자 대시보드 목록에서만 숨길 때 사용.
     # 파일과 DB row 자체는 유지하고, /uploads 목록에서만 제외한다.
@@ -283,4 +282,3 @@ class Notification(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     user: Mapped["User"] = relationship(back_populates="notifications")
-

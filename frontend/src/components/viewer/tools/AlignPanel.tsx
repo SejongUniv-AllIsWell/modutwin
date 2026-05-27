@@ -21,8 +21,8 @@ interface Props {
   moduleDoorCorners: Array<[number, number, number]> | null;
   /**
    * 모듈 등록 흐름: 정합 완료 시 호출. 다듬기 결과 자산 + 정합 행렬을 일괄 영속화.
-   * 제공되면 기존 saveResult (POST /uploads/{id}/alignment + PUT /modules/{id}/alignment-transform)
-   * 대신 이 콜백 사용. UnifiedSplatEditor 가 gatherRefinedAssets + commit-final 호출.
+   * 제공되면 module alignment-transform fallback 대신 이 콜백 사용.
+   * UnifiedSplatEditor 가 gatherRefinedAssets + commit-final 호출.
    */
   onCommitFinal?: (args: {
     matrix4x4: number[];
@@ -610,21 +610,8 @@ export default function AlignPanel({
         return;
       }
 
-      // 기존 흐름: Upload + Module 별개 엔드포인트 저장.
-      try {
-        await api.post(`/uploads/${uploadId}/alignment`, {
-          transform: {
-            matrix: matrix4x4,
-            position: [p.x, p.y, p.z],
-            rotation: [q.x, q.y, q.z, q.w],
-            scale: [s.x, s.y, s.z],
-          },
-          rmsd,
-          matches: [{ module_door_id: 'door_1', basemap_id: 'auto' }],
-        });
-      } catch (e) {
-        console.warn('[AlignPanel] upload alignment 저장 실패', e);
-      }
+      // Legacy fallback: older entry points can still persist the module transform
+      // directly, but upload-scoped alignment state is no longer stored.
       try {
         await api.put(`/modules/${metadata.module_id}/alignment-transform`, {
           transform: {

@@ -742,37 +742,6 @@ export default function UnifiedSplatEditor({
     toggleAssociatedMeshes('module-main', next);
   }, [mainVisible, toggleAssociatedMeshes]);
 
-  // 정합 transform 저장 — 정합 결과를 DB에
-  const handleSaveAlignmentTransform = useCallback(async () => {
-    // SPEC: upload-scoped 변환행렬 저장 — POST /uploads/{id}/alignment.
-    // upload_id 가 없으면(로컬 파일만 띄운 상태) 저장 불가.
-    if (!uploadId) {
-      alert('정합 완료는 서버에 등록된 업로드에서만 가능합니다.');
-      return;
-    }
-    const ent = (coreRef.current?.getSplatData() as any)?.splatEntity;
-    if (!ent) return;
-    const p = ent.getLocalPosition();
-    const q = ent.getLocalRotation();
-    const s = ent.getLocalScale();
-    const transform = {
-      position: [p.x, p.y, p.z],
-      rotation: [q.x, q.y, q.z, q.w],
-      scale: [s.x, s.y, s.z],
-    };
-    try {
-      await api.post(`/uploads/${uploadId}/alignment`, {
-        transform,
-        rmsd: null,
-        // matches: 정합 UI(DoorAlignModal) 가 별도로 채우므로 여기서는 빈 배열.
-        matches: [],
-      });
-      alert('정합 완료');
-    } catch (e: any) {
-      alert(`정합 완료 실패: ${e?.message || e}`);
-    }
-  }, [uploadId]);
-
   // ── 레이어 패널용 메인 정보 ──
   const mainLayerInfo = useMemo(() => {
     if (!currentUrl) return null;

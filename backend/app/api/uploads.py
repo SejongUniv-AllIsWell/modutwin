@@ -312,6 +312,7 @@ def _upload_to_response(
     upload: Upload,
     has_scene_output: bool = False,
     is_basemap_source: bool = False,
+    has_alignment: bool = False,
 ) -> UploadResponse:
     """Upload ORM → UploadResponse (SAM3 파이프라인 파생 플래그 포함).
 
@@ -330,7 +331,7 @@ def _upload_to_response(
         sam3_prompt=upload.sam3_prompt,
         has_refined=bool(upload.refined_ply_path) or has_scene_output,
         has_doors_json=bool(upload.door_corners_json_path),
-        has_alignment=bool(upload.alignment_transform),
+        has_alignment=has_alignment,
         has_gsplat_ply=bool(upload.gsplat_ply_path),
         is_basemap_source=is_basemap_source,
     )
@@ -366,11 +367,18 @@ async def list_uploads(
         .distinct()
     )
     basemap_source_ids = {row[0] for row in basemap_rows.all() if row[0] is not None}
+    module_ids = {u.module_id for u in uploads}
+    aligned_module_rows = await db.execute(
+        select(Module.id)
+        .where(Module.id.in_(module_ids), Module.alignment_transform.is_not(None))
+    )
+    aligned_module_ids = {row[0] for row in aligned_module_rows.all()}
     return [
         _upload_to_response(
             u,
             has_scene_output=(u.id in has_scene),
             is_basemap_source=(u.id in basemap_source_ids),
+            has_alignment=(u.module_id in aligned_module_ids),
         )
         for u in uploads
     ]
@@ -405,10 +413,15 @@ async def get_upload(
         select(Basemap.id).where(Basemap.source_upload_id == upload_id).limit(1)
     )
     is_basemap_source = basemap_check.scalar_one_or_none() is not None
+    module_check = await db.execute(
+        select(Module.alignment_transform).where(Module.id == upload.module_id).limit(1)
+    )
+    has_alignment = module_check.scalar_one_or_none() is not None
     return _upload_to_response(
         upload,
         has_scene_output=has_scene,
         is_basemap_source=is_basemap_source,
+        has_alignment=has_alignment,
     )
 
 
@@ -1065,51 +1078,3 @@ async def put_doors(
     upload.door_corners_json_path = key
     await db.commit()
     return body
-
-
-# ── 정합 결과 저장 (변환행렬 + basemap/door 매칭) ────────────────────────────
-
-class AlignmentMatch(BaseModel):
-    """모듈 문 ID(doors.json 의 id) ↔ basemap 의 매칭."""
-    module_door_id: str
-    basemap_id: str
-    basemap_door_id: str | None = None  # basemap 측 문 식별자(있으면)
-
-
-class AlignmentSaveRequest(BaseModel):
-    transform: dict[str, Any]            # {position:[x,y,z], rotation:[x,y,z,w], scale:[x,y,z]}
-    rmsd: float | None = None
-    matches: list[AlignmentMatch] = Field(default_factory=list)
-
-
-class AlignmentSaveResponse(BaseModel):
-    upload_id: UUID
-    saved_at: str
-
-
-@router.post("/{upload_id}/alignment", response_model=AlignmentSaveResponse)
-async def save_alignment(
-    upload_id: UUID,
-    body: AlignmentSaveRequest,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """정합 결과(변환행렬 + 매칭 정보) 를 upload-scoped 로 저장."""
-    from datetime import datetime, timezone
-
-    result = await db.execute(
-        select(Upload).where(Upload.id == upload_id, Upload.user_id == user.id)
-    )
-    upload = result.scalar_one_or_none()
-    if not upload:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="업로드를 찾을 수 없습니다.")
-
-    now = datetime.now(timezone.utc)
-    upload.alignment_transform = {
-        "transform": body.transform,
-        "rmsd": body.rmsd,
-        "matches": [m.model_dump() for m in body.matches],
-        "saved_at": now.isoformat(),
-    }
-    await db.commit()
-    return AlignmentSaveResponse(upload_id=upload.id, saved_at=now.isoformat())

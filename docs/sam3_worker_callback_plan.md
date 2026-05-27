@@ -86,7 +86,7 @@ Current relevant endpoints:
 | `GET /api/uploads/{upload_id}/sam3` | Return DB-backed SAM3 status. |
 | `GET /api/uploads/{upload_id}/doors` | Read `doors.json`. |
 | `PUT /api/uploads/{upload_id}/doors` | Replace `doors.json`. |
-| `POST /api/uploads/{upload_id}/alignment` | Save alignment transform/matching metadata. |
+| `PUT /api/modules/{module_id}/alignment-transform` | Legacy module transform fallback. Current module registration should prefer `POST /api/uploads/commit-final`. |
 | `POST /api/refine/refined-upload-url` | Issue presigned PUT URL under refined prefix. |
 | `POST /api/refine/save` | Create task/scene output for refined PLY. |
 | `GET /api/refine/refined-bundle` | Return refined PLY/mesh/texture bundle URLs. |

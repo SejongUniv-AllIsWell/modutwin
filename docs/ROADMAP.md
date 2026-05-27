@@ -101,15 +101,11 @@ AlignPanel 의 rectFit 호출 + gap push + 애니메이션 셋업 코드가 `run
 
 조회 경로는 SOG 가 있으면 뷰어용 경량 자산으로 우선 사용하고, 없으면 canonical PLY 로 fallback 한다. `sog_path=final_ply_key` 처럼 PLY 를 SOG 컬럼에 중복 저장하는 임시 호환 코드는 migration 적용 후 제거해야 한다.
 
-### 22. Legacy alignment 저장 경로 정리
+### 22. SceneOutput 버전 선택 정책
 
-현재 정합 완료 정보는 `Module.alignment_transform` 이 기준이다. `Upload.alignment_transform` 과 `/uploads/{id}/alignment` legacy 경로는 과거 흐름 호환용으로 남아 있으므로, `AlignPanel` 의 legacy 분기가 더 이상 실제로 호출되지 않는지 확인한 뒤 별도 migration 으로 제거한다.
+정제/정합 저장은 새 `SceneOutput` row 를 계속 생성한다. 이는 같은 모듈에 여러 버전의 에셋이 쌓일 수 있게 하려는 의도된 설계다. 현재 조회는 최신 row 를 사용하지만, 장기적으로는 좋아요/평가/관리자 선택 기준으로 대표 에셋을 고르는 정책을 추가한다. 시연 단계에서는 관리자 계정으로 최신/승인 에셋을 직접 보여주는 운영으로 충분하므로 후순위로 둔다.
 
-### 23. SceneOutput 누적 정책 정리
-
-정제/정합 저장은 새 `SceneOutput` row 를 계속 생성한다. 현재 조회는 최신 row 를 사용하므로 기능은 동작하지만, 장기 운영 전에는 최신 row 만 유지하는 upsert 정책 또는 오래된 row 정리 정책을 정한다.
-
-### 24. Basemap 교체 후 기존 모듈 재정렬
+### 23. Basemap 교체 후 기존 모듈 재정렬
 
 활성 basemap 을 교체하면 기존 모듈의 정합 기준이 바뀔 수 있다. 현재는 활성 basemap 의 `minio_path` 를 직접 조회하고, 교체 시 기존 모듈 재정렬이 필요하다는 응답만 반환한다. 실제 basemap 재정렬 작업이 필요해지면 `basemap_realign` 태스크를 추가해 기존 모듈 transform 을 새 basemap 기준으로 재계산한다.
 
