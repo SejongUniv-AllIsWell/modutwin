@@ -90,15 +90,58 @@ function reparentPreserveWorld(pc: any, ent: any, newParent: any): void {
   ent.setLocalScale(s.x, s.y, s.z);
 }
 
-/** Similarity transform (row-major R(3×3) · scalar s + t(3)) → PlayCanvas Mat4 (column-major).
- *  적용: p' = s · R · p + t. s=1 이면 rigid. */
-function similarityToMat4(pc: any, R: number[], s: number, t: number[]): any {
+function anisotropicRectToMat4(pc: any, R: number[], scale: [number, number, number], t: number[]): any {
   const m = new pc.Mat4();
-  m.data[0]  = s*R[0]; m.data[1]  = s*R[3]; m.data[2]  = s*R[6]; m.data[3]  = 0;
-  m.data[4]  = s*R[1]; m.data[5]  = s*R[4]; m.data[6]  = s*R[7]; m.data[7]  = 0;
-  m.data[8]  = s*R[2]; m.data[9]  = s*R[5]; m.data[10] = s*R[8]; m.data[11] = 0;
+  m.data[0]  = scale[0]*R[0]; m.data[1]  = scale[0]*R[3]; m.data[2]  = scale[0]*R[6]; m.data[3]  = 0;
+  m.data[4]  = scale[1]*R[1]; m.data[5]  = scale[1]*R[4]; m.data[6]  = scale[1]*R[7]; m.data[7]  = 0;
+  m.data[8]  = scale[2]*R[2]; m.data[9]  = scale[2]*R[5]; m.data[10] = scale[2]*R[8]; m.data[11] = 0;
   m.data[12] = t[0]; m.data[13] = t[1]; m.data[14] = t[2]; m.data[15] = 1;
   return m;
+}
+
+function rectCentroid(p: Float64Array): [number, number, number] {
+  return [
+    (p[0] + p[3] + p[6] + p[9]) * 0.25,
+    (p[1] + p[4] + p[7] + p[10]) * 0.25,
+    (p[2] + p[5] + p[8] + p[11]) * 0.25,
+  ];
+}
+
+function rectEdgeLength(p: Float64Array, a: number, b: number): number {
+  const ai = a * 3;
+  const bi = b * 3;
+  return Math.hypot(p[bi] - p[ai], p[bi + 1] - p[ai + 1], p[bi + 2] - p[ai + 2]);
+}
+
+function transformPointByRS(
+  R: number[],
+  scale: [number, number, number],
+  p: [number, number, number],
+): [number, number, number] {
+  return [
+    R[0] * scale[0] * p[0] + R[1] * scale[1] * p[1] + R[2] * scale[2] * p[2],
+    R[3] * scale[0] * p[0] + R[4] * scale[1] * p[1] + R[5] * scale[2] * p[2],
+    R[6] * scale[0] * p[0] + R[7] * scale[1] * p[1] + R[8] * scale[2] * p[2],
+  ];
+}
+
+function rmsdForRectTransform(
+  src: Float64Array,
+  dst: Float64Array,
+  R: number[],
+  scale: [number, number, number],
+  t: number[],
+): number {
+  let sumSq = 0;
+  for (let i = 0; i < 4; i++) {
+    const p: [number, number, number] = [src[i*3], src[i*3+1], src[i*3+2]];
+    const rp = transformPointByRS(R, scale, p);
+    const dx = rp[0] + t[0] - dst[i*3];
+    const dy = rp[1] + t[1] - dst[i*3+1];
+    const dz = rp[2] + t[2] - dst[i*3+2];
+    sumSq += dx*dx + dy*dy + dz*dz;
+  }
+  return Math.sqrt(sumSq / 4);
 }
 
 /**
@@ -336,11 +379,29 @@ export default function AlignPanel({
         dst[i*3+1] += pushN[1] * gap;
         dst[i*3+2] += pushN[2] * gap;
       }
-      const fit = rectFit(src, dst, { ...(dstForcedN ? { dstForcedN } : {}), withScale: true });
-      setRmsd(fit.rmsd);
-      // fit 은 src world → dst world 의 similarity transform (R, s, t).
+      const fit = rectFit(src, dst, { ...(dstForcedN ? { dstForcedN } : {}), withScale: false });
+      const srcWidth = rectEdgeLength(src, 0, 1);
+      const srcHeight = rectEdgeLength(src, 1, 2);
+      const dstWidth = rectEdgeLength(dst, 0, 1);
+      const dstHeight = rectEdgeLength(dst, 1, 2);
+      const widthScale = srcWidth > 1e-9 ? dstWidth / srcWidth : 1;
+      const heightScale = srcHeight > 1e-9 ? dstHeight / srcHeight : 1;
+      // 도어는 정규화 단계에서 세로가 local Y, 가로가 수평 XZ 평면에 놓인다.
+      // 그래서 수평 축(X/Z)은 가로 비율, Y 축은 세로 비율을 적용해 문 bbox 가 정확히 일치하게 한다.
+      const rectScale: [number, number, number] = [widthScale, heightScale, widthScale];
+      const srcCenter = rectCentroid(src);
+      const dstCenter = rectCentroid(dst);
+      const rotatedScaledCenter = transformPointByRS(fit.R as unknown as number[], rectScale, srcCenter);
+      const rectT = [
+        dstCenter[0] - rotatedScaledCenter[0],
+        dstCenter[1] - rotatedScaledCenter[1],
+        dstCenter[2] - rotatedScaledCenter[2],
+      ];
+      const rectRmsd = rmsdForRectTransform(src, dst, fit.R as unknown as number[], rectScale, rectT);
+      setRmsd(rectRmsd);
+      // fit 은 src world → dst world 의 affine transform (R + axis별 scale + t).
       // alignmentGroup 의 새 world = fit · 현재 group world. group 부모가 app.root (identity) 이라 local = world.
-      const fitMat = similarityToMat4(pc, fit.R as unknown as number[], fit.s, fit.t as unknown as number[]);
+      const fitMat = anisotropicRectToMat4(pc, fit.R as unknown as number[], rectScale, rectT);
       const newGroupWorld = new pc.Mat4().mul2(fitMat, group.getWorldTransform());
 
       // 분해: position + quaternion + scale.

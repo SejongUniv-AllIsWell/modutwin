@@ -986,6 +986,7 @@ export default function UnifiedSplatEditor({
               getBakeRgba={(sid) => refine.getBakeRgba?.(sid) ?? null}
               getRemainingRotationToAY={() => refine.getRemainingRotationToAY?.() ?? { rotX: 0, rotZ: 0, wallAngleRad: 0 }}
               markNextSplatLoadSkipRebake={() => refine.markNextSplatLoadSkipRebake?.()}
+              onMainSplatReplaced={(scene) => refine.replaceCanonicalSceneFromCurrentSplat?.(scene)}
               onSetupSaveDone={async (activeUploadId: string, doorCorners) => {
                 // 문 설정 완료 → 정합 단계 진입.
                 //   - 메모리에 자산 (PLY, wall mesh, doors) 이 이미 있어 서버 fetch 안 함.

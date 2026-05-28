@@ -88,6 +88,8 @@ interface Props {
   /** 도어 추출이 메인 splat 을 PLY 재로드로 갱신할 때 호출. useRefineTool 의 onSplatLoaded
    *  에서 자동 re-bake 가 돌아 double rotation 되는 것 방지 — 한 번만 skip. */
   markNextSplatLoadSkipRebake?: () => void;
+  /** 도어 추출/원복으로 메인 splat 을 교체한 뒤 저장용 canonical scene 을 갱신. */
+  onMainSplatReplaced?: (scene?: GaussianScene) => void;
   basemapMode?: boolean;
   basemapEditMode?: boolean;
   basemapId?: string;
@@ -259,7 +261,7 @@ function derivePlanesFromMeshSurfaces(surfaces: any[]): SurfacePlane[] {
  * 정합 단계는 별도 `AlignPanel` 이 담당.
  */
 export default function DoorAlignModal({
-  coreRef, uploadId, currentUrl, onDone, onClose, autoExtracting = false, autoExtractedCorners = null, onManualPickStart, onSetupSaveDone, ensureUploadId, onCommitRefined, getCurrentKeepMask, getBakeRgba, getRemainingRotationToAY, markNextSplatLoadSkipRebake, basemapMode = false, basemapEditMode = false, basemapId, basemapUnitName, basemapFloorId, basemapFloorNumber, onBasemapDone, deferPersistenceToAlign = false, onSetupCornersFinalized, onSetupDoorAssetsFinalized, sharedAdditional,
+  coreRef, uploadId, currentUrl, onDone, onClose, autoExtracting = false, autoExtractedCorners = null, onManualPickStart, onSetupSaveDone, ensureUploadId, onCommitRefined, getCurrentKeepMask, getBakeRgba, getRemainingRotationToAY, markNextSplatLoadSkipRebake, onMainSplatReplaced, basemapMode = false, basemapEditMode = false, basemapId, basemapUnitName, basemapFloorId, basemapFloorNumber, onBasemapDone, deferPersistenceToAlign = false, onSetupCornersFinalized, onSetupDoorAssetsFinalized, sharedAdditional,
 }: Props) {
   const [picked, setPicked] = useState<Array<PickedCorner | null>>(() => emptyPicked());
   // 모듈 등록 흐름: 문 설정 완료 시 메모리 보관 → 정합 완료 시 commit-final 페이로드에 포함.
@@ -1306,6 +1308,7 @@ export default function DoorAlignModal({
         if (core && revertMainPlyBlobUrlRef.current) {
           markNextSplatLoadSkipRebake?.();
           await core.reloadSplatFromUrl(revertMainPlyBlobUrlRef.current, { preserveCamera: true });
+          onMainSplatReplaced?.();
           // current blob 갱신 (revert 후 다음 추출은 다시 새 main blob 만들 거라 이전 거 revoke).
           if (currentMainPlyBlobUrlRef.current && currentMainPlyBlobUrlRef.current !== revertMainPlyBlobUrlRef.current) {
             try { URL.revokeObjectURL(currentMainPlyBlobUrlRef.current); } catch {}
@@ -1758,6 +1761,7 @@ export default function DoorAlignModal({
         const sdNew = core.getSplatData();
         if (!sdNew) throw new Error('reload 후 splatData 미준비');
         sd = sdNew;
+        onMainSplatReplaced?.(mainScene);
       }
 
       if (wallMeshTex && wallCorners && wallUvs && wallEntName) {
@@ -1917,7 +1921,7 @@ export default function DoorAlignModal({
       setDoorRefining(false);
     }
   }, [allPicked, picked, currentUrl, coreRef, additional, planes, doorExtractionDepth,
-      doorRefineActive, boundarySplitEnabled, findEntityByName, revertDoorRefine, getCurrentEditorRotation, basemapEditMode, getRemainingRotationToAY]);
+      doorRefineActive, boundarySplitEnabled, findEntityByName, revertDoorRefine, getCurrentEditorRotation, basemapEditMode, getRemainingRotationToAY, onMainSplatReplaced]);
 
   // 서버에서 corners 복원 후 1회 자동 문 추출 — 다시 들어와도 회전이 바로 활성.
   // 수동 픽 (사용자가 4점 직접 클릭) 일 때는 발동 안 함 (serverHydratedRef 게이트).

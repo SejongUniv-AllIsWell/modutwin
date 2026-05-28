@@ -3769,6 +3769,16 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     return { rotX, rotZ, wallAngleRad: (wallAngleDeg * Math.PI) / 180 };
   }, []);
 
+  const replaceCanonicalSceneFromCurrentSplat = useCallback((scene?: GaussianScene) => {
+    if (scene) {
+      refinedCanonicalSceneRef.current = scene;
+      return;
+    }
+    const data = splatDataRef.current;
+    if (!data?.gsplatData) return;
+    refinedCanonicalSceneRef.current = buildSceneFromSplatData(data);
+  }, [buildSceneFromSplatData]);
+
   // 외부 호출자가 다음 splatLoad 에서 re-bake 한 번 건너뛰도록 신호.
   // 호출 후 정상 흐름에서는 onSplatLoaded 가 flag 를 clear. 호출자가 reload 까지 도달 못 하고 throw
   // 한 케이스를 대비해 5초 후 자동 clear (dangling 상태로 다른 legitimate load 에 영향 주는 것 방지).
@@ -3777,5 +3787,5 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     setTimeout(() => { skipNextSplatRebakeRef.current = false; }, 5000);
   }, []);
 
-  return { overlay, panel, modals, onSplatLoaded, planes, saveRefined, commitRefinedToServer, gatherRefinedAssets, getCurrentKeepMask, getBakeRgba, registerPersistedBake, getRemainingRotationToAY, markNextSplatLoadSkipRebake };
+  return { overlay, panel, modals, onSplatLoaded, planes, saveRefined, commitRefinedToServer, gatherRefinedAssets, getCurrentKeepMask, getBakeRgba, registerPersistedBake, getRemainingRotationToAY, replaceCanonicalSceneFromCurrentSplat, markNextSplatLoadSkipRebake };
 }

@@ -9,7 +9,7 @@
  *   ext   = PlayCanvas visible radius along n_e (원본).
  *   door:  center += (ext − sd)/2 · n_e,   scale_ratio = (sd + ext)/(2·ext)
  *   wall:  center −= (ext + sd)/2 · n_e,   scale_ratio = (ext − sd)/(2·ext)
- * 이 비율은 원본 가우시안의 모든 axis scale 에 곱해짐 (uniform shrink).
+ * 이 비율은 선택된 edge normal 방향으로만 줄어들도록 local axis 별로 근사 적용됨.
  *
  * 가우시안 총 수: N → N + N_boundary.
  * - 메인 PLY 에 남는 원본 slot 들은 wall-side sub 데이터로 in-place 덮어쓰기 (caller 가 GPU sync).
@@ -43,6 +43,21 @@ function vdot(a: Vec3, b: Vec3): number { return a[0]*b[0]+a[1]*b[1]+a[2]*b[2]; 
 function vnorm(a: Vec3): Vec3 {
   const n = Math.hypot(a[0], a[1], a[2]) || 1;
   return [a[0]/n, a[1]/n, a[2]/n];
+}
+
+function planeCoordsInBasis(P: Vec3, origin: Vec3, eU: Vec3, eV: Vec3): [number, number] {
+  const d = vsub(P, origin);
+  const uu = vdot(eU, eU);
+  const uv = vdot(eU, eV);
+  const vv = vdot(eV, eV);
+  const du = vdot(d, eU);
+  const dv = vdot(d, eV);
+  const det = uu * vv - uv * uv;
+  if (Math.abs(det) < 1e-12) return [0, 0];
+  return [
+    (du * vv - dv * uv) / det,
+    (dv * uu - du * uv) / det,
+  ];
 }
 
 /** 4꼭짓점 → 4 edge plane (각 변 위의 한 점 + inward normal). */
@@ -170,7 +185,7 @@ export function decomposeBoundaryGaussians(
   const geom = rectGeom(rect.corners);
   const pO = geom.planeOrigin;
   // 슬랩 방향 = 명시된 wallOutwardNormal. 미지정이면 rectGeom.planeNormal (방향 보장 X — 호출자가 넘기는 게 정확).
-  const wallOut: Vec3 = opts.wallOutwardNormal ?? geom.planeNormal;
+  const wallOut: Vec3 = vnorm(opts.wallOutwardNormal ?? geom.planeNormal);
   const px = scene.attrs.get('x');
   const py = scene.attrs.get('y');
   const pz = scene.attrs.get('z');
@@ -209,7 +224,9 @@ export function decomposeBoundaryGaussians(
     const kSigma = forcedKSigma ?? gsplatVisibleSigmaRadius(op ? sigmoidOpacity(op[i]) : 1);
     if (kSigma <= 0) continue;
 
-    // 4 edge 검사: fully outside (한 edge 라도 sd <= -ext) 인지, 아니면 가로지르는 edge 가 있는지.
+    // 4 edge 검사: fully outside (한 edge 라도 visible extent 전체가 edge 바깥) 인지,
+    // 아니면 edge 를 가로지르는지. center 가 edge 바깥(sd < 0)에 있어도 extent 가 문 안쪽으로
+    // 넘어오면 boundary 로 split 해야 문 가장자리 번짐이 남지 않는다.
     let isOutside = false;
     let mostBoundaryEdge = -1;
     let bestAbsSd = Infinity;
@@ -228,8 +245,7 @@ export function decomposeBoundaryGaussians(
       const variance = a0n*a0n*s0*s0 + a1n*a1n*s1*s1 + a2n*a2n*s2*s2;
       const ext = kSigma * Math.sqrt(variance);
       if (ext < 1e-6) continue;
-      // STRICT: center 가 어느 한 edge 의 outside (sd < 0) 면 도어 영역 X. 가로세로 방향 확장 없음.
-      if (sd < 0) { isOutside = true; break; }
+      if (sd <= -ext) { isOutside = true; break; }
       if (sd < ext) {
         // 가로지름. 가장 깊게 가로지르는 (|sd| 작은) edge 를 분할 기준으로.
         const absSd = Math.abs(sd);
@@ -421,14 +437,9 @@ export function punchAlphaZeroInDoorRegion(
   const TLw = wallCorners[0], TRw = wallCorners[1], BLw = wallCorners[3];
   const eU = vsub(TRw, TLw);
   const eV = vsub(BLw, TLw);
-  const eUlen2 = vdot(eU, eU);
-  const eVlen2 = vdot(eV, eV);
 
   // 도어 corner 를 wall (s, t) 로 투영.
-  const stOf = (P: Vec3): [number, number] => {
-    const d = vsub(P, TLw);
-    return [vdot(d, eU) / eUlen2, vdot(d, eV) / eVlen2];
-  };
+  const stOf = (P: Vec3): [number, number] => planeCoordsInBasis(P, TLw, eU, eV);
   const doorST: [number, number][] = [
     stOf(doorCorners[0]),
     stOf(doorCorners[1]),
@@ -455,7 +466,9 @@ export function punchAlphaZeroInDoorRegion(
   const xHi = Math.min(w - 1, Math.ceil(xMax));
   const yLo = Math.max(0, Math.floor(yMin));
   const yHi = Math.min(h - 1, Math.ceil(yMax));
-  if (xLo > xHi || yLo > yHi) return 0;
+  if (xLo > xHi || yLo > yHi) {
+    throw new Error('문 영역이 벽 텍스처 범위를 벗어났습니다. 문 4점을 벽 안쪽에 다시 지정하세요.');
+  }
 
   // 4변 (P0→P1, P1→P2, P2→P3, P3→P0). inside = 모든 cross 가 같은 부호.
   // 부호는 첫 변에서 sample 후 일관 검사.
@@ -468,6 +481,9 @@ export function punchAlphaZeroInDoorRegion(
   const cx = (doorPx[0][0] + doorPx[1][0] + doorPx[2][0] + doorPx[3][0]) / 4;
   const cy = (doorPx[0][1] + doorPx[1][1] + doorPx[2][1] + doorPx[3][1]) / 4;
   const sign = Math.sign(edgeCross(0, cx, cy));
+  if (sign === 0) {
+    throw new Error('문 영역이 유효한 사각형이 아닙니다. 문 4점을 다시 지정하세요.');
+  }
 
   let touched = 0;
   for (let y = yLo; y <= yHi; y++) {
@@ -520,13 +536,8 @@ export function extractDoorRegionTexture(
   const TLw = wallCorners[0], TRw = wallCorners[1], BLw = wallCorners[3];
   const eU = vsub(TRw, TLw);
   const eV = vsub(BLw, TLw);
-  const eUlen2 = vdot(eU, eU);
-  const eVlen2 = vdot(eV, eV);
 
-  const stOf = (P: Vec3): [number, number] => {
-    const d = vsub(P, TLw);
-    return [vdot(d, eU) / eUlen2, vdot(d, eV) / eVlen2];
-  };
+  const stOf = (P: Vec3): [number, number] => planeCoordsInBasis(P, TLw, eU, eV);
   const doorST: [number, number][] = [
     stOf(doorCorners[0]),
     stOf(doorCorners[1]),
@@ -551,6 +562,9 @@ export function extractDoorRegionTexture(
   const xHi = Math.min(wallW - 1, Math.ceil(xMax));
   const yLo = Math.max(0, Math.floor(yMin));
   const yHi = Math.min(wallH - 1, Math.ceil(yMax));
+  if (xLo > xHi || yLo > yHi) {
+    throw new Error('문 영역이 벽 텍스처 범위를 벗어났습니다. 문 4점을 벽 안쪽에 다시 지정하세요.');
+  }
   const cutW = Math.max(1, xHi - xLo + 1);
   const cutH = Math.max(1, yHi - yLo + 1);
   const rgba = new Uint8ClampedArray(cutW * cutH * 4);
