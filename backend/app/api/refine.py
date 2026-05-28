@@ -24,6 +24,7 @@ from app.core.database import get_db
 from app.core.security import get_current_user
 from app.core.storage_keys import is_key_under_prefix, normalize_minio_key
 from app.models import User, Upload, Task, SceneOutput, TaskType, TaskStatus, Module, Floor
+from app.services.celery_service import dispatch_sog_conversion_task
 from app.services.minio_service import get_minio_service, PART_SIZE
 from app.services.storage_paths import (
     build_refined_object_key,
@@ -286,6 +287,13 @@ async def save_refined(
         )
 
     await db.commit()
+
+    # refined PLY → SOG 변환 비동기 발행 (basemap 등 다듬기 확정 경로). 뷰어용 경량
+    # 파생물이라 발행 실패해도 무시 — sog_path 는 None 으로 남고 표시는 PLY 로 폴백.
+    try:
+        dispatch_sog_conversion_task(str(scene.id), source_key)
+    except Exception as e:
+        logger.warning(f"[refine save] SOG 변환 발행 실패 (무시): {e}")
 
     return SaveResponse(scene_id=scene.id, message="정제 결과가 저장되었습니다.")
 

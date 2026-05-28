@@ -76,6 +76,14 @@ def notify_task_success(task_id: str, result_dict: dict) -> None:
     _post_callback("/internal/worker/tasks/success", payload)
 
 
+def notify_sog_ready(scene_id: str, sog_key: str) -> None:
+    payload = {
+        "scene_id": scene_id,
+        "sog_key": sog_key,
+    }
+    _post_callback("/internal/worker/scenes/sog-ready", payload)
+
+
 def notify_task_failure(task_id: str, upload_id: str | None, error_message: str | None) -> None:
     payload = {
         "celery_task_id": task_id,

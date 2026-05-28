@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import get_settings
 from app.core.database import get_db
 from app.core.storage_keys import normalize_minio_key
+from app.services.minio_service import get_minio_service
 from app.models import (
     Floor,
     Module,
@@ -38,6 +39,11 @@ class WorkerTaskFailureRequest(BaseModel):
     celery_task_id: str
     upload_id: UUID | None = None
     error_message: str | None = None
+
+
+class WorkerSogReadyRequest(BaseModel):
+    scene_id: UUID
+    sog_key: str
 
 
 class WorkerTaskCallbackResponse(BaseModel):
@@ -209,4 +215,38 @@ async def worker_task_failure(
         task_id=task.id,
         scene_id=None,
         status=task.status.value,
+    )
+
+
+@router.post("/scenes/sog-ready", response_model=WorkerTaskCallbackResponse)
+async def worker_scene_sog_ready(
+    body: WorkerSogReadyRequest,
+    _auth: None = Depends(_require_worker_token),
+    db: AsyncSession = Depends(get_db),
+):
+    """refined PLY → SOG 변환 완료 통지. 기존 SceneOutput 의 sog_path 만 채운다."""
+    sog_key = _normalize_path(body.sog_key, "sog_key")
+    if not sog_key:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="sog_key is required.",
+        )
+
+    scene = await db.get(SceneOutput, body.scene_id)
+    if scene is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="SceneOutput not found.")
+
+    minio = get_minio_service()
+    if not minio.object_exists(sog_key):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="SOG object not found in storage.",
+        )
+
+    scene.sog_path = sog_key
+
+    return WorkerTaskCallbackResponse(
+        task_id=scene.task_id,
+        scene_id=scene.id,
+        status="completed",
     )

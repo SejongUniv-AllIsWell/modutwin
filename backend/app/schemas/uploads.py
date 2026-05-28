@@ -168,6 +168,7 @@ class UploadResponse(BaseModel):
     has_gsplat_ply: bool = False  # COLMAP→GS 결과 PLY 존재 여부
     is_basemap_source: bool = False  # basemap 으로 등록된 원본 업로드인지 — 삭제 비활성화 판단용
     is_basemap_upload: bool = False  # basemap 목적 업로드인지 ('__basemap__' 모듈 소속) — 대시보드 상태/정합 버튼 분기용
+    is_basemap_active: bool = False  # 이 업로드 기반 basemap 이 활성(관리자 승인/등록 완료)인지 — '업로드 완료' vs 'Basemap' 구분용
 
     class Config:
         from_attributes = True

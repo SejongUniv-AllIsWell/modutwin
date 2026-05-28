@@ -616,6 +616,8 @@ export default function VisibilityManager() {
                                 ) : (
                                   f.modules.map((m) => {
                                     const modBusy = busyKey === `mod:${m.id}`;
+                                    // '__basemap__' 는 층의 기준맵 placeholder — 친화 라벨로 표기.
+                                    const moduleLabel = m.name === '__basemap__' ? 'Basemap' : m.name;
                                     return (
                                       <div
                                         key={m.id}
@@ -624,12 +626,12 @@ export default function VisibilityManager() {
                                         }`}
                                       >
                                         <div className="flex items-center gap-2 text-sm min-w-0">
-                                          <span className="text-[var(--ink-2)] truncate">{m.name}</span>
+                                          <span className="text-[var(--ink-2)] truncate">{moduleLabel}</span>
                                           {visBadge(m.is_visible)}
                                         </div>
                                         <div className="flex items-center gap-2">
                                           {toggleBtn(m.is_visible, modBusy, () => toggleModuleVisibility(m))}
-                                          {deleteBtn({ scope: 'module', id: m.id, label: m.name, noun: '모듈' })}
+                                          {deleteBtn({ scope: 'module', id: m.id, label: moduleLabel, noun: '모듈' })}
                                         </div>
                                       </div>
                                     );

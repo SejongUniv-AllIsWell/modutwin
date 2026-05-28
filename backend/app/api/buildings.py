@@ -481,6 +481,7 @@ async def list_buildings(
                         Floor.building_id == Building.id,
                         Floor.is_visible == True,
                         Module.is_visible == True,
+                        Module.name != "__basemap__",
                     )
                 ),
             )
@@ -756,6 +757,7 @@ async def get_building_metadata_options(
         .where(
             Module.floor_id.in_(floor_ids),
             Module.is_visible == True,
+            Module.name != "__basemap__",
             User.role == UserRole.admin,
         )
         .order_by(Module.floor_id, Module.name)
@@ -865,7 +867,11 @@ async def explore_building(
     mod_result = await db.execute(
         select(Module, User.name.label("uploader_name"))
         .join(User, Module.user_id == User.id)
-        .where(Module.floor_id.in_(floor_ids), Module.is_visible == True)
+        .where(
+            Module.floor_id.in_(floor_ids),
+            Module.is_visible == True,
+            Module.name != "__basemap__",
+        )
         .order_by(Module.floor_id, Module.name)
     )
     mod_rows = mod_result.all()
@@ -1268,7 +1274,9 @@ async def list_modules(
     if not is_admin:
         stmt = stmt.where(Module.user_id == user.id)
     if not show_hidden:
-        stmt = stmt.where(Module.is_visible == True)
+        # 일반 목록에서는 숨김 모듈과 placeholder '__basemap__' 를 제외한다.
+        # admin 표시 관리(show_hidden)에서는 basemap 도 'Basemap' 항목으로 노출한다.
+        stmt = stmt.where(Module.is_visible == True, Module.name != "__basemap__")
     stmt = stmt.order_by(Module.name)
     result = await db.execute(stmt)
     return result.scalars().all()

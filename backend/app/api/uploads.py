@@ -314,6 +314,7 @@ def _upload_to_response(
     is_basemap_source: bool = False,
     has_alignment: bool = False,
     is_basemap_upload: bool = False,
+    is_basemap_active: bool = False,
 ) -> UploadResponse:
     """Upload ORM → UploadResponse (SAM3 파이프라인 파생 플래그 포함).
 
@@ -321,6 +322,9 @@ def _upload_to_response(
     is_basemap_source: 이 업로드가 어떤 basemap의 원본 PLY 인지 — 삭제 비활성화 판단용.
     is_basemap_upload: basemap 목적으로 올라온 업로드인지 (register-local-basemap 가 생성하는 '__basemap__' 모듈 소속).
         등록 전이라도 모듈 업로드와 구분 가능 — 대시보드 상태/정합 버튼 분기용.
+    is_basemap_active: 이 업로드를 원본으로 하는 basemap 이 활성(관리자 승인/등록 완료)인지.
+        pending(제출만 됨) 단계에서도 Basemap row(source_upload) 는 생기므로, '업로드 완료' vs 'Basemap'
+        구분은 is_basemap_source 가 아니라 이 플래그로 한다.
     """
     return UploadResponse(
         id=upload.id,
@@ -338,6 +342,7 @@ def _upload_to_response(
         has_gsplat_ply=bool(upload.gsplat_ply_path),
         is_basemap_source=is_basemap_source,
         is_basemap_upload=is_basemap_upload,
+        is_basemap_active=is_basemap_active,
     )
 
 
@@ -371,6 +376,13 @@ async def list_uploads(
         .distinct()
     )
     basemap_source_ids = {row[0] for row in basemap_rows.all() if row[0] is not None}
+    # 활성(관리자 승인/등록 완료) basemap 의 원본 업로드 — 상태 'Basemap' 표시 판단용.
+    active_basemap_rows = await db.execute(
+        select(Basemap.source_upload_id)
+        .where(Basemap.source_upload_id.in_(upload_ids), Basemap.is_active == True)
+        .distinct()
+    )
+    active_basemap_source_ids = {row[0] for row in active_basemap_rows.all() if row[0] is not None}
     module_ids = {u.module_id for u in uploads}
     aligned_module_rows = await db.execute(
         select(Module.id)
@@ -390,6 +402,7 @@ async def list_uploads(
             is_basemap_source=(u.id in basemap_source_ids),
             has_alignment=(u.module_id in aligned_module_ids),
             is_basemap_upload=(u.module_id in basemap_module_ids),
+            is_basemap_active=(u.id in active_basemap_source_ids),
         )
         for u in uploads
     ]
@@ -424,6 +437,12 @@ async def get_upload(
         select(Basemap.id).where(Basemap.source_upload_id == upload_id).limit(1)
     )
     is_basemap_source = basemap_check.scalar_one_or_none() is not None
+    active_basemap_check = await db.execute(
+        select(Basemap.id)
+        .where(Basemap.source_upload_id == upload_id, Basemap.is_active == True)
+        .limit(1)
+    )
+    is_basemap_active = active_basemap_check.scalar_one_or_none() is not None
     module_check = await db.execute(
         select(Module.alignment_transform, Module.name).where(Module.id == upload.module_id).limit(1)
     )
@@ -436,6 +455,7 @@ async def get_upload(
         is_basemap_source=is_basemap_source,
         has_alignment=has_alignment,
         is_basemap_upload=is_basemap_upload,
+        is_basemap_active=is_basemap_active,
     )
 
 

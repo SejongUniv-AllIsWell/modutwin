@@ -79,6 +79,19 @@ def dispatch_sam3_door_detection_task(
     )
 
 
+def dispatch_sog_conversion_task(scene_id: str, ply_key: str) -> str:
+    """refined(정합 완료) PLY → SOG 변환 태스크 발행 → celery_task_id 반환.
+
+    SceneOutput 은 이미 존재하므로 변환 완료 후 워커가 scene_id 로 sog_path 만 채운다.
+    """
+    result = celery_app.send_task(
+        "tasks.sog.convert_scene_to_sog",
+        args=[scene_id, ply_key],
+        queue="training",
+    )
+    return result.id
+
+
 def dispatch_colmap_task(
     upload_id: str,
     user_id: str,

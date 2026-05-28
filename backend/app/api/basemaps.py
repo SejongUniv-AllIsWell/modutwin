@@ -822,6 +822,19 @@ async def _activate_basemap_inplace(db: AsyncSession, new_basemap: Basemap) -> N
         .values(is_visible=True)
     )
 
+    # basemap 원본 업로드가 속한 '__basemap__' placeholder 모듈도 표시중으로 전환 —
+    # 표시 관리에서 승인 후 '숨기기'(=표시중) 상태로 보이게 한다.
+    # (end-user/통계 쿼리는 이름으로 '__basemap__' 를 항상 제외하므로 실제 노출로 이어지지 않는다.)
+    if new_basemap.source_upload_id is not None:
+        src_module_q = await db.execute(
+            select(Upload.module_id).where(Upload.id == new_basemap.source_upload_id)
+        )
+        src_module_id = src_module_q.scalar_one_or_none()
+        if src_module_id is not None:
+            await db.execute(
+                sa_update(Module).where(Module.id == src_module_id).values(is_visible=True)
+            )
+
 
 @router.put("/{basemap_id}/approve")
 async def approve_basemap(

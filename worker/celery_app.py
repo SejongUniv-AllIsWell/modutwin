@@ -19,14 +19,17 @@ app.config_from_object({
     'task_routes': {
         'tasks.training.*': {'queue': 'training'},
         'tasks.alignment.*': {'queue': 'alignment'},
+        'tasks.sog.*': {'queue': 'training'},
     },
     'task_default_queue': 'training',
     'imports': (
         'tasks.training',
         'tasks.alignment',
+        'tasks.sog',
     ),
 })
 
 import tasks.colmap   # noqa: F401
 import tasks.training  # noqa: F401
 import tasks.alignment # noqa: F401
+import tasks.sog       # noqa: F401

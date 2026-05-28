@@ -56,6 +56,7 @@ async def list_scenes(
                 and_(
                     SceneOutput.is_aligned == True,
                     Module.is_visible == True,
+                    Module.name != "__basemap__",
                     Floor.is_visible == True,
                     Building.is_visible == True,
                 ),

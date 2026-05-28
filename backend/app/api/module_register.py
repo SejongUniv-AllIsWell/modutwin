@@ -35,6 +35,7 @@ from app.models import (
     Building, Floor, Module, SceneOutput, Task, Upload, User, UserRole,
     PlyTarget, UploadStatus, TaskType, TaskStatus,
 )
+from app.services.celery_service import dispatch_sog_conversion_task
 from app.services.minio_service import get_minio_service
 from app.services.sam3_temp_storage import (
     delete_temp, is_expired, new_session_id, temp_path,
@@ -470,6 +471,13 @@ async def commit_final(
     )
 
     await db.commit()
+
+    # refined(정합 완료) PLY → SOG 변환 비동기 발행. 뷰어용 경량 파생물이라 브로커
+    # 미가용 등으로 실패해도 무시 — sog_path 는 None 으로 남고 표시는 PLY 로 폴백된다.
+    try:
+        dispatch_sog_conversion_task(str(scene_output.id), final_ply_key)
+    except Exception as e:
+        logger.warning(f"[commit_final] SOG 변환 발행 실패 (무시): {e}")
 
     # SAM3 임시 PLY 삭제 (있으면)
     if sam3_session_id:

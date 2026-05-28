@@ -35,11 +35,13 @@ async def landing_stats(db: AsyncSession = Depends(get_db)):
         select(func.count())
         .select_from(Module)
         .where(Module.is_visible.is_(True))
+        .where(Module.name != "__basemap__")
         .where(has_scene_output)
     )
     contributors = await db.scalar(
         select(func.count(distinct(Module.user_id)))
         .where(Module.is_visible.is_(True))
+        .where(Module.name != "__basemap__")
         .where(has_scene_output)
     )
     return LandingStatsResponse(
@@ -96,6 +98,7 @@ async def landing_feed(db: AsyncSession = Depends(get_db)):
         .join(Floor, Module.floor_id == Floor.id)
         .join(Building, Floor.building_id == Building.id)
         .where(Module.is_visible.is_(True))
+        .where(Module.name != "__basemap__")
         .where(
             exists().where(SceneOutput.module_id == Module.id)
         )

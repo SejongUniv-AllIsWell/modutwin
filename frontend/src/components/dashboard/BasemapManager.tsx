@@ -47,7 +47,7 @@ export default function BasemapManager() {
   };
 
   const ACTION_LABEL: Record<'approve' | 'reject', string> = {
-    approve: '승인 및 등록',
+    approve: '승인',
     reject: '거부',
   };
 
@@ -111,7 +111,7 @@ export default function BasemapManager() {
                 <div className="flex gap-2 items-center shrink-0">
                   {bm.status === 'pending' && (
                     <>
-                      <Button size="sm" onClick={() => handleAction(bm.id, 'approve')}>승인 및 등록</Button>
+                      <Button size="sm" onClick={() => handleAction(bm.id, 'approve')}>승인</Button>
                       <Button size="sm" variant="danger" onClick={() => handleAction(bm.id, 'reject')}>거부</Button>
                     </>
                   )}

@@ -169,11 +169,14 @@ For a fresh unauthenticated environment:
 
 ## GPU Worker Notes
 
-The default web stack does not require the GPU worker.
+The PC web stack runs no Celery worker. The DGX Spark is the sole GPU worker and
+runs `training` + `alignment` (COLMAP preprocessing, gsplat training, door
+alignment, SOG conversion) via `docker-compose.gpu-remote.yml`.
 
 Current status:
 
-- `worker/` contains `training` and `alignment` Celery tasks.
+- `worker/` contains `training` and `alignment` Celery tasks (built into the DGX
+  worker image; the PC base `docker-compose.yml` no longer defines a worker).
 - Viewer automatic door designation uses the door-ml/SAM3 HTTP path when the
   service is available.
 - `core/door_detection` contains the SAM3-based door detection pipeline used by
@@ -181,9 +184,9 @@ Current status:
 - The older async worker/callback SAM3 path remains optional; keep
   `ENABLE_SAM3_DISPATCH=false` unless that path is intentionally deployed.
 
-If a separate GPU machine is prepared later, expose Redis/RabbitMQ/MinIO through
-`PC_HOST_IP` on a private interface such as Tailscale, keep secrets identical on
-both machines, and validate connectivity before starting workers:
+The DGX Spark reaches the PC's Redis/RabbitMQ/MinIO over Tailscale via
+`PC_HOST_IP`. Keep secrets identical on both machines, and validate connectivity
+before starting the worker:
 
 ```bash
 nc -zv <PC_HOST_IP> 5673

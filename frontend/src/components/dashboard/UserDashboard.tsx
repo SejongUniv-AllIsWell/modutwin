@@ -51,14 +51,15 @@ const STAGE_COLOR: Record<ProgressStage, string> = {
   processing:    'text-yellow-400',
 };
 
-function progressStage(u: { status: string; has_refined?: boolean; has_doors_json?: boolean; has_alignment?: boolean; is_basemap_upload?: boolean; is_basemap_source?: boolean }): ProgressStage {
+function progressStage(u: { status: string; has_refined?: boolean; has_doors_json?: boolean; has_alignment?: boolean; is_basemap_upload?: boolean; is_basemap_active?: boolean }): ProgressStage {
   if (u.status === 'failed') return 'failed';
   if (u.status === 'processing') return 'processing';
   if (u.status === 'uploaded') return 'uploaded';
   // basemap 목적 업로드: 문지정/정합 단계를 거치지 않는다.
   if (u.is_basemap_upload) {
-    // 관리자가 basemap 으로 등록 완료 → 'Basemap', 등록 전 → '업로드 완료'.
-    return u.is_basemap_source ? 'basemap' : 'uploaded_only';
+    // 관리자 승인(=활성화)으로 등록 완료 → 'Basemap', 그 전(제출/대기) → '업로드 완료'.
+    // pending Basemap row 도 source_upload 를 갖기 때문에 is_basemap_source 가 아니라 is_basemap_active 로 판단.
+    return u.is_basemap_active ? 'basemap' : 'uploaded_only';
   }
   // status === 'completed': 다듬기/정합 진행 단계로 더 세분화.
   if (u.has_alignment) return 'aligned';
