@@ -24,6 +24,7 @@ from app.core.database import get_db
 from app.core.security import get_current_user
 from app.core.storage_keys import is_key_under_prefix, normalize_minio_key
 from app.models import User, Upload, Task, SceneOutput, TaskType, TaskStatus, Module, Floor
+from app.services.celery_service import dispatch_scene_sog_conversion
 from app.services.minio_service import get_minio_service, PART_SIZE
 from app.services.storage_paths import (
     build_refined_object_key,
@@ -262,13 +263,14 @@ async def save_refined(
     await db.flush()
 
     # SceneOutput 생성
+    # sog_path 는 우선 None — 뷰어가 source PLY 로 fallback 하고, 아래에서 발행하는
+    # convert_scene_sog 가 완료되면 실제 .sog 키로 교체한다.
+    sog_key = os.path.splitext(source_key)[0] + ".sog"
     scene = SceneOutput(
         task_id=task.id,
         user_id=user.id,
         module_id=upload.module_id,
         ply_path=source_key,
-        # Refine saves the canonical PLY directly; SOG may be produced later by a
-        # worker, so this column intentionally stays nullable.
         sog_path=None,
         is_aligned=False,
     )
@@ -286,6 +288,13 @@ async def save_refined(
         )
 
     await db.commit()
+
+    # 최종 PLY → SOG 변환 발행 (커밋 이후라 워커 콜백 시 scene 행이 존재).
+    # 발행/변환이 실패해도 sog_path 가 None 이라 뷰어는 source PLY 로 fallback 한다.
+    try:
+        dispatch_scene_sog_conversion(str(scene.id), source_key, sog_key)
+    except Exception as e:
+        logger.warning(f"[refine.save] SOG 변환 발행 실패 (뷰어는 PLY fallback): {e}")
 
     return SaveResponse(scene_id=scene.id, message="정제 결과가 저장되었습니다.")
 

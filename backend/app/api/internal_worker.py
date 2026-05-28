@@ -40,6 +40,15 @@ class WorkerTaskFailureRequest(BaseModel):
     error_message: str | None = None
 
 
+class WorkerSceneSogRequest(BaseModel):
+    sog_key: str
+
+
+class WorkerSceneSogResponse(BaseModel):
+    scene_id: UUID
+    sog_path: str
+
+
 class WorkerTaskCallbackResponse(BaseModel):
     task_id: UUID
     scene_id: UUID | None = None
@@ -110,13 +119,9 @@ async def worker_task_success(
         )
 
     ply_key = _normalize_path(body.ply_key, "ply_key")
-    sog_key = _normalize_path(body.web_sog_key, "web_sog_key") or _normalize_path(body.sog_key, "sog_key") or ply_key
+    # SOG 는 선택적 뷰어 파생물 — 없으면 None 으로 두면 뷰어가 ply_path 로 fallback 한다.
+    sog_key = _normalize_path(body.web_sog_key, "web_sog_key") or _normalize_path(body.sog_key, "sog_key")
     metadata_key = _normalize_path(body.metadata_key, "metadata_key")
-    if not ply_key and not sog_key:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="At least one of ply_key/sog_key/web_sog_key must be provided.",
-        )
     if not ply_key:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -179,6 +184,37 @@ async def worker_task_success(
         scene_id=scene.id,
         status=task.status.value,
     )
+
+
+@router.post("/scenes/{scene_id}/sog", response_model=WorkerSceneSogResponse)
+async def worker_scene_sog(
+    scene_id: UUID,
+    body: WorkerSceneSogRequest,
+    _auth: None = Depends(_require_worker_token),
+    db: AsyncSession = Depends(get_db),
+):
+    """워커의 최종 씬 SOG 변환 완료 콜백 — SceneOutput.sog_path 를 실제 SOG 로 교체.
+
+    변환 전 sog_path 는 None 이라 변환이 실패/누락돼도 뷰어는 PLY 로 fallback 하며,
+    이 콜백이 도착하면 실제 SOG 키로 갱신된다.
+    """
+    sog_key = _normalize_path(body.sog_key, "sog_key")
+    if not sog_key:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="sog_key is required.",
+        )
+
+    scene_result = await db.execute(
+        select(SceneOutput).where(SceneOutput.id == scene_id).limit(1)
+    )
+    scene = scene_result.scalar_one_or_none()
+    if scene is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="SceneOutput not found.")
+
+    scene.sog_path = sog_key
+
+    return WorkerSceneSogResponse(scene_id=scene.id, sog_path=sog_key)
 
 
 @router.post("/tasks/failure", response_model=WorkerTaskCallbackResponse)

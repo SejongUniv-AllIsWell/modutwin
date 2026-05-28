@@ -7,7 +7,7 @@ from celery_app import app
 from minio_helper import download_file, upload_file
 from redis_helper import update_progress, clear_progress
 from backend_callback import notify_upload_progress
-from callback_client import notify_task_failure, notify_task_success
+from callback_client import notify_task_failure, notify_task_success, notify_scene_sog
 
 from pipeline.runner import PipelineRunner
 from pipeline.sog_converter import SogConverterModule, convert_to_sog
@@ -235,7 +235,6 @@ def run_gs_training_from_colmap(self, upload_id: str, user_id: str, zip_minio_ke
     try:
         from pipeline.ffmpeg_module import FFmpegModule
         from pipeline.gsplat_module import GsplatModule
-        from pipeline.sog_converter import SogConverterModule
     except ImportError as e:
         update_progress(task_id, -1, f"파이프라인 모듈 로드 실패: {e}")
         raise RuntimeError(str(e))
@@ -272,23 +271,14 @@ def run_gs_training_from_colmap(self, upload_id: str, user_id: str, zip_minio_ke
         ply_path = gsplat.run(work_dir)
         logger.info(f"[Task {task_id}] 학습 완료: {ply_path}")
 
-        # 4. SOG 변환 (optional, 실패해도 PLY는 저장)
-        sog_path = None
-        try:
-            sog = SogConverterModule()
-            sog_path = sog.run(ply_path)
-        except Exception as e:
-            logger.warning(f"[Task {task_id}] SOG 변환 실패 (무시): {e}")
-
-        # 5. MinIO 업로드
+        # 4. MinIO 업로드 (PLY 만)
+        #    중간 SOG 는 만들지 않는다 — DB 가 가리키지 않는 고아 파일이었고,
+        #    최종 씬 SOG 는 commit_final/save_refined 이후 convert_scene_sog 가
+        #    최종 PLY 로 별도 생성한다.
         update_progress(task_id, 90, "업로드")
         ply_key = f"{result_base}/output.ply"
         upload_file(ply_path, ply_key)
         logger.info(f"[Task {task_id}] PLY 업로드: {ply_key}")
-
-        if sog_path and os.path.isfile(sog_path):
-            sog_key = f"{result_base}/output.sog"
-            upload_file(sog_path, sog_key)
 
         update_progress(task_id, 100, "완료")
 
@@ -312,3 +302,42 @@ def run_gs_training_from_colmap(self, upload_id: str, user_id: str, zip_minio_ke
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
         clear_progress(task_id)
+
+
+@app.task(
+    name="tasks.training.convert_scene_sog",
+    bind=True,
+    max_retries=2,
+    default_retry_delay=30,
+)
+def convert_scene_sog(self, scene_id: str, ply_key: str, sog_key: str):
+    """이미 저장된 최종 씬 PLY 를 SOG 로 변환해 SceneOutput.sog_path 를 갱신한다.
+
+    commit_final / save_refined 가 final PLY 를 MinIO 에 올린 뒤 호출한다. 변환 전엔
+    sog_path 가 PLY fallback 이라 뷰어는 즉시 동작하고, 변환이 끝나면 콜백으로 실제
+    SOG 키로 교체된다. 변환이 실패해도(예: 비-가우시안 PLY) sog_path 는 PLY 그대로
+    남아 뷰어 동작에는 지장이 없다.
+    """
+    task_id = self.request.id
+    work_dir = tempfile.mkdtemp(prefix=f"scenesog_{scene_id}_")
+
+    logger.info(f"[Task {task_id}] 씬 SOG 변환 시작: scene_id={scene_id}, ply={ply_key}")
+    try:
+        ext = os.path.splitext(ply_key)[1].lower() or ".ply"
+        local_ply = os.path.join(work_dir, f"input{ext}")
+        download_file(ply_key, local_ply)
+
+        sog_local = os.path.join(work_dir, "scene.sog")
+        convert_to_sog(local_ply, output_path=sog_local)
+        upload_file(sog_local, sog_key)
+
+        notify_scene_sog(scene_id, sog_key)
+        logger.info(f"[Task {task_id}] 씬 SOG 변환 완료: {sog_key}")
+        return {"status": "completed", "scene_id": scene_id, "sog_key": sog_key}
+
+    except Exception as e:
+        logger.error(f"[Task {task_id}] 씬 SOG 변환 실패 (sog_path 는 PLY fallback 유지): {e}")
+        raise
+
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)

@@ -94,6 +94,25 @@ def dispatch_colmap_task(
 
 
 
+def dispatch_scene_sog_conversion(
+    scene_id: str,
+    ply_key: str,
+    sog_key: str,
+) -> str:
+    """최종 씬 PLY → SOG 변환 태스크 발행 → celery_task_id 반환.
+
+    commit_final / save_refined 가 SceneOutput 을 생성(sog_path=None)한 뒤 호출한다.
+    완료되면 워커가 /internal/worker/scenes/{scene_id}/sog 로 콜백해 sog_path 를
+    실제 SOG 키로 갱신한다. 변환 전/실패 시엔 sog_path=None 이라 뷰어가 PLY 로 fallback.
+    """
+    result = celery_app.send_task(
+        "tasks.training.convert_scene_sog",
+        args=[scene_id, ply_key, sog_key],
+        queue="training",
+    )
+    return result.id
+
+
 def dispatch_alignment_task(
     upload_id: str,
     user_id: str,

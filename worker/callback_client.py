@@ -83,3 +83,8 @@ def notify_task_failure(task_id: str, upload_id: str | None, error_message: str 
         "error_message": error_message,
     }
     _post_callback("/internal/worker/tasks/failure", payload)
+
+
+def notify_scene_sog(scene_id: str, sog_key: str) -> None:
+    """기존 SceneOutput 의 sog_path 를 변환 완료된 실제 SOG 키로 갱신 통지."""
+    _post_callback(f"/internal/worker/scenes/{scene_id}/sog", {"sog_key": sog_key})

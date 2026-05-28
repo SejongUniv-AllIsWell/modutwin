@@ -35,6 +35,7 @@ from app.models import (
     Building, Floor, Module, SceneOutput, Task, Upload, User, UserRole,
     PlyTarget, UploadStatus, TaskType, TaskStatus,
 )
+from app.services.celery_service import dispatch_scene_sog_conversion
 from app.services.minio_service import get_minio_service
 from app.services.sam3_temp_storage import (
     delete_temp, is_expired, new_session_id, temp_path,
@@ -343,6 +344,7 @@ async def commit_final(
     refined_session = f"s{int(time.time() * 1000)}"
     refined_dir = f"{base}/alignment/refined/{refined_session}"
     final_ply_key = f"{refined_dir}/final.ply"
+    final_sog_key = f"{refined_dir}/final.sog"
     mesh_key = f"{refined_dir}/mesh.json"
     doors_key = f"{base}/alignment/refined/doors.json"  # CLAUDE.md 규약과 일관 (doors 는 refined 디렉터리 직속)
     tex_keys = {tid: f"{refined_dir}/tex_{tid}.png" for tid in tex_uploads.keys()}
@@ -442,8 +444,8 @@ async def commit_final(
         user_id=user.id,
         module_id=module.id,
         ply_path=final_ply_key,
-        # SOG is an optional viewer-optimized derivative. The canonical persisted
-        # module output for this flow is final.ply.
+        # SOG 는 뷰어용 경량 파생물(optional). 우선 None 으로 두면 뷰어가 final.ply 로
+        # fallback 하고, 커밋 후 발행하는 convert_scene_sog 가 완료되면 실제 final.sog 로 채운다.
         sog_path=None,
         is_aligned=True,
     )
@@ -470,6 +472,13 @@ async def commit_final(
     )
 
     await db.commit()
+
+    # 최종 PLY → SOG 변환 발행 (커밋 이후라 워커 콜백 시 scene 행이 존재).
+    # 발행/변환이 실패해도 sog_path 가 None 이라 뷰어는 final.ply 로 fallback 한다.
+    try:
+        dispatch_scene_sog_conversion(str(scene_output.id), final_ply_key, final_sog_key)
+    except Exception as e:
+        logger.warning(f"[commit-final] SOG 변환 발행 실패 (뷰어는 PLY fallback): {e}")
 
     # SAM3 임시 PLY 삭제 (있으면)
     if sam3_session_id:
