@@ -12,7 +12,9 @@ struct Params {
   width: u32,
   height: u32,
   tilesPerRow: u32,
-  _pad: u32,
+  // 출력 버퍼가 maxStorageBufferBindingSize 를 초과하지 않도록 strip 별 dispatch.
+  // 셰이더는 global py (= pyLocal + yOffset) 로 tile 조회, local pyLocal 로 출력 인덱스 계산.
+  yOffset: u32,
 };
 
 struct Splat {
@@ -44,7 +46,8 @@ struct Splat {
 @compute @workgroup_size(16, 16)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let px = gid.x;
-  let py = gid.y;
+  let pyLocal = gid.y;
+  let py = pyLocal + params.yOffset;
   if (px >= params.width || py >= params.height) { return; }
 
   let tileX = px / 16u;
@@ -76,7 +79,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (T < 0.001) { break; }
   }
 
-  outRGBA[py * params.width + px] = vec4<f32>(rgb, 1.0 - T);
+  outRGBA[pyLocal * params.width + px] = vec4<f32>(rgb, 1.0 - T);
 }
 `;
 
@@ -187,35 +190,78 @@ export async function compositeTextureGPU(
     splatArr[o + 9]  = sp.alpha;
   }
 
-  const outSize = totalPixels * 4 * 4; // f32 RGBA per pixel
   const splatBytes = splatArr.byteLength;
   const tileOffsetsBytes = tileOffsets.byteLength;
   const tileListBytes = Math.max(4, tileSplatList.byteLength);
 
-  // 한계 사전 체크
+  // 정적 버퍼 한계 사전 체크 — output 버퍼는 strip 분할로 우회 가능하지만
+  // splat/tileOffsets/tileList 는 전체가 한 번에 바인딩되어야 함.
   const maxStorage = device.limits.maxStorageBufferBindingSize;
-  if (outSize > maxStorage || splatBytes > maxStorage || tileOffsetsBytes > maxStorage || tileListBytes > maxStorage) {
-    console.warn(`[textureBakeGPU] buffer size exceeds device limit. Falling back to CPU.`);
+  if (splatBytes > maxStorage) {
+    console.warn(`[textureBakeGPU] splat buffer ${splatBytes} > limit ${maxStorage}. Falling back to CPU.`);
     return null;
   }
+  if (tileOffsetsBytes > maxStorage) {
+    console.warn(`[textureBakeGPU] tileOffsets buffer ${tileOffsetsBytes} > limit ${maxStorage}. Falling back to CPU.`);
+    return null;
+  }
+  if (tileListBytes > maxStorage) {
+    console.warn(`[textureBakeGPU] tileSplatList buffer ${tileListBytes} > limit ${maxStorage}. Falling back to CPU.`);
+    return null;
+  }
+
+  // Output 버퍼는 width*height*16 byte (RGBA f32). 가로 strip 으로 분할.
+  //
+  // strip 크기 결정:
+  //  - 하드 cap (32 MiB) — Firefox/시스템 GPU 풀 압박 회피. outGpu + readBuf 합쳐 64 MiB.
+  //  - 정적 버퍼 (splats + tileOffsets + tileList) 합산 후에도 GPU 풀이 남도록.
+  //  - 한도 (maxStorage / maxBufferSize) 와 cap 의 min.
+  const STRIP_BUF_CAP = 32 * 1024 * 1024;  // 32 MiB
+  const bytesPerRow = width * 16;
+  const maxStripBytes = Math.min(maxStorage, device.limits.maxBufferSize, STRIP_BUF_CAP);
+  const maxRowsPerStripRaw = Math.floor(maxStripBytes / bytesPerRow);
+  if (maxRowsPerStripRaw < TILE_SIZE) {
+    console.warn(`[textureBakeGPU] texture row too wide (${bytesPerRow} bytes/row, cap ${maxStripBytes}). Falling back to CPU.`);
+    return null;
+  }
+  const stripRowsMax = Math.min(height, Math.floor(maxRowsPerStripRaw / TILE_SIZE) * TILE_SIZE);
+  const stripBufSizeMax = stripRowsMax * width * 16;
+  void tilesPerCol;  // strip 분할 시 strip 별 workgroupsY 로 대체.
 
   device.pushErrorScope('validation');
   device.pushErrorScope('out-of-memory');
 
   const S = GPUBufferUsage.STORAGE;
+  // 정적 버퍼 — 한 번만 생성, strip 간 공유.
   const splatGpu = makeBuf(device, splatArr.buffer, S);
-  const outGpu = device.createBuffer({ size: outSize, usage: S | GPUBufferUsage.COPY_SRC });
-  const paramsGpu = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-  const readBuf = device.createBuffer({ size: outSize, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+  splatGpu.label = 'bake-splats';
+  const paramsGpu = device.createBuffer({
+    label: 'bake-params',
+    size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
   // typed array → ArrayBuffer (Uint32Array.buffer 가 SharedArrayBuffer 일 수도 있어서 새 ArrayBuffer 로 복사).
   const tileOffsetsAB = new ArrayBuffer(tileOffsets.byteLength);
   new Uint32Array(tileOffsetsAB).set(tileOffsets);
   const tileOffsetsGpu = makeBuf(device, tileOffsetsAB, S);
+  tileOffsetsGpu.label = 'bake-tileOffsets';
   // tileSplatList 가 비어있을 수 있음 (M=0 케이스) — 4byte 더미 버퍼라도 만들어야 bind group 생성 됨.
   const tileListAB = new ArrayBuffer(Math.max(4, tileSplatList.byteLength));
   if (tileSplatList.byteLength > 0) new Uint32Array(tileListAB).set(tileSplatList);
   const tileListGpu = makeBuf(device, tileListAB, S);
+  tileListGpu.label = 'bake-tileList';
 
+  // outGpu, readBuf — 최대 strip 크기로 1회 할당, 모든 strip 이 재사용.
+  // 마지막 strip 이 작으면 버퍼 끝부분은 미사용 (셰이더가 안 쓰는 영역, 읽기도 안 함).
+  const outGpu = device.createBuffer({
+    label: 'bake-out',
+    size: stripBufSizeMax, usage: S | GPUBufferUsage.COPY_SRC,
+  });
+  const readBuf = device.createBuffer({
+    label: 'bake-read',
+    size: stripBufSizeMax, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+  });
+
+  // bind group 도 한 번만 — 모든 버퍼가 strip 간 불변.
   const bg = device.createBindGroup({
     layout: pipeline.getBindGroupLayout(0),
     entries: [
@@ -227,40 +273,59 @@ export async function compositeTextureGPU(
     ],
   });
 
-  const paramsBuf = new ArrayBuffer(16);
-  const pu = new Uint32Array(paramsBuf);
-  pu[0] = width;
-  pu[1] = height;
-  pu[2] = tilesPerRow;
-  pu[3] = 0;
-  device.queue.writeBuffer(paramsGpu, 0, paramsBuf);
+  const fullOut = new Float32Array(totalPixels * 4);
+  let stripFailed = false;
 
-  const enc = device.createCommandEncoder();
-  const pass = enc.beginComputePass();
-  pass.setPipeline(pipeline);
-  pass.setBindGroup(0, bg);
-  // workgroup 16×16 → 한 workgroup 이 한 타일 (16×16 픽셀) 처리.
-  pass.dispatchWorkgroups(tilesPerRow, tilesPerCol);
-  pass.end();
-  enc.copyBufferToBuffer(outGpu, 0, readBuf, 0, outSize);
-  device.queue.submit([enc.finish()]);
-  await device.queue.onSubmittedWorkDone();
+  try {
+    for (let yStart = 0; yStart < height; yStart += stripRowsMax) {
+      const actualRows = Math.min(stripRowsMax, height - yStart);
+      const workgroupsY = Math.ceil(actualRows / TILE_SIZE);
+      // 셰이더는 pyLocal ∈ [0, workgroupsY*16) 까지 쓰지만 outGpu/readBuf 는 stripBufSizeMax 로 잡혀있어 안전.
+      const stripCopySize = workgroupsY * TILE_SIZE * width * 16;
+
+      const paramsBuf = new ArrayBuffer(16);
+      const pu = new Uint32Array(paramsBuf);
+      pu[0] = width;
+      pu[1] = height;
+      pu[2] = tilesPerRow;
+      pu[3] = yStart;
+      device.queue.writeBuffer(paramsGpu, 0, paramsBuf);
+
+      const enc = device.createCommandEncoder();
+      const pass = enc.beginComputePass();
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, bg);
+      pass.dispatchWorkgroups(tilesPerRow, workgroupsY);
+      pass.end();
+      enc.copyBufferToBuffer(outGpu, 0, readBuf, 0, stripCopySize);
+      device.queue.submit([enc.finish()]);
+      await device.queue.onSubmittedWorkDone();
+
+      await readBuf.mapAsync(GPUMapMode.READ, 0, stripCopySize);
+      const stripData = new Float32Array(readBuf.getMappedRange(0, stripCopySize).slice(0));
+      readBuf.unmap();
+
+      // actualRows 행만 fullOut 에 복사 (workgroupsY*16 의 마지막 패딩 행은 무시).
+      const copyFloats = actualRows * width * 4;
+      fullOut.set(stripData.subarray(0, copyFloats), yStart * width * 4);
+    }
+  } catch (e) {
+    console.warn('[textureBakeGPU] strip dispatch failed:', e);
+    stripFailed = true;
+  }
 
   const oomErr = await device.popErrorScope();
   const valErr = await device.popErrorScope();
-  if (oomErr || valErr) {
-    console.warn(`[textureBakeGPU] GPU error detected → CPU fallback. validation=${valErr?.message ?? 'none'}, oom=${oomErr?.message ?? 'none'}`);
+  const cleanup = () => {
     [splatGpu, outGpu, paramsGpu, readBuf, tileOffsetsGpu, tileListGpu].forEach(b => { try { b.destroy(); } catch {} });
+  };
+  if (stripFailed || oomErr || valErr) {
+    console.warn(`[textureBakeGPU] GPU error → CPU fallback. validation=${valErr?.message ?? 'none'}, oom=${oomErr?.message ?? 'none'}`);
+    cleanup();
     return null;
   }
-
-  await readBuf.mapAsync(GPUMapMode.READ);
-  const result = new Float32Array(readBuf.getMappedRange().slice(0));
-  readBuf.unmap();
-
-  [splatGpu, outGpu, paramsGpu, readBuf, tileOffsetsGpu, tileListGpu].forEach(b => b.destroy());
-
-  return result;
+  cleanup();
+  return fullOut;
 }
 
 export const TILE_SIZE_EXPORT = TILE_SIZE;
