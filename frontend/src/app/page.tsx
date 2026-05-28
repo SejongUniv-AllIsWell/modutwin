@@ -41,23 +41,23 @@ const SECTIONS: SectionDef[] = [
     cards: [
       {
         numeral: 'i.',
-        title: '영상 업로드',
+        title: '영상 등록',
         body:
           '휴대폰이나 드론 영상 한 편을 올리면 서버가 프레임 추출 · SfM · 3DGS 학습을 ' +
-          '자동으로 진행합니다. 학습이 끝나는 즉시 아틀라스의 일부가 됩니다.',
+          '자동으로 진행합니다.',
       },
       {
         numeral: 'ii.',
-        title: '포인트 클라우드 제출',
+        title: '3DGS 에셋 등록',
         body:
           '이미 학습한 splat 이 있다면 .ply / .sog / .splat 파일을 직접 업로드하세요. ' +
           '지오태그만 붙이면 즉시 둘러볼 수 있습니다.',
       },
       {
         numeral: 'iii.',
-        title: '이미지 + SfM 기여',
+        title: '이미지 + SfM 등록',
         body:
-          '직접 찍은 사진과 COLMAP / OpenSfM 결과물을 가져오세요. 그 지점부터 재구성을 ' +
+          '직접 찍은 사진과 SfM 결과물을 가져오세요. 그 지점부터 재구성을 ' +
           '이어 받고, 결과 씬에 기여자를 함께 표기합니다.',
       },
     ],

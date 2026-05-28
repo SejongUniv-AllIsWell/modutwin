@@ -597,13 +597,7 @@ export default function FloorDetailPage() {
           Floor {manifest?.floor_number ?? floorNumber}
         </p>
 
-        <div
-          className="mt-4 text-[11px] font-semibold uppercase shrink-0"
-          style={{ color: 'var(--muted)', fontFamily: 'ui-monospace, Menlo, monospace', letterSpacing: 0 }}
-        >
-          Rooms ({moduleGroups.length})
-        </div>
-        <div className="mt-3 space-y-2 overflow-y-auto flex-1 min-h-0 pr-1">
+        <div className="mt-4 space-y-2 overflow-y-auto flex-1 min-h-0 pr-1">
           {moduleGroups.map(({ name: roomName, modules: mods, fromBasemap }) => {
             const expanded = expandedModuleNames.has(roomName);
             const anySelected = mods.some((m) => m.id === selectedModuleId);
@@ -874,9 +868,10 @@ export default function FloorDetailPage() {
                       floor_number: String(manifest.floor_number),
                       module_name: name,
                     });
-                    router.push(`/viewer?${qs.toString()}`);
+                    // 등록 방식 선택 페이지로 이동 (영상 / 3DGS 에셋 / 이미지+SfM).
+                    router.push(`/register?${qs.toString()}`);
                   } catch (err: any) {
-                    setAddModuleError(err?.message || '뷰어 이동에 실패했습니다.');
+                    setAddModuleError(err?.message || '등록 페이지 이동에 실패했습니다.');
                     setCreatingModule(false);
                   }
                 }}
@@ -943,7 +938,8 @@ export default function FloorDetailPage() {
                     floor_id: manifest.floor_id,
                     floor_number: String(manifest.floor_number),
                   });
-                  router.push(`/viewer?${qs.toString()}`);
+                  // 등록 방식 선택 페이지로 이동 (영상 / 3DGS 에셋 / 이미지+SfM).
+                  router.push(`/register?${qs.toString()}`);
                 }}
                 disabled={!user}
                 title={!user ? '로그인 후 등록 가능합니다' : undefined}

@@ -171,6 +171,7 @@ export interface Upload {
   has_alignment?: boolean;
   has_gsplat_ply?: boolean;
   is_basemap_source?: boolean;
+  is_basemap_upload?: boolean;
 }
 
 // ── Task ──

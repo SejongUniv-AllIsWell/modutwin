@@ -24,14 +24,23 @@ async def landing_stats(db: AsyncSession = Depends(get_db)):
 
     공개된(visible) 건물 / 등록된 모듈 / 모듈을 올린 distinct 사용자 수.
     """
+    # 정합 미완료(placeholder) 모듈은 통계에서 제외하기 위해, feed 와 동일하게
+    # SceneOutput 이 존재하는(실제 렌더 가능한) 모듈만 집계한다. ensure-registration-context
+    # 가 만든 is_visible=True placeholder Module 은 SceneOutput 이 없으므로 빠진다.
+    has_scene_output = exists().where(SceneOutput.module_id == Module.id)
     buildings = await db.scalar(
         select(func.count()).select_from(Building).where(Building.is_visible.is_(True))
     )
     modules = await db.scalar(
-        select(func.count()).select_from(Module).where(Module.is_visible.is_(True))
+        select(func.count())
+        .select_from(Module)
+        .where(Module.is_visible.is_(True))
+        .where(has_scene_output)
     )
     contributors = await db.scalar(
-        select(func.count(distinct(Module.user_id))).where(Module.is_visible.is_(True))
+        select(func.count(distinct(Module.user_id)))
+        .where(Module.is_visible.is_(True))
+        .where(has_scene_output)
     )
     return LandingStatsResponse(
         buildings=int(buildings or 0),

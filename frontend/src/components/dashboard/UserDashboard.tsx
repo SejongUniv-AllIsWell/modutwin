@@ -17,17 +17,21 @@ function isViewable(filename: string): boolean {
 
 // 파이프라인 진행 단계 라벨 — 업로드(MinIO) 상태가 아니라 사용자가 어디까지 진행했는지 표시.
 //   failed → 실패
+//   basemap → Basemap (관리자가 basemap 으로 등록 완료)
 //   has_alignment → 정합 완료 (정합 행렬 저장됨)
 //   has_doors_json → 문 꼭짓점 지정 (정합 진행 중)
 //   has_refined → 다듬기 완료
 //   completed (refined 없음) → 업로드 완료
 //   uploaded / processing → 그대로
+// basemap 목적 업로드(is_basemap_upload)는 모듈 업로드와 달리 문지정/정합 단계를 거치지 않으므로
+//   등록 전엔 '업로드 완료', 등록 후엔 'Basemap' 만 표시한다.
 type ProgressStage =
-  | 'failed' | 'aligned' | 'doors' | 'refined'
+  | 'failed' | 'basemap' | 'aligned' | 'doors' | 'refined'
   | 'uploaded_only' | 'uploaded' | 'processing';
 
 const STAGE_LABEL: Record<ProgressStage, string> = {
   failed:        '실패',
+  basemap:       'Basemap',
   aligned:       '정합 완료',
   doors:         '문 꼭짓점 지정',
   refined:       '다듬기 완료',
@@ -38,6 +42,7 @@ const STAGE_LABEL: Record<ProgressStage, string> = {
 
 const STAGE_COLOR: Record<ProgressStage, string> = {
   failed:        'text-red-400',
+  basemap:       'text-cyan-400',
   aligned:       'text-cyan-400',
   doors:         'text-purple-400',
   refined:       'text-cyan-300',
@@ -46,10 +51,15 @@ const STAGE_COLOR: Record<ProgressStage, string> = {
   processing:    'text-yellow-400',
 };
 
-function progressStage(u: { status: string; has_refined?: boolean; has_doors_json?: boolean; has_alignment?: boolean }): ProgressStage {
+function progressStage(u: { status: string; has_refined?: boolean; has_doors_json?: boolean; has_alignment?: boolean; is_basemap_upload?: boolean; is_basemap_source?: boolean }): ProgressStage {
   if (u.status === 'failed') return 'failed';
   if (u.status === 'processing') return 'processing';
   if (u.status === 'uploaded') return 'uploaded';
+  // basemap 목적 업로드: 문지정/정합 단계를 거치지 않는다.
+  if (u.is_basemap_upload) {
+    // 관리자가 basemap 으로 등록 완료 → 'Basemap', 등록 전 → '업로드 완료'.
+    return u.is_basemap_source ? 'basemap' : 'uploaded_only';
+  }
   // status === 'completed': 다듬기/정합 진행 단계로 더 세분화.
   if (u.has_alignment) return 'aligned';
   if (u.has_doors_json) return 'doors';
@@ -206,7 +216,9 @@ export default function UserDashboard({ showHeader = true }: Props) {
                   const colmapFailed = isColmap && u.status === 'failed';
                   const filenameClickable = isViewable(u.original_filename) || colmapDone;
                   const isBasemap = !!u.is_basemap_source;
-                  const canAlign = !isColmap && (!!u.has_refined || !!u.has_doors_json);
+                  const isBasemapUpload = !!u.is_basemap_upload;
+                  // basemap 목적 업로드는 정합 대상이 아니므로 어떤 경우에도 '정합하기' 노출 안 함.
+                  const canAlign = !isColmap && !isBasemapUpload && (!!u.has_refined || !!u.has_doors_json);
                   return (
                     <tr key={u.id} className="border-b border-[var(--rule)]/50">
                       <td className="py-3 pr-4">

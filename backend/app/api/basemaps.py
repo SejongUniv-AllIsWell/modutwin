@@ -782,13 +782,54 @@ async def delete_basemap_metadata_module(
     return await _metadata_response_for_building(db, basemap_id, building)
 
 
+async def _activate_basemap_inplace(db: AsyncSession, new_basemap: Basemap) -> None:
+    """승인된 basemap 을 활성화한다 (commit 은 호출자가 수행).
+
+    - 같은 층의 기존 활성 basemap 을 superseded 로 내림
+    - new_basemap.is_active = True
+    - 해당 floor.overview_dirty = True
+    - 해당 floor 및 부모 building 의 is_visible = True (explore/viewer 자동 노출)
+
+    활성 basemap 은 Basemap row 의 minio_path 를 직접 조회하므로 공용 고정 key
+    로 복사하지 않아도 현재 조회 경로와 충돌하지 않는다.
+    """
+    # 층 정보 조회
+    floor_result = await db.execute(select(Floor).where(Floor.id == new_basemap.floor_id))
+    floor = floor_result.scalar_one()
+
+    # 기존 활성 basemap 비활성화
+    result = await db.execute(
+        select(Basemap).where(
+            Basemap.floor_id == new_basemap.floor_id,
+            Basemap.is_active == True,
+            Basemap.id != new_basemap.id,
+        )
+    )
+    old_basemap = result.scalar_one_or_none()
+    if old_basemap:
+        old_basemap.is_active = False
+        old_basemap.status = BasemapStatus.superseded
+
+    # 새 basemap 활성화
+    new_basemap.is_active = True
+    floor.overview_dirty = True
+
+    # 층 및 부모 건물 자동 표시 (별도 VisibilityManager 조작 없이 노출)
+    floor.is_visible = True
+    await db.execute(
+        sa_update(Building)
+        .where(Building.id == floor.building_id)
+        .values(is_visible=True)
+    )
+
+
 @router.put("/{basemap_id}/approve")
 async def approve_basemap(
     basemap_id: UUID,
     admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """basemap 승인 (관리자)"""
+    """basemap 승인 (관리자) — 승인 즉시 활성화(등록)까지 수행."""
     result = await db.execute(select(Basemap).where(Basemap.id == basemap_id))
     basemap = result.scalar_one_or_none()
 
@@ -801,9 +842,16 @@ async def approve_basemap(
     basemap.status = BasemapStatus.approved
     basemap.approved_by = admin.id
     basemap.approved_at = datetime.now(timezone.utc)
+
+    # 승인 = 등록: 곧바로 활성화하고 층/건물을 자동 표시한다.
+    await _activate_basemap_inplace(db, basemap)
+
     await db.commit()
 
-    return {"message": "승인 완료", "basemap_id": str(basemap.id)}
+    return {
+        "message": "승인 및 활성화 완료",
+        "basemap_id": str(basemap.id),
+    }
 
 
 @router.put("/{basemap_id}/reject")
@@ -853,38 +901,21 @@ async def activate_basemap(
     admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """basemap 활성화 — 기존 모듈 재정렬 태스크 발행 (관리자)"""
+    """basemap 활성화 (관리자).
+
+    승인 시 이미 활성화까지 처리되므로 일반적으로는 호출되지 않지만,
+    하위호환을 위해 엔드포인트를 유지한다. 이미 활성인 경우 멱등하게 동작한다.
+    """
     result = await db.execute(select(Basemap).where(Basemap.id == basemap_id))
     new_basemap = result.scalar_one_or_none()
 
     if new_basemap is None:
         raise HTTPException(status_code=404, detail="Basemap을 찾을 수 없습니다.")
 
-    if new_basemap.status != BasemapStatus.approved:
+    if new_basemap.status not in (BasemapStatus.approved,):
         raise HTTPException(status_code=400, detail="승인된 basemap만 활성화할 수 있습니다.")
 
-    # 층 정보 조회
-    floor_result = await db.execute(select(Floor).where(Floor.id == new_basemap.floor_id))
-    floor = floor_result.scalar_one()
-
-    # 기존 활성 basemap 비활성화
-    result = await db.execute(
-        select(Basemap).where(
-            Basemap.floor_id == new_basemap.floor_id,
-            Basemap.is_active == True,
-        )
-    )
-    old_basemap = result.scalar_one_or_none()
-    if old_basemap:
-        old_basemap.is_active = False
-        old_basemap.status = BasemapStatus.superseded
-
-    # 새 basemap 활성화
-    new_basemap.is_active = True
-    floor.overview_dirty = True
-
-    # 활성 basemap 은 Basemap row 의 minio_path 를 직접 조회한다.
-    # 공용 고정 key 로 복사하지 않아도 현재 조회 경로와 충돌하지 않는다.
+    await _activate_basemap_inplace(db, new_basemap)
 
     await db.commit()
 

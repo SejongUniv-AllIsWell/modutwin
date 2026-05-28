@@ -215,9 +215,10 @@ export default function BuildingOverviewPage() {
       setRegisterTarget(null);
       setPickerRoomSuffix(1);
       setRegisterNameError(null);
-      router.push(`/viewer?${qs.toString()}`);
+      // 등록 방식 선택 페이지로 이동 (영상 / 3DGS 에셋 / 이미지+SfM).
+      router.push(`/register?${qs.toString()}`);
     } catch (err: any) {
-      setRegisterNameError(err?.message || '뷰어 이동에 실패했습니다.');
+      setRegisterNameError(err?.message || '등록 페이지 이동에 실패했습니다.');
       setRegisterBusy(false);
     }
   };
@@ -317,11 +318,7 @@ export default function BuildingOverviewPage() {
           </h1>
         </div>
 
-        <div className="mt-4 text-[11px] font-semibold" style={{ color: 'var(--muted)', letterSpacing: 0 }}>
-          FLOORS ({floors.length})
-        </div>
-
-        <div className="mt-3 flex-1 overflow-y-auto space-y-2">
+        <div className="mt-4 flex-1 overflow-y-auto space-y-2">
           {floors.map((floor) => {
             const isPendingFloor = floor.floor_id.startsWith('pending-');
             const hasBasemapWarning = !floor.has_active_basemap;

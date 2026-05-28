@@ -166,6 +166,57 @@ export default function WallModal({
   // pts 가 바뀌면 (모달 첫 마운트) viewport 초기화.
   useEffect(() => { setViewport(null); }, [dataBounds]);
   const viewBounds = viewport ?? dataBounds;
+  // viewBounds 의 최신값을 ref 로도 보관 — 패닝 시작 시점의 스냅샷을 안전하게 읽기 위함.
+  const viewBoundsRef = useRef(viewBounds);
+  viewBoundsRef.current = viewBounds;
+
+  // 패닝 — 우클릭은 이미 (parallel 선분이동 / draw undo) 점유되어 있어 충돌 회피.
+  // 기본 패닝 수단: 중간버튼(휠클릭) 드래그, + 스페이스바 누른 상태 좌드래그.
+  const spaceHeldRef = useRef(false);
+  useEffect(() => {
+    const onKeyDown = (ev: KeyboardEvent) => {
+      if (ev.code === 'Space') {
+        spaceHeldRef.current = true;
+        // 캔버스에 포커스가 없어도 스페이스 스크롤 등 기본동작 방지.
+        const tag = (ev.target as HTMLElement | null)?.tagName;
+        if (tag !== 'INPUT' && tag !== 'TEXTAREA') ev.preventDefault();
+      }
+    };
+    const onKeyUp = (ev: KeyboardEvent) => {
+      if (ev.code === 'Space') spaceHeldRef.current = false;
+    };
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
+    };
+  }, []);
+
+  // 패닝 시작 — 시작 클라이언트 px + 시작 viewBounds 스냅샷을 잡고 document 리스너로 추적.
+  // px 이동량을 데이터 좌표 스케일로 환산해 setViewport 로 평행 이동 (드래그한 만큼 그림이 따라옴).
+  const startPan = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    const canvas = e.currentTarget;
+    const rect = canvas.getBoundingClientRect();
+    const rectW = rect.width, rectH = rect.height;
+    const startVp = { ...viewBoundsRef.current };
+    const startClientX = e.clientX, startClientY = e.clientY;
+    const plotW = CW - PAD * 2, plotH = CH - PAD * 2;
+    const onMove = (ev: MouseEvent) => {
+      const dxData = ((ev.clientX - startClientX) * (CW / rectW)) * (startVp.mxR - startVp.mnR) / plotW;
+      const dzData = ((ev.clientY - startClientY) * (CH / rectH)) * (startVp.mxT - startVp.mnT) / plotH;
+      setViewport({
+        mnR: startVp.mnR - dxData, mxR: startVp.mxR - dxData,
+        mnT: startVp.mnT - dzData, mxT: startVp.mxT - dzData,
+      });
+    };
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  }, []);
 
   const [pathPoints, setPathPoints] = useState<PathPoint[]>([]);
   const [pathEdges, setPathEdges] = useState<PathEdge[]>([]);
@@ -414,6 +465,13 @@ export default function WallModal({
   // 좌클릭 — 기존 점 hit 면 선택/드래그, 빈 공간이면 새 점 추가 + 직전 선택점과 edge.
   // 점 드래그는 document mousemove/mouseup 으로 추적 — 캔버스 밖으로 나가도 끊기지 않음.
   const handleMouseDown = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    // 패닝 — 중간버튼(휠클릭) 드래그, 또는 스페이스바 누른 상태 좌드래그.
+    // 우클릭은 기존 동작(parallel 선분이동 / draw undo)으로 점유되어 충돌 회피 위해 좌/중간버튼만 사용.
+    if (e.button === 1 || (e.button === 0 && spaceHeldRef.current)) {
+      e.preventDefault();
+      startPan(e);
+      return;
+    }
     // 우클릭 — 평행화 모드에서 선분 수직(normal) 평행이동 드래그.
     // (draw 모드 우클릭은 onContextMenu 의 undo 가 처리하므로 여기선 무시.)
     if (e.button === 2) {
@@ -535,7 +593,7 @@ export default function WallModal({
     const edge = fromIdx >= 0 ? addPathEdge(fromIdx, nextIdx) : null;
     pathActionsRef.current.push({ type: 'point', pointIdx: nextIdx, edge, prevSelected: selected });
     selectPathPoint(nextIdx);
-  }, [addPathEdge, findPathPointHit, mouseToWorld, nativeToWorld, selectPathPoint]);
+  }, [addPathEdge, findPathPointHit, mouseToWorld, nativeToWorld, selectPathPoint, startPan]);
 
   // hover 표시만 — 드래그는 document listener 가 담당.
   const handleMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -835,13 +893,13 @@ export default function WallModal({
             <>
               ① 좌클릭으로 <span style={{color:'#22d3ee', fontWeight:'bold'}}>기준 선분</span> 선택 → ② <span style={{color:'#f59e0b', fontWeight:'bold'}}>대상 선분</span>들을 순서대로 클릭으로 평행화.
               <br />
-              우클릭 드래그로 선분 수직 평행이동 (되돌리기는 모드 해제 후 우클릭).
+              우클릭 드래그로 선분 수직 평행이동 (되돌리기는 모드 해제 후 우클릭). 휠클릭(또는 스페이스+좌)드래그로 화면 이동.
             </>
           ) : (
             <>
               좌클릭으로 점과 선을 추가, 기존 점은 드래그로 이동. 점을 클릭하면 직전에 선택한 점과 연결되고, 우클릭은 마지막 조작을 되돌립니다.
               <br />
-              모든 점이 닫힌 cycle 로 연결되어야 확인이 활성화됩니다. 마우스 휠로 줌, 더블클릭으로 초기화.
+              모든 점이 닫힌 cycle 로 연결되어야 확인이 활성화됩니다. 마우스 휠로 줌, 휠클릭(또는 스페이스+좌)드래그로 화면 이동, 더블클릭으로 초기화.
             </>
           )}
         </div>

@@ -313,11 +313,14 @@ def _upload_to_response(
     has_scene_output: bool = False,
     is_basemap_source: bool = False,
     has_alignment: bool = False,
+    is_basemap_upload: bool = False,
 ) -> UploadResponse:
     """Upload ORM → UploadResponse (SAM3 파이프라인 파생 플래그 포함).
 
     has_refined: SAM3 정식 경로 (refined_ply_path) 또는 다듬기 저장으로 생성된 SceneOutput 중 하나라도 있으면 true.
     is_basemap_source: 이 업로드가 어떤 basemap의 원본 PLY 인지 — 삭제 비활성화 판단용.
+    is_basemap_upload: basemap 목적으로 올라온 업로드인지 (register-local-basemap 가 생성하는 '__basemap__' 모듈 소속).
+        등록 전이라도 모듈 업로드와 구분 가능 — 대시보드 상태/정합 버튼 분기용.
     """
     return UploadResponse(
         id=upload.id,
@@ -334,6 +337,7 @@ def _upload_to_response(
         has_alignment=has_alignment,
         has_gsplat_ply=bool(upload.gsplat_ply_path),
         is_basemap_source=is_basemap_source,
+        is_basemap_upload=is_basemap_upload,
     )
 
 
@@ -373,12 +377,19 @@ async def list_uploads(
         .where(Module.id.in_(module_ids), Module.alignment_transform.is_not(None))
     )
     aligned_module_ids = {row[0] for row in aligned_module_rows.all()}
+    # basemap 목적 업로드 — register-local-basemap 가 만드는 '__basemap__' 모듈 소속.
+    basemap_module_rows = await db.execute(
+        select(Module.id)
+        .where(Module.id.in_(module_ids), Module.name == "__basemap__")
+    )
+    basemap_module_ids = {row[0] for row in basemap_module_rows.all()}
     return [
         _upload_to_response(
             u,
             has_scene_output=(u.id in has_scene),
             is_basemap_source=(u.id in basemap_source_ids),
             has_alignment=(u.module_id in aligned_module_ids),
+            is_basemap_upload=(u.module_id in basemap_module_ids),
         )
         for u in uploads
     ]
@@ -414,14 +425,17 @@ async def get_upload(
     )
     is_basemap_source = basemap_check.scalar_one_or_none() is not None
     module_check = await db.execute(
-        select(Module.alignment_transform).where(Module.id == upload.module_id).limit(1)
+        select(Module.alignment_transform, Module.name).where(Module.id == upload.module_id).limit(1)
     )
-    has_alignment = module_check.scalar_one_or_none() is not None
+    module_row = module_check.first()
+    has_alignment = module_row is not None and module_row[0] is not None
+    is_basemap_upload = module_row is not None and module_row[1] == "__basemap__"
     return _upload_to_response(
         upload,
         has_scene_output=has_scene,
         is_basemap_source=is_basemap_source,
         has_alignment=has_alignment,
+        is_basemap_upload=is_basemap_upload,
     )
 
 
@@ -646,6 +660,15 @@ class RegisterLocalBasemapRequest(BaseModel):
     content_type: str = "application/octet-stream"
 
 
+class EnsureBasemapModuleRequest(BaseModel):
+    building_id: UUID
+    floor_id: UUID
+
+
+class EnsureBasemapModuleResponse(BaseModel):
+    module_id: UUID
+
+
 @router.post("/register-local", response_model=RegisterLocalResponse)
 async def register_local_upload(
     body: RegisterLocalRequest,
@@ -785,6 +808,53 @@ async def register_local_basemap_upload(
     await db.commit()
 
     return RegisterLocalResponse(upload_id=upload.id, minio_path=placeholder_key)
+
+
+@router.post("/ensure-basemap-module", response_model=EnsureBasemapModuleResponse)
+async def ensure_basemap_module(
+    body: EnsureBasemapModuleRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """basemap 목적 COLMAP(영상/사진묶음) 업로드용 — 해당 층의 숨김 '__basemap__'
+    모듈을 찾거나 생성해 module_id 를 반환한다.
+
+    PLY basemap 등록은 register-local-basemap 이 placeholder 업로드까지 만들지만,
+    COLMAP 업로드는 /uploads/init 가 실제 업로드를 만들므로 여기서는 모듈만 확보한다.
+    is_visible=False 규약으로 일반 모듈 목록/통계에 노출되지 않게 한다.
+    """
+    floor_result = await db.execute(
+        select(Floor).where(Floor.id == body.floor_id, Floor.building_id == body.building_id)
+    )
+    floor = floor_result.scalar_one_or_none()
+    if floor is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="building_id / floor_id 조합이 유효하지 않습니다.",
+        )
+
+    module_result = await db.execute(
+        select(Module).where(
+            Module.floor_id == body.floor_id,
+            Module.user_id == user.id,
+            Module.name == "__basemap__",
+        )
+    )
+    module = module_result.scalar_one_or_none()
+    if module is None:
+        module = Module(
+            floor_id=body.floor_id,
+            user_id=user.id,
+            name="__basemap__",
+            is_visible=False,
+        )
+        db.add(module)
+        await db.flush()
+    elif module.is_visible:
+        module.is_visible = False
+    await db.commit()
+
+    return EnsureBasemapModuleResponse(module_id=module.id)
 
 
 # refined PLY: 클라이언트가 /refine/refined-upload-url 로 단일 PUT 업로드 한 후,

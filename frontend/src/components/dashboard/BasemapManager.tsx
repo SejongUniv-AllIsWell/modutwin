@@ -46,13 +46,18 @@ export default function BasemapManager() {
     setTimeout(() => setMessage(null), 4000);
   };
 
-  const handleAction = async (id: string, action: 'approve' | 'reject' | 'activate') => {
+  const ACTION_LABEL: Record<'approve' | 'reject', string> = {
+    approve: '승인 및 등록',
+    reject: '거부',
+  };
+
+  const handleAction = async (id: string, action: 'approve' | 'reject') => {
     try {
       await api.put(`/admin/basemaps/${id}/${action}`);
-      showMessage(`${action} 완료`, 'ok');
+      showMessage(`${ACTION_LABEL[action]} 완료`, 'ok');
       loadAll();
     } catch (e: any) {
-      showMessage(e.message || `${action} 실패`, 'err');
+      showMessage(e.message || `${ACTION_LABEL[action]} 실패`, 'err');
     }
   };
 
@@ -106,12 +111,9 @@ export default function BasemapManager() {
                 <div className="flex gap-2 items-center shrink-0">
                   {bm.status === 'pending' && (
                     <>
-                      <Button size="sm" onClick={() => handleAction(bm.id, 'approve')}>승인</Button>
+                      <Button size="sm" onClick={() => handleAction(bm.id, 'approve')}>승인 및 등록</Button>
                       <Button size="sm" variant="danger" onClick={() => handleAction(bm.id, 'reject')}>거부</Button>
                     </>
-                  )}
-                  {bm.status === 'approved' && !bm.is_active && (
-                    <Button size="sm" onClick={() => handleAction(bm.id, 'activate')}>활성화</Button>
                   )}
                   <button
                     onClick={() => handleUnregister(bm.id)}
