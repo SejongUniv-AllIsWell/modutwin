@@ -285,6 +285,34 @@ export default function VisibilityManager() {
     }
   };
 
+  // 층 대표 이미지 삭제 — overview_image_path 있을 때만 노출되는 버튼이 호출. idempotent (백엔드는 없어도 200).
+  const deleteFloorOverviewImage = async (b: BuildingWithFloors, f: FloorWithModules) => {
+    if (!f.overview_image_path) return;
+    const ok = window.confirm(`${b.name} ${formatFloor(f.floor_number)} 의 대표 이미지를 삭제하시겠습니까?`);
+    if (!ok) return;
+    const key = `overview:${f.id}`;
+    setBusyKey(key);
+    try {
+      await api.delete(`/admin/floors/${f.id}/overview-image`);
+      setBuildings((prev) =>
+        prev.map((x) => {
+          if (x.id !== b.id) return x;
+          return {
+            ...x,
+            floors: x.floors.map((fl) =>
+              fl.id === f.id ? { ...fl, overview_image_path: null } : fl,
+            ),
+          };
+        }),
+      );
+      showMessage('대표 이미지 삭제 완료', 'ok');
+    } catch (e: any) {
+      showMessage(e.message || '대표 이미지 삭제 실패', 'err');
+    } finally {
+      setBusyKey(null);
+    }
+  };
+
   const toggleFloorVisibility = async (b: BuildingWithFloors, f: FloorWithModules) => {
     const key = `floor:${f.id}`;
     setBusyKey(key);
@@ -567,6 +595,18 @@ export default function VisibilityManager() {
                               </button>
                               <div className="flex items-center gap-2">
                                 {toggleBtn(f.is_visible, floorBusy, () => toggleFloorVisibility(b, f))}
+                                {f.overview_image_path && (
+                                  <button
+                                    type="button"
+                                    onClick={() => deleteFloorOverviewImage(b, f)}
+                                    disabled={busyKey === `overview:${f.id}`}
+                                    title="대표 이미지 삭제"
+                                    aria-label={`${b.name} ${formatFloor(f.floor_number)} 대표 이미지 삭제`}
+                                    className="text-xs px-2 py-1 rounded text-[var(--ink-2)] hover:text-[var(--ink)] hover:bg-amber-600/20 border border-[var(--rule)] disabled:opacity-50 shrink-0"
+                                  >
+                                    이미지 삭제
+                                  </button>
+                                )}
                                 {deleteBtn({ scope: 'floor', id: f.id, label: `${b.name} ${formatFloor(f.floor_number)}`, noun: '층' })}
                               </div>
                             </div>

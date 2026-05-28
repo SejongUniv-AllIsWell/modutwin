@@ -49,11 +49,25 @@ export function useRefinedMeshLoader(
     uvs: number[][];
     normalInward: [number, number, number];
   }) => void,
+  /**
+   * 모든 wallMesh 엔티티가 생성된 직후 1회 호출. 호출자가 ceiling 엔티티/corners 등을
+   * 잡아 천장제거 같은 후속 토글 기능에 사용.
+   *
+   * 호출 시점: mesh.json fetch + 모든 surface 의 createWallMeshFromPersisted 완료 후.
+   * 도어 mesh/splat 은 별도 비동기 — 이 콜백에는 포함되지 않음 (천장 제거 대상 아님).
+   */
+  onLoaded?: (info: {
+    surfaces: Array<{ surfaceId: string; entity: any; corners: number[][] }>;
+  }) => void,
 ): void {
   const entitiesRef = useRef<any[]>([]);
   const doorSplatIdsRef = useRef<string[]>([]);
   const labelOverlayRef = useRef<HTMLDivElement | null>(null);
   const labelRafRef = useRef<number>(0);
+  // onLoaded 콜백을 ref 로 보관 — 호출자가 인라인 함수로 넘겨도 effect 가 매 렌더 재실행되지 않게.
+  // 토글 같은 부모 state 변경 → 콜백 identity 변경 → mesh 전체 destroy+refetch 회귀를 방지.
+  const onLoadedRef = useRef(onLoaded);
+  useEffect(() => { onLoadedRef.current = onLoaded; }, [onLoaded]);
   const addDoorSplat = additionalForDoorSplats?.add;
   const removeDoorSplat = additionalForDoorSplats?.remove;
   const getDoorSplatEntity = additionalForDoorSplats?.getEntity;
@@ -239,6 +253,7 @@ export function useRefinedMeshLoader(
           );
           if (cancelled) return;
 
+          const loadedSurfaces: Array<{ surfaceId: string; entity: any; corners: number[][] }> = [];
           for (let i = 0; i < surfaces.length; i++) {
             const surface = surfaces[i];
             const img = images[i];
@@ -271,6 +286,13 @@ export function useRefinedMeshLoader(
             // basemap 자산 — enterAlignmentMode 가 module-side 와 구분해서 reparent 안 하도록 tag.
             try { ent.tags?.add?.('basemap'); } catch {}
             entitiesRef.current.push(ent);
+            loadedSurfaces.push({ surfaceId: surface.surfaceId, entity: ent, corners: surface.corners });
+          }
+          // 모든 wallMesh 엔티티 생성 후 콜백 — 호출자가 visual ceiling entity / corners 를 잡아 마스킹 토글에 사용.
+          if (!cancelled && loadedSurfaces.length > 0) {
+            try { onLoadedRef.current?.({ surfaces: loadedSurfaces }); } catch (e) {
+              console.warn('[useRefinedMeshLoader] onLoaded callback threw:', e);
+            }
           }
         }
         // 도어 호수 라벨 — 말풍선 HTML overlay. 도어 corners 는 A'+Y 프레임이므로
@@ -359,6 +381,8 @@ export function useRefinedMeshLoader(
     })();
 
     return () => { cancelled = true; cleanup(); };
+    // onLoaded 는 ref 로 보관 (위 onLoadedRef) 해 deps 에 넣지 않는다.
+    // 호출자가 인라인 함수로 넘겨도 mesh 전체 재로드 회귀 없음.
   }, [
     coreRef,
     uploadId,

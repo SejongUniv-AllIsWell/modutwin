@@ -1,7 +1,7 @@
 import re
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from pydantic import BaseModel, field_validator
 from sqlalchemy import and_, delete as sa_delete, exists, func, or_, select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -86,6 +86,8 @@ class FloorResponse(BaseModel):
     floor_number: int
     is_confirmed: bool
     is_visible: bool
+    # 대시보드 VisibilityManager 에서 "대표 이미지 삭제" 버튼 노출 조건. None 이면 등록된 이미지 없음.
+    overview_image_path: str | None = None
     created_at: datetime
 
     class Config:
@@ -259,6 +261,15 @@ class RegenerateOverviewResponse(BaseModel):
     floor_id: UUID
     overview_dirty: bool
     message: str
+
+
+class UploadFloorOverviewResponse(BaseModel):
+    floor_id: UUID
+    overview_image_path: str
+    overview_meta_path: str | None
+    overview_version: datetime
+    topdown_url: str | None
+    meta_url: str | None
 
 
 class AdminDeleteResponse(BaseModel):
@@ -1246,6 +1257,109 @@ async def regenerate_floor_overview(
         floor_id=floor.id,
         overview_dirty=floor.overview_dirty,
         message="층 overview 재생성이 표시되었습니다. 백그라운드 렌더러 연동은 추후 연결됩니다.",
+    )
+
+
+@router.post("/admin/floors/{floor_id}/overview-image", response_model=UploadFloorOverviewResponse)
+async def upload_floor_overview_image(
+    floor_id: UUID,
+    image: UploadFile = File(..., description="층 대표 이미지 PNG (천장 제거 + ortho top-down 캡처 결과)"),
+    meta: str | None = Form(None, description="JSON 문자열 — 카메라/bbox 메타. 미래 자동 재현용. 없어도 됨"),
+    _: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """관리자가 천장 제거 상태의 ortho top-down 캡처를 층 대표 이미지로 저장.
+
+    MinIO 키 컨벤션: `buildings/{building_id}/{floor_id}/overview/{timestamp}.png` — floor 정리 시
+    `buildings/{building_id}/{floor_id}` prefix 기반 cleanup 에 자동 포함됨 (storage_paths.py 규칙).
+
+    동시에 `overview_version` 도 `datetime.now(utc)` 로 갱신해 카드/캐시 무효화 신호.
+    `overview_dirty=False` 로 직접 캡처 완료 상태 표시.
+    """
+    result = await db.execute(select(Floor).where(Floor.id == floor_id))
+    floor = result.scalar_one_or_none()
+    if floor is None:
+        raise HTTPException(status_code=404, detail="층을 찾을 수 없습니다.")
+
+    # 이미지 검증 — content-type + size 가벼운 게이트.
+    if image.content_type not in ("image/png", "image/jpeg", "image/webp"):
+        raise HTTPException(status_code=400, detail="지원하지 않는 이미지 형식 (png/jpeg/webp).")
+    image_bytes = await image.read()
+    if len(image_bytes) == 0:
+        raise HTTPException(status_code=400, detail="빈 이미지 파일입니다.")
+    if len(image_bytes) > 20 * 1024 * 1024:  # 20MB hard cap — 4K PNG 도 보통 수 MB 안쪽.
+        raise HTTPException(status_code=413, detail="이미지가 20MB 한도를 초과합니다.")
+
+    now = datetime.now(timezone.utc)
+    ts = now.strftime("%Y%m%dT%H%M%S")
+    ext = "png" if image.content_type == "image/png" else ("jpg" if image.content_type == "image/jpeg" else "webp")
+    image_key = f"buildings/{floor.building_id}/{floor.id}/overview/{ts}.{ext}"
+    meta_key: str | None = None
+
+    minio = get_minio_service()
+    minio.put_object_bytes(image_key, image_bytes, image.content_type)
+
+    # 메타 JSON 도 함께 저장 — 카메라/bbox 정보로 나중에 자동 재현 가능 (옵션 B 로 마이그레이션 시 활용).
+    if meta:
+        meta_key = f"buildings/{floor.building_id}/{floor.id}/overview/{ts}.meta.json"
+        minio.put_object_bytes(meta_key, meta.encode("utf-8"), "application/json")
+
+    floor.overview_image_path = image_key
+    floor.overview_meta_path = meta_key
+    floor.overview_version = now
+    floor.overview_dirty = False
+    await db.commit()
+
+    return UploadFloorOverviewResponse(
+        floor_id=floor.id,
+        overview_image_path=image_key,
+        overview_meta_path=meta_key,
+        overview_version=now,
+        topdown_url=safe_presigned_download_url(minio, image_key),
+        meta_url=safe_presigned_download_url(minio, meta_key) if meta_key else None,
+    )
+
+
+@router.delete("/admin/floors/{floor_id}/overview-image", response_model=RegenerateOverviewResponse)
+async def delete_floor_overview_image(
+    floor_id: UUID,
+    _: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """관리자가 층 대표 이미지를 삭제. MinIO 객체 + DB 필드 정리.
+
+    동작:
+      1. floor.overview_image_path / overview_meta_path 에 등록된 MinIO 객체 삭제 (실패해도 진행)
+      2. DB 필드 모두 None, overview_dirty=True (다시 미캡처 상태로 복귀), overview_version=None
+      3. 카드는 그 다음 floor-overview 응답에서 topdown_url=null 받아 회색 그라데이션으로 돌아감
+
+    이미지가 원래 없던 floor 에 호출해도 200 OK (idempotent). MinIO 삭제 실패는 무시 — DB 정리가 핵심.
+    """
+    result = await db.execute(select(Floor).where(Floor.id == floor_id))
+    floor = result.scalar_one_or_none()
+    if floor is None:
+        raise HTTPException(status_code=404, detail="층을 찾을 수 없습니다.")
+
+    minio = get_minio_service()
+    if floor.overview_image_path:
+        try: minio.delete_object(floor.overview_image_path)
+        except Exception:
+            pass
+    if floor.overview_meta_path:
+        try: minio.delete_object(floor.overview_meta_path)
+        except Exception:
+            pass
+
+    floor.overview_image_path = None
+    floor.overview_meta_path = None
+    floor.overview_version = None
+    floor.overview_dirty = True
+    await db.commit()
+
+    return RegenerateOverviewResponse(
+        floor_id=floor.id,
+        overview_dirty=True,
+        message="층 대표 이미지를 삭제했습니다.",
     )
 
 

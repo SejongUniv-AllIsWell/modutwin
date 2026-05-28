@@ -1,12 +1,13 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import { api } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
 import type { FloorDetailManifest, FloorDetailModuleEntry } from '@/types';
 import SplatViewerCore, { type SplatViewerCoreRef } from '@/components/viewer/SplatViewerCore';
 import { useAdditionalGsplats } from '@/components/viewer/tools/useAdditionalGsplats';
+import { useCeilingRemoval, type CeilingMaskRecord } from '@/components/viewer/tools/useCeilingRemoval';
 import { useRefinedMeshLoader } from '@/components/viewer/tools/useRefinedMeshLoader';
 import { useToast } from '@/components/ui/Toast';
 import RoomWheelPicker, { roomNumberLabel } from '@/components/ui/RoomWheelPicker';
@@ -22,9 +23,9 @@ type RoomModuleGroup = {
   modules: FloorDetailModuleEntry[];
   fromBasemap: boolean;
 };
-type ModuleOverlayRecord = {
+type ModuleOverlayRecord = CeilingMaskRecord & {
   group: any | null;
-  splatLayerIds: string[];
+  splatLayerIds: string[];               // 전체 splat layer (cleanup 용 — 메인 + 도어)
   meshEntities: any[];
   cancelled: boolean;
 };
@@ -178,21 +179,80 @@ function delay(ms: number): Promise<void> {
 function FloorCompositeViewer({
   primaryUrl,
   basemapSourceUploadId,
+  primarySourceUploadId,
+  primaryIsModule,
   moduleOverlays,
+  ceilingRemoved,
+  onCoreReady,
 }: {
   primaryUrl: string;
   basemapSourceUploadId: string | null;
+  primarySourceUploadId: string | null;   // 천장제거: primary 자산의 mesh.json fetch 대상
+  primaryIsModule: boolean;               // 베이스맵 없이 모듈이 primary 인 경우
   moduleOverlays: FloorDetailModuleEntry[];
+  ceilingRemoved: boolean;
+  /**
+   * coreRef 가 mount 되면 부모에 전달. 부모(FloorPage)가 snapshotTopdown 같은 imperative API 를
+   * 호출할 수 있도록. unmount 시 null 로 한 번 더 호출.
+   */
+  onCoreReady?: (core: SplatViewerCoreRef | null) => void;
 }) {
   const coreRef = useRef<SplatViewerCoreRef>(null);
   const additional = useAdditionalGsplats(coreRef);
-  const { add, getEntity, remove } = additional;
+  const { add, getEntity, remove, applyCeilingMask } = additional;
   const overlayRecordsRef = useRef<Map<string, ModuleOverlayRecord>>(new Map());
+  const {
+    applyModuleCeilingState,
+    clearPrimaryCeiling,
+    handlePrimarySplatLoaded,
+    registerPrimaryFromSurfaces,
+  } = useCeilingRemoval<ModuleOverlayRecord>({
+    coreRef,
+    ceilingRemoved,
+    overlayRecordsRef,
+    applyAdditionalCeilingMask: applyCeilingMask,
+  });
+
+  useEffect(() => {
+    clearPrimaryCeiling();
+  }, [clearPrimaryCeiling, primaryUrl, primarySourceUploadId, basemapSourceUploadId, primaryIsModule]);
 
   // 베이스맵의 wall mesh + 텍스처(천장/바닥/벽) + 도어 splat 까지 같이 로드.
   // 4번째 인자 (additional) 가 있어야 도어 splat 도 씬에 add 됨.
   // 층 overview 는 보기 전용이므로 CPU ImageData 복사 없이 로드해 대형 텍스처 메모리 사용을 줄인다.
-  useRefinedMeshLoader(coreRef, basemapSourceUploadId ?? undefined, !!basemapSourceUploadId, additional, null, false);
+  // onLoaded: primary 자산이 베이스맵일 때 visual ceiling entity + Y 를 잡아둠. primary 가 모듈이면
+  //   별도의 useRefinedMeshLoader 호출 (아래) 이 채움.
+  useRefinedMeshLoader(
+    coreRef,
+    basemapSourceUploadId ?? undefined,
+    !!basemapSourceUploadId,
+    additional,
+    null,
+    false,
+    undefined,
+    !primaryIsModule
+      ? ({ surfaces }) => {
+          registerPrimaryFromSurfaces(surfaces);
+        }
+      : undefined,
+  );
+
+  // primary 가 모듈인 경우 — 그 모듈의 mesh.json 을 별도로 로드해 visual ceiling entity / Y 를 잡음.
+  // additionalForDoorSplats / onlyDoorUnitName 둘 다 null/undefined — 도어 splat 은 별도 흐름이 처리.
+  useRefinedMeshLoader(
+    coreRef,
+    primaryIsModule ? (primarySourceUploadId ?? undefined) : undefined,
+    primaryIsModule && !!primarySourceUploadId,
+    undefined,
+    null,
+    false,
+    undefined,
+    primaryIsModule
+      ? ({ surfaces }) => {
+          registerPrimaryFromSurfaces(surfaces);
+        }
+      : undefined,
+  );
 
   useEffect(() => {
     const cleanupRecord = (record: ModuleOverlayRecord) => {
@@ -201,10 +261,13 @@ function FloorCompositeViewer({
         try { remove(layerId); } catch {}
       }
       record.splatLayerIds = [];
+      record.mainSplatLayerId = null;
       for (const ent of record.meshEntities) {
         try { ent.destroy(); } catch {}
       }
       record.meshEntities = [];
+      record.visualCeilingEntity = null;
+      record.visualCeilingY = null;
       if (record.group) {
         try { record.group.destroy(); } catch {}
       }
@@ -241,7 +304,15 @@ function FloorCompositeViewer({
         return;
       }
 
-      const record: ModuleOverlayRecord = { group: null, splatLayerIds: [], meshEntities: [], cancelled: false };
+      const record: ModuleOverlayRecord = {
+        group: null,
+        splatLayerIds: [],
+        mainSplatLayerId: null,
+        meshEntities: [],
+        visualCeilingEntity: null,
+        visualCeilingY: null,
+        cancelled: false,
+      };
       overlayRecordsRef.current.set(module.id, record);
 
       (async () => {
@@ -272,6 +343,7 @@ function FloorCompositeViewer({
           visible: true,
         });
         record.splatLayerIds.push(splat.id);
+        record.mainSplatLayerId = splat.id;   // 천장제거 마스크 대상 (도어 splat 제외)
         splat.ready
           .then(() => {
             if (record.cancelled || !record.group) return;
@@ -279,6 +351,8 @@ function FloorCompositeViewer({
             if (!ent) return;
             record.group.addChild(ent);
             resetPlyLocalFrame(ent);
+            // 천장제거 토글이 ON 상태라면 이 모듈에 즉시 마스킹 (race-safe).
+            applyModuleCeilingState(record);
           })
           .catch(() => {});
 
@@ -354,6 +428,12 @@ function FloorCompositeViewer({
                 record.group.addChild(ent);
                 resetPlyLocalFrame(ent);
                 record.meshEntities.push(ent);
+                // visual ceiling = 코드 surfaceId 'floor' (claude.md:78-80). entity 와 baked Y 잡고 토글 즉시 반영.
+                if (surface.surfaceId === 'floor') {
+                  record.visualCeilingEntity = ent;
+                  record.visualCeilingY = surface.corners[0][1];
+                  applyModuleCeilingState(record);
+                }
               }
             }
           }
@@ -424,7 +504,7 @@ function FloorCompositeViewer({
         }
       })();
     });
-  }, [add, getEntity, moduleOverlays, remove]);
+  }, [add, getEntity, moduleOverlays, remove, applyModuleCeilingState]);
 
   useEffect(() => {
     return () => {
@@ -441,7 +521,15 @@ function FloorCompositeViewer({
     };
   }, [remove]);
 
-  return <SplatViewerCore ref={coreRef} sogUrl={primaryUrl} />;
+  // primary splat (베이스맵 또는 primary 모듈) 의 PLY asset 이 로드된 시점에 호출.
+  // mesh.json 이 먼저 도착해 천장 마스크가 skip 됐더라도 useCeilingRemoval 이 여기서 복구 적용한다.
+  // callback ref — mount 시 부모에 core 전달, unmount 시 null 전달. snapshotTopdown 등 imperative API 호출용.
+  const setCoreRef = useCallback((node: SplatViewerCoreRef | null) => {
+    (coreRef as React.MutableRefObject<SplatViewerCoreRef | null>).current = node;
+    onCoreReady?.(node);
+  }, [onCoreReady]);
+
+  return <SplatViewerCore ref={setCoreRef} sogUrl={primaryUrl} onSplatLoaded={handlePrimarySplatLoaded} />;
 }
 
 function formatRegisteredAt(iso: string | null | undefined): string | null {
@@ -570,6 +658,48 @@ export default function FloorDetailPage() {
     if (!primaryUrl || !hasBasemap) return [];
     return renderableModules.filter((module) => module.url !== primaryUrl && module.alignment_transform);
   }, [hasBasemap, primaryUrl, renderableModules]);
+
+  // primary 자산의 source_upload_id — 베이스맵이 primary 면 베이스맵의, 모듈이 primary 면 그 모듈의 것.
+  // 천장제거가 mesh.json 의 ceiling corners 를 읽어야 하므로 둘 다 cover.
+  const primarySourceUploadId = useMemo<string | null>(() => {
+    if (!primaryUrl) return null;
+    if (manifest?.basemap?.url === primaryUrl) return manifest?.basemap?.source_upload_id ?? null;
+    const primaryModule = renderableModules.find((m) => m.url === primaryUrl);
+    return primaryModule?.source_upload_id ?? null;
+  }, [manifest, primaryUrl, renderableModules]);
+  const primaryIsModule = !!primaryUrl && manifest?.basemap?.url !== primaryUrl;
+
+  // 천장제거 토글 — primary + overlay 모든 모듈의 천장 wallMesh + 천장 위 가우시안 alpha 마스킹.
+  // FloorCompositeViewer 가 자산 도착 시점에 따라 race-safe 하게 적용.
+  const [ceilingRemoved, setCeilingRemoved] = useState(false);
+
+  // 층 대표 이미지 캡처 (admin) — FloorCompositeViewer 의 coreRef 를 통해 imperative snapshotTopdown 호출.
+  const viewerCoreRef = useRef<SplatViewerCoreRef | null>(null);
+  const [capturingOverview, setCapturingOverview] = useState(false);
+  const isAdmin = user?.role === 'admin';
+  const handleCaptureOverview = useCallback(async () => {
+    if (!manifest) return;
+    const core = viewerCoreRef.current;
+    if (!core) { showToast('뷰어 준비 중입니다. 잠시 후 다시 시도하세요.'); return; }
+    if (!ceilingRemoved) {
+      showToast('천장 제거 후 캡처해야 실내가 보입니다.');
+      return;
+    }
+    setCapturingOverview(true);
+    try {
+      const result = await core.snapshotTopdown({ padding: 0.5 });
+      if (!result) { showToast('캡처 실패 — 자산 로드를 기다려주세요.'); return; }
+      const fd = new FormData();
+      fd.append('image', result.blob, 'overview.png');
+      fd.append('meta', JSON.stringify(result.meta));
+      await api.postForm(`/admin/floors/${manifest.floor_id}/overview-image`, fd);
+      showToast('층 대표 이미지 저장 완료. 빌딩 페이지로 돌아가면 카드에 반영됩니다.');
+    } catch (e: any) {
+      showToast(`저장 실패: ${e?.message ?? e}`);
+    } finally {
+      setCapturingOverview(false);
+    }
+  }, [manifest, ceilingRemoved, showToast]);
 
   if (loading) return null;
 
@@ -894,13 +1024,51 @@ export default function FloorDetailPage() {
         </div>
       )}
 
-      <main className="flex-1 bg-black">
+      <main className="flex-1 bg-black relative">
         {primaryUrl ? (
-          <FloorCompositeViewer
-            primaryUrl={primaryUrl}
-            basemapSourceUploadId={manifest?.basemap?.source_upload_id ?? null}
-            moduleOverlays={moduleOverlays}
-          />
+          <>
+            <FloorCompositeViewer
+              primaryUrl={primaryUrl}
+              basemapSourceUploadId={manifest?.basemap?.source_upload_id ?? null}
+              primarySourceUploadId={primarySourceUploadId}
+              primaryIsModule={primaryIsModule}
+              moduleOverlays={moduleOverlays}
+              ceilingRemoved={ceilingRemoved}
+              onCoreReady={(core) => { viewerCoreRef.current = core; }}
+            />
+            {primarySourceUploadId && (
+              <div className="absolute top-4 right-4 z-10 flex flex-col gap-2 items-end">
+                <button
+                  type="button"
+                  onClick={() => setCeilingRemoved((v) => !v)}
+                  className="px-3 py-2 rounded text-xs font-semibold border transition"
+                  style={{
+                    background: ceilingRemoved ? 'var(--accent)' : 'var(--paper)',
+                    color: ceilingRemoved ? '#04131f' : 'var(--ink)',
+                    borderColor: 'var(--rule)',
+                  }}
+                >
+                  {ceilingRemoved ? '천장 복원' : '천장 제거'}
+                </button>
+                {isAdmin && (
+                  <button
+                    type="button"
+                    onClick={handleCaptureOverview}
+                    disabled={capturingOverview || !ceilingRemoved}
+                    title={!ceilingRemoved ? '천장 제거 후 캡처하세요' : '현재 씬을 위에서 본 ortho top-down 으로 캡처해 층 대표 이미지로 저장'}
+                    className="px-3 py-2 rounded text-xs font-semibold border transition disabled:opacity-50 disabled:cursor-not-allowed"
+                    style={{
+                      background: 'var(--paper)',
+                      color: 'var(--ink)',
+                      borderColor: 'var(--rule)',
+                    }}
+                  >
+                    {capturingOverview ? '저장 중...' : '대표 이미지로 저장'}
+                  </button>
+                )}
+              </div>
+            )}
+          </>
         ) : manifest?.basemap_pending_approval ? (
           <div
             className="h-full flex items-center justify-center px-6"
