@@ -4,7 +4,7 @@
 # 이 파일은 GPU 머신에서 worker + sog-worker + door-ml(SAM3) 을 띄운다.
 #   - worker     : celery training/alignment → PC 를 PC_HOST_IP 로 바라봄
 #   - sog-worker : celery 'sog' 큐 전용 (PLY→SOG 변환). training 을 굶기지 않도록 분리.
-#   - door-ml    : SAM3 문검출 HTTP 서버. PC 백엔드가 DGX:8000 으로 호출
+#   - door-ml    : SAM3 문검출 HTTP 서버. PC 백엔드가 DGX:8100 으로 호출
 # (base docker-compose.yml 과 합치지 말고 이 파일 "단독"으로 실행할 것.)
 #
 # 사용법 (GPU 머신에서):
@@ -31,7 +31,7 @@
 #
 # ★ SAM3 를 실제로 쓰려면 PC 백엔드 .env 에서도:
 #     ENABLE_SAM3_DISPATCH=true
-#     DOOR_ML_URL=http://<이 DGX 의 IP>:8000   (예: Tailscale IP)
+#     DOOR_ML_URL=http://<이 DGX 의 IP>:8100   (예: Tailscale IP)
 #   를 설정하고 백엔드를 재시작해야 한다. (door-ml 은 celery 가 아니라 백엔드
 #   백그라운드 스레드가 HTTP 로 직접 호출한다.)
 # ===========================================================================
@@ -107,9 +107,9 @@ services:
     build: ./door_ml
     container_name: 3dgs-door-ml
     ports:
-      # PC 백엔드가 DOOR_ML_URL=http://<DGX_IP>:8000 으로 접근. Tailscale 등
-      # 사설망만 열려 있도록 방화벽/ACL 로 제한 권장.
-      - "8000:8000"
+      # 호스트 포트는 8100 (백엔드 .env 의 DOOR_ML_URL=http://<DGX_IP>:8100 과 일치).
+      # 컨테이너 내부는 8000. Tailscale 등 사설망만 열리도록 방화벽/ACL 로 제한 권장.
+      - "8100:8000"
     volumes:
       - ./core:/app/core:ro
       - ./utilities:/app/utilities:ro
