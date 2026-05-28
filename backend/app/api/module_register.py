@@ -41,6 +41,7 @@ from app.services.sam3_temp_storage import (
     delete_temp, is_expired, new_session_id, temp_path,
 )
 from app.services.storage_paths import module_base_path
+from app.core.storage_keys import is_key_under_prefix, normalize_minio_key
 
 router = APIRouter(prefix="/uploads", tags=["module-register"])
 settings = get_settings()
@@ -217,7 +218,7 @@ async def commit_final(
     module_name: str = Form(...),
     original_filename: str = Form(...),
     alignment_transform_json: str = Form(...),
-    final_ply: UploadFile = File(...),
+    final_ply_staging_key: str = Form(...),
     mesh_json: UploadFile = File(...),
     doors_json: UploadFile = File(...),
     sam3_session_id: str | None = Form(None),
@@ -243,6 +244,17 @@ async def commit_final(
         raise HTTPException(status_code=400, detail=f"alignment_transform 형식 오류: {e}")
     if len(at.position) != 3 or len(at.rotation) != 4 or len(at.scale) != 3:
         raise HTTPException(status_code=400, detail="alignment_transform position/rotation/scale 형식 오류.")
+
+    # ── final.ply staging 키 검증 ──
+    # 대용량 PLY 는 Cloudflare 100MB 본문 한도 때문에 멀티파트로 못 싣는다. 클라이언트가
+    # /uploads/staging-multipart-* 로 미리 MinIO 에 청크 업로드한 staging 키를 받아,
+    # 아래에서 서버사이드 copy 로 최종 위치에 옮긴다. (본인 staging 경로만 허용.)
+    try:
+        staging_key = normalize_minio_key(final_ply_staging_key)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="유효하지 않은 final_ply_staging_key 입니다.")
+    if not is_key_under_prefix(staging_key, f"staging/{user.id}/"):
+        raise HTTPException(status_code=400, detail="본인 staging 경로의 PLY 키가 아닙니다.")
 
     # ── 동적 텍스처 키 수집 — 'tex_<surfaceId>' 패턴 ──
     # ceiling/floor 필수 + w0..w(N-1) 폴리곤 변 수만큼. multipart form 한 번 읽음 (cached).
@@ -306,6 +318,12 @@ async def commit_final(
 
     minio = get_minio_service()
 
+    # staging PLY 존재 + 크기 확인 — 덮어쓰기로 옛 객체를 지우기 전에 먼저 검증한다
+    # (소스가 없으면 옛 작업물을 파괴하기 전에 즉시 중단).
+    if not minio.object_exists(staging_key):
+        raise HTTPException(status_code=400, detail="업로드된 PLY(staging)를 찾을 수 없습니다. 다시 업로드하세요.")
+    final_ply_size = int(minio.stat_object(staging_key).size)
+
     # ── 덮어쓰기 처리: 옛 uploads/tasks/scene_outputs + MinIO 객체 정리 ──
     if existing_module is not None:
         # 옛 uploads 모두 가져와 MinIO prefix 청소
@@ -353,12 +371,11 @@ async def commit_final(
     door_splat_keys = {field: f"{door_asset_dir}/{field}.ply" for field in door_splat_uploads.keys()}
 
     # ── Upload 행 생성 ──
-    final_ply_bytes = await final_ply.read()
     upload = Upload(
         user_id=user.id,
         module_id=module.id,
         original_filename=original_filename,
-        file_size=len(final_ply_bytes),  # 다듬기 결과 PLY 기준
+        file_size=final_ply_size,  # staging 으로 올라온 다듬기 결과 PLY 크기
         content_type="application/octet-stream",
         minio_path=placeholder_key,
         ply_target=PlyTarget.alignment,
@@ -398,7 +415,8 @@ async def commit_final(
 
     # ── MinIO 업로드 (final.ply + mesh.json + tex_*.png + doors.json + door assets) ──
     try:
-        minio.put_object_bytes(final_ply_key, final_ply_bytes, "application/octet-stream")
+        # 대용량 PLY: staging → 최종 키로 MinIO 서버사이드 복사 (데이터가 백엔드/Cloudflare 미경유).
+        minio.copy_object(final_ply_key, staging_key)
 
         mesh_bytes = await mesh_json.read()
         minio.put_object_bytes(mesh_key, mesh_bytes, "application/json")
@@ -471,6 +489,12 @@ async def commit_final(
     )
 
     await db.commit()
+
+    # staging PLY 정리 — 최종 키로 복사 완료됐으니 임시본 삭제 (실패해도 무시, 누수만 됨).
+    try:
+        minio.delete_object(staging_key)
+    except Exception:
+        pass
 
     # refined(정합 완료) PLY → SOG 변환 비동기 발행. 뷰어용 경량 파생물이라 브로커
     # 미가용 등으로 실패해도 무시 — sog_path 는 None 으로 남고 표시는 PLY 로 폴백된다.

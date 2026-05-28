@@ -1202,7 +1202,39 @@ export default function UnifiedSplatEditor({
                     //    (`/floors/{id}/modules` 리스트 조회 후 confirm). 여기까지 도달한 시점에는
                     //    사용자가 이미 동의한 상태. 서버 응답 `was_overwrite` 로 결과 통지.
 
-                    // 4) multipart POST /uploads/commit-final
+                    // 4) 대용량 PLY 는 Cloudflare 100MB 요청 본문 한도를 넘으므로 commit-final
+                    //    멀티파트에 싣지 않고, staging 키로 청크 presigned PUT 하여 MinIO 에 직접
+                    //    올린다(각 청크 ≤ part_size). basemap 다듬기 확정 경로와 동일한 방식.
+                    const plyView = assets.plyBytes instanceof Uint8Array
+                      ? assets.plyBytes
+                      : new Uint8Array(assets.plyBytes);
+                    const stagingInit = await api.post<{
+                      key: string; minio_upload_id: string; presigned_urls: string[]; part_size: number;
+                    }>('/uploads/staging-multipart-init', {
+                      filename: assets.plyFilename,
+                      file_size: plyView.byteLength,
+                      content_type: 'application/octet-stream',
+                    });
+                    const plyParts: { part_number: number; etag: string }[] = [];
+                    for (let i = 0; i < stagingInit.presigned_urls.length; i++) {
+                      const start = i * stagingInit.part_size;
+                      const end = Math.min(start + stagingInit.part_size, plyView.byteLength);
+                      const partResp = await fetch(stagingInit.presigned_urls[i], {
+                        method: 'PUT', body: plyView.subarray(start, end) as unknown as BodyInit,
+                      });
+                      if (!partResp.ok) throw new Error(`PLY 청크 ${i + 1} 업로드 실패: ${partResp.status}`);
+                      plyParts.push({
+                        part_number: i + 1,
+                        etag: partResp.headers.get('etag')?.replace(/"/g, '') ?? '',
+                      });
+                    }
+                    await api.post('/uploads/staging-multipart-complete', {
+                      key: stagingInit.key,
+                      minio_upload_id: stagingInit.minio_upload_id,
+                      parts: plyParts,
+                    });
+
+                    // 5) 나머지 작은 자산(mesh/doors/텍스처/도어) + PLY staging 키를 멀티파트 POST.
                     const form = new FormData();
                     form.append('building_id', initialRegistrationContext.building_id);
                     form.append('floor_id', initialRegistrationContext.floor_id);
@@ -1220,7 +1252,7 @@ export default function UnifiedSplatEditor({
                         wallAngleRad: assets.wallAngleRad,
                       },
                     }));
-                    form.append('final_ply', new Blob([assets.plyBytes as unknown as BlobPart], { type: 'application/octet-stream' }), assets.plyFilename);
+                    form.append('final_ply_staging_key', stagingInit.key);
                     form.append('mesh_json', new Blob([assets.meshJson], { type: 'application/json' }), 'mesh.json');
                     form.append('doors_json', new Blob([doorsJson], { type: 'application/json' }), 'doors.json');
                     if (doorAssets?.doorMesh) {

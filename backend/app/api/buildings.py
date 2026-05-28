@@ -1,3 +1,4 @@
+import os
 import re
 from datetime import datetime, timezone
 
@@ -1080,14 +1081,22 @@ async def get_floor_detail_manifest(
             .limit(1)
         )
         has_pending_basemap = pending_check.scalar_one_or_none() is not None
-    basemap_url = safe_presigned_download_url(minio, basemap.minio_path) if basemap else None
+    # basemap 서빙 키 — 경량 SOG 파생물(worker/DGX 가 refined PLY 옆에 '{name}.sog' 로 생성)이
+    # 있으면 우선, 없으면 원본 PLY 로 폴백. (모듈 _scene_active_key 와 동일한 sog 우선 규약.)
+    basemap_serve_key = None
+    if basemap is not None:
+        sog_candidate = os.path.splitext(basemap.minio_path)[0] + ".sog"
+        basemap_serve_key = (
+            sog_candidate if safe_object_exists(minio, sog_candidate) else basemap.minio_path
+        )
+    basemap_url = safe_presigned_download_url(minio, basemap_serve_key) if basemap_serve_key else None
     basemap_entry = (
         DetailBasemapEntry(
             id=basemap.id,
             version=basemap.version,
             source_upload_id=basemap.source_upload_id,
             url=basemap_url,
-            filename=basemap.minio_path.rsplit("/", 1)[-1],
+            filename=basemap_serve_key.rsplit("/", 1)[-1],
         )
         if basemap is not None
         else None

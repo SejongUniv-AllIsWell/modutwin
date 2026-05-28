@@ -162,6 +162,15 @@ class MinioService:
             self.bucket, key, BytesIO(data), length=len(data), content_type=content_type,
         )
 
+    def copy_object(self, dest_key: str, src_key: str) -> None:
+        """버킷 내 서버사이드 복사 — 데이터가 클라이언트/프록시(Cloudflare)를 거치지 않는다.
+
+        대용량(>100MB) PLY 를 staging 키로 청크 업로드한 뒤 최종 키로 옮길 때 사용.
+        단일 copy_object 는 5GB 까지 지원하므로 refined PLY(수백 MB)엔 충분하다.
+        """
+        from minio.commonconfig import CopySource
+        self.client.copy_object(self.bucket, dest_key, CopySource(self.bucket, src_key))
+
 
 _minio_service: MinioService | None = None
 

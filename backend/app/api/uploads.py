@@ -49,6 +49,95 @@ logger = logging.getLogger(__name__)
 # 사용자당 업로드 제한 (개수 / 총 용량)
 MAX_UPLOADS_PER_USER = 100
 MAX_STORAGE_PER_USER = 200 * 1024 * 1024 * 1024  # 200 GB
+
+# ── Staging multipart 업로드 ───────────────────────────────────────────────
+# Cloudflare 요청 본문 100MB 한도를 피하기 위한 범용 청크 업로드. 대용량 자산
+# (예: commit-final 의 refined PLY ~130MB)을 module/Upload 행 없이도 MinIO 에
+# 직접 청크 PUT 으로 올린 뒤, 이어지는 핸들러(commit-final)가 그 키를 받아
+# 서버사이드 copy 로 최종 위치에 옮긴다. 키는 사용자 격리: staging/{user}/{uuid}.
+STAGING_PREFIX = "staging"
+
+
+def _user_staging_prefix(user_id) -> str:
+    return f"{STAGING_PREFIX}/{user_id}/"
+
+
+class StagingMultipartInitRequest(BaseModel):
+    filename: str
+    file_size: int
+    content_type: str = "application/octet-stream"
+
+
+class StagingMultipartInitResponse(BaseModel):
+    key: str
+    minio_upload_id: str
+    presigned_urls: list[str]
+    part_size: int
+    part_count: int
+
+
+class StagingMultipartPart(BaseModel):
+    part_number: int
+    etag: str
+
+
+class StagingMultipartCompleteRequest(BaseModel):
+    key: str
+    minio_upload_id: str
+    parts: list[StagingMultipartPart]
+
+
+class StagingMultipartCompleteResponse(BaseModel):
+    key: str
+
+
+@router.post("/staging-multipart-init", response_model=StagingMultipartInitResponse)
+async def staging_multipart_init(
+    body: StagingMultipartInitRequest,
+    user: User = Depends(get_current_user),
+):
+    """대용량 자산을 staging 키로 청크 presigned PUT 하기 위한 multipart 초기화."""
+    if body.file_size <= 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="file_size는 양수여야 합니다.")
+    ext = os.path.splitext(body.filename)[1].lower() or ".ply"
+    key = f"{STAGING_PREFIX}/{user.id}/{uuid4()}{ext}"
+    part_count = max(1, math.ceil(body.file_size / PART_SIZE))
+    minio = get_minio_service()
+    minio_upload_id = minio.init_multipart_upload(key, body.content_type)
+    presigned_urls = minio.get_presigned_upload_urls(key, minio_upload_id, part_count)
+    return StagingMultipartInitResponse(
+        key=key,
+        minio_upload_id=minio_upload_id,
+        presigned_urls=presigned_urls,
+        part_size=PART_SIZE,
+        part_count=part_count,
+    )
+
+
+@router.post("/staging-multipart-complete", response_model=StagingMultipartCompleteResponse)
+async def staging_multipart_complete(
+    body: StagingMultipartCompleteRequest,
+    user: User = Depends(get_current_user),
+):
+    """모든 청크 PUT 후 호출. 본인 staging 경로의 키만 완료 처리한다."""
+    try:
+        key = normalize_minio_key(body.key)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="유효하지 않은 key 입니다.")
+    if not is_key_under_prefix(key, _user_staging_prefix(user.id)):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="본인 staging 경로의 키가 아닙니다.")
+    minio = get_minio_service()
+    try:
+        parts = [{"part_number": p.part_number, "etag": p.etag} for p in body.parts]
+        minio.complete_multipart_upload(key, body.minio_upload_id, parts)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"MinIO staging multipart 완료 실패: {str(e)}",
+        )
+    return StagingMultipartCompleteResponse(key=key)
+
+
 @router.post("/init", response_model=UploadInitResponse)
 async def init_upload(
     body: UploadInitRequest,
