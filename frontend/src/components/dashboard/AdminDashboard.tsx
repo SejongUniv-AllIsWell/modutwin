@@ -10,7 +10,7 @@ export default function AdminDashboard() {
       <div className="flex items-center justify-between mb-8">
         <div className="flex items-center gap-3">
           <h1 className="text-2xl font-bold">대시보드</h1>
-          <span className="text-xs bg-purple-600/20 text-purple-300 px-2 py-0.5 rounded">관리자</span>
+          <span className="text-xs bg-[var(--accent-soft)] text-[var(--accent)] px-2 py-0.5 rounded-sm border border-sky-400/30">관리자</span>
         </div>
       </div>
 

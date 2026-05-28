@@ -10,7 +10,7 @@ from backend_callback import notify_upload_progress
 from callback_client import notify_task_failure, notify_task_success
 
 from pipeline.runner import PipelineRunner
-from pipeline.sog_converter import SogConverterModule
+from pipeline.sog_converter import SogConverterModule, convert_to_sog
 
 try:
     from pipeline.ffmpeg_module import FFmpegModule
@@ -117,8 +117,7 @@ def run_3dgs_training(self, upload_id: str, user_id: str, minio_input_key: str,
             # PLY 파일: SOG 변환만 수행하여 gsplat/ 에 저장
             update_progress(task_id, 50, "SOG 변환")
             sog_local = os.path.join(work_dir, f"{module_name}.sog")
-            # stub: 실제 SOG 변환 시 교체
-            shutil.copy2(local_input, sog_local)
+            convert_to_sog(local_input, output_path=sog_local)
 
             update_progress(task_id, 90, "업로드")
             ply_key = f"{module_base}/gsplat/{module_name}.ply"

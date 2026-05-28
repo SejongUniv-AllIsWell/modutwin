@@ -1,5 +1,5 @@
 /**
- * 방 경계면 (천장/바닥/벽) 을 가우시안의 extent (3σ) 가 넘지 않게 scale 을 축소한다.
+ * 방 경계면 (천장/바닥/벽) 을 가우시안의 PlayCanvas 렌더 extent 가 넘지 않게 scale 을 축소한다.
  *
  * 목표: center 가 평면 안쪽인 splat 의 평면 수직 (n) 방향 extent 가 |sd| − ε 이하가 되도록.
  *       (= 평면 안쪽 ε 위치까지만 뻗고 멈춤. 평면 통과 금지.)
@@ -18,6 +18,7 @@
  */
 import type { GaussianScene } from '../ply/types';
 import type { SurfacePlane } from './planes';
+import { GSPLAT_SIGMA_CUTOFF } from './playcanvasGsplat';
 
 export interface ClipScaleUpdate {
   idx: number;
@@ -26,19 +27,28 @@ export interface ClipScaleUpdate {
 }
 
 export interface ClipOptions {
-  /** sigma 배수. extent = kSigma · σ. default 3. */
+  /**
+   * 법선 방향 mahalanobis cutoff (σ 배수). 가우시안의 normal 방향 kSigma·σ 점이 벽 평면에 닿게 강제.
+   *
+   * PlayCanvas gsplat render cutoff:
+   *   - vertex quad radius: q = d² <= 8  →  d <= √8 ≈ 2.82843σ
+   *   - fragment alpha: `normExp(q/8) * opacity < 1/255` 이면 discard
+   *   - 따라서 실제 visible radius 는 opacity 에 따라 0..√8 이고, √8 은 보수적인 최대 hard cutoff.
+   *
+   * 따라서 kSigma > √8 이면 렌더되는 모든 픽셀이 벽 평면 안에 있음 (= 닿지 않음).
+   * default = √8 + 1e-3 — 이론 최대값에 아주 작은 여유를 더해 float 정밀도 차이를 흡수한다.
+   */
   kSigma?: number;
-  /** 평면 안쪽으로 살짝 당겨서 끊을 여유 거리 (m). default 0.001 (1mm). */
-  epsilon?: number;
 }
+
+export const RENDER_CUTOFF_SIGMA = GSPLAT_SIGMA_CUTOFF;  // = 2.8284271... (PlayCanvas gsplat q<=8)
 
 export function computeBoundaryClipping(
   scene: GaussianScene,
   planes: SurfacePlane[],
   opts: ClipOptions = {},
 ): ClipScaleUpdate[] {
-  const kSigma = Math.max(1, opts.kSigma ?? 3);
-  const epsilon = Math.max(0, opts.epsilon ?? 0.001);
+  const kSigma = Math.max(1, opts.kSigma ?? (RENDER_CUTOFF_SIGMA + 1e-3));
   const kSq = kSigma * kSigma;
 
   const px = scene.attrs.get('x');
@@ -81,11 +91,10 @@ export function computeBoundaryClipping(
     for (const p of planes) {
       const nx = p.normal[0], ny = p.normal[1], nz = p.normal[2];
       const sd = nx*cx + ny*cy + nz*cz - p.d;
-      if (sd > 0) continue; // center 가 평면 외부 → flatten 처리. clip 대상 아님.
+      if (sd > 0) continue; // center 가 평면 외부 → boundaryCull 대상. clip 대상 아님.
 
       const absSd = -sd;
-      const target = Math.max(0, absSd - epsilon);
-      const T = (target * target) / kSq;
+      const T = (absSd * absSd) / kSq;
 
       const a0 = lx0*nx + lx1*ny + lx2*nz;
       const a1 = ly0*nx + ly1*ny + ly2*nz;

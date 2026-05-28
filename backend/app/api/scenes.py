@@ -98,7 +98,10 @@ async def download_scene(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """SOG 파일 presigned GET URL 반환"""
+    """씬 파일 presigned GET URL 반환.
+
+    SOG가 있으면 뷰어용 경량 자산으로 우선 사용하고, 없으면 canonical PLY로 fallback한다.
+    """
     row = await _get_scene_hierarchy_row(scene_id, db)
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="씬을 찾을 수 없습니다.")
@@ -108,11 +111,14 @@ async def download_scene(
 
     minio = get_minio_service()
 
-    if not minio.object_exists(scene.sog_path):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="SOG 파일을 찾을 수 없습니다.")
+    scene_key = scene.sog_path if scene.sog_path and minio.object_exists(scene.sog_path) else None
+    if scene_key is None and minio.object_exists(scene.ply_path):
+        scene_key = scene.ply_path
+    if not scene_key or not minio.object_exists(scene_key):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="씬 파일을 찾을 수 없습니다.")
 
     expires = 3600
-    url = minio.get_presigned_download_url(scene.sog_path, expires)
+    url = minio.get_presigned_download_url(scene_key, expires)
 
     return SceneDownloadResponse(url=url, expires_in=expires)
 

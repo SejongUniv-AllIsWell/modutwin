@@ -39,18 +39,30 @@ export interface RefineToolOptions {
   // 항상 호출되며, 받은 building/floor/module 로 새 upload 를 등록한 뒤 PLY+sidecar 를 그 위에 PUT.
   // reject 되면 저장 흐름 취소.
   onRequestMetadata?: () => Promise<SaveMetadata>;
-  // basemap 등록 viewer 에서만 wall modal 을 포인트-라인 입력으로 전환.
-  basemapMode?: boolean;
 }
 
-export const ALL_SURFACES = ['ceiling', 'floor', 'w1a', 'w1b', 'w2a', 'w2b'] as const;
-export type Surface = typeof ALL_SURFACES[number];
-export const CF_SURFACES: Surface[] = ['ceiling', 'floor'];
-export const WALL_SURFACES: Surface[] = ['w1a', 'w1b', 'w2a', 'w2b'];
+// 표면 종류 — 천장/바닥은 고정 ID, 벽은 폴리곤 변 수만큼 동적 `w0..w(N-1)`.
+//   ex. polygon 4점 → 'w0','w1','w2','w3'. polygon 5점 → 'w0'..'w4'.
+//   surfaceId 가 동적이므로 Surface 는 string 으로 통일 (template literal 로 좁힐 수도 있으나
+//   여러 사용처에서 set/map 키로 쓰여 단순 string 이 실용적).
+export type Surface = string;
+
+export const CF_SURFACES: ReadonlyArray<Surface> = ['ceiling', 'floor'];
+
+/** wall surface id pattern: `w` + 정수. polygon 의 i번째 변 → `w${i}`. */
+export const isWallSurface = (s: Surface): boolean => /^w\d+$/.test(s);
+export const isFixedSurface = (s: Surface): boolean => s === 'ceiling' || s === 'floor';
+
+/** polygon 의 변 수 → wall surfaceId 배열. */
+export function wallSurfaceIds(numEdges: number): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < numEdges; i++) out.push(`w${i}`);
+  return out;
+}
 
 export type OpRecord =
   | { type: 'rotation'; prevRotation: { rotX: number; rotZ: number } }
-  | { type: 'flatten'; prevMask: Uint8Array | null; prevActive: boolean }
+  | { type: 'boundaryCull'; prevMask: Uint8Array | null; prevActive: boolean }
   | { type: 'floater'; prevMask: Uint8Array | null; prevActive: boolean }
   | { type: 'clipping'; prevSnapshot: Array<{ idx: number; s0: number; s1: number; s2: number }>; prevActive: boolean }
   | { type: 'wallMesh'; prevEntities: any[]; prevActive: boolean };

@@ -26,7 +26,9 @@ services:
     container_name: 3dgs-frontend
     expose:
       - "3000"
-    env_file: .env
+    environment:
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
+      - NEXT_PUBLIC_KAKAO_MAP_KEY=${NEXT_PUBLIC_KAKAO_MAP_KEY}
     depends_on:
       backend:
         condition: service_started
@@ -42,6 +44,8 @@ services:
     volumes:
       - ./core:/app/core:ro
       - ./utilities:/app/utilities:ro
+      # 모듈 신흐름 — SAM3 자동 문 검출용 임시 PLY 저장소 (30분 TTL, 자동 청소).
+      - sam3-temp:/var/lib/sam3-temp
     env_file: .env
     environment:
       - POSTGRES_HOST=postgres
@@ -141,9 +145,12 @@ services:
       - RABBITMQ_DEFAULT_PASS=${RABBITMQ_DEFAULT_PASS}
     healthcheck:
       test: [ "CMD", "rabbitmq-diagnostics", "-q", "ping" ]
-      interval: 10s
-      timeout: 10s
+      interval: 15s
+      timeout: 30s
       retries: 5
+      # ARM64 호스트에서 RabbitMQ 부팅이 ~55초 걸리고 diagnostics ping 자체도 무거워
+      # start_period 없으면 부팅 중 실패가 retries 를 소진해 unhealthy 상태로 빠짐.
+      start_period: 90s
     networks:
       - 3dgs-net
     restart: unless-stopped
@@ -213,6 +220,7 @@ volumes:
   redisdata:
   rabbitmqdata:
   miniodata:
+  sam3-temp:
 
 
 networks:

@@ -12,6 +12,11 @@ def _reload_auth_code_service():
     return importlib.reload(module)
 
 
+def _reload_redis_one_time_store():
+    module = importlib.import_module("app.services.redis_one_time_store")
+    return importlib.reload(module)
+
+
 def test_ws_ticket_key_has_expected_prefix(required_env: dict[str, str]) -> None:
     ws_ticket_service = _reload_ws_ticket_service()
     assert ws_ticket_service._key("abc123") == "ws_ticket:abc123"
@@ -26,11 +31,12 @@ def test_consume_ws_ticket_with_blank_ticket_skips_redis(
     required_env: dict[str, str], monkeypatch
 ) -> None:
     ws_ticket_service = _reload_ws_ticket_service()
+    redis_one_time_store = _reload_redis_one_time_store()
 
     def _unexpected_call(*args, **kwargs):
         raise AssertionError("redis client should not be created for empty ticket")
 
-    monkeypatch.setattr(ws_ticket_service.aioredis, "from_url", _unexpected_call)
+    monkeypatch.setattr(redis_one_time_store.aioredis, "from_url", _unexpected_call)
     assert asyncio.run(ws_ticket_service.consume_ws_ticket("")) is None
 
 
@@ -38,6 +44,7 @@ def test_consume_ws_ticket_returns_payload_and_closes_client(
     required_env: dict[str, str], monkeypatch
 ) -> None:
     ws_ticket_service = _reload_ws_ticket_service()
+    redis_one_time_store = _reload_redis_one_time_store()
 
     class DummyClient:
         def __init__(self) -> None:
@@ -52,7 +59,7 @@ def test_consume_ws_ticket_returns_payload_and_closes_client(
             self.closed = True
 
     client = DummyClient()
-    monkeypatch.setattr(ws_ticket_service.aioredis, "from_url", lambda *args, **kwargs: client)
+    monkeypatch.setattr(redis_one_time_store.aioredis, "from_url", lambda *args, **kwargs: client)
 
     payload = asyncio.run(ws_ticket_service.consume_ws_ticket("ticket-1"))
 

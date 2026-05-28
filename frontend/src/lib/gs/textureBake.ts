@@ -1,14 +1,19 @@
 import type { GaussianScene } from '../ply/types';
 import { compositeTextureGPU, type SplatGPU } from './textureBakeGPU';
-
-const SH0 = 0.28209479177387814;
+import type { PolygonPoint, SurfacePlane } from './planes';
+import { GSPLAT_SH0, gsplatKernelAlpha, gsplatVisibleSigmaRadius, sigmoidOpacity } from './playcanvasGsplat';
 
 export type Vec3 = [number, number, number];
 
-/** 방 기하 — 벽4 거리, 회전각, 천장/바닥 Y. */
+/**
+ * 방 기하 — N벽 폴리곤 + 천장/바닥 Y.
+ *
+ * `surfacePlanes` 는 천장/바닥 + N벽 (`w0..w(N-1)`) 모두 포함된 SurfacePlane[].
+ * 보통 `surfacePlanesFromPolygon` 결과 그대로 전달. wall ID `wi` ↔ polygon i번째 변 매칭.
+ */
 export interface RoomGeometry {
-  angleDeg: number;
-  walls: [number, number, number, number];  // a1, b1, a2, b2
+  surfacePlanes: SurfacePlane[];
+  polygon: PolygonPoint[];
   ceilingY: number;
   floorY: number;
 }
@@ -16,34 +21,22 @@ export interface RoomGeometry {
 export interface TextureBakeOptions {
   /** 텍스처 해상도. 1m당 픽셀 수. 디폴트 512 (~2mm/px) */
   texelsPerMeter: number;
-  /** 샘플 평면(origin) ±이 거리 안 가우시안만 채택 (m) */
-  depthGate: number;
   /** 한 가우시안의 텍스처 footprint 픽셀 반경 한계. 너무 큰 가우시안(스카이/노이즈) 배제용 */
   maxFootprintPx: number;
-  /** 자동 게이트 산정 시 paint peak 안쪽으로 추가로 더 보는 거리 (m).
-   *  실제 dgateEff = max(depthGate, |paintSd 음수 부분| + autoMargin).
-   *  너무 작으면 paint peak 가까이만 채택 → 빈 텍셀, 너무 크면 occluder 가구 가 합성 → 어두워짐. */
-  autoMargin: number;
+  /**
+   * 지정하면 단순 surface-normal depth(sd) 대신 대표 카메라 위치/방향 기준 depth 로 합성한다.
+   * viewpoint 만 있으면 거리순, viewDirection 도 있으면 dot(center-viewpoint, viewDirection) 순.
+   */
+  viewpoint?: Vec3;
+  viewDirection?: Vec3;
 }
 
 export const DEFAULT_TEXTURE_BAKE_OPTIONS: TextureBakeOptions = {
   texelsPerMeter: 512,
-  // 안쪽 마진 — 벽면에서 방 쪽으로 이만큼 안쪽까지만 가우시안 채택 (페인트 살짝 새는 것만 허용).
-  // 너무 크면 벽 앞의 occluder (TV, 조명, 가구) 가 sd ascending sort 에서 먼저 컴포지팅 → 어두워짐.
-  depthGate: 0.005,
-  maxFootprintPx: 500,
-  autoMargin: 0.05,
+  // 저주파 벽/천장 색을 담당하는 큰 Gaussian 이 잘려나가면 coverage 와 색이 크게 틀어진다.
+  // 기본값은 사실상 "안전장치" 수준으로만 두고, 필요 시 호출자가 낮춰 제한한다.
+  maxFootprintPx: 4096,
 };
-
-/**
- * 텍스처 메시(quad)를 방 경계 평면(sd=0) 으로부터 법선 방향(=방 바깥쪽) 으로 얼마나 들여놓을지 (m).
- *
- * 0 = 사용자가 모달에서 정의한 경계면 위치에 정확히 막 배치 (사용자 요청).
- * 막 위치 + 텍스처 베이크 시작 위치가 모두 사용자 경계면(sd=0) 에 정렬됨 → "층 두 개" 잔상 최소화.
- * 메시 배치 위치(`bakeTextureForPlane` 안의 `meshOffsetEff`)와 코너 extend (`planeBakeInputForSurface`
- * 의 `extend*`) 가 모두 이 단일 상수에서 파생되므로 항상 동기화.
- */
-export const MESH_PLANE_INSET = 0;
 
 export interface PlaneBakeInput {
   /** 샘플링 평면의 한 점 (보통 벽 표면 sd=0). 가우시안 sd는 이 origin 기준. */
@@ -54,16 +47,22 @@ export interface PlaneBakeInput {
   vAxis: Vec3;
   /** 평면 법선 (단위 벡터, 방 바깥) */
   normal: Vec3;
-  /** 베이크(샘플링) 범위 — 텍스처 컨텐츠가 차지하는 (u, v) 영역. 원래 방 범위. */
+  /**
+   * 베이크(샘플링) 범위.
+   *
+   * u/v 는 픽셀 좌표나 0..1 UV 가 아니라, origin + u*uAxis + v*vAxis 로
+   * 3D 위치를 복원하는 평면 로컬 실제 거리 좌표다. 벽의 경우 보통
+   * uMin=0, uMax=벽 실제 길이, vMin=0, vMax=천장-바닥 높이로 잡는다.
+   *
+   * 텍스처 픽셀 크기 = (uMax-uMin, vMax-vMin) * texelsPerMeter.
+   * mesh UV 는 나중에 이 실제 거리 범위를 0..1 로 정규화해서 만든다.
+   */
   uMin: number; uMax: number;
   vMin: number; vMax: number;
-  /** 메시 quad는 베이크 범위보다 양쪽으로 이만큼 더 뻗는다 (m).
-   *  텍스처 자체는 늘어나지 않고, UV가 [0,1] 밖으로 나가 clamp-to-edge로 가장자리 픽셀이
-   *  복제됨 (replicate padding). 인접 면과 만나도록 직육면체 코너 닫는 용도. */
-  extendU0: number; extendU1: number;
-  extendV0: number; extendV1: number;
-  /** 메시 quad를 origin 으로부터 normal 방향으로 얼마나 떨어진 곳에 배치할지 (m). */
-  meshOffset: number;
+  /** 천장/바닥 한정 — 픽셀의 world XZ 가 이 polygon 외부면 alpha=0 처리.
+   *  mesh quad 는 polygon bbox 직사각이지만 텍스처 알파로 polygon 모양 시각화.
+   *  벽 surface 는 undefined (직사각 그대로). */
+  polygonMaskXZ?: { x: number; z: number }[];
 }
 
 export interface TextureBakeResult {
@@ -71,6 +70,12 @@ export interface TextureBakeResult {
   rgba: Uint8ClampedArray;
   width: number;
   height: number;
+  /** 같은 면을 여러 대표 시점에서 굽는 view-dependent texture variants. */
+  viewVariants?: Array<{
+    id: string;
+    viewpoint: Vec3;
+    rgba: Uint8ClampedArray;
+  }>;
   /** 4 코너 (월드 좌표) — TL, TR, BR, BL 순서. extend* 적용 후 위치. */
   corners: [Vec3, Vec3, Vec3, Vec3];
   /** 각 코너의 UV (TL, TR, BR, BL). extend가 있으면 [0,1] 밖으로 나갈 수 있음 (clamp-to-edge). */
@@ -78,60 +83,24 @@ export interface TextureBakeResult {
   input: PlaneBakeInput;
 }
 
-function sigmoid(x: number): number {
-  return 1 / (1 + Math.exp(-x));
-}
-
-function linToSrgb(c: number): number {
-  if (c <= 0) return 0;
-  if (c >= 1) return 1;
-  return c <= 0.0031308 ? 12.92 * c : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
-}
-
 /**
- * 평면 위의 paint plane 위치를 자동 검출.
- * sd = 0 부근 ±searchRangeM 범위에서 opacity 가중 sd 히스토그램의 peak 를 찾음.
+ * point-in-polygon 테스트 (ray casting, XZ 평면).
  *
- * 메시 코너 정합용: 각 면 베이크 전에 미리 호출해서 모든 인접 면의 paintSd 를 알아야
- * extend 거리를 정확히 잡을 수 있음.
+ * polygon 은 cycle 순서의 점 배열 (마지막→첫 점 자동 연결). polygon 변 위에 정확히 닿는 경계
+ * 점은 ray casting 의 동률 보정상 일부는 inside, 일부는 outside 로 잡힐 수 있음 — 텍스처 마스크
+ * 용도에서는 1픽셀 오차라 무방.
  */
-export function detectPaintSd(
-  origin: Vec3,
-  normal: Vec3,
-  scene: GaussianScene,
-  searchRangeM = 0.5,
-): number {
-  const px = scene.attrs.get('x');
-  const py = scene.attrs.get('y');
-  const pz = scene.attrs.get('z');
-  const op = scene.attrs.get('opacity');
-  if (!px || !py || !pz || !op) throw new Error('detectPaintSd: required attrs missing');
-
-  const [ox, oy, oz] = origin;
-  const [nx, ny, nz] = normal;
-  const N = scene.numSplats;
-
-  const HIST_BINS = 400;
-  const HIST_RANGE = 2.0;
-  const HIST_RES = (2 * HIST_RANGE) / HIST_BINS;
-  const wHist = new Float32Array(HIST_BINS);
-  for (let i = 0; i < N; i++) {
-    const dx = px[i] - ox, dy = py[i] - oy, dz = pz[i] - oz;
-    const sd = dx * nx + dy * ny + dz * nz;
-    const bin = Math.floor((sd + HIST_RANGE) / HIST_RES);
-    if (bin >= 0 && bin < HIST_BINS) {
-      wHist[bin] += sigmoid(op[i]);
-    }
+function isPointInPolygonXZ(x: number, z: number, polygon: { x: number; z: number }[]): boolean {
+  let inside = false;
+  const N = polygon.length;
+  for (let i = 0, j = N - 1; i < N; j = i++) {
+    const xi = polygon[i].x, zi = polygon[i].z;
+    const xj = polygon[j].x, zj = polygon[j].z;
+    const intersect = ((zi > z) !== (zj > z)) &&
+      (x < (xj - xi) * (z - zi) / (zj - zi) + xi);
+    if (intersect) inside = !inside;
   }
-
-  const centerBin = Math.floor(HIST_RANGE / HIST_RES);
-  const halfSearch = Math.floor(searchRangeM / HIST_RES);
-  let peakBin = centerBin;
-  let peakW = -1;
-  for (let b = Math.max(0, centerBin - halfSearch); b <= Math.min(HIST_BINS - 1, centerBin + halfSearch); b++) {
-    if (wHist[b] > peakW) { peakW = wHist[b]; peakBin = b; }
-  }
-  return (peakBin + 0.5) * HIST_RES - HIST_RANGE;
+  return inside;
 }
 
 interface SplatInfo {
@@ -147,29 +116,39 @@ interface SplatInfo {
   alpha: number;
   /** signed distance (origin 평면 기준). 정렬 key (ascending = 안쪽→바깥). */
   sd: number;
+  /** 대표 시점 기준 거리 정렬 key. 작을수록 먼저 합성. */
+  viewDepth: number;
 }
 
 /**
  * 한 평면의 텍스처를 가우시안 수직투영 + alpha 컴포지팅으로 굽는다.
  *
- * 적응형 깊이 샘플링 (Adaptive depth):
- *   - 안쪽 경계: sd ≥ -depthGate (방 쪽 occluder 배제)
- *   - 바깥쪽 경계: 없음 (벽 안쪽 깊이 / 다른 방 / 벽 너머까지 모두 채택)
+ * 경계 교차 샘플링:
+ *   - 평면 바깥쪽 중심(sd >= 0) 가우시안은 채택
+ *   - 평면 안쪽 중심(sd < 0) 가우시안은 렌더 가능한 extent 가 평면에 닿을 때만 채택
  *   - sd ascending (signed) 으로 정렬 → 안쪽에서 바깥으로 walk
  *   - 픽셀별로 T saturate(<1e-3) 시 break → wall paint 충분한 픽셀은 빨리 멈추고,
- *     sparse한 픽셀만 더 멀리까지 walk해서 alpha=1 채움
+ *     sparse한 픽셀은 더 멀리까지 walk해서 coverage alpha 를 최대한 누적
  *
  * 알고리즘:
  *  1. 각 가우시안:
- *     - sd = (g - origin) · normal. sd < -depthGate 이면 스킵
+ *     - sd = (g - origin) · normal.
+ *     - sd < 0 이고 normal 방향 render extent 가 평면에 닿지 않으면 스킵
  *     - 평면 좌표 (u, v) 계산
  *     - 2D 투영 covariance Σ₂ = J · Σ₃ · Jᵀ (anisotropic 그대로 보존)
- *     - 픽셀 footprint = 3σ bbox
+ *     - 픽셀 footprint = PlayCanvas visible radius bbox (opacity 에 따라 0..√8σ)
  *  2. sd ascending 정렬 (signed)
  *  3. 각 가우시안을 footprint 픽셀에 splat:
- *     `α_g = opacity · exp(-0.5 · dᵀ Σ₂⁻¹ d)`
+ *     PlayCanvas gsplat fragment 와 같은 커널:
+ *     `q = dᵀ Σ₂⁻¹ d`
+ *     `profile = (exp(-0.5q) - exp(-4)) / (1 - exp(-4))`, q <= 8
+ *     `α_g = opacity · profile`, α_g >= 1/255
  *     `rgb_acc += T · α_g · color; T *= (1 - α_g); break if T < 1e-3`
  *  4. 최종: alpha = 1 - T, rgb = rgb_acc / alpha (un-premultiply)
+ *
+ * 색 공간:
+ * PlayCanvas uncompressed gsplat 은 `f_dc*C0+0.5` 를 gamma color 로 `splatColor` 에 저장하고,
+ * 기본 출력도 그 gamma color 를 사용한다. 따라서 여기서 linear→sRGB 변환을 추가로 걸지 않는다.
  */
 export async function bakeTextureForPlane(
   input: PlaneBakeInput,
@@ -177,7 +156,6 @@ export async function bakeTextureForPlane(
   options: Partial<TextureBakeOptions> = {},
 ): Promise<TextureBakeResult> {
   const opts = { ...DEFAULT_TEXTURE_BAKE_OPTIONS, ...options };
-  console.log(`[bakeTextureForPlane] ENTER — received options=${JSON.stringify(options)}, merged opts=${JSON.stringify(opts)}`);
 
   const uW = input.uMax - input.uMin;
   const vH = input.vMax - input.vMin;
@@ -210,78 +188,15 @@ export async function bakeTextureForPlane(
   const [nx, ny, nz] = input.normal;
   const tpm = opts.texelsPerMeter;
   const tpm2 = tpm * tpm;
-  const dgate = opts.depthGate;
   const maxBB = opts.maxFootprintPx;
   const N = scene.numSplats;
 
   // ── 단계 1: 필터 + 투영 + 2D covariance ──
   const splats: SplatInfo[] = [];
-  let candCount = 0;
-  // 진단 카운터
-  let rejSdInner = 0;     // sd < -dgate (방 안쪽 너무 깊음)
-  let rejDet = 0;         // 2D 공분산 degenerate
-  let rejBigBB = 0;       // bbR > maxBB (스카이/노이즈)
-  let rejTinyBB = 0;      // bbR < 0.3 (너무 작음)
-  let rejOutOfRange = 0;  // 큰 텍스처에서 픽셀 범위 밖
-
-  // ── 사전 패스: opacity-가중 sd 히스토그램으로 paint plane 자동 검출 ──
-  //  - 1cm 빈, ±2m 범위 (200 + 200 = 400 빈)
-  //  - 빈마다 sigmoid(opacity) 합산 — opacity 높은 가우시안일수록 가중
-  //  - sd=0 부근 ±50cm 에서 peak 찾기 → 거기가 실제 paint plane
-  //  - 자동 게이트 = max(slider, |peak sd| + 5cm 마진) 으로 paint 포함 보장
-  // 부수: 진단용 통계도 같이 계산.
-  const HIST_BINS = 400;
-  const HIST_RANGE = 2.0;
-  const HIST_RES = (2 * HIST_RANGE) / HIST_BINS; // 0.01 m
-  const wHist = new Float32Array(HIST_BINS);
-  let sdMin = Infinity, sdMax = -Infinity, sdSum = 0;
-  const sdHist = new Int32Array(40); // 진단용 10cm 빈 (±2m)
-  for (let i = 0; i < N; i++) {
-    const dx = px[i] - ox, dy = py[i] - oy, dz = pz[i] - oz;
-    const sd0 = dx * nx + dy * ny + dz * nz;
-    if (sd0 < sdMin) sdMin = sd0;
-    if (sd0 > sdMax) sdMax = sd0;
-    sdSum += sd0;
-    // 10cm 빈 (진단용)
-    const dbin = Math.floor((sd0 + 2) / 0.1);
-    if (dbin >= 0 && dbin < 40) sdHist[dbin]++;
-    // 1cm 빈 (auto-gate 용, opacity 가중)
-    const fbin = Math.floor((sd0 + HIST_RANGE) / HIST_RES);
-    if (fbin >= 0 && fbin < HIST_BINS) {
-      const w = sigmoid(op[i]);
-      wHist[fbin] += w;
-    }
-  }
-  const sdMean = sdSum / Math.max(1, N);
-
-  // sd=0 ±50cm 범위에서 paint peak 검출
-  const SEARCH_RANGE = 0.5;
-  const centerBin = Math.floor(HIST_RANGE / HIST_RES);
-  const halfSearch = Math.floor(SEARCH_RANGE / HIST_RES);
-  let peakBin = centerBin;
-  let peakW = -1;
-  for (let b = Math.max(0, centerBin - halfSearch); b <= Math.min(HIST_BINS - 1, centerBin + halfSearch); b++) {
-    if (wHist[b] > peakW) { peakW = wHist[b]; peakBin = b; }
-  }
-  const paintSd = (peakBin + 0.5) * HIST_RES - HIST_RANGE;
-  // 자동 게이트 — paint peak 가 음수면 그만큼 안쪽까지 허용 + autoMargin.
-  // autoMargin = 0 이면 자동 확장 비활성화 → 사용자가 설정한 경계면(depthGate)을 그대로 사용 (strict mode).
-  const autoMargin = opts.autoMargin;
-  const autoGate = autoMargin > 0
-    ? Math.max(opts.depthGate, -Math.min(0, paintSd) + autoMargin)
-    : opts.depthGate;
-  console.log(`[textureBake] paint peak: sd=${paintSd.toFixed(3)}m (weight=${peakW.toFixed(0)}) → autoGate=${autoGate.toFixed(3)}m (slider=${opts.depthGate.toFixed(3)}m, autoMargin=${autoMargin.toFixed(3)}m), mesh placed at sd=${MESH_PLANE_INSET.toFixed(3)}m (fixed)`);
-  const dgateEff = autoGate;
 
   for (let i = 0; i < N; i++) {
     const dx = px[i] - ox, dy = py[i] - oy, dz = pz[i] - oz;
     const sd = dx * nx + dy * ny + dz * nz;
-    // 적응형 깊이: 안쪽 경계만 차단, 바깥쪽은 무한대까지 허용. 픽셀별 T saturate 로 자동 종료.
-    // dgateEff = max(슬라이더, paint peak 안쪽 + 5cm). 자동 검출이라 사용자 입력 0.5cm 도 OK.
-    if (sd < -dgateEff) { rejSdInner++; continue; }
-    const u = dx * ux + dy * uy + dz * uz;
-    const v = dx * vx + dy * vy + dz * vz;
-    candCount++;
 
     // 쿼터니언 정규화 + 회전 행렬
     const qw0 = r0[i], qx0 = r1[i], qy0 = r2[i], qz0 = r3[i];
@@ -297,6 +212,20 @@ export async function bakeTextureForPlane(
     // 스케일 (log → exp). Σ₃ = R · diag(s²) · Rᵀ
     const s0 = Math.exp(sc0[i]), s1 = Math.exp(sc1[i]), s2 = Math.exp(sc2[i]);
     const ss00 = s0 * s0, ss11 = s1 * s1, ss22 = s2 * s2;
+    const alpha = sigmoidOpacity(op[i]);
+    const visibleSigma = gsplatVisibleSigmaRadius(alpha);
+    if (visibleSigma <= 0) continue;
+
+    // 중심이 평면 안쪽(sd < 0)에 있더라도 Gaussian의 렌더 가능한 normal 방향 extent 가
+    // 평면을 가로지르면 bake 대상이다. PlayCanvas gsplat fragment 의 alpha cutoff 까지 반영한다.
+    const anX = R00 * nx + R10 * ny + R20 * nz;
+    const anY = R01 * nx + R11 * ny + R21 * nz;
+    const anZ = R02 * nx + R12 * ny + R22 * nz;
+    const sigmaN = Math.sqrt(anX * anX * ss00 + anY * anY * ss11 + anZ * anZ * ss22);
+    if (sd < 0 && sd + visibleSigma * sigmaN < 0) continue;
+
+    const u = dx * ux + dy * uy + dz * uz;
+    const v = dx * vx + dy * vy + dz * vz;
 
     // a_u = Rᵀ · uAxis, a_v = Rᵀ · vAxis (각 3-vector). Σ₂ = a^T · diag(s²) · a 형태.
     const auX = R00 * ux + R10 * uy + R20 * uz;
@@ -317,35 +246,46 @@ export async function bakeTextureForPlane(
     const p11 = c11 * tpm2;
 
     const det = p00 * p11 - p01 * p01;
-    if (det < 1e-10) { rejDet++; continue; } // degenerate
+    if (det < 1e-10) continue; // degenerate
 
     const inv00 = p11 / det;
     const inv01 = -p01 / det;
     const inv11 = p00 / det;
 
-    // 3σ bounding box (보수적, 이방성 포함)
+    // PlayCanvas fragment 에서 실제 보이는 radius 기준 bbox (opacity 에 따라 0..sqrt(8)σ).
     const sigU = Math.sqrt(p00);
     const sigV = Math.sqrt(p11);
-    const bbR = 3 * Math.max(sigU, sigV);
-    if (bbR > maxBB) { rejBigBB++; continue; } // 너무 큰 가우시안 (스카이 등)
-    if (bbR < 0.3) { rejTinyBB++; continue; }  // 너무 작은 가우시안
+    const bbR = visibleSigma * Math.max(sigU, sigV);
+    if (bbR > maxBB) continue; // 너무 큰 가우시안 (스카이 등)
+    if (bbR < 0.3) continue;  // 너무 작은 가우시안
 
-    // 픽셀 좌표계 중심
+    // 픽셀 좌표계 중심.
+    // u/v 는 평면 로컬 실제 거리 좌표이고, texelsPerMeter 를 곱해 texel 좌표로 변환한다.
     const tu = (u - input.uMin) * tpm;
     const tv = (v - input.vMin) * tpm;
-    if (tu < -bbR || tu > width + bbR) { rejOutOfRange++; continue; }
-    if (tv < -bbR || tv > height + bbR) { rejOutOfRange++; continue; }
+    if (tu < -bbR || tu > width + bbR) continue;
+    if (tv < -bbR || tv > height + bbR) continue;
 
-    const r = Math.max(0, Math.min(1, 0.5 + SH0 * f0[i]));
-    const g = Math.max(0, Math.min(1, 0.5 + SH0 * f1[i]));
-    const b = Math.max(0, Math.min(1, 0.5 + SH0 * f2[i]));
-    const alpha = sigmoid(op[i]);
+    const r = Math.max(0, Math.min(1, 0.5 + GSPLAT_SH0 * f0[i]));
+    const g = Math.max(0, Math.min(1, 0.5 + GSPLAT_SH0 * f1[i]));
+    const b = Math.max(0, Math.min(1, 0.5 + GSPLAT_SH0 * f2[i]));
 
-    splats.push({ tu, tv, inv00, inv01, inv11, bbR, r, g, b, alpha, sd });
+    let viewDepth = sd;
+    if (opts.viewpoint && opts.viewDirection) {
+      viewDepth =
+        (px[i] - opts.viewpoint[0]) * opts.viewDirection[0] +
+        (py[i] - opts.viewpoint[1]) * opts.viewDirection[1] +
+        (pz[i] - opts.viewpoint[2]) * opts.viewDirection[2];
+    } else if (opts.viewpoint) {
+      viewDepth = Math.hypot(px[i] - opts.viewpoint[0], py[i] - opts.viewpoint[1], pz[i] - opts.viewpoint[2]);
+    }
+
+    splats.push({ tu, tv, inv00, inv01, inv11, bbR, r, g, b, alpha, sd, viewDepth });
   }
 
-  // ── 단계 2: sd ascending 정렬 (signed) — 안쪽에서 바깥쪽 순 ──
-  splats.sort((a, b) => a.sd - b.sd);
+  // ── 단계 2: front-to-back 정렬 ──
+  // 기본은 plane normal 기준(sd ascending), viewpoint 가 있으면 대표 시점에서 가까운 순.
+  splats.sort((a, b) => a.viewDepth - b.viewDepth);
 
   // ── 단계 2.5: 타일 인덱스 자료구조 빌드 ──
   // 각 splat 의 footprint(bbR) 가 닿는 16×16 픽셀 타일들에 등록.
@@ -355,8 +295,6 @@ export async function bakeTextureForPlane(
   const tilesPerRow = Math.ceil(width / TILE);
   const tilesPerCol = Math.ceil(height / TILE);
   const numTiles = tilesPerRow * tilesPerCol;
-
-  const tBinStart = performance.now();
 
   // Pass 1: count entries per tile
   const tileCounts = new Uint32Array(numTiles);
@@ -404,10 +342,6 @@ export async function bakeTextureForPlane(
     }
   }
 
-  let maxTileCount = 0;
-  for (let t = 0; t < numTiles; t++) if (tileCounts[t] > maxTileCount) maxTileCount = tileCounts[t];
-  console.log(`[textureBake] tile binning: ${numTiles} tiles (${tilesPerRow}×${tilesPerCol}), ${totalEntries} entries (avg ${(totalEntries / Math.max(1, numTiles)).toFixed(1)}/tile, max ${maxTileCount}/tile) → ${(performance.now() - tBinStart).toFixed(0)}ms`);
-
   // ── 단계 3: alpha compositing — GPU 우선, CPU 폴백 ──
   // 둘 다 결과: width*height*4 의 Float32Array [r_premult, g_premult, b_premult, alpha]
   let composited: Float32Array | null = null;
@@ -427,7 +361,6 @@ export async function bakeTextureForPlane(
 
   if (!composited) {
     // CPU 폴백
-    const tCpuStart = performance.now();
     composited = new Float32Array(width * height * 4);
     const T = new Float32Array(width * height);
     T.fill(1.0);
@@ -444,10 +377,9 @@ export async function bakeTextureForPlane(
         for (let xx = u0; xx <= u1; xx++) {
           const du = xx + 0.5 - sp.tu;
           const dv = yy + 0.5 - sp.tv;
-          const exponent = -0.5 * (du * du * sp.inv00 + 2 * du * dv * sp.inv01 + dv * dv * sp.inv11);
-          if (exponent < -6) continue;
-          const ag = sp.alpha * Math.exp(exponent);
-          if (ag < 1e-3) continue;
+          const q = du * du * sp.inv00 + 2 * du * dv * sp.inv01 + dv * dv * sp.inv11;
+          const ag = gsplatKernelAlpha(sp.alpha, q);
+          if (ag <= 0) continue;
 
           const idx = rowBase + xx;
           const t = T[idx];
@@ -466,27 +398,46 @@ export async function bakeTextureForPlane(
     for (let i = 0; i < width * height; i++) {
       composited[i * 4 + 3] = 1 - T[i];
     }
-    console.log(`[textureBake CPU] ${(performance.now() - tCpuStart).toFixed(0)}ms`);
   }
 
-  // ── 단계 4: 최종 RGBA8 (un-premultiply + sRGB encode + V flip) ──
+  // ── 단계 4: 최종 RGBA8 (un-premultiply + V flip + polygon/cutout mask) ──
+  // composited alpha 는 색을 un-premultiply 하기 위한 coverage 신뢰도로만 사용한다.
+  // wall mesh PNG 의 alpha 채널은 렌더링 투명도가 아니라 cutout mask 이므로,
+  // 유효 texel 은 255, polygon 외부/coverage 없음은 0 으로 저장한다.
+  // polygon mask (ceiling/floor 한정): 픽셀의 world XZ 가 polygon 외부면 alpha=0.
+  // 픽셀 (xx, yy) → 베이크 (u_local, v_local) = ((xx+0.5)/tpm, (yy+0.5)/tpm)
+  //   → world: origin + u_local * uAxis + v_local * vAxis. y 성분은 평면에 의존하므로 무시 (XZ test).
+  const mask = input.polygonMaskXZ;
+  const useMask = !!mask && mask.length >= 3;
   const rgba = new Uint8ClampedArray(width * height * 4);
-  let nOpaque = 0;
   for (let yy = 0; yy < height; yy++) {
     for (let xx = 0; xx < width; xx++) {
       const srcIdx = (yy * width + xx) * 4;
       const finalAlpha = composited[srcIdx + 3];
       const imgRow = height - 1 - yy; // V 뒤집기
       const imgIdx = (imgRow * width + xx) * 4;
-      if (finalAlpha > 1e-3) {
-        const r = composited[srcIdx]     / finalAlpha;
-        const g = composited[srcIdx + 1] / finalAlpha;
-        const b = composited[srcIdx + 2] / finalAlpha;
-        rgba[imgIdx]     = Math.round(linToSrgb(r) * 255);
-        rgba[imgIdx + 1] = Math.round(linToSrgb(g) * 255);
-        rgba[imgIdx + 2] = Math.round(linToSrgb(b) * 255);
-        rgba[imgIdx + 3] = Math.round(finalAlpha * 255);
-        nOpaque++;
+
+      let alphaPass = finalAlpha > 1e-3;
+      if (alphaPass && useMask) {
+        // textureBake 좌표계 — input.uMin/vMin 은 0 또는 음수일 수 있음.
+        // 픽셀 중심: (xx+0.5)/tpm + uMin = ... 이건 splat sampling 식과 일치.
+        const uLocal = input.uMin + (xx + 0.5) / tpm;
+        const vLocal = input.vMin + (yy + 0.5) / tpm;
+        const worldX = ox + uLocal * ux + vLocal * vx;
+        const worldZ = oz + uLocal * uz + vLocal * vz;
+        if (!isPointInPolygonXZ(worldX, worldZ, mask!)) {
+          alphaPass = false;
+        }
+      }
+
+      if (alphaPass) {
+        const r = Math.max(0, Math.min(1, composited[srcIdx]     / finalAlpha));
+        const g = Math.max(0, Math.min(1, composited[srcIdx + 1] / finalAlpha));
+        const b = Math.max(0, Math.min(1, composited[srcIdx + 2] / finalAlpha));
+        rgba[imgIdx]     = Math.round(r * 255);
+        rgba[imgIdx + 1] = Math.round(g * 255);
+        rgba[imgIdx + 2] = Math.round(b * 255);
+        rgba[imgIdx + 3] = 255;
       } else {
         rgba[imgIdx] = 0;
         rgba[imgIdx + 1] = 0;
@@ -495,60 +446,32 @@ export async function bakeTextureForPlane(
       }
     }
   }
-
-  // ── 코너: 메시는 베이크 범위보다 extend* 만큼 더 뻗음. ──
-  // 메시 위치는 방 경계 평면(sd=0) 에서 법선 방향(=방 바깥) 으로 MESH_PLANE_INSET 들여놓음 (현재 0).
-  // 6 면 모두 동일한 오프셋이라 인접 면 extend 도 같은 값. 직육면체 코너에서 메시들이 정확히 만남.
-  // (paintSd 는 autoGate 산정용으로만 사용.)
-  const meshOffsetEff = MESH_PLANE_INSET;
-  const mox = ox + meshOffsetEff * nx;
-  const moy = oy + meshOffsetEff * ny;
-  const moz = oz + meshOffsetEff * nz;
-  const meshUMin = input.uMin - input.extendU0;
-  const meshUMax = input.uMax + input.extendU1;
-  const meshVMin = input.vMin - input.extendV0;
-  const meshVMax = input.vMax + input.extendV1;
-
+  // 메시 코너 = 베이크 origin 위치 (사용자가 정의한 경계 평면, sd=0) 에 정확히 배치.
   const corner = (uu: number, vv: number): Vec3 => [
-    mox + uu * ux + vv * vx,
-    moy + uu * uy + vv * vy,
-    moz + uu * uz + vv * vz,
+    ox + uu * ux + vv * vx,
+    oy + uu * uy + vv * vy,
+    oz + uu * uz + vv * vz,
   ];
   const corners: [Vec3, Vec3, Vec3, Vec3] = [
-    corner(meshUMin, meshVMax),  // TL
-    corner(meshUMax, meshVMax),  // TR
-    corner(meshUMax, meshVMin),  // BR
-    corner(meshUMin, meshVMin),  // BL
+    corner(input.uMin, input.vMax),  // TL
+    corner(input.uMax, input.vMax),  // TR
+    corner(input.uMax, input.vMin),  // BR
+    corner(input.uMin, input.vMin),  // BL
   ];
 
-  // UV 매핑: 텍스처 [0,1] 범위가 베이크 범위 [uMin, uMax] × [vMin, vMax] 에 대응.
-  // 메시 코너가 베이크 범위 밖이면 UV도 [0,1] 밖으로 나감 → clamp-to-edge로 가장자리 픽셀 복제.
+  // UV 매핑: 평면 로컬 실제 거리 범위 [uMin, uMax] × [vMin, vMax] 를
+  // 텍스처 [0,1] 범위로 정규화한다.
   // 이미지 row 0 = vMax (V flip 적용했으므로). 따라서 UV v = (vMax - world_v) / (vMax - vMin).
   const uvOf = (uu: number, vv: number): [number, number] => [
     (uu - input.uMin) / uW,
     (input.vMax - vv) / vH,
   ];
   const uvs: [[number, number], [number, number], [number, number], [number, number]] = [
-    uvOf(meshUMin, meshVMax),  // TL
-    uvOf(meshUMax, meshVMax),  // TR
-    uvOf(meshUMax, meshVMin),  // BR
-    uvOf(meshUMin, meshVMin),  // BL
+    uvOf(input.uMin, input.vMax),  // TL
+    uvOf(input.uMax, input.vMax),  // TR
+    uvOf(input.uMax, input.vMin),  // BR
+    uvOf(input.uMin, input.vMin),  // BL
   ];
-
-  const tag = `[textureBake]`;
-  console.log(`${tag} ${width}×${height}, candidates ${candCount}, splats ${splats.length}, opaque texels ${nOpaque}/${width * height} (${(100 * nOpaque / (width * height)).toFixed(1)}%)`);
-  console.log(`${tag} sd dist: min=${sdMin.toFixed(3)} max=${sdMax.toFixed(3)} mean=${sdMean.toFixed(3)} (m), dgateEff=-${dgateEff.toFixed(3)} (slider=${dgate.toFixed(3)}, autoGate=${autoGate.toFixed(3)})`);
-  console.log(`${tag} reject: sdInner=${rejSdInner} (sd<-dgate), det=${rejDet}, bigBB=${rejBigBB}, tinyBB=${rejTinyBB}, outRange=${rejOutOfRange}`);
-  // sd 히스토그램 — -2..+2m, 10cm 빈. paint peak 위치 확인용.
-  const histLines: string[] = [];
-  for (let i = 0; i < 40; i++) {
-    if (sdHist[i] > 0) {
-      const lo = (-2 + i * 0.1).toFixed(2);
-      const hi = (-2 + (i + 1) * 0.1).toFixed(2);
-      histLines.push(`  [${lo}..${hi}] = ${sdHist[i]}`);
-    }
-  }
-  console.log(`${tag} sd histogram (10cm bins, only nonzero):\n${histLines.join('\n')}`);
 
   return { rgba, width, height, corners, uvs, input };
 }
@@ -557,9 +480,13 @@ export async function bakeTextureForPlane(
  * 방 기하 + 면 ID → PlaneBakeInput.
  *
  * - 샘플 평면(origin) = **벽 표면 sd=0**. 벽 paint 가우시안을 그대로 샘플.
- * - 메시는 `bakeTextureForPlane` 에서 항상 `MESH_PLANE_INSET` 위치에 배치 (현재 0 = 사용자 경계면 sd=0).
- * - (u, v) 범위는 인접 면의 메시 오프셋 (= MESH_PLANE_INSET) 만큼 양쪽 확장 → 직육면체 코너에서
- *   메시들이 정확히 만남. 본 면의 메시 오프셋과 인접 면의 extend 가 같은 상수에서 파생되므로 항상 동기화.
+ * - 메시는 `bakeTextureForPlane` 에서 origin 위치(사용자 경계면, sd=0) 에 정확히 배치.
+ *
+ * N벽 일반화:
+ *   - wall surfaceId `wi` → 폴리곤 i 번째 변 (`polygon[i]` → `polygon[(i+1)%N]`).
+ *   - 변 방향이 uAxis, Y축이 vAxis.
+ *   - 벽은 평면 로컬 실제 거리 범위를 u=0..벽 길이, v=0..천장-바닥 높이로 둔다.
+ *   - ceiling/floor: 폴리곤 XZ bbox 로 직사각 quad. polygon 외부 픽셀은 빈 텍셀 (alpha=0).
  *
  * 좌표 규약은 planes.ts와 동일 (raw PLY 프레임).
  */
@@ -567,103 +494,62 @@ export function planeBakeInputForSurface(
   surfaceId: string,
   room: RoomGeometry,
 ): PlaneBakeInput {
-  const rad = (room.angleDeg * Math.PI) / 180;
-  const c = Math.cos(rad), s = Math.sin(rad);
-  const [a1, b1, a2, b2] = room.walls;
-  const { ceilingY: cy, floorY: fy } = room;
+  const { polygon, ceilingY: cy, floorY: fy, surfacePlanes } = room;
+  const N = polygon.length;
 
-  // 모든 면의 메시 오프셋이 동일 (MESH_PLANE_INSET) → 인접 면 extend 도 그대로 이 값.
-  // 본 면의 메시는 bakeTextureForPlane 안에서 `meshOffsetEff = MESH_PLANE_INSET` 으로 배치되므로,
-  // 여기서 같은 상수를 extend* 에 쓰면 직육면체 6면이 정확히 만남.
-  const offSelf = MESH_PLANE_INSET;
-  const oCeil = MESH_PLANE_INSET;
-  const oFloor = MESH_PLANE_INSET;
-  const oW1a = MESH_PLANE_INSET;
-  const oW1b = MESH_PLANE_INSET;
-  const oW2a = MESH_PLANE_INSET;
-  const oW2b = MESH_PLANE_INSET;
-
-  // 베이크 범위는 원래 방 범위 그대로. 메시는 인접 offset 만큼 extend (replicate padding).
-  switch (surfaceId) {
-    case 'ceiling': {
-      const normal: Vec3 = [0, 1, 0];
-      return {
-        origin: [c * a1 - s * a2, cy, s * a1 + c * a2],
-        uAxis: [c, 0, s],
-        vAxis: [-s, 0, c],
-        normal,
-        uMin: 0, uMax: b1 - a1, vMin: 0, vMax: b2 - a2,
-        extendU0: oW1a, extendU1: oW1b,
-        extendV0: oW2a, extendV1: oW2b,
-        meshOffset: offSelf,
-      };
+  if (surfaceId === 'ceiling' || surfaceId === 'floor') {
+    // 폴리곤 XZ bbox.
+    let mnX = Infinity, mxX = -Infinity, mnZ = Infinity, mxZ = -Infinity;
+    for (const p of polygon) {
+      if (p.x < mnX) mnX = p.x; if (p.x > mxX) mxX = p.x;
+      if (p.z < mnZ) mnZ = p.z; if (p.z > mxZ) mxZ = p.z;
     }
-    case 'floor': {
-      const normal: Vec3 = [0, -1, 0];
-      return {
-        origin: [c * a1 - s * a2, fy, s * a1 + c * a2],
-        uAxis: [c, 0, s],
-        vAxis: [-s, 0, c],
-        normal,
-        uMin: 0, uMax: b1 - a1, vMin: 0, vMax: b2 - a2,
-        extendU0: oW1a, extendU1: oW1b,
-        extendV0: oW2a, extendV1: oW2b,
-        meshOffset: offSelf,
-      };
-    }
-    case 'w1a': {
-      const normal: Vec3 = [-c, 0, -s];
-      return {
-        origin: [c * a1 - s * a2, fy, s * a1 + c * a2],
-        uAxis: [-s, 0, c],
-        vAxis: [0, 1, 0],
-        normal,
-        uMin: 0, uMax: b2 - a2, vMin: 0, vMax: cy - fy,
-        extendU0: oW2a, extendU1: oW2b,
-        extendV0: oFloor, extendV1: oCeil,
-        meshOffset: offSelf,
-      };
-    }
-    case 'w1b': {
-      const normal: Vec3 = [c, 0, s];
-      return {
-        origin: [c * b1 - s * a2, fy, s * b1 + c * a2],
-        uAxis: [-s, 0, c],
-        vAxis: [0, 1, 0],
-        normal,
-        uMin: 0, uMax: b2 - a2, vMin: 0, vMax: cy - fy,
-        extendU0: oW2a, extendU1: oW2b,
-        extendV0: oFloor, extendV1: oCeil,
-        meshOffset: offSelf,
-      };
-    }
-    case 'w2a': {
-      const normal: Vec3 = [s, 0, -c];
-      return {
-        origin: [c * a1 - s * a2, fy, s * a1 + c * a2],
-        uAxis: [c, 0, s],
-        vAxis: [0, 1, 0],
-        normal,
-        uMin: 0, uMax: b1 - a1, vMin: 0, vMax: cy - fy,
-        extendU0: oW1a, extendU1: oW1b,
-        extendV0: oFloor, extendV1: oCeil,
-        meshOffset: offSelf,
-      };
-    }
-    case 'w2b': {
-      const normal: Vec3 = [-s, 0, c];
-      return {
-        origin: [c * a1 - s * b2, fy, s * a1 + c * b2],
-        uAxis: [c, 0, s],
-        vAxis: [0, 1, 0],
-        normal,
-        uMin: 0, uMax: b1 - a1, vMin: 0, vMax: cy - fy,
-        extendU0: oW1a, extendU1: oW1b,
-        extendV0: oFloor, extendV1: oCeil,
-        meshOffset: offSelf,
-      };
-    }
-    default:
-      throw new Error(`planeBakeInputForSurface: unknown surfaceId "${surfaceId}"`);
+    const plane = surfacePlanes.find(p => p.id === surfaceId);
+    const normal: Vec3 = plane
+      ? [plane.normal[0], plane.normal[1], plane.normal[2]]
+      : (surfaceId === 'ceiling' ? [0, 1, 0] : [0, -1, 0]);
+    const yLevel = surfaceId === 'ceiling' ? cy : fy;
+    return {
+      origin: [mnX, yLevel, mnZ],
+      uAxis: [1, 0, 0],
+      vAxis: [0, 0, 1],
+      normal,
+      uMin: 0, uMax: mxX - mnX,
+      vMin: 0, vMax: mxZ - mnZ,
+      // polygon 외부 픽셀 alpha=0 — quad 는 bbox 직사각, 텍스처 알파로 polygon 모양 시각화.
+      polygonMaskXZ: polygon.map(p => ({ x: p.x, z: p.z })),
+    };
   }
+
+  const m = /^w(\d+)$/.exec(surfaceId);
+  if (!m) throw new Error(`planeBakeInputForSurface: unknown surfaceId "${surfaceId}"`);
+  const i = parseInt(m[1], 10);
+  if (i < 0 || i >= N) throw new Error(`planeBakeInputForSurface: wall index ${i} out of range (N=${N})`);
+
+  const a = polygon[i];
+  const b = polygon[(i + 1) % N];
+  const dx = b.x - a.x;
+  const dz = b.z - a.z;
+  const len = Math.hypot(dx, dz);
+  if (len < 1e-9) throw new Error(`planeBakeInputForSurface: degenerate edge "${surfaceId}"`);
+
+  const plane = surfacePlanes.find(p => p.id === surfaceId);
+  if (!plane) throw new Error(`planeBakeInputForSurface: SurfacePlane "${surfaceId}" not in surfacePlanes`);
+  const normal: Vec3 = [plane.normal[0], plane.normal[1], plane.normal[2]];
+
+  // uAxis = 변 방향 (a→b 정규화). vAxis = Y up.
+  // origin = 벽 시작점 a 의 바닥 위치. 즉 벽 평면 로컬 좌표 (u=0, v=0) 의 3D 위치.
+  // bakeTextureForPlane 안의 V flip 으로 vMax 가 텍스처 row 0 (이미지 상단) 이 됨.
+  const uAxis: Vec3 = [dx / len, 0, dz / len];
+  const vAxis: Vec3 = [0, 1, 0];
+  return {
+    origin: [a.x, fy, a.z],
+    uAxis,
+    vAxis,
+    normal,
+    // u/v 범위는 실제 거리 단위다. 여기서 len 은 실제 3D 벽 길이이며,
+    // texelsPerMeter 를 곱해 텍스처 픽셀 폭으로 변환된다.
+    uMin: 0, uMax: len,
+    vMin: 0, vMax: cy - fy,
+  };
 }

@@ -157,8 +157,6 @@ export function useDepthNormal() {
       const fovRad = (fovDeg * Math.PI) / 180;
       const focalLength = (h / 2) / Math.tan(fovRad / 2);
 
-      console.log(`[DepthNormal] depth ${w}x${h}, FOV=${fovDeg.toFixed(1)}°, focal=${focalLength.toFixed(1)}px`);
-
       depthCacheRef.current = {
         data: floatData,
         width: w,

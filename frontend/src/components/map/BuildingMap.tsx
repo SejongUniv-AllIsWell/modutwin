@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { api } from '@/lib/api';
+import { loadKakaoMapsSdk } from '@/lib/map/loadKakaoMapsSdk';
 
 interface Building {
   name: string;
@@ -39,20 +40,13 @@ export default function BuildingMap({ buildings, onBuildingSelect }: BuildingMap
       return;
     }
 
-    // 카카오맵 SDK 로드
-    if (window.kakao?.maps) {
-      initMap();
-      return;
-    }
-
-    const script = document.createElement('script');
-    script.src = `https://dapi.kakao.com/v2/maps/sdk.js?appkey=${kakaoKey}&autoload=false&libraries=services`;
-    script.onload = () => {
-      window.kakao.maps.load(() => {
+    loadKakaoMapsSdk(kakaoKey)
+      .then(() => {
         initMap();
+      })
+      .catch(() => {
+        // 로드 실패 시 기존과 동일하게 로딩 상태 유지
       });
-    };
-    document.head.appendChild(script);
   }, []);
 
   const initMap = () => {
@@ -113,25 +107,25 @@ export default function BuildingMap({ buildings, onBuildingSelect }: BuildingMap
 
   return (
     <div className="flex flex-col h-full">
-      <div className="flex gap-2 p-2 bg-gray-800">
+      <div className="flex gap-2 p-2 bg-[var(--bg-soft)]">
         <input
           type="text"
           value={searchQuery}
           onChange={(e) => setSearchQuery(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
           placeholder="건물 검색..."
-          className="flex-1 bg-gray-700 border border-gray-600 rounded px-3 py-1.5 text-white text-sm focus:outline-none focus:border-blue-500"
+          className="flex-1 bg-[var(--bg-soft)] border border-[var(--rule)] rounded px-3 py-1.5 text-[var(--ink)] text-sm focus:outline-none focus:border-blue-500"
         />
         <button
           onClick={handleSearch}
-          className="bg-blue-600 hover:bg-blue-700 text-white text-sm px-4 py-1.5 rounded"
+          className="bg-blue-600 hover:bg-blue-700 text-[var(--ink)] text-sm px-4 py-1.5 rounded"
         >
           검색
         </button>
       </div>
       <div ref={mapRef} className="flex-1 min-h-[300px]">
         {!mapLoaded && (
-          <div className="flex items-center justify-center h-full bg-gray-900 text-gray-500 text-sm">
+          <div className="flex items-center justify-center h-full bg-[var(--paper)] text-[var(--muted)] text-sm">
             {process.env.NEXT_PUBLIC_KAKAO_MAP_KEY
               ? '지도 로딩 중...'
               : '카카오맵 API 키가 설정되지 않았습니다. (.env의 NEXT_PUBLIC_KAKAO_MAP_KEY)'}

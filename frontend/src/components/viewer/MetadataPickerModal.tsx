@@ -3,6 +3,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { api } from '@/lib/api';
 import { Building, BuildingMetadataOptions, MetadataFloorOption, Module } from '@/types';
+import { floorLabelKo as formatFloor } from '@/lib/format/floor';
+import { Button } from '@/components/ui/Button';
 
 export interface MetadataResult {
   building_id: string;
@@ -46,10 +48,6 @@ interface Props {
   } | null;
   onConfirm: (result: MetadataResult) => Promise<void> | void;
   onClose: () => void;
-}
-
-function formatFloor(n: number): string {
-  return n < 0 ? `B${Math.abs(n)}` : `${n}층`;
 }
 
 export default function MetadataPickerModal({
@@ -278,29 +276,29 @@ export default function MetadataPickerModal({
 
   return (
     <div className="fixed inset-0 z-[60] bg-black/70 flex items-center justify-center p-4">
-      <div className="bg-gray-900 border border-gray-800 rounded-lg w-full max-w-md p-5 space-y-4">
+      <div className="bg-[var(--paper)] border border-[var(--rule)] rounded-lg w-full max-w-md p-5 space-y-4">
         <div>
-          <h3 className="text-lg font-semibold text-gray-100">{title}</h3>
-          <p className="text-xs text-gray-400 mt-1">{description}</p>
+          <h3 className="text-lg font-semibold text-[var(--ink)]">{title}</h3>
+          <p className="text-xs text-[var(--muted)] mt-1">{description}</p>
         </div>
 
         {/* 건물 선택 */}
         {!fixedContext && (
         <div ref={dropdownRef} className="relative">
-          <label className="block text-sm text-gray-400 mb-1">건물</label>
+          <label className="block text-sm text-[var(--muted)] mb-1">건물</label>
           <button
             type="button"
             onClick={() => !submitting && setSearchOpen(prev => !prev)}
             disabled={submitting}
-            className="w-full text-left bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-blue-500 disabled:opacity-40 hover:border-gray-500"
+            className="w-full text-left bg-[var(--bg-soft)] border border-[var(--rule)] rounded px-3 py-2 text-sm focus:outline-none focus:border-blue-500 disabled:opacity-40 hover:border-gray-500"
           >
             {selectedBuildingName
-              ? <span className="text-white">{selectedBuildingName}</span>
-              : <span className="text-gray-500">건물 선택...</span>}
+              ? <span className="text-[var(--ink)]">{selectedBuildingName}</span>
+              : <span className="text-[var(--muted)]">건물 선택...</span>}
           </button>
 
           {searchOpen && (
-            <div className="absolute z-10 top-full mt-1 w-full bg-gray-800 border border-gray-700 rounded shadow-lg">
+            <div className="absolute z-10 top-full mt-1 w-full bg-[var(--bg-soft)] border border-[var(--rule)] rounded shadow-lg">
               <div className="p-2">
                 <input
                   type="text"
@@ -308,39 +306,39 @@ export default function MetadataPickerModal({
                   onChange={e => setSearchQuery(e.target.value)}
                   placeholder="건물 이름 검색..."
                   autoFocus
-                  className="w-full bg-gray-900 border border-gray-600 rounded px-3 py-1.5 text-white text-sm focus:outline-none focus:border-blue-500"
+                  className="w-full bg-[var(--paper)] border border-[var(--rule)] rounded px-3 py-1.5 text-[var(--ink)] text-sm focus:outline-none focus:border-blue-500"
                 />
               </div>
               <div className="max-h-60 overflow-y-auto">
                 {/* 기존 등록된 건물 */}
                 {!searchQuery.trim() && buildings.length > 0 && (
-                  <div className="border-t border-gray-700">
-                    <div className="px-3 py-1 text-[10px] text-gray-500 uppercase tracking-wide">등록된 건물</div>
+                  <div className="border-t border-[var(--rule)]">
+                    <div className="px-3 py-1 text-[10px] text-[var(--muted)] uppercase tracking-wide">등록된 건물</div>
                     {buildings.map(b => (
                       <button
                         key={b.id}
                         type="button"
                         onClick={() => selectBuilding(b.name, b.id)}
-                        className="w-full text-left px-3 py-2 hover:bg-gray-700 transition-colors text-white text-sm"
+                        className="w-full text-left px-3 py-2 hover:bg-[var(--bg-soft)] transition-colors text-[var(--ink)] text-sm"
                       >
                         {b.name}
                       </button>
                     ))}
                   </div>
                 )}
-                {searchLoading && <div className="px-3 py-2 text-gray-400 text-sm">검색 중...</div>}
+                {searchLoading && <div className="px-3 py-2 text-[var(--muted)] text-sm">검색 중...</div>}
                 {!searchLoading && searchQuery.trim() && searchResults.length === 0 && (
-                  <div className="px-3 py-2 text-gray-400 text-sm">검색 결과가 없습니다.</div>
+                  <div className="px-3 py-2 text-[var(--muted)] text-sm">검색 결과가 없습니다.</div>
                 )}
                 {searchResults.map(place => (
                   <button
                     key={place.id}
                     type="button"
                     onClick={() => selectBuilding(place.place_name)}
-                    className="w-full text-left px-3 py-2 hover:bg-gray-700 transition-colors border-t border-gray-700 first:border-t-0"
+                    className="w-full text-left px-3 py-2 hover:bg-[var(--bg-soft)] transition-colors border-t border-[var(--rule)] first:border-t-0"
                   >
-                    <div className="text-white text-sm font-medium">{place.place_name}</div>
-                    <div className="text-gray-400 text-xs mt-0.5">{place.road_address_name || place.address_name}</div>
+                    <div className="text-[var(--ink)] text-sm font-medium">{place.place_name}</div>
+                    <div className="text-[var(--muted)] text-xs mt-0.5">{place.road_address_name || place.address_name}</div>
                   </button>
                 ))}
               </div>
@@ -353,12 +351,12 @@ export default function MetadataPickerModal({
         {!fixedContext && (
         <div className="flex gap-3">
           <div className="flex-1">
-            <label className="block text-sm text-gray-400 mb-1">층</label>
+            <label className="block text-sm text-[var(--muted)] mb-1">층</label>
             <select
               value={selectedFloorId}
               onChange={e => setSelectedFloorId(e.target.value)}
               disabled={submitting || optionsLoading || !selectedBuildingId || !metadataOptions?.floors.length}
-              className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white text-sm focus:outline-none focus:border-blue-500 disabled:opacity-40"
+              className="w-full bg-[var(--bg-soft)] border border-[var(--rule)] rounded px-3 py-2 text-[var(--ink)] text-sm focus:outline-none focus:border-blue-500 disabled:opacity-40"
             >
               <option value="">{optionsLoading ? '불러오는 중...' : '층 선택'}</option>
               {metadataOptions?.floors.map(floor => (
@@ -369,12 +367,12 @@ export default function MetadataPickerModal({
             </select>
           </div>
           <div className="flex-1">
-            <label className="block text-sm text-gray-400 mb-1">모듈</label>
+            <label className="block text-sm text-[var(--muted)] mb-1">모듈</label>
             <select
               value={moduleName}
               onChange={e => setModuleName(e.target.value)}
               disabled={submitting || optionsLoading || !selectedFloor || selectedFloor.modules.length === 0}
-              className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white text-sm focus:outline-none focus:border-blue-500 disabled:opacity-40"
+              className="w-full bg-[var(--bg-soft)] border border-[var(--rule)] rounded px-3 py-2 text-[var(--ink)] text-sm focus:outline-none focus:border-blue-500 disabled:opacity-40"
             >
               <option value="">{selectedFloor ? '모듈 선택' : '층 선택 필요'}</option>
               {selectedFloor?.modules.map(module => (
@@ -388,21 +386,21 @@ export default function MetadataPickerModal({
         )}
         {fixedContext && !fixedContext.module_name && (
           <div>
-            <label className="block text-sm text-gray-400 mb-1">모듈 이름</label>
+            <label className="block text-sm text-[var(--muted)] mb-1">모듈 이름</label>
             <input
               type="text"
               value={moduleName}
               onChange={e => setModuleName(e.target.value)}
               placeholder="모듈 이름"
               disabled={submitting}
-              className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white text-sm focus:outline-none focus:border-blue-500 disabled:opacity-40"
+              className="w-full bg-[var(--bg-soft)] border border-[var(--rule)] rounded px-3 py-2 text-[var(--ink)] text-sm focus:outline-none focus:border-blue-500 disabled:opacity-40"
             />
           </div>
         )}
         {fixedContext?.module_name && (
           <div>
-            <label className="block text-sm text-gray-400 mb-1">모듈 이름</label>
-            <div className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white text-sm">
+            <label className="block text-sm text-[var(--muted)] mb-1">모듈 이름</label>
+            <div className="w-full bg-[var(--bg-soft)] border border-[var(--rule)] rounded px-3 py-2 text-[var(--ink)] text-sm">
               {fixedContext.module_name}
             </div>
           </div>
@@ -410,16 +408,16 @@ export default function MetadataPickerModal({
 
         {showSamPrompt && (
           <div>
-            <label className="block text-sm text-gray-400 mb-1">SAM3 프롬프트</label>
+            <label className="block text-sm text-[var(--muted)] mb-1">SAM3 프롬프트</label>
             <input
               type="text"
               value={samPrompt}
               onChange={e => setSamPrompt(e.target.value)}
               placeholder='예: "white wooden door"'
               disabled={submitting}
-              className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white text-sm focus:outline-none focus:border-blue-500 disabled:opacity-40"
+              className="w-full bg-[var(--bg-soft)] border border-[var(--rule)] rounded px-3 py-2 text-[var(--ink)] text-sm focus:outline-none focus:border-blue-500 disabled:opacity-40"
             />
-            <p className="text-[11px] text-gray-500 mt-1">
+            <p className="text-[11px] text-[var(--muted)] mt-1">
               GPU worker 가 이 프롬프트로 문 꼭짓점을 자동 검출합니다. 비워두면 기본 프롬프트로 진행합니다.
             </p>
           </div>
@@ -431,17 +429,17 @@ export default function MetadataPickerModal({
           <button
             onClick={onClose}
             disabled={submitting}
-            className="px-3 py-1.5 text-sm text-gray-300 hover:text-white hover:bg-gray-800 rounded disabled:opacity-40"
+            className="px-3 py-1.5 text-sm text-[var(--ink-2)] hover:text-[var(--ink)] hover:bg-[var(--bg-soft)] rounded disabled:opacity-40"
           >
             취소
           </button>
-          <button
+          <Button
             onClick={handleConfirm}
             disabled={submitting}
-            className="px-4 py-1.5 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded disabled:opacity-40"
+            size="sm"
           >
             {submitting ? '저장 중...' : (showSamPrompt ? '완료' : '확인')}
-          </button>
+          </Button>
         </div>
       </div>
     </div>

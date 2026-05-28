@@ -14,17 +14,25 @@ def get_redis_client() -> redis.Redis:
     return _redis_client
 
 
-def update_progress(task_id: str, progress: int, module_name: str = ""):
-    """Redis에 태스크 진행률 업데이트"""
-    client = get_redis_client()
-    data = json.dumps({
+def _progress_key(task_id: str) -> str:
+    return f"task:progress:{task_id}"
+
+
+def _progress_payload(progress: int, module_name: str) -> str:
+    return json.dumps({
         "progress": progress,
         "module": module_name,
     })
-    client.set(f"task:progress:{task_id}", data)
+
+
+def update_progress(task_id: str, progress: int, module_name: str = ""):
+    """Redis에 태스크 진행률 업데이트"""
+    client = get_redis_client()
+    data = _progress_payload(progress, module_name)
+    client.set(_progress_key(task_id), data)
 
 
 def clear_progress(task_id: str):
     """태스크 완료 시 진행률 키 삭제"""
     client = get_redis_client()
-    client.delete(f"task:progress:{task_id}")
+    client.delete(_progress_key(task_id))

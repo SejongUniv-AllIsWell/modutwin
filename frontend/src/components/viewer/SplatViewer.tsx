@@ -94,7 +94,6 @@ export default function SplatViewer({ sogUrl, mode, uploadId, onSelectionDone }:
       if (fp) {
         setFloorplan(fp);
         firstBakeRef.current = false;
-        console.log(`[SplatViewer] floorplan baked (cutoff=${(floorplanCutoff*100).toFixed(0)}cm): ${fp.width}×${fp.height} @ ${fp.ppm.toFixed(1)} px/m`);
       } else {
         console.warn('[SplatViewer] floorplan bake returned null');
       }
@@ -119,7 +118,7 @@ export default function SplatViewer({ sogUrl, mode, uploadId, onSelectionDone }:
         <button
           onClick={() => setDoorAlignOpen(v => !v)}
           className={`absolute top-3 left-3 z-40 px-3 py-1.5 rounded cursor-pointer text-xs font-bold ${
-            doorAlignOpen ? 'bg-yellow-500 text-black' : 'bg-indigo-600 hover:bg-indigo-500 text-white'
+            doorAlignOpen ? 'bg-yellow-500 text-black' : 'bg-indigo-600 hover:bg-indigo-500 text-[var(--ink)]'
           }`}
         >
           {doorAlignOpen ? '문 설정 닫기' : '문 설정'}

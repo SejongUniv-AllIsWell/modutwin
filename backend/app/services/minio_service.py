@@ -155,6 +155,13 @@ class MinioService:
             resp.close()
             resp.release_conn()
 
+    def put_object_bytes(self, key: str, data: bytes, content_type: str = "application/octet-stream") -> None:
+        """바이트를 MinIO에 직접 업로드 (작은 ~중간 크기 파일용)."""
+        from io import BytesIO
+        self.client.put_object(
+            self.bucket, key, BytesIO(data), length=len(data), content_type=content_type,
+        )
+
 
 _minio_service: MinioService | None = None
 

@@ -166,6 +166,10 @@ class ApiClient {
   async delete<T = any>(path: string): Promise<T> {
     return this.fetch<T>(path, { method: 'DELETE' });
   }
+
+  async postForm<T = any>(path: string, form: FormData): Promise<T> {
+    return this.fetch<T>(path, { method: 'POST', body: form });
+  }
 }
 
 export const api = new ApiClient();

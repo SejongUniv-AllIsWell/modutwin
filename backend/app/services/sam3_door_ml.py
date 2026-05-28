@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 import threading
 import uuid
@@ -35,6 +36,7 @@ from app.services.minio_service import get_minio_service
 from app.services.storage_paths import doors_json_key
 
 settings = get_settings()
+logger = logging.getLogger(__name__)
 
 
 def _apply_bake_rotation(
@@ -206,7 +208,7 @@ def _run_door_ml_pipeline(
 
     except Exception as exc:  # noqa: BLE001
         error = f"{type(exc).__name__}: {exc}"
-        print(f"[sam3_door_ml] FAILED upload_id={upload_id} task={celery_task_id}: {error}")
+        logger.exception(f"[sam3_door_ml] FAILED upload_id={upload_id} task={celery_task_id}: {error}")
 
     # 4) DB 반영.
     asyncio.run(_persist_result(

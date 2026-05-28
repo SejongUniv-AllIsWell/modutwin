@@ -1,13 +1,15 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
+import { api } from '@/lib/api';
 import { SplatViewerCoreRef } from '../SplatViewerCore';
 import { loadRefineState } from '@/lib/refine/persistence';
-import { getEditorRotation, rawToA, aToRaw, rawToAY, ayToRaw, type FrameRotation } from '@/lib/refine/coordFrames';
-import { surfacePlanesFromRoom, type SurfacePlane } from '@/lib/gs/planes';
-import { useAdditionalGsplats } from './useAdditionalGsplats';
+import { getEditorRotation, rawToA, aToRaw, rawToAY, type FrameRotation } from '@/lib/refine/coordFrames';
+import { surfacePlanesFromPolygon, type SurfacePlane } from '@/lib/gs/planes';
+import { useAdditionalGsplats, type AdditionalGsplatsApi } from './useAdditionalGsplats';
+import { useDoorLabels } from './useDoorLabels';
 import type { GaussianScene } from '@/lib/ply/types';
-import type { BoundarySubUpdate } from '@/lib/gs/doorTrim';
 import {
   clearDoorsOnServer,
   emptyPicked,
@@ -15,12 +17,33 @@ import {
   persistDoorsToServer,
   persistEmptyDoorsToServer,
   PRIMARY_DOOR_ID,
+  type DoorMeta,
+  type DoorsJson,
   type PersistOpts,
   type PickedCorner,
   type Vec3,
 } from './doorAlignDoors';
-import { loadBasemapJson, loadBasemapUrl, saveBasemapJson, saveBasemapUrl } from './doorAlignPersistence';
-import { easeInOutCubic, parseBasemapCorners, rotationMatrixToQuat } from './doorAlignMath';
+import { easeInOutCubic } from './doorAlignMath';
+
+export interface ModuleDoorAssetPayload {
+  wallSurfaceId: string;
+  doorExtractionDepth: number;
+  boundarySplitEnabled: boolean;
+  hingeEdge: number;
+  swing: number;
+  angleDeg: number;
+  doorMesh?: {
+    corners: number[][];
+    uvs: number[][];
+    normalInward: number[];
+    textureWidth: number;
+    textureHeight: number;
+    textureBlob: Blob;
+  };
+  doorSplat?: {
+    plyBlob: Blob;
+  };
+}
 
 interface Props {
   coreRef: React.RefObject<SplatViewerCoreRef>;
@@ -28,35 +51,74 @@ interface Props {
   currentUrl: string;
   onDone: (newUrl: string) => void;
   onClose: () => void;
-  /** 'setup' = 문 꼭짓점 / 추출 / 회전 / 설정 저장. 'align' = basemap PLY + 4코너 + 정합/확정저장. default 'setup'. */
-  view?: 'setup' | 'align';
   /** SAM3 자동 추출 진행 중 — "문 수동 지정" 버튼 외 모두 비활성화. */
   autoExtracting?: boolean;
-  /** SAM3 자동 추출 완료 시 부모가 doors.json 에서 가져온 4 코너 (refined 좌표계 raw 프레임).
+  /** SAM3 자동 추출 완료 시 부모가 doors.json 에서 가져온 4 코너 (현재 PLY local frame).
    *  값이 들어오면 picked 슬롯에 채워지고 사용자는 즉시 보거나 보정 후 저장 가능. */
   autoExtractedCorners?: Array<[number, number, number]> | null;
   /** 사용자가 "문 수동 지정" 을 누르면 호출 — 부모가 autoExtracting 을 false 로 내릴 수 있게. */
   onManualPickStart?: () => void;
-  /** "문 설정 완료" 가 성공한 후 호출 — 부모가 메타데이터 모달 띄우거나 정합으로 진입할 수 있게.
+  /** "문 설정 완료" 가 성공한 후 호출 — 부모가 정합 단계로 진입할 수 있게.
    *  반환된 promise 가 resolve 되어야 모달이 닫힘 (취소 시 reject 로 닫힘 방지).
-   *  uploadId 인자는 ensureUploadId 가 확정한 값. 부모는 이 값으로 doors fetch 등에 사용. */
-  onSetupSaveDone?: (uploadId: string) => Promise<void> | void;
+   *  - `uploadId`: ensureUploadId 가 확정한 값.
+   *  - `doorCorners` (옵션, 모듈 흐름): 4 코너 현재 PLY local frame. 부모가 `moduleDoorCorners` 즉시 주입. */
+  onSetupSaveDone?: (
+    uploadId: string,
+    doorCorners?: Array<[number, number, number]> | null,
+  ) => Promise<void> | void;
   /** "문 설정 완료" 누른 직후 호출 — uploadId 가 없으면 부모가 모달 + register-local 처리하고 새 uploadId 반환. */
   ensureUploadId?: () => Promise<string>;
   /** 도어 설정 영속화 직전 호출 — refined PLY + mesh.json + tex_*.png 일괄 업로드.
-   *  반환: PLY 에 베이크된 회전값 (raw → A'+Y). doors corners 도 같은 프레임으로 변환해야 일관 유지. */
+   *  반환: PLY 에 베이크된 회전값. 신규 도어 자산도 같은 final frame 으로 변환해야 일관 유지. */
   onCommitRefined?: (uploadId: string) => Promise<{ rotX: number; rotZ: number; wallAngleRad: number; plyKey: string }>;
-  /** 다듬기 단계의 현재 keep mask (flatten/floater/brush 모두 반영). 문 추출이 cachedScene 에 적용해
-   *  외부 가우시안이 부활하는 문제 방지. 없으면 무필터로 동작. */
+  /** 다듬기 단계의 현재 keep mask (boundaryCull/floater/brush 모두 반영). 문 추출이 cachedScene 에 적용해
+   *  이미 제외한 경계/삭제 가우시안이 부활하는 문제 방지. 없으면 무필터로 동작. */
   getCurrentKeepMask?: () => Uint8Array | null;
   /** 면별 베이크 텍스처의 CPU 캐시 RGBA 접근. 문 영역 alpha-punch 가 GPU colorTexture 뿐 아니라
    *  서버에 직렬화되는 CPU rgba 에도 반영되도록 — 재진입/다음 세션에서도 punch 유지. */
-  getBakeRgba?: (surfaceId: string) => { rgba: Uint8ClampedArray; width: number; height: number } | null;
+  getBakeRgba?: (surfaceId: string) => {
+    rgba: Uint8ClampedArray;
+    width: number;
+    height: number;
+    viewVariants?: Array<{ rgba: Uint8ClampedArray }>;
+  } | null;
   /** 다듬기 단계의 정렬 회전값 (pendingRotation + wallAngle) 동기 조회. 메모리 직주입 흐름에서
    *  서버 업로드 await 없이 즉시 doors corners 변환에 사용. */
-  getCurrentBakedRotation?: () => { rotX: number; rotZ: number; wallAngleRad: number };
+  getRemainingRotationToAY?: () => { rotX: number; rotZ: number; wallAngleRad: number };
+  /** 도어 추출이 메인 splat 을 PLY 재로드로 갱신할 때 호출. useRefineTool 의 onSplatLoaded
+   *  에서 자동 re-bake 가 돌아 double rotation 되는 것 방지 — 한 번만 skip. */
+  markNextSplatLoadSkipRebake?: () => void;
+  /** 도어 추출/원복으로 메인 splat 을 교체한 뒤 저장용 canonical scene 을 갱신. */
+  onMainSplatReplaced?: (scene?: GaussianScene) => void;
   basemapMode?: boolean;
+  basemapEditMode?: boolean;
+  basemapId?: string;
   basemapUnitName?: string;
+  basemapFloorId?: string;
+  /** basemap 모드 — 호수 휠 피커의 prefix 층 번호 (예: 6 → 601~699). 미지정 시 1 default. */
+  basemapFloorNumber?: number;
+  /** basemap 등록 완료 후 모달에서 페이지 선택 시 호출 — 부모가 라우팅. (id, route 결정) */
+  onBasemapDone?: (destination: 'main' | 'building' | 'dashboard') => void;
+  /**
+   * 모듈 등록 흐름: true 면 문 설정 완료 시 onCommitRefined / persistDoorsToServer 호출 안 함.
+   * 메모리에 보관 후 정합 완료 시 onCommitFinal 로 일괄 영속화.
+   * picked corners 는 새 화면 전환 후에도 유지되어 정합 단계에서 doors 시각화에 사용.
+   */
+  deferPersistenceToAlign?: boolean;
+  /**
+   * 문 설정 완료 시점에 최종 확정된 4 코너(final PLY 좌표계)를 부모에게 전달.
+   * 자동 검출이든 수동 4점이든 동일 코드 경로로 호출. 부모는 이 코너를 commit-final
+   * 페이로드의 doors.json 작성에 사용.
+   */
+  onSetupCornersFinalized?: (corners: Array<[number, number, number]>) => void;
+  /** 모듈 등록 흐름: 정합 완료 시 commit-final multipart 에 함께 넣을 문 옆면 mesh/texture/splat 자산. */
+  onSetupDoorAssetsFinalized?: (payload: ModuleDoorAssetPayload | null) => void;
+  /**
+   * 부모 컴포넌트의 `useAdditionalGsplats` 인스턴스. 제공되면 자체 인스턴스 대신 사용.
+   * DoorAlignModal 언마운트 시 자체 인스턴스의 cleanup 이 도어 splat entity 까지 destroy 하던 버그를 회피.
+   * 정합 단계로 transition 시 도어 splat 이 유지되도록 부모 인스턴스 공유.
+   */
+  sharedAdditional?: AdditionalGsplatsApi;
 }
 
 // 픽 / 영속화 / 다운스트림 기하 (Kabsch 등) 는 시계방향 (TL → TR → BR → BL) 인덱스 순서를 가정.
@@ -73,41 +135,328 @@ const CORNERS = [
 const DISPLAY_ORDER = [0, 1, 3, 2] as const;
 
 /**
- * 문 설정 + 정합 단일 모달.
+ * 도어 4 코너를 "바닥에 평행한 위/아래 변 + 직사각형" 으로 정규화.
+ * - 위 변 (0-1) 와 아래 변 (2-3) 은 Y 평행 (높이 일치).
+ * - 좌측 변 (0-3) 과 우측 변 (1-2) 은 같은 horizontal axis 위치 → 수직 평행.
+ * - 벽 평면 위에 있어야 하므로 (n·P = d) 조건 유지.
  *
- * - 다듬기에서 저장된 벽/천장/바닥 6개 평면을 불러옴
- * - 사용자가 순서대로(시계방향: 왼위→오위→오아→왼아) 4번 클릭
- * - 각 클릭의 ray와 가장 가까운 평면의 교점을 raw 프레임에서 계산
- * - 각 코너마다 해당 색의 점 + 라벨을 화면에 표시
+ * anchorIdx:
+ *   null      → 초기 4점 픽 직후. 각 변 평균값으로 직사각형 fit.
+ *   0..3      → 드래그 중. 그 코너는 raycast 위치 그대로, 대각선 반대 코너는 고정.
+ *               남은 두 코너는 직사각형 유지하며 자동 재배치.
+ */
+function normalizeDoorRect(
+  corners: [Vec3, Vec3, Vec3, Vec3],
+  plane: SurfacePlane,
+  anchorIdx: number | null = null,
+  rotation: FrameRotation = { rotX: 0, rotZ: 0, wallAngleRad: 0 },
+): [Vec3, Vec3, Vec3, Vec3] {
+  const [nx, ny, nz] = plane.normal;
+  // 벽이 아니면 (천장/바닥 normal.y=±1) 정규화 skip — 도어는 벽 위.
+  if (Math.abs(ny) > 0.5) return corners;
+  const hxLen = Math.hypot(nz, -nx);
+  if (hxLen < 1e-6) return corners;
+  const hxN = nz / hxLen;
+  const hzN = -nx / hxLen;
+  const d = plane.d;
+
+  // corners 는 raw 프레임, plane 은 A' 프레임 — u/v 분해 + recon 은 A' 에서 일관 처리.
+  // 진입 시 raw → A' 변환, 반환 시 A' → raw 로 되돌려 caller 의 raw 컨벤션 유지.
+  const cornersA = corners.map(c => rawToA([c[0], c[1], c[2]] as Vec3, rotation)) as [Vec3, Vec3, Vec3, Vec3];
+
+  // (u, v) decomposition: u = pos · h (horizontal on wall), v = pos.y.
+  const us = cornersA.map(c => c[0] * hxN + c[2] * hzN);
+  const vs = cornersA.map(c => c[1]);
+
+  let u_left: number, u_right: number, v_top: number, v_bot: number;
+
+  if (anchorIdx === null) {
+    u_left  = (us[0] + us[3]) * 0.5;
+    u_right = (us[1] + us[2]) * 0.5;
+    v_top   = (vs[0] + vs[1]) * 0.5;
+    v_bot   = (vs[2] + vs[3]) * 0.5;
+  } else {
+    // anchorIdx = 드래그된 코너 (사용자가 끌어둔 위치). 대각선 반대는 그 전 상태 유지.
+    const opp = (anchorIdx + 2) % 4;
+    const isLeft = anchorIdx === 0 || anchorIdx === 3;
+    const isTop  = anchorIdx === 0 || anchorIdx === 1;
+    u_left  = isLeft ? us[anchorIdx] : us[opp];
+    u_right = isLeft ? us[opp]       : us[anchorIdx];
+    v_top   = isTop  ? vs[anchorIdx] : vs[opp];
+    v_bot   = isTop  ? vs[opp]       : vs[anchorIdx];
+  }
+
+  // 주의: u/v swap 자동 보정 금지.
+  // PLY 프레임에서 +Y 가 ceiling 인데 Z-180 회전으로 화면상 아래로 가고, h 방향도 wall normal sign 에 따라
+  // 좌우가 바뀜. v_top<v_bot 또는 u_left>u_right 가 PLY 컨벤션에서 정상 상태라 swap 하면 인덱스 → 위치
+  // 매핑이 깨져서 정합 시 상하/좌우 반전 발생. 사용자가 시계방향으로 픽한 ORIGINAL 인덱스 그대로 사용.
+
+  // 평면 위 점 P = d * n_xz + u * h + v * Y. (n.y = 0, h.y = 0 가정.) — A' 프레임 산출.
+  const recon = (u: number, v: number): Vec3 => [
+    nx * d + hxN * u,
+    v,
+    nz * d + hzN * u,
+  ];
+  const reconA: [Vec3, Vec3, Vec3, Vec3] = [
+    recon(u_left, v_top),
+    recon(u_right, v_top),
+    recon(u_right, v_bot),
+    recon(u_left, v_bot),
+  ];
+
+  return reconA.map(p => aToRaw(p, rotation)) as [Vec3, Vec3, Vec3, Vec3];
+}
+
+function asVec3(value: unknown): Vec3 | null {
+  if (!Array.isArray(value) || value.length !== 3) return null;
+  const nums = value.map(Number);
+  return nums.every(Number.isFinite) ? [nums[0], nums[1], nums[2]] : null;
+}
+
+function normalizeVec3(v: Vec3): Vec3 | null {
+  const len = Math.hypot(v[0], v[1], v[2]);
+  if (len < 1e-9) return null;
+  return [v[0] / len, v[1] / len, v[2] / len];
+}
+
+function derivePlanesFromMeshSurfaces(surfaces: any[]): SurfacePlane[] {
+  const out: SurfacePlane[] = [];
+  for (const surface of surfaces) {
+    const id = typeof surface?.surfaceId === 'string' ? surface.surfaceId : '';
+    const cornersRaw = Array.isArray(surface?.corners) ? surface.corners : [];
+    if (!id || cornersRaw.length < 4) continue;
+    const corners = cornersRaw.map(asVec3).filter(Boolean) as Vec3[];
+    const inward = asVec3(surface?.normalInward);
+    if (corners.length < 4 || !inward) continue;
+    const normal = normalizeVec3([-inward[0], -inward[1], -inward[2]]);
+    if (!normal) continue;
+    const d = normal[0] * corners[0][0] + normal[1] * corners[0][1] + normal[2] * corners[0][2];
+    const plane: SurfacePlane = { id, normal, d };
+    if (id.startsWith('w')) {
+      const yVals = corners.map(c => c[1]);
+      const e01 = Math.hypot(corners[1][0] - corners[0][0], corners[1][2] - corners[0][2]);
+      const e32 = Math.hypot(corners[2][0] - corners[3][0], corners[2][2] - corners[3][2]);
+      const a = e01 >= e32 ? corners[0] : corners[3];
+      const b = e01 >= e32 ? corners[1] : corners[2];
+      plane.segment = {
+        a: { x: a[0], z: a[2] },
+        b: { x: b[0], z: b[2] },
+        yMin: Math.min(...yVals),
+        yMax: Math.max(...yVals),
+      };
+    }
+    out.push(plane);
+  }
+  return out;
+}
+
+/**
+ * 문 설정 단계 모달. 다듬기에서 저장된 벽/천장/바닥 평면 위에 4 꼭짓점 + 두께 + 추출 + 회전 + 완료.
  *
- * `view` prop:
- *   - 'setup' (기본) — 문 설정 단계: 4꼭짓점 + 두께 + 추출 + 회전 + 문 설정 완료.
- *   - 'align' — 정합 단계: basemap 4꼭짓점 픽 + Kabsch + applyAndSave 로 aligned.ply 업로드.
+ * - 다듬기에서 저장된 벽/천장/바닥 평면을 불러옴 (ceiling + floor + N개 벽).
+ * - 사용자가 순서대로 (시계방향: 왼위 → 오위 → 오아 → 왼아) 4번 클릭.
+ * - 각 클릭의 ray 와 가장 작은 양수 t 의 평면 교점을 현재 PLY local frame 에서 계산 (segment 안 + Y 범위 안만 인정).
+ * - 각 코너마다 해당 색의 점 + 라벨을 화면에 표시.
+ *
+ * 정합 단계는 별도 `AlignPanel` 이 담당.
  */
 export default function DoorAlignModal({
-  coreRef, uploadId, currentUrl, onDone, onClose, view = 'setup', autoExtracting = false, autoExtractedCorners = null, onManualPickStart, onSetupSaveDone, ensureUploadId, onCommitRefined, getCurrentKeepMask, getBakeRgba, getCurrentBakedRotation, basemapMode = false, basemapUnitName,
+  coreRef, uploadId, currentUrl, onDone, onClose, autoExtracting = false, autoExtractedCorners = null, onManualPickStart, onSetupSaveDone, ensureUploadId, onCommitRefined, getCurrentKeepMask, getBakeRgba, getRemainingRotationToAY, markNextSplatLoadSkipRebake, onMainSplatReplaced, basemapMode = false, basemapEditMode = false, basemapId, basemapUnitName, basemapFloorId, basemapFloorNumber, onBasemapDone, deferPersistenceToAlign = false, onSetupCornersFinalized, onSetupDoorAssetsFinalized, sharedAdditional,
 }: Props) {
   const [picked, setPicked] = useState<Array<PickedCorner | null>>(() => emptyPicked());
+  // 모듈 등록 흐름: 문 설정 완료 시 메모리 보관 → 정합 완료 시 commit-final 페이로드에 포함.
+  const pendingDoorPersistenceRef = useRef<{
+    pickedTransformed: Array<PickedCorner | null>;
+    doorOpts: PersistOpts;
+  } | null>(null);
 
-  // SAM3 자동 추출 완료 시 부모가 넘겨준 4 코너로 picked 초기 채움.
-  // doors.json contract = A'+Y frame (회전 베이크된 PLY 와 동일 frame). picked.pos contract = raw frame
-  // (raycastToPlanes 가 splatEntity 역변환으로 산출). 다듬기 직후 세션은 메모리 PLY 가 아직 raw 이고
-  // splatEntity 가 시각화 회전을 적용 중 → A'+Y → raw 역변환 필요.
-  // 재진입 세션은 베이크된 PLY 가 새 raw 로 로드되고 getCurrentBakedRotation 이 0 을 반환 → 항등 변환.
-  // 사용자가 이미 직접 픽한 코너가 있으면 덮어쓰지 않음. surfaceId 는 빈 문자열 — 후속 회전/저장 단계가
-  // raycast 로 보정.
+  // basemap 다중 도어: applyDoorRefine 완료 시 메모리 리스트에 누적. "Basemap 등록 완료" 시 일괄 영속.
+  interface InMemoryDoor {
+    doorId: string;                                             // local id (commit 시 그대로 doors.json 의 id 로 사용)
+    cornersRaw: Vec3[];                                         // 4 corners (raw 프레임)
+    cornersAY: Vec3[];                                          // 4 corners (final PLY 좌표계 — 저장용)
+    wallSurfaceId: string;
+    doorMeshInput: {
+      rgba: Uint8ClampedArray; width: number; height: number;
+      corners: [number, number, number][]; uvs: [number, number][]; normalInward: [number, number, number];
+    };                                                          // PNG 인코드 + doors.json doorMesh 메타 작성용
+    doorSplatBlobUrl: string | null;                            // door-side gaussian PLY blob URL (있을 때만)
+    doorMeshEntityName: string;                                 // PlayCanvas entity name — 삭제 시 destroy
+    doorSplatLayerId: string | null;                            // additional splat layer id — 삭제 시 remove
+    outlineHandle: import('@/lib/gs/doorOutline').DoorOutlineHandle | null;  // 노란 outline entity (시각화)
+    wallTextureSnapshotRect: { x: number; y: number; w: number; h: number } | null; // 벽 텍스처 복원용 bbox (cut.rgba 가 이 위치에서 잘림)
+    doorExtractionDepth: number;                                      // 두께 메타 (commit 시 그대로 사용)
+    boundarySplitEnabled: boolean;
+    unitName: string;                                           // 빈 문자열 = 미설정
+    // 업로드 시 도어 splat PLY 를 final frame 으로 베이크할 때 사용. 베이스맵 메인 PLY 와 동일 프레임 보장.
+    bakeRotation: { rotX: number; rotZ: number; wallAngleRad: number };
+    // basemap 다중 도어용 — "Basemap 등록 완료" 시 모든 도어의 doorOrig 마킹을 일괄 재적용 위해 보관.
+    // (개별 추출 후 다음 도어 추출 시 revertDoorRefine 가 마킹을 풀어버려서, 저장 직전에 다시 적용 필요.)
+    doorOriginalIndices: number[];
+  }
+  const [inMemoryDoors, setInMemoryDoors] = useState<InMemoryDoor[]>([]);
+  const inMemoryDoorsRef = useRef<InMemoryDoor[]>([]);
+  useEffect(() => { inMemoryDoorsRef.current = inMemoryDoors; }, [inMemoryDoors]);
+  const [persistedBasemapDoors, setPersistedBasemapDoors] = useState<Array<{
+    door: DoorMeta;
+    locked: boolean;
+  }>>([]);
+  const [persistedDoorPickerOpen, setPersistedDoorPickerOpen] = useState<{ doorId: string; initialSuffix: number } | null>(null);
+  const [basemapEditDirty, setBasemapEditDirty] = useState(false);
+  const [basemapEditSaving, setBasemapEditSaving] = useState(false);
+  const [basemapEditError, setBasemapEditError] = useState<string | null>(null);
+  const [persistedRefinedPlanes, setPersistedRefinedPlanes] = useState<SurfacePlane[] | null>(null);
+
+  const buildDoorEntriesForUpload = useCallback(async (activeUploadId: string, doors: InMemoryDoor[]) => {
+    const entries: Array<{
+      id: string;
+      corners: number[][];
+      unitName: string;
+      wallSurfaceId: string;
+      doorExtractionDepth: number;
+      boundarySplitEnabled: boolean;
+      doorMesh?: { corners: number[][]; uvs: number[][]; normalInward: number[]; textureFilename: string; textureWidth: number; textureHeight: number };
+      doorSplat?: { filename: string };
+    }> = [];
+    for (const d of doors) {
+      const entry: typeof entries[0] = {
+        id: d.doorId,
+        corners: d.cornersAY.map(c => [c[0], c[1], c[2]]),
+        unitName: d.unitName,
+        wallSurfaceId: d.wallSurfaceId,
+        doorExtractionDepth: d.doorExtractionDepth,
+        boundarySplitEnabled: d.boundarySplitEnabled,
+      };
+      if (d.doorMeshInput.rgba.length > 0) {
+        const canvas = document.createElement('canvas');
+        canvas.width = d.doorMeshInput.width;
+        canvas.height = d.doorMeshInput.height;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) throw new Error('canvas 2d ctx failed');
+        ctx.putImageData(new ImageData(new Uint8ClampedArray(d.doorMeshInput.rgba), d.doorMeshInput.width, d.doorMeshInput.height), 0, 0);
+        const pngBlob = await new Promise<Blob>((res, rej) => {
+          canvas.toBlob(b => b ? res(b) : rej(new Error('toBlob null')), 'image/png');
+        });
+        const texUrl = await api.post<{ put_url: string; key: string }>(
+          '/refine/refined-upload-url',
+          { upload_id: activeUploadId, filename: `tex_${d.doorId}.png` },
+        );
+        const texResp = await fetch(texUrl.put_url, {
+          method: 'PUT', body: pngBlob, headers: { 'Content-Type': 'image/png' },
+        });
+        if (!texResp.ok) throw new Error(`도어 ${d.doorId} 텍스처 업로드 실패: ${texResp.status}`);
+        entry.doorMesh = {
+          corners: d.doorMeshInput.corners.map(c => [c[0], c[1], c[2]]),
+          uvs: d.doorMeshInput.uvs.map(u => [u[0], u[1]]),
+          normalInward: [d.doorMeshInput.normalInward[0], d.doorMeshInput.normalInward[1], d.doorMeshInput.normalInward[2]],
+          textureFilename: texUrl.key,
+          textureWidth: d.doorMeshInput.width,
+          textureHeight: d.doorMeshInput.height,
+        };
+      }
+      if (d.doorSplatBlobUrl) {
+        const blobResp = await fetch(d.doorSplatBlobUrl);
+        const arrayBuf = await blobResp.arrayBuffer();
+        const { parsePly, serializePly } = await import('@/lib/ply');
+        const { rotateScene, rotateSceneY } = await import('@/lib/gs');
+        const doorScene = parsePly(arrayBuf);
+        const br = d.bakeRotation;
+        if (br.rotX !== 0 || br.rotZ !== 0) rotateScene(doorScene, br.rotX, br.rotZ);
+        if (br.wallAngleRad !== 0) rotateSceneY(doorScene, br.wallAngleRad);
+        const bakedBytes = serializePly(doorScene);
+        const plyUrl = await api.post<{ put_url: string; key: string }>(
+          '/refine/refined-upload-url',
+          { upload_id: activeUploadId, filename: `${d.doorId}.ply` },
+        );
+        const plyResp = await fetch(plyUrl.put_url, {
+          method: 'PUT', body: bakedBytes as unknown as BlobPart, headers: { 'Content-Type': 'application/octet-stream' },
+        });
+        if (!plyResp.ok) throw new Error(`도어 ${d.doorId} splat 업로드 실패: ${plyResp.status}`);
+        entry.doorSplat = { filename: plyUrl.key };
+      }
+      entries.push(entry);
+    }
+    return entries;
+  }, []);
+
   useEffect(() => {
-    if (!autoExtractedCorners || autoExtractedCorners.length !== 4) return;
-    const r = getCurrentBakedRotation?.() ?? { rotX: 0, rotZ: 0, wallAngleRad: 0 };
-    setPicked(prev => {
-      const allEmpty = prev.every(p => p === null);
-      if (!allEmpty) return prev;
-      return autoExtractedCorners.map(c => ({
-        pos: ayToRaw([c[0], c[1], c[2]] as Vec3, r),
-        surfaceId: '',
-      }));
-    });
-  }, [autoExtractedCorners, getCurrentBakedRotation]);
+    if (!basemapMode || !basemapEditMode || !uploadId) return;
+    let cancelled = false;
+    (async () => {
+      setBasemapEditError(null);
+      try {
+        const [doorsRes, modulesRes, bundleRes] = await Promise.all([
+          api.get<DoorsJson>(`/uploads/${uploadId}/doors`).catch(() => ({ doors: [] })),
+          basemapFloorId
+            ? api.get<Array<{ name: string; alignment_transform?: unknown | null }>>(`/floors/${basemapFloorId}/modules`).catch(() => [])
+            : Promise.resolve([]),
+          api.get<{ mesh_meta_url: string | null }>(`/refine/refined-bundle?upload_id=${uploadId}`).catch(() => ({ mesh_meta_url: null })),
+        ]);
+        if (cancelled) return;
+        let refinedPlanes: SurfacePlane[] | null = null;
+        if (bundleRes.mesh_meta_url) {
+          const meshResp = await fetch(bundleRes.mesh_meta_url);
+          if (meshResp.ok) {
+            const meshMeta = await meshResp.json();
+            if (Array.isArray(meshMeta.planes)) {
+              refinedPlanes = meshMeta.planes;
+            }
+            if (!refinedPlanes?.length && Array.isArray(meshMeta.surfaces)) {
+              refinedPlanes = derivePlanesFromMeshSurfaces(meshMeta.surfaces);
+            }
+          }
+        }
+        if (cancelled) return;
+        const lockedNames = new Set(
+          modulesRes
+            .filter((m) => m.name !== '__basemap__' && !!m.alignment_transform)
+            .map((m) => m.name),
+        );
+        setPersistedBasemapDoors((doorsRes.doors ?? []).map((door) => ({
+          door,
+          locked: !!door.unitName && lockedNames.has(door.unitName),
+        })));
+        setPersistedRefinedPlanes(refinedPlanes);
+        if (!refinedPlanes?.length) setBasemapEditError('최종 평면 정보를 찾을 수 없습니다. basemap mesh.json 을 확인해야 합니다.');
+        setBasemapEditDirty(false);
+      } catch (e: any) {
+        if (!cancelled) setBasemapEditError(`등록된 문 정보 로드 실패: ${e?.message ?? e}`);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [basemapMode, basemapEditMode, uploadId, basemapFloorId]);
+
+  // 도어 추출 즉시 호수 라벨 (말풍선) 표시. cornersRaw 사용 — useDoorLabels 가 splatEntity.worldTransform 으로
+  // 직접 world 변환 → 등록 단계 (Z-180 + pendingRotation, wallAngle 미베이크) 든 재진입 단계 (Z-180 만) 든 일관.
+  const doorLabelEntries = useMemo(() => (
+    basemapMode ? inMemoryDoors.map(d => ({
+      id: d.doorId,
+      unitName: d.unitName || null,
+      corners: d.cornersRaw as number[][],
+    })) : []
+  ), [basemapMode, inMemoryDoors]);
+  useDoorLabels(coreRef, doorLabelEntries, basemapMode);
+
+  // 호수 휠 피커 모달 — 추출된 도어의 unitName 부여용.
+  const [unitNamePickerOpen, setUnitNamePickerOpen] = useState<{ doorId: string; initialSuffix: number } | null>(null);
+
+  // basemap 등록 완료 모달 (성공 후 페이지 선택).
+  const [completionModalOpen, setCompletionModalOpen] = useState(false);
+  const [committing, setCommitting] = useState(false);
+  const [commitError, setCommitError] = useState<string | null>(null);
+  // basemap 다중 도어 영속화 — 가장 최근 applyDoorRefine 결과의 mesh input 보관 (PNG 직렬화 + corners/uvs 추출).
+  // 문 저장 시점에 이 ref 값을 PNG 로 인코드 + MinIO 업로드, doors.json 메타에 첨부.
+  const lastDoorMeshInputRef = useRef<{
+    rgba: Uint8ClampedArray;
+    width: number;
+    height: number;
+    corners: [number, number, number][];        // final PLY 좌표계 (Z-fight 오프셋 적용된 메시 코너)
+    uvs: [number, number][];                    // 4×2
+    normalInward: [number, number, number];     // 방 안쪽 normal
+  } | null>(null);
+  // basemap 다중 도어 — 도어 X 삭제 시 wall 텍스처 alpha=0 punch 복원을 위해 cut.bbox + wallSurfaceId 도 함께 보관.
+  const lastDoorMeshBboxRef = useRef<{ x: number; y: number; w: number; h: number } | null>(null);
+  const lastDoorMeshWallSurfaceIdRef = useRef<string | null>(null);
 
   // 문 경계 (4 변 노란선 + 힌지 cylinder) 표시 토글. true 면 그리고, false 면 둘 다 숨김.
   const [boundaryVisible, setBoundaryVisible] = useState(true);
@@ -117,34 +466,11 @@ export default function DoorAlignModal({
   const [error, setError] = useState<string | null>(null);
   const [showMarkers, setShowMarkers] = useState(true);
 
-  // ── basemap 4 코너 (JSON 입력) ──
-  const [basemapJson, setBasemapJson] = useState<string>(() => loadBasemapJson(uploadId));
-  const basemapCorners = useMemo<Vec3[] | null>(() => parseBasemapCorners(basemapJson), [basemapJson]);
+  // 부모가 sharedAdditional 을 넘기면 그 인스턴스 사용 (도어 splat 이 모달 언마운트 후에도 살아남음).
+  // 안 넘기면 자체 인스턴스 — 언마운트 시 entity destroy.
+  const ownAdditional = useAdditionalGsplats(coreRef);
+  const additional = sharedAdditional ?? ownAdditional;
 
-  // ── basemap PLY URL (입력 → 자동 로드) ──
-  const [basemapUrl, setBasemapUrl] = useState<string>(() => loadBasemapUrl(uploadId));
-  const additional = useAdditionalGsplats(coreRef);
-  const basemapIdRef = useRef<string | null>(null);
-
-  // URL 변경 → 이전 basemap 제거하고 새로 add
-  useEffect(() => {
-    const url = basemapUrl.trim();
-    // 이전 것 정리
-    if (basemapIdRef.current) {
-      additional.remove(basemapIdRef.current);
-      basemapIdRef.current = null;
-    }
-    if (!url || !/^https?:\/\//.test(url)) return;
-    const { id, ready } = additional.add(url);
-    if (id) basemapIdRef.current = id;
-    // basemap 은 await 안 함 — 백그라운드 로딩, 실패는 items[].error 로 표시.
-    ready.catch(() => { /* 표시는 items 에서 */ });
-  }, [basemapUrl, additional]);
-
-  // ── 정합 상태 ──
-  const [rmsd, setRmsd] = useState<number | null>(null);
-  const [running, setRunning] = useState(false);
-  const [aligned, setAligned] = useState(false); // 애니메이션 한 번이라도 성공했는지
 
   // ── 애니메이션 상태 ──
   const animRef = useRef<{
@@ -183,32 +509,77 @@ export default function DoorAlignModal({
     });
   }, [coreRef]);
 
-  // ── 다듬기에서 저장한 벽/천장/바닥 → 6개 평면 ──
+  // ── 다듬기에서 저장한 벽/천장/바닥 → ceiling/floor + N벽 평면 ──
   const planes = useMemo<SurfacePlane[] | null>(() => {
+    if (basemapEditMode) {
+      return persistedRefinedPlanes?.length ? persistedRefinedPlanes : null;
+    }
     const st = loadRefineState(uploadId);
     if (!st) return null;
     if (!st.cfConfirmed || !st.wallConfirmed) return null;
-    if (st.wallAngle === null || !st.wallDistances) return null;
-    return surfacePlanesFromRoom({
-      angleDeg: st.wallAngle,
-      walls: st.wallDistances,
+    if (!st.wallPolygon) return null;
+    const out = surfacePlanesFromPolygon({
+      polygon: st.wallPolygon,
       ceilingY: st.ceilingY,
       floorY: st.floorY,
     });
-  }, [uploadId]);
-  const showRefineGuide = !planes && !(basemapMode && view === 'setup');
+    return out;
+  }, [basemapEditMode, persistedRefinedPlanes, uploadId]);
+  const showRefineGuide = !planes && !basemapMode;
 
-  // ── ray-plane 교점 (raw 프레임) ──
+  // 신규 등록 중에는 아직 final PLY 로 저장되기 전일 수 있으므로 live refine-tool 회전을 우선한다.
+  // 저장된 basemap 수정 모드는 mesh.json 의 final-frame planes 를 사용하므로 추가 회전이 없다.
+  const getCurrentEditorRotation = useCallback((): FrameRotation => {
+    if (basemapEditMode) {
+      return { rotX: 0, rotZ: 0, wallAngleRad: 0 };
+    }
+    const live = getRemainingRotationToAY?.();
+    if (live) {
+      return {
+        rotX: live.rotX,
+        rotZ: live.rotZ,
+        wallAngleRad: live.wallAngleRad,
+      };
+    }
+    return getEditorRotation(uploadId);
+  }, [basemapEditMode, getRemainingRotationToAY, uploadId]);
+
+  // SAM3 자동 추출 완료 시 부모가 넘겨준 4 코너로 picked 초기 채움.
+  // autoExtractedCorners 는 현재 PLY local frame 기준으로 전달된다.
+  // surfaceId 는 closest-plane 으로 추정한다. 신규 등록 중에는 rawToA 로 live 평면 프레임에 맞추고,
+  // 저장된 basemap 수정 모드는 getCurrentEditorRotation 이 identity 라 final-frame planes 와 그대로 비교된다.
+  useEffect(() => {
+    if (basemapEditMode) return;
+    if (!autoExtractedCorners || autoExtractedCorners.length !== 4) return;
+    if (!planes) return;
+    setPicked(prev => {
+      const allEmpty = prev.every(p => p === null);
+      if (!allEmpty) return prev;
+      const r = getCurrentEditorRotation();
+      const ref = autoExtractedCorners[0];
+      const refA = rawToA([ref[0], ref[1], ref[2]] as Vec3, r);
+      let bestSd = Infinity;
+      let bestId = '';
+      for (const p of planes) {
+        const sd = Math.abs(p.normal[0]*refA[0] + p.normal[1]*refA[1] + p.normal[2]*refA[2] - p.d);
+        if (sd < bestSd) { bestSd = sd; bestId = p.id; }
+      }
+      return autoExtractedCorners.map(c => ({
+        pos: [c[0], c[1], c[2]] as Vec3,
+        surfaceId: bestId,
+      }));
+    });
+  }, [autoExtractedCorners, planes, getCurrentEditorRotation, basemapEditMode]);
+
+  // ── ray-plane 교점 (splat 프레임 = A') ──
   // 클릭은 "평면 위의 점" 으로만 떨어진다 (가우시안 위치가 아니라 수학적 평면 교점).
   // forcePlaneId 가 주어지면 그 평면 하나에만 투영 — 4 코너가 같은 면 위에 있도록 보장.
-  // (없으면 6개 평면 중 ray 가 가장 먼저 만나는 평면 — 첫 코너 픽 용도.)
+  // (없으면 N+2 개 평면 중 ray 가 가장 먼저 만나는 평면 — 첫 코너 픽 용도.)
   //
-  // 좌표 프레임 정합:
-  //   `splatEntity.worldTransform` = Z-180 · Rz(rotZ) · Rx(rotX) (pendingRotation 포함).
-  //   inv 적용 결과는 raw 프레임 점/방향. surfacePlanesFromRoom 의 평면들은 A' 프레임 (= raw + pendingRotation) 에서 정의됨
-  //   (CeilingFloorModal 에서 잡은 ceilingY, WallModal 에서 잡은 wallAngle/walls 가 모두 A' 기준).
-  //   따라서 평면 테스트 전에 ray O, D 를 pendingRotation 으로 다시 회전 (raw → A') 해 t 를 정확히 산출.
-  //   최종 점은 raw 프레임으로 반환 — 다른 코드 (rendering, persist 등) 가 raw 가정.
+  // 좌표 프레임:
+  //   ray 를 `splatEntity.worldTransform` 역변환 → 현재 PLY local frame.
+  //   신규 등록 중에는 localStorage refine state 기반 평면(A')을 쓰므로 ray 를 A' 로 lift 한다.
+  //   basemap 수정 모드는 mesh.json 의 final-frame planes 를 쓰므로 lift 는 identity.
   const raycastToPlanes = useCallback((mouseX: number, mouseY: number, forcePlaneId?: string): PickedCorner | null => {
     if (!planes) return null;
     const core = coreRef.current;
@@ -235,8 +606,9 @@ export default function DoorAlignModal({
     const dl = Math.hypot(dx, dy, dz) || 1;
     dx /= dl; dy /= dl; dz /= dl;
 
-    // pendingRotation 으로 ray 를 A' 프레임으로 lift — 평면 식과 동일 프레임에서 t 산출.
-    const r = getEditorRotation(uploadId);
+    // pendingRotation 으로 ray 를 평면 프레임으로 lift — 평면 식과 동일 프레임에서 t 산출.
+    // basemap 수정 모드에서는 getCurrentEditorRotation() 이 identity 라 현재 PLY local 그대로 계산된다.
+    const r = getCurrentEditorRotation();
     const [oxA, oyA, ozA] = rawToA([ox, oy, oz], r);
     const [dxA, dyA, dzA] = rawToA([dx, dy, dz], r);
 
@@ -252,7 +624,12 @@ export default function DoorAlignModal({
       return { pos, surfaceId: p.id };
     }
 
-    // 가장 작은 양수 t 채택 (첫 코너용)
+    // 가장 작은 양수 t 채택 (첫 코너용).
+    // ⚠ 벽 plane 은 무한 plane 이라 N-각형 (특히 비스듬한 벽 / concave) 에서 같은 ray 가 여러 벽 plane 을
+    // 양수 t 로 교차할 수 있다. 사용자가 보고 있지 않은 벽이 더 작은 t 로 채택되면 도어 코너가 잘못된
+    // 위치 (방 안쪽 / 다른 벽) 에 박힘. → 벽 plane 은 segment(edge 양 끝점 + ceiling/floor Y범위) 안에
+    // 교점이 들어올 때만 후보로 인정. 천장/바닥은 segment 없음 — 그대로 무한 plane 으로 처리 (polygon
+    // mask 가 외곽 처리). 픽 좌표와 segment 는 동일한 평면 프레임에서 비교한다.
     let bestT = Infinity;
     let bestId = '';
     let bestPoint: Vec3 | null = null;
@@ -261,13 +638,46 @@ export default function DoorAlignModal({
       if (Math.abs(denom) < 1e-6) continue;
       const numer = p.d - (p.normal[0]*oxA + p.normal[1]*oyA + p.normal[2]*ozA);
       const t = numer / denom;
-      if (t <= 0 || t >= bestT) continue;
+      if (t <= 0) continue;
+      // 벽 plane segment 체크: A' 프레임의 교점이 edge ab 의 길이방향 [0, 1] 안 + Y 가 ceiling/floor
+      // 사이에 있어야 그 벽이라고 인정. tolerance 5cm — picking 부정확성 흡수.
+      if (p.segment) {
+        const ix = oxA + dxA*t, iy = oyA + dyA*t, iz = ozA + dzA*t;
+        const ax = p.segment.a.x, az = p.segment.a.z;
+        const ex = p.segment.b.x - ax, ez = p.segment.b.z - az;
+        const eLen2 = ex*ex + ez*ez || 1;
+        const s = ((ix - ax)*ex + (iz - az)*ez) / eLen2;
+        // tolerance 없음 — 교점이 segment [0, 1] 안 + Y 가 [floor, ceiling] 안일 때만 그 벽 인정.
+        // (인접 벽 vertex 공유 corner 에서 옆 벽 plane 의 연장이 통과되는 것을 막기 위해 엄격하게 가져감.
+        //  vertex 정확히 클릭하는 케이스도 어느 한 벽으로 떨어지면 그쪽이 됨.)
+        const sOK = s >= 0 && s <= 1;
+        const yOK = iy >= p.segment.yMin && iy <= p.segment.yMax;
+        if (!sOK || !yOK) continue;
+      }
+      if (t >= bestT) continue;
       bestT = t; bestId = p.id;
       bestPoint = [ox + dx*t, oy + dy*t, oz + dz*t];
     }
     if (!bestPoint) return null;
     return { pos: bestPoint, surfaceId: bestId };
-  }, [coreRef, planes, uploadId]);
+  }, [coreRef, planes, getCurrentEditorRotation]);
+
+  /**
+   * 도어 하단 코너(BR=2, BL=3) Y 좌표를 바닥 평면 아래로 내려가지 않게 클램프.
+   * CLAUDE.md 좌표 규약: 코드 `ceiling` 평면 (PLY +Y, ceilingY = 큰 값) 이 화면상 **방 바닥**.
+   * 따라서 하단 코너의 평면-frame Y 가 ceilingY 를 초과하면 (= 시각적 바닥 아래) ceilingY 로 클램프.
+   * 벽 plane 은 ny=0 이라 Y 만 바꿔도 plane 위에 그대로 남음.
+   */
+  const clampBottomCornerToFloor = useCallback((rawPos: Vec3, idx: number): Vec3 => {
+    if (idx !== 2 && idx !== 3) return rawPos;
+    const ceilingPlane = planes?.find(p => p.id === 'ceiling');
+    if (!ceilingPlane) return rawPos;
+    const cY = ceilingPlane.d;  // A' frame Y of visual floor
+    const r = getCurrentEditorRotation();
+    const a = rawToA(rawPos, r);
+    if (a[1] <= cY) return rawPos;
+    return aToRaw([a[0], cY, a[2]], r);
+  }, [planes, getCurrentEditorRotation]);
 
   // ── 순차 픽 클릭 + ESC 취소 (seqArmed 상태일 때만) ──
   // 픽 순서: CORNERS index 순 = TL(0) → TR(1) → BR(2) → BL(3) (시계방향).
@@ -292,11 +702,28 @@ export default function DoorAlignModal({
         const lockedSurfaceId = prev.find((p, i) => i !== targetIdx && p && p.surfaceId)?.surfaceId;
         const result = raycastToPlanes(mx, my, lockedSurfaceId);
         if (!result) { setError('평면과 교점을 찾지 못했습니다'); return prev; }
-        const next = [...prev];
-        next[targetIdx] = result;
-        // 자동 저장 제거 — 모든 서버 저장은 문 설정 완료 시점에 일괄 처리.
-        // 4 번째 픽이 끝나면 순차 모드 종료.
-        if (next.every(p => p !== null)) setSeqArmed(false);
+        let next = [...prev];
+        // 하단 코너 (2, 3) 가 바닥 평면 아래로 내려가지 않게 클램프.
+        const clampedPos = clampBottomCornerToFloor(result.pos, targetIdx);
+        next[targetIdx] = { ...result, pos: clampedPos };
+        // 4 번째 픽이 끝나면 순차 모드 종료 + 직사각형 정규화 (위/아래 변 수평, 직사각형 유지).
+        if (next.every(p => p !== null)) {
+          setSeqArmed(false);
+          const wallPlane = planes?.find(p => p.id === next[0]!.surfaceId);
+          if (wallPlane) {
+            const normalized = normalizeDoorRect(
+              [next[0]!.pos, next[1]!.pos, next[2]!.pos, next[3]!.pos],
+              wallPlane,
+              null,
+              getCurrentEditorRotation(),
+            );
+            // 정규화 후에도 v_bot 평균이 바닥을 넘을 수 있으므로 하단 corner 다시 클램프.
+            next = next.map((p, i) => p ? {
+              pos: clampBottomCornerToFloor(normalized[i], i),
+              surfaceId: p.surfaceId,
+            } : null);
+          }
+        }
         setError(null);
         return next;
       });
@@ -316,7 +743,7 @@ export default function DoorAlignModal({
       canvas.removeEventListener('mouseup', onMouseUp);
       window.removeEventListener('keydown', onKey);
     };
-  }, [seqArmed, coreRef, raycastToPlanes, uploadId]);
+  }, [seqArmed, coreRef, raycastToPlanes, getCurrentEditorRotation, clampBottomCornerToFloor, planes]);
 
   // ── DOM 라벨 (코너 4개) ──
   const labelsRef = useRef<Array<HTMLDivElement | null>>([null, null, null, null]);
@@ -517,14 +944,31 @@ export default function DoorAlignModal({
         const cur = prev[dragIdx];
         if (!cur) return prev;
         // 자기 자신 제외하고 다른 픽의 surfaceId 가 있으면 그걸 강제 (4 코너가 같은 면 위에 있도록).
-        // 자기 자신만 surfaceId 가 있는 단독 케이스 (1 점만 픽된 상태) 면 자기 surfaceId 를 사용.
         const lockedSurfaceId =
           prev.find((p, i) => i !== dragIdx && p && p.surfaceId)?.surfaceId
           ?? cur.surfaceId;
         const result = raycastToPlanes(mx, my, lockedSurfaceId);
         if (!result) return prev;
-        const next = [...prev];
-        next[dragIdx] = { pos: result.pos, surfaceId: cur.surfaceId };
+        let next = [...prev];
+        // 하단 corner (2, 3) 가 바닥 평면 아래로 내려가지 않게 클램프.
+        next[dragIdx] = { pos: clampBottomCornerToFloor(result.pos, dragIdx), surfaceId: cur.surfaceId };
+        // 4 코너가 모두 차 있으면 드래그 중에도 직사각형 정규화 — 대각선 반대 코너 anchor, 나머지 두 코너 자동 재계산.
+        if (next.every(p => p !== null)) {
+          const wallPlane = planes?.find(p => p.id === lockedSurfaceId);
+          if (wallPlane) {
+            const normalized = normalizeDoorRect(
+              [next[0]!.pos, next[1]!.pos, next[2]!.pos, next[3]!.pos],
+              wallPlane,
+              dragIdx,
+              getCurrentEditorRotation(),
+            );
+            // 정규화 후에도 하단 corner 다시 클램프.
+            next = next.map((p, i) => p ? {
+              pos: clampBottomCornerToFloor(normalized[i], i),
+              surfaceId: p.surfaceId,
+            } : null);
+          }
+        }
         return next;
       });
     };
@@ -548,7 +992,7 @@ export default function DoorAlignModal({
       window.removeEventListener('mousemove', onMove);
       window.removeEventListener('mouseup', onUp);
     };
-  }, [dragIdx, coreRef, raycastToPlanes, uploadId]);
+  }, [dragIdx, coreRef, raycastToPlanes, getCurrentEditorRotation, clampBottomCornerToFloor, planes]);
 
   // 노란 사각형 (코너 4개 잇는 변) 매 프레임 렌더.
   //   기본: 4 변 모두 노란 실선.
@@ -682,7 +1126,19 @@ export default function DoorAlignModal({
         q.setFromAxisAngle(axis, ang);
       }
       cyl.setRotation(q);
-      const radius = 0.03;
+      // 반지름 = min(hinge 길이, perpendicular 길이) × 2.5% — 짧은 변 기준으로 도어 크기에 비례 (최소 5mm).
+      const perpEdgeIdx = (e + 1) % 4;  // hinge edge 다음 변 = perpendicular
+      const pa = ps[perpEdgeIdx];
+      const pb = ps[(perpEdgeIdx + 1) % 4];
+      let perpLen = length;
+      if (pa && pb) {
+        const paRaw = new pcLib.Vec3(pa.pos[0], pa.pos[1], pa.pos[2]);
+        const pbRaw = new pcLib.Vec3(pb.pos[0], pb.pos[1], pb.pos[2]);
+        const paW = new pcLib.Vec3(); m.transformPoint(paRaw, paW);
+        const pbW = new pcLib.Vec3(); m.transformPoint(pbRaw, pbW);
+        perpLen = Math.hypot(pbW.x - paW.x, pbW.y - paW.y, pbW.z - paW.z) || length;
+      }
+      const radius = Math.max(0.005, Math.min(length, perpLen) * 0.025);
       cyl.setLocalScale(radius * 2, length, radius * 2);
     });
 
@@ -694,271 +1150,11 @@ export default function DoorAlignModal({
 
   const allPicked = picked.every(p => p !== null);
 
-  // ── 텍스처맵 저장 (디버그) ──
-  // 6개 wall mesh + 1개 도어 영역 = 총 7개 PNG 다운로드. 사용자 Downloads 폴더로.
-  const downloadRgbaAsPng = async (rgba: Uint8ClampedArray | Uint8Array, w: number, h: number, filename: string): Promise<void> => {
-    const canvas = document.createElement('canvas');
-    canvas.width = w;
-    canvas.height = h;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-    const imageData = ctx.createImageData(w, h);
-    const len = Math.min(imageData.data.length, rgba.length);
-    for (let i = 0; i < len; i++) imageData.data[i] = rgba[i];
-    ctx.putImageData(imageData, 0, 0);
-    return new Promise<void>((resolve) => {
-      canvas.toBlob((blob) => {
-        if (!blob) { resolve(); return; }
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = filename;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
-        resolve();
-      }, 'image/png');
-    });
-  };
-
-  // GPU 텍스처에서 픽셀을 직접 읽기 — 서버 로드 텍스처는 lock() 으로 못 읽음 (CPU side 없음).
-  // 임시 framebuffer 에 첨부해 gl.readPixels.
-  const readTextureFromGPU = (tex: any, app: any): { rgba: Uint8ClampedArray; w: number; h: number } | null => {
-    const w = tex.width, h = tex.height;
-    if (!w || !h) return null;
-    const device = app.graphicsDevice;
-    const gl = device?.gl;
-    if (!gl) return null;
-    const glTex = tex.impl?._glTexture ?? tex._impl?._glTexture ?? tex._glTexture;
-    if (!glTex) return null;
-    const fb = gl.createFramebuffer();
-    gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
-    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, glTex, 0);
-    let rgba: Uint8ClampedArray | null = null;
-    const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
-    if (status === gl.FRAMEBUFFER_COMPLETE) {
-      const tmp = new Uint8Array(w * h * 4);
-      gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, tmp);
-      // readPixels 는 bottom-up. canvas 그리기는 top-down 이므로 row flip.
-      const flipped = new Uint8ClampedArray(w * h * 4);
-      for (let y = 0; y < h; y++) {
-        const srcOff = (h - 1 - y) * w * 4;
-        const dstOff = y * w * 4;
-        for (let i = 0; i < w * 4; i++) flipped[dstOff + i] = tmp[srcOff + i];
-      }
-      rgba = flipped;
-    } else {
-      console.warn(`[SaveTex] FB incomplete: 0x${status.toString(16)}`);
-    }
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    gl.deleteFramebuffer(fb);
-    return rgba ? { rgba, w, h } : null;
-  };
-
-  const saveAllTextureMaps = async () => {
-    const core = coreRef.current;
-    const app = core?.getApp();
-    if (!core || !app || !allPicked || !planes) {
-      console.warn('[SaveTex] prerequisites not met');
-      return;
-    }
-
-    // 1. Wall mesh 6개 저장
-    const surfaces = ['ceiling', 'floor', 'w1a', 'w1b', 'w2a', 'w2b'];
-    for (const sid of surfaces) {
-      const ent = findEntityByName(app.root, `wallMesh_${sid}`);
-      const tex = ent?.render?.meshInstances?.[0]?.material?.emissiveMap;
-      if (!tex) {
-        console.warn(`[SaveTex] wallMesh_${sid} not found in app.root`);
-        continue;
-      }
-      const result = readTextureFromGPU(tex, app);
-      if (!result) {
-        console.warn(`[SaveTex] wallMesh_${sid} GPU read failed`);
-        continue;
-      }
-      const { rgba, w, h } = result;
-      let rmin = 255, rmax = 0;
-      for (let i = 0; i < rgba.length; i += 4) {
-        if (rgba[i] < rmin) rmin = rgba[i];
-        if (rgba[i] > rmax) rmax = rgba[i];
-      }
-      console.log(`[SaveTex] wallMesh_${sid}: ${w}×${h}, alpha=0 pixels: ${countAlpha0(rgba)}, R range=[${rmin},${rmax}]`);
-      await downloadRgbaAsPng(rgba, w, h, `wallMesh_${sid}.png`);
-    }
-
-    // 2. 도어 영역 저장 — 문 추출 활성 상태면 기존 mesh, 아니면 fresh bake
-    const doorSurfaceId = picked[0]!.surfaceId;
-    if (doorMeshEntityRef.current) {
-      const tex = doorMeshEntityRef.current.render?.meshInstances?.[0]?.material?.emissiveMap;
-      if (tex) {
-        const lvl = tex.lock();
-        if (lvl) {
-          const w = tex.width, h = tex.height;
-          const rgba = new Uint8ClampedArray(w * h * 4);
-          const lim = Math.min(rgba.length, (lvl as any).length ?? 0);
-          for (let i = 0; i < lim; i++) rgba[i] = (lvl as any)[i];
-          tex.unlock();
-          console.log(`[SaveTex] doorMesh_${doorSurfaceId}: ${w}×${h}`);
-          await downloadRgbaAsPng(rgba, w, h, `doorMesh_${doorSurfaceId}.png`);
-        } else {
-          try { tex.unlock(); } catch {}
-        }
-      }
-    } else {
-      // Fresh bake
-      try {
-        const wallPlane = planes.find(p => p.id === doorSurfaceId);
-        if (!wallPlane) throw new Error('wall plane not found');
-        const projectFn = (p: Vec3): Vec3 => {
-          const n = wallPlane.normal;
-          const sdv = n[0]*p[0]+n[1]*p[1]+n[2]*p[2] - wallPlane.d;
-          return [p[0]-sdv*n[0], p[1]-sdv*n[1], p[2]-sdv*n[2]];
-        };
-        const corners: [Vec3, Vec3, Vec3, Vec3] = [
-          projectFn(picked[0]!.pos),
-          projectFn(picked[1]!.pos),
-          projectFn(picked[2]!.pos),
-          projectFn(picked[3]!.pos),
-        ];
-        if (!cachedSceneRef.current) {
-          const { fetchAndParsePly } = await import('@/lib/ply');
-          cachedSceneRef.current = await fetchAndParsePly(currentUrl);
-        }
-        const { decomposeBoundaryGaussians, doorPlaneBakeInput } = await import('@/lib/gs/doorTrim');
-        const decomp = decomposeBoundaryGaussians(cachedSceneRef.current, { corners }, {
-          safetyMargin: DOOR_SAFETY_MARGIN,
-          doorThickness,
-        });
-        const { filterScene } = await import('@/lib/ply');
-        const keepDoor = new Uint8Array(cachedSceneRef.current.numSplats);
-        for (const i of decomp.doorOriginalIndices) keepDoor[i] = 1;
-        const doorScene = filterScene(cachedSceneRef.current, keepDoor);
-        const { bakeTextureForPlane } = await import('@/lib/gs/textureBake');
-        const bakeInput = doorPlaneBakeInput(corners, wallPlane.normal);
-        const doorBake = await bakeTextureForPlane(bakeInput, doorScene, { depthGate: DOOR_BAKE_GATE });
-        console.log(`[SaveTex] doorRegion_${doorSurfaceId}: ${doorBake.width}×${doorBake.height} (fresh bake)`);
-        await downloadRgbaAsPng(doorBake.rgba, doorBake.width, doorBake.height, `doorRegion_${doorSurfaceId}.png`);
-      } catch (e) {
-        console.error('[SaveTex] door fresh bake failed:', e);
-      }
-    }
-    console.log('[SaveTex] DONE — 7 PNG files in Downloads');
-  };
-
-  const countAlpha0 = (rgba: Uint8ClampedArray): number => {
-    let n = 0;
-    for (let i = 3; i < rgba.length; i += 4) if (rgba[i] === 0) n++;
-    return n;
-  };
-
-  // ── 정합 시작 (Kabsch 계산 → 모듈 entity transform 애니메이션) ──
-  const startAlignment = useCallback(async () => {
-    setError(null); setRmsd(null);
-    if (!allPicked) { setError('모듈 4 코너를 먼저 추출하세요'); return; }
-    if (!basemapCorners) { setError('basemap 4 코너 JSON이 유효하지 않습니다'); return; }
-    const core = coreRef.current;
-    const pc = core?.getPC();
-    const sd = core?.getSplatData();
-    if (!pc || !sd) return;
-
-    try {
-      const { matchCorners } = await import('@/lib/alignment');
-      const src = new Float64Array(12);
-      const dst = new Float64Array(12);
-      for (let i = 0; i < 4; i++) {
-        const s = picked[i]!.pos;
-        src[i*3] = s[0]; src[i*3+1] = s[1]; src[i*3+2] = s[2];
-        const t = basemapCorners[i];
-        dst[i*3] = t[0]; dst[i*3+1] = t[1]; dst[i*3+2] = t[2];
-      }
-      const fit = matchCorners(src, dst);
-      setRmsd(fit.rmsd);
-      console.log('[DoorAlign] Kabsch fit:', fit);
-
-      // PLY entity는 Z180이 baked-in. 최종 entity transform:
-      //   rotation = Z180 ∘ R_kabsch (matrix mul, 같은 의미로 quat mul z180 * R)
-      //   position = Z180 * t_kabsch (Z180이 t 벡터를 회전시킴)
-      const z180 = new pc.Quat();
-      z180.setFromEulerAngles(0, 0, 180);
-
-      const [qw, qx, qy, qz] = rotationMatrixToQuat(fit.R);
-      const qR = new pc.Quat(qx, qy, qz, qw);
-      const targetRot = new pc.Quat();
-      targetRot.copy(z180).mul(qR);
-
-      const tVec = new pc.Vec3(fit.t[0], fit.t[1], fit.t[2]);
-      const tWorld = new pc.Vec3();
-      z180.transformVector(tVec, tWorld);
-
-      // 현재 entity transform을 시작값으로
-      const curPos = sd.splatEntity.getLocalPosition();
-      const curRot = sd.splatEntity.getLocalRotation();
-
-      animRef.current = {
-        start: performance.now(),
-        duration: 1500,
-        fromPos: [curPos.x, curPos.y, curPos.z],
-        fromQuat: [curRot.x, curRot.y, curRot.z, curRot.w],
-        toPos: [tWorld.x, tWorld.y, tWorld.z],
-        toQuat: [targetRot.x, targetRot.y, targetRot.z, targetRot.w],
-      };
-      setAligned(true);
-    } catch (e: any) {
-      setError(`정합 실패: ${e?.message ?? e}`);
-    }
-  }, [allPicked, basemapCorners, picked, coreRef]);
-
-  // ── 원위치 (모듈을 raw 상태로 되돌림) ──
-  const resetPosition = useCallback(() => {
-    const core = coreRef.current;
-    const pc = core?.getPC();
-    const sd = core?.getSplatData();
-    if (!pc || !sd) return;
-    const z180 = new pc.Quat();
-    z180.setFromEulerAngles(0, 0, 180);
-    const curPos = sd.splatEntity.getLocalPosition();
-    const curRot = sd.splatEntity.getLocalRotation();
-    animRef.current = {
-      start: performance.now(),
-      duration: 1500,
-      fromPos: [curPos.x, curPos.y, curPos.z],
-      fromQuat: [curRot.x, curRot.y, curRot.z, curRot.w],
-      toPos: [0, 0, 0],
-      toQuat: [z180.x, z180.y, z180.z, z180.w],
-    };
-    setAligned(false);
-  }, [coreRef]);
-
-  // ── 정합 미리보기 (Kabsch만 돌려 RMSD 표시) ──
-  const computePreview = useCallback(async () => {
-    setError(null); setRmsd(null);
-    if (!allPicked) { setError('모듈 4 코너를 먼저 추출하세요'); return; }
-    if (!basemapCorners) { setError('basemap 4 코너 JSON이 유효하지 않습니다'); return; }
-    try {
-      const { matchCorners } = await import('@/lib/alignment');
-      const src = new Float64Array(12);
-      const dst = new Float64Array(12);
-      for (let i = 0; i < 4; i++) {
-        const s = picked[i]!.pos;
-        src[i*3] = s[0]; src[i*3+1] = s[1]; src[i*3+2] = s[2];
-        const t = basemapCorners[i];
-        dst[i*3] = t[0]; dst[i*3+1] = t[1]; dst[i*3+2] = t[2];
-      }
-      const fit = matchCorners(src, dst);
-      setRmsd(fit.rmsd);
-      console.log('[DoorAlign] Kabsch fit:', fit);
-    } catch (e: any) {
-      setError(`추정 실패: ${e?.message ?? e}`);
-    }
-  }, [allPicked, basemapCorners, picked]);
-
   // ────────────────────────────────────────────────────────────────────
   // 문 경계 정제 (boundary 가우시안 분할 + wall mesh 도어 영역 alpha=0 + 도어 mesh)
   //
   // 토글 ON  → applyDoorRefine: cachedScene 으로 분할 계산 → main PLY GPU in-place
-  //            (boundary slot → wall-side sub) + door-side sub blob → additional splat
+  //            (원본 slot → wall-side sub) + door-side sub blob → additional splat
   //            + door mesh 베이크 + wall 텍스처 alpha=0 punch.
   // 토글 OFF → revertDoorRefine: 모든 변경 원복.
   // 슬라이더 변경 (활성 상태 시) → 600ms 디바운스 후 재적용.
@@ -966,27 +1162,27 @@ export default function DoorAlignModal({
   const [doorRefineActive, setDoorRefineActive] = useState(false);
   const [doorRefining, setDoorRefining] = useState(false);
   const [doorRefineError, setDoorRefineError] = useState<string | null>(null);
-  // 도어 mesh 베이크 depthGate / 분할 안전 margin — 슬라이더 UI 제거됨. 고정값 사용 (decompose / bake 기본).
-  const DOOR_BAKE_GATE = 0.05;       // 5cm: 도어 mesh 베이크 시 평면 안쪽 splat 채택 한계.
-  const DOOR_SAFETY_MARGIN = 0;       // 0: boundary split 비대칭 보정 없음 (anisotropic split 으로 자연스럽게 처리).
-  const [doorThickness, setDoorThickness] = useState(0.3);     // 문 두께 (m). doorOriginalIndices 깊이 필터 (±thickness/2 from wall plane).
-  const [boundarySplitEnabled, setBoundarySplitEnabled] = useState(true); // 가장자리 가우시안 분할 (SAGS-style). 끄면 추출만, split 안 함.
+  // 도어 mesh 베이크/분할 기준값 — 슬라이더 UI 제거됨. decompose/bake 기본값 사용.
+  // 도어로 분류할 가우시안의 슬랩 깊이 (m) — 벽 평면에서 방 안쪽 방향 단방향.
+  const [doorExtractionDepth, setDoorExtractionDepth] = useState(0.15);
+  const [boundarySplitEnabled, setBoundarySplitEnabled] = useState(true); // 문 가장자리 가우시안 분할. 끄면 추출만, split 안 함.
   const [doorRefineStats, setDoorRefineStats] = useState<{ N: number; nBoundary: number; nDoorOrig: number } | null>(null);
 
   const cachedSceneRef = useRef<GaussianScene | null>(null);
   // currentUrl 이 바뀌면 (예: 정합 후 reloadWithUrl) 캐시된 scene 도 stale → 무효화.
   useEffect(() => { cachedSceneRef.current = null; }, [currentUrl]);
-  // 메인 PLY 의 boundary 슬롯 in-place 변경 전 snapshot — 원복용.
-  const boundarySnapshotRef = useRef<Array<{ idx: number; x: number; y: number; z: number; s0: number; s1: number; s2: number }>>([]);
+  // 도어 추출 자원 ref — apply 가 생성, revert 가 정리. 모달 lifecycle 과 무관하게 추출 흐름 안에서만 관리.
   const doorSubGsplatIdRef = useRef<string | null>(null);
   const doorSubBlobUrlRef = useRef<string | null>(null);
   const doorMeshEntityRef = useRef<any>(null);
+  // 모듈 도어 wrapper (mesh + splat 의 부모, 회전 transform 보유). 정합 시 AlignPanel doorPivotGroup 으로 reparent.
+  const moduleDoorWrapperRef = useRef<any>(null);
+  // 메인 splat blob URL 두 개. apply 가 currentMainPly 갱신, revert 가 revertMainPly 로 reload.
+  const currentMainPlyBlobUrlRef = useRef<string | null>(null);
+  const revertMainPlyBlobUrlRef = useRef<string | null>(null);
   const wallMeshNameRef = useRef<string | null>(null);
   const wallTexSnapshotRef = useRef<Uint8ClampedArray | null>(null);
-  // 메인 PLY 의 doorOriginalIndices 들 — 정제 ON 시 숨김 (scale → -30) 하기 전 원본 scale snapshot.
-  const doorOrigSnapshotRef = useRef<Array<{ idx: number; s0: number; s1: number; s2: number }>>([]);
-  // doorOrig 들의 colorTexture alpha snapshot (정제 ON 시 alpha=0 적용 → invisible 보장).
-  const doorOrigAlphaSnapshotRef = useRef<Array<{ idx: number; alpha: number }>>([]);
+  const wallViewTexSnapshotsRef = useRef<Array<{ texture: any; rgba: Uint8ClampedArray }> | null>(null);
   // 디버그 노랑 틴트용 — 추가 gsplat 의 원본 colorTexture 데이터 + 도어 mesh 의 원본 emissive.
   const doorGsplatOrigColorsRef = useRef<Uint16Array | null>(null);
   const doorMeshOrigEmissiveRef = useRef<{ r: number; g: number; b: number } | null>(null);
@@ -1009,19 +1205,20 @@ export default function DoorAlignModal({
   // "문 설정 완료" 버튼 피드백.
   const [saveDoorBusy, setSaveDoorBusy] = useState(false);
   const [saveDoorToast, setSaveDoorToast] = useState<string | null>(null);
-  const resolvedBasemapUnitName = basemapUnitName?.trim() ?? '';
-  const [savedDoorCount, setSavedDoorCount] = useState(0);
+  // basemapUnitName prop 은 호출자(UnifiedSplatEditor) 가 전달하지만 본 컴포넌트에선 무시 — basemap 다중 도어는 도어별 휠 피커로 호수 부여.
+  void basemapUnitName;
 
   // 서버 doors.json 으로부터 door_1 로드. surfaceId 는 서버에 없어서 코너 위치 ↔ plane 으로 추정.
   // 힌지/방향/각도도 함께 복원해 사용자가 다시 들어와도 마지막 설정 유지.
   // (planes 가 준비되어야 surfaceId 추정 가능 → planes 가 deps).
   useEffect(() => {
+    if (basemapEditMode) return;
     if (!planes) return;
     let cancelled = false;
     fetchDoorsFromServer(uploadId).then(({
       picked: corners, hingeEdge: he, swing: sw, angleDeg: ang,
-      wallSurfaceId: savedSurfaceId, doorThickness: savedThick,
-      boundarySplitEnabled: savedSplit, /* safetyMargin 은 현재 상수라 패스. */
+      wallSurfaceId: savedSurfaceId, doorExtractionDepth: savedThick,
+      boundarySplitEnabled: savedSplit,
     }) => {
       if (cancelled) return;
       const hasAny = corners.some(c => c !== null);
@@ -1046,11 +1243,11 @@ export default function DoorAlignModal({
       if (he !== null) setHingeEdge(he);
       setDoorSwing(sw);
       setDoorAngleDeg(ang);
-      if (savedThick !== null && savedThick > 0) setDoorThickness(savedThick);
+      if (savedThick !== null && savedThick > 0) setDoorExtractionDepth(savedThick);
       if (savedSplit !== null) setBoundarySplitEnabled(savedSplit);
     });
     return () => { cancelled = true; };
-  }, [uploadId, planes]);
+  }, [uploadId, planes, basemapEditMode]);
 
   // 자동 저장 제거 — 모든 서버 저장은 문 설정 완료 버튼에서 일괄 처리.
   const [doorRotated, setDoorRotated] = useState(false);
@@ -1075,106 +1272,12 @@ export default function DoorAlignModal({
     return null;
   }, []);
 
-  // 메인 splat data 의 boundary 슬롯들에 wall-side sub 데이터 in-place 적용 (GPU sync 포함).
-  const applyBoundaryUpdatesToGPU = useCallback((
-    splatData: any,
-    updates: BoundarySubUpdate[],
-    float2Half: (v: number) => number,
-  ) => {
-    const gsplat = splatData.gsplatData;
-    const sc0 = gsplat?.getProp('scale_0');
-    const sc1 = gsplat?.getProp('scale_1');
-    const sc2 = gsplat?.getProp('scale_2');
-    if (!sc0 || !sc1 || !sc2) {
-      console.warn('[DoorRefine] gsplatData scale props missing');
-      return;
-    }
-    const tA = splatData.transformATexture;
-    const tB = splatData.transformBTexture;
-    const dataA = tA?.lock();
-    const dataAF32 = dataA ? new Float32Array(dataA.buffer) : null;
-    const dataB = tB?.lock();
-    for (const u of updates) {
-      splatData.posX[u.idx] = u.wallNewPos[0];
-      splatData.posY[u.idx] = u.wallNewPos[1];
-      splatData.posZ[u.idx] = u.wallNewPos[2];
-      sc0[u.idx] = u.wallNewLogScale[0];
-      sc1[u.idx] = u.wallNewLogScale[1];
-      sc2[u.idx] = u.wallNewLogScale[2];
-      if (dataAF32) {
-        dataAF32[u.idx*4 + 0] = u.wallNewPos[0];
-        dataAF32[u.idx*4 + 1] = u.wallNewPos[1];
-        dataAF32[u.idx*4 + 2] = u.wallNewPos[2];
-      }
-      if (dataB) {
-        dataB[u.idx*4 + 0] = float2Half(Math.exp(u.wallNewLogScale[0]));
-        dataB[u.idx*4 + 1] = float2Half(Math.exp(u.wallNewLogScale[1]));
-        dataB[u.idx*4 + 2] = float2Half(Math.exp(u.wallNewLogScale[2]));
-      }
-    }
-    if (tA) tA.unlock();
-    if (tB) tB.unlock();
-    const inst = (splatData.splatEntity as any)?.gsplat?.instance;
-    if (inst?.sorter?.centers) {
-      for (const u of updates) {
-        inst.sorter.centers[u.idx*3 + 0] = u.wallNewPos[0];
-        inst.sorter.centers[u.idx*3 + 1] = u.wallNewPos[1];
-        inst.sorter.centers[u.idx*3 + 2] = u.wallNewPos[2];
-      }
-      inst.sorter.setMapping(null);
-      inst.lastCameraPosition.set(Infinity, Infinity, Infinity);
-    }
-  }, []);
-
-  // 토글 OFF: 모든 변경 원복.
+  // 토글 OFF: 모든 변경 원복. 메인 splat 을 추출 전 snapshot 으로 reload.
   const revertDoorRefine = useCallback(async () => {
-    console.log('[DoorRefine] revert START');
     try {
       const core = coreRef.current;
-      const sd = core?.getSplatData();
-      const float2Half = core?.float2Half;
 
-      // 1. boundary 슬롯 GPU 복원
-      try {
-        if (sd && float2Half && boundarySnapshotRef.current.length > 0) {
-          const restoreUpdates: BoundarySubUpdate[] = boundarySnapshotRef.current.map(s => ({
-            idx: s.idx,
-            wallNewPos: [s.x, s.y, s.z],
-            wallNewLogScale: [s.s0, s.s1, s.s2],
-          }));
-          applyBoundaryUpdatesToGPU(sd, restoreUpdates, float2Half);
-        }
-      } catch (e) { console.error('[DoorRefine] revert step 1 (boundary restore):', e); }
-      boundarySnapshotRef.current = [];
-
-      // 1b. doorOriginalIndices 슬롯 scale 복원 (숨김 → 원본)
-      try {
-        if (sd && float2Half && doorOrigSnapshotRef.current.length > 0) {
-          const restoreOrigs: BoundarySubUpdate[] = doorOrigSnapshotRef.current.map(s => ({
-            idx: s.idx,
-            wallNewPos: [sd.posX[s.idx], sd.posY[s.idx], sd.posZ[s.idx]],
-            wallNewLogScale: [s.s0, s.s1, s.s2],
-          }));
-          applyBoundaryUpdatesToGPU(sd, restoreOrigs, float2Half);
-        }
-      } catch (e) { console.error('[DoorRefine] revert step 1b (doorOrig restore):', e); }
-      doorOrigSnapshotRef.current = [];
-
-      // 1c. doorOrig colorTexture alpha 복원
-      try {
-        if (sd?.colorTexture && doorOrigAlphaSnapshotRef.current.length > 0) {
-          const td = sd.colorTexture.lock();
-          if (td) {
-            for (const s of doorOrigAlphaSnapshotRef.current) {
-              td[s.idx * 4 + 3] = s.alpha;
-            }
-            sd.colorTexture.unlock();
-          }
-        }
-      } catch (e) { console.error('[DoorRefine] revert step 1c (alpha restore):', e); }
-      doorOrigAlphaSnapshotRef.current = [];
-
-      // 2. additional door splat 제거
+      // 1. additional door splat 제거 (메인 reload 전에 — reload 후 entity 가 alignmentGroup 등으로 옮겨갈 수 있어 미리 정리)
       try {
         if (doorSubGsplatIdRef.current) {
           additional.remove(doorSubGsplatIdRef.current);
@@ -1184,15 +1287,35 @@ export default function DoorAlignModal({
           try { URL.revokeObjectURL(doorSubBlobUrlRef.current); } catch {}
           doorSubBlobUrlRef.current = null;
         }
-      } catch (e) { console.error('[DoorRefine] revert step 2 (additional remove):', e); }
+      } catch (e) { console.error('[DoorRefine] revert step 1 (additional remove):', e); }
 
-      // 3. door mesh entity 제거
+      // 2. door mesh entity + wrapper destroy.
+      // wrapper 가 있으면 mesh 는 wrapper 자식이므로 wrapper 한 번만 destroy 한다.
+      // mesh 를 먼저 destroy 한 뒤 wrapper 를 다시 destroy 하면 PlayCanvas 내부 child 상태가 꼬일 수 있다.
       try {
-        if (doorMeshEntityRef.current) {
+        if (moduleDoorWrapperRef.current) {
+          try { moduleDoorWrapperRef.current.destroy(); } catch {}
+          moduleDoorWrapperRef.current = null;
+          doorMeshEntityRef.current = null;
+        } else if (doorMeshEntityRef.current) {
           try { doorMeshEntityRef.current.destroy(); } catch {}
           doorMeshEntityRef.current = null;
         }
-      } catch (e) { console.error('[DoorRefine] revert step 3 (door mesh destroy):', e); }
+      } catch (e) { console.error('[DoorRefine] revert step 2 (mesh/wrapper destroy):', e); }
+
+      // 3. 메인 splat 을 추출 전 snapshot 으로 reload — 도어 가우시안 복귀.
+      try {
+        if (core && revertMainPlyBlobUrlRef.current) {
+          markNextSplatLoadSkipRebake?.();
+          await core.reloadSplatFromUrl(revertMainPlyBlobUrlRef.current, { preserveCamera: true });
+          onMainSplatReplaced?.();
+          // current blob 갱신 (revert 후 다음 추출은 다시 새 main blob 만들 거라 이전 거 revoke).
+          if (currentMainPlyBlobUrlRef.current && currentMainPlyBlobUrlRef.current !== revertMainPlyBlobUrlRef.current) {
+            try { URL.revokeObjectURL(currentMainPlyBlobUrlRef.current); } catch {}
+          }
+          currentMainPlyBlobUrlRef.current = revertMainPlyBlobUrlRef.current;
+        }
+      } catch (e) { console.error('[DoorRefine] revert step 3 (main reload):', e); }
 
       // 4. wall mesh 텍스처 복원 — lvl 이 TypedArray 가 아닐 수 있어 인덱스 복사로 수행.
       try {
@@ -1214,11 +1337,30 @@ export default function DoorAlignModal({
               }
               tex.unlock();
             }
+            for (const snap of wallViewTexSnapshotsRef.current ?? []) {
+              const lvl: any = snap.texture.lock();
+              if (lvl) {
+                const len = Math.min(lvl.length ?? 0, snap.rgba.length);
+                if (typeof lvl.set === 'function' && lvl.length === snap.rgba.length) {
+                  lvl.set(snap.rgba);
+                } else {
+                  for (let i = 0; i < len; i++) lvl[i] = snap.rgba[i];
+                }
+              }
+              snap.texture.unlock();
+            }
           }
         }
       } catch (e) { console.error('[DoorRefine] revert step 4 (wall tex restore):', e); }
       wallTexSnapshotRef.current = null;
+      wallViewTexSnapshotsRef.current = null;
       wallMeshNameRef.current = null;
+      lastDoorMeshInputRef.current = null;
+      lastDoorMeshBboxRef.current = null;
+      lastDoorMeshWallSurfaceIdRef.current = null;
+      // 취소 후 다음 추출은 현재 scene 에서 fresh revert snapshot 을 다시 만든다.
+      // 이전 snapshot 을 재사용하면 취소/재추출 반복 시 도어 mesh/texture 상태가 stale 해질 수 있다.
+      revertMainPlyBlobUrlRef.current = null;
 
       // 5. 회전 애니메이션 / 상태 정리
       doorAnimRef.current = null;
@@ -1237,7 +1379,6 @@ export default function DoorAlignModal({
       setHingeEdge(null);
       setEdgePickArmed(false);
       hoveredEdgeRef.current = null;
-      console.log('[DoorRefine] revert COMPLETE');
     } catch (e) {
       console.error('[DoorRefine] revert outer error:', e);
       setDoorRefineActive(false);
@@ -1249,11 +1390,10 @@ export default function DoorAlignModal({
       setEdgePickArmed(false);
       hoveredEdgeRef.current = null;
     }
-  }, [coreRef, additional, applyBoundaryUpdatesToGPU, findEntityByName]);
+  }, [coreRef, additional, findEntityByName]);
 
   // 토글 ON 또는 슬라이더 변경 시 재적용.
   const applyDoorRefine = useCallback(async () => {
-    console.log('[DoorRefine] apply START');
     setDoorRefineError(null);
     setDoorRefining(true);
     try {
@@ -1263,44 +1403,50 @@ export default function DoorAlignModal({
       if (new Set(surfaceIds).size > 1) throw new Error('도어 4점이 같은 면 위에 있어야 합니다');
       const wallSurfaceId = surfaceIds[0];
 
+      let attempts = 0;
+      while (
+        attempts < 60 &&
+        (!coreRef.current?.getPC() || !coreRef.current?.getApp() || !coreRef.current?.getSplatData() || !coreRef.current?.float2Half)
+      ) {
+        await new Promise(resolve => setTimeout(resolve, 50));
+        attempts++;
+      }
       const core = coreRef.current;
       const pc = core?.getPC();
       const app = core?.getApp();
-      const sd = core?.getSplatData();
+      // 메인 splat reload 후 새 splatData 로 재할당해야 하므로 let.
+      let sd = core?.getSplatData();
       const float2Half = core?.float2Half;
       if (!pc || !app || !sd || !float2Half) throw new Error('PlayCanvas 미준비');
 
       // 1. 이전 상태가 있으면 먼저 원복
-      if (doorRefineActive || boundarySnapshotRef.current.length > 0
-          || doorSubGsplatIdRef.current || doorMeshEntityRef.current) {
+      if (doorRefineActive || doorSubGsplatIdRef.current || doorMeshEntityRef.current) {
         await revertDoorRefine();
       }
 
-      // 2. cachedScene 확보 (PLY parse 1회만). full N 유지 — 라이브 splatData 와 인덱스 정합 필요.
-      if (!cachedSceneRef.current) {
-        const { fetchAndParsePly } = await import('@/lib/ply');
-        cachedSceneRef.current = await fetchAndParsePly(currentUrl);
-      }
-      const scene = cachedSceneRef.current;
-      // 다듬기 단계의 keep mask (flatten/floater/brush 삭제). decomp 결과를 이걸로 거르면
-      // 외부 가우시안이 도어 영역에서 부활하는 문제 방지.
-      const keepMaskCurrent = getCurrentKeepMask?.() ?? null;
-
-      // 라이브 splatData 의 scale 이 cachedScene 과 다를 수 있다 (예: 다듬기 단계의 경계 Clipping
-      // 적용 후 정합으로 넘어온 경우 — 라이브에는 clip 된 scale, cachedScene 에는 PLY 원본 scale).
-      // decompose 는 scene.sc 를 분할 베이스로 쓰므로 동기화하지 않으면 boundary 가우시안의 clipping 이
-      // raw + split 으로 덮어써져 풀린다. 라이브 → cached 로 복사해 현재 상태를 분할 베이스로 사용.
-      {
-        const liveSc0 = sd.gsplatData?.getProp('scale_0') as Float32Array | undefined;
-        const liveSc1 = sd.gsplatData?.getProp('scale_1') as Float32Array | undefined;
-        const liveSc2 = sd.gsplatData?.getProp('scale_2') as Float32Array | undefined;
-        const cs0 = scene.attrs.get('scale_0') as Float32Array | undefined;
-        const cs1 = scene.attrs.get('scale_1') as Float32Array | undefined;
-        const cs2 = scene.attrs.get('scale_2') as Float32Array | undefined;
-        if (liveSc0 && liveSc1 && liveSc2 && cs0 && cs1 && cs2 && liveSc0.length === cs0.length) {
-          cs0.set(liveSc0); cs1.set(liveSc1); cs2.set(liveSc2);
+      // 2. 현재 sd 의 gsplatData 에서 GaussianScene 빌드. 매 apply 마다 새로 — live sd 가 단일
+      //    source of truth: posX/Y/Z, rot_*, scale_* 모두 현재 상태 (베이크/clipping 반영).
+      //    PC GSplatData 의 속성 메타: elements[0].properties[].name + properties[].storage.
+      const scene: GaussianScene = (() => {
+        const g = sd.gsplatData;
+        const vertexElement = g?.getElement?.('vertex');
+        const propertyOrder: string[] = (vertexElement?.properties ?? [])
+          .map((p: { name: string }) => p.name);
+        const attrs = new Map<string, Float32Array>();
+        for (const prop of propertyOrder) {
+          const a = g?.getProp(prop);
+          if (a) attrs.set(prop, new Float32Array(a));
         }
-      }
+        // posX/Y/Z 는 splatData 의 별도 참조와 동일해야 함 — gsplatData 의 x/y/z 와 같은 버퍼.
+        // 안전 보장으로 sd.posX/Y/Z 로 덮어씀.
+        if (sd.posX) attrs.set('x', new Float32Array(sd.posX));
+        if (sd.posY) attrs.set('y', new Float32Array(sd.posY));
+        if (sd.posZ) attrs.set('z', new Float32Array(sd.posZ));
+        return { numSplats: sd.numSplats, attrs, propertyOrder };
+      })();
+      // 다듬기 단계의 keep mask (boundaryCull/floater/brush 삭제). decomp 결과를 이걸로 거르면
+      // 이미 제외한 경계/삭제 가우시안이 도어 영역에서 부활하는 문제 방지.
+      const keepMaskCurrent = getCurrentKeepMask?.() ?? null;
 
       // 3. 분할 계산
       // 사용자가 픽한 4 점을 wall plane 으로 projection — visualization (setDoorInternalShowAsync) 도 같은
@@ -1314,7 +1460,7 @@ export default function DoorAlignModal({
       // 방법: A' 평면의 normal 을 pendingRotation^-1 로 회전해 raw 프레임 평면으로 변환 후 그 위에 raw 점 투영.
       const wallPlaneForRefine = planes?.find(p => p.id === wallSurfaceId);
       // 좌표 프레임: scene/picked 모두 raw, planes 는 A'. raw 프레임 평면을 만들어 동일 프레임에서 작업.
-      const rotR = getEditorRotation(uploadId);
+      const rotR = getCurrentEditorRotation();
       const wallNormalRaw: Vec3 | null = wallPlaneForRefine
         ? aToRaw(wallPlaneForRefine.normal as Vec3, rotR)
         : null;
@@ -1342,11 +1488,10 @@ export default function DoorAlignModal({
       // wallOutwardNormal: scene/corners 가 raw 프레임이므로 raw 프레임 wall normal 을 넘겨줘야 isInDoorSlab 의 sdOut 부호가 정합.
       // (wallPlaneForRefine.normal 은 A' 프레임. wallNormalRaw 는 위에서 pendingRotation^-1 으로 계산해뒀음.)
       const decompRaw = decomposeBoundaryGaussians(scene, { corners }, {
-        safetyMargin: DOOR_SAFETY_MARGIN,
-        doorThickness,
+        doorExtractionDepth: doorExtractionDepth,
         wallOutwardNormal: wallNormalRaw ?? wallPlaneForRefine?.normal,
       });
-      // 다듬기에서 삭제된 가우시안 (flatten/floater/brush) 은 도어 영역에서 부활시키지 않도록
+      // 다듬기에서 삭제된 가우시안 (boundaryCull/floater/brush) 은 도어 영역에서 부활시키지 않도록
       // decomp 결과의 인덱스 집합을 keep mask 로 거른다. boundary 갱신/wall-side 도 마찬가지.
       const decomp = keepMaskCurrent
         ? {
@@ -1358,7 +1503,6 @@ export default function DoorAlignModal({
           }
         : decompRaw;
       doorOriginalIndicesRef.current = decomp.doorOriginalIndices.slice();
-      console.log(`[DoorRefine] N=${scene.numSplats}, boundary=${decomp.boundaryIndices.length}, doorOrig=${decomp.doorOriginalIndices.length}, wallOrig=${decomp.wallOriginalIndices.length}${keepMaskCurrent ? ' (다듬기 삭제 반영)' : ''}`);
       setDoorRefineStats({
         N: scene.numSplats,
         nBoundary: decomp.boundaryIndices.length,
@@ -1378,7 +1522,7 @@ export default function DoorAlignModal({
       if (!sc0 || !sc1 || !sc2) throw new Error('gsplatData scale props missing');
 
       const { filterScene, concatScenes, serializePly } = await import('@/lib/ply');
-      // flatten/brush 로 alpha=0 처리된 splat (origColorData[i*4+3] ≈ 0) 은 도어 entity 에도 포함하지 않음.
+      // boundaryCull/brush 로 alpha=0 처리된 splat (origColorData[i*4+3] ≈ 0) 은 도어 entity 에도 포함하지 않음.
       // 안 그러면 cachedScene 의 원본 alpha 로 부활해 방 밖 잔여물 다시 보임.
       const h2f = core.half2Float;
       const origColor = sd.origColorData;
@@ -1387,14 +1531,12 @@ export default function DoorAlignModal({
         return h2f(origColor[i * 4 + 3]) < 1e-3;
       };
       const keepDoor = new Uint8Array(scene.numSplats);
-      let doorAlphaDeleted = 0;
       for (const i of decomp.doorOriginalIndices) {
-        if (isAlphaDeleted(i)) { doorAlphaDeleted++; continue; }
+        if (isAlphaDeleted(i)) continue;
         keepDoor[i] = 1;
       }
-      // doorSubMetadata 도 같은 기준으로 필터 (boundary 가우시안 중 flatten 삭제된 건 sub 도 부활시키지 않음).
+      // doorSubMetadata 도 같은 기준으로 필터 (boundary 가우시안 중 boundaryCull 삭제된 건 sub 도 부활시키지 않음).
       const filteredSubMeta = decomp.doorSubMetadata.filter(m => !isAlphaDeleted(m.origIdx));
-      console.log(`[DoorRefine] flatten 삭제된 splat 도어 entity 제외: doorOrig=${doorAlphaDeleted}, sub=${decomp.doorSubMetadata.length - filteredSubMeta.length}`);
       const doorOrigScene = filterScene(scene, keepDoor);
       const doorSubsScene = (boundarySplitEnabled && filteredSubMeta.length > 0)
         ? buildDoorSubScene(scene, filteredSubMeta)
@@ -1408,18 +1550,18 @@ export default function DoorAlignModal({
         const blob = new Blob([bytes], { type: 'application/octet-stream' });
         const blobUrl = URL.createObjectURL(blob);
         doorSubBlobUrlRef.current = blobUrl;
-        const { id, ready } = additional.add(blobUrl);
+        const { id, ready } = additional.add(blobUrl, { name: '도어 영역 가우시안', source: 'local' });
         if (id) {
           doorSubGsplatIdRef.current = id;
           // asset.ready 까지 정확히 대기 — Promise 기반, 폴링 불필요.
           await ready;
-          // 메인 splatEntity 와 동일 회전 (Z-180 + pendingRotation) 부여 — raw 좌표 기준 doorScene 이라
-          // 메인과 일치한 자리에 그려짐. additional.add 의 default 는 Z-180 만 부여.
+          // 자식 splat 의 local 은 identity. 회전(Z-180)은 wrapper (doorWrapper) 가 보유 —
+          // wrapper 한 곳에 transform 을 걸면 mesh + splat 이 함께 따라감.
+          // additional.add default 가 Z-180 이므로 명시적 reset.
           const ent = additional.getEntity(id);
-          const splatEnt = sd?.splatEntity;
-          if (ent && splatEnt) {
-            const r = splatEnt.getLocalRotation();
-            ent.setLocalRotation(r.x, r.y, r.z, r.w);
+          if (ent) {
+            ent.setLocalRotation(0, 0, 0, 1);
+            ent.setLocalPosition(0, 0, 0);
           }
         }
       }
@@ -1430,6 +1572,7 @@ export default function DoorAlignModal({
       const wallPlane = planes?.find(p => p.id === wallSurfaceId);
       let wallEntName: string | null = null;
       let wallMeshTex: any = null;
+      let wallMeshViewTextures: any[] = [];
       let wallMeshObj: any = null;
       let wallCorners: [Vec3, Vec3, Vec3, Vec3] | null = null;
       let wallUvs: [[number, number], [number, number], [number, number], [number, number]] | null = null;
@@ -1445,6 +1588,7 @@ export default function DoorAlignModal({
         } else {
           const meshInst = wallEnt.render?.meshInstances?.[0];
           wallMeshTex = meshInst?.material?.emissiveMap;
+          wallMeshViewTextures = ((wallEnt as any).__viewTextureVariants ?? []).map((v: any) => v.texture).filter(Boolean);
           wallMeshObj = meshInst?.mesh;
           if (wallMeshTex && wallMeshObj) {
             const positions: number[] = [];
@@ -1471,26 +1615,21 @@ export default function DoorAlignModal({
               wallCorners, wallUvs, cornersA,
             );
             wallMeshTex.unlock();
-            console.log(`[DoorRefine] door tex cut: ${cut.width}×${cut.height} from wall ${wallMeshTex.width}×${wallMeshTex.height}`);
-
             // 3) cut 결과 + 도어 corners + UV 매핑.
             //    Wall 텍스쳐 행 방향: row 0 = raw y 큰 쪽. Z-180 entity 회전 때문에 화면상으론 아래쪽
             //    (CLAUDE.md "코드 ceiling = 화면 바닥" 규칙).
             //    Door corners 는 picked 순서 = 사용자 화면 라벨 [TL, TR, BR, BL] = raw y [낮음, 낮음, 높음, 높음].
             //    UV 를 세로 반전 [(0,1),(1,1),(1,0),(0,0)] 로 매핑하면 vertex 0 이 row cutH-1 (raw y 낮은 콘텐츠) 샘플 → 정합.
             //
-            //    Z-fight 방지: 도어 mesh 코너를 방 안쪽 (-wallNormal 방향) 으로 1mm 미세 오프셋.
-            //    wall mesh 와 도어 mesh 가 모두 sd=0 평면이라 동일 깊이 → 깊이 충돌. 도어 mesh 만 살짝 안쪽으로
-            //    빼서 카메라(방 안)에 더 가까운 위치 → 항상 wall mesh 위에 깨끗하게 그려짐.
-            const Z_FIGHT_OFFSET = 0.001;
-            // inwardN: corners 가 raw 프레임이므로 raw 프레임 normal 사용 — wallPlane.normal (A') 을 pendingRotation^-1 회전.
+            // inwardN 은 doorMesh.normalInward 메타로 저장되므로 계산 자체는 유지 (저장 형식).
             const wallNormalRawForOffset: Vec3 = wallNormalRaw ?? (wallPlane.normal as Vec3);
             const inwardN: Vec3 = [-wallNormalRawForOffset[0], -wallNormalRawForOffset[1], -wallNormalRawForOffset[2]];
-            const offsetCorners: [Vec3, Vec3, Vec3, Vec3] = corners.map(c => [
-              c[0] + inwardN[0] * Z_FIGHT_OFFSET,
-              c[1] + inwardN[1] * Z_FIGHT_OFFSET,
-              c[2] + inwardN[2] * Z_FIGHT_OFFSET,
-            ] as Vec3) as [Vec3, Vec3, Vec3, Vec3];
+            const doorCornersForMesh: [Vec3, Vec3, Vec3, Vec3] = [
+              [corners[0][0], corners[0][1], corners[0][2]] as Vec3,
+              [corners[1][0], corners[1][1], corners[1][2]] as Vec3,
+              [corners[2][0], corners[2][1], corners[2][2]] as Vec3,
+              [corners[3][0], corners[3][1], corners[3][2]] as Vec3,
+            ];
             // 도어 mesh UV: 각 코너의 cut texture 픽셀 위치를 정규화. axis-aligned bbox crop 이라
             //   사다리꼴 도어 코너가 bbox 코너와 일치하지 않을 수 있어 고정 UV 로는 텍스쳐 어긋남.
             //   cut.doorCornerPx[i] = 도어 corner i 의 cut.rgba 픽셀 좌표.
@@ -1505,7 +1644,7 @@ export default function DoorAlignModal({
               rgba: cut.rgba,
               width: cut.width,
               height: cut.height,
-              corners: offsetCorners,
+              corners: doorCornersForMesh,
               uvs: doorMeshUvs,
               input: {
                 origin: corners[0],
@@ -1513,69 +1652,116 @@ export default function DoorAlignModal({
                 vAxis: [0, 1, 0] as Vec3,
                 normal: wallPlane.normal as Vec3,
                 uMin: 0, uMax: 1, vMin: 0, vMax: 1,
-                extendU0: 0, extendU1: 0, extendV0: 0, extendV1: 0,
-                meshOffset: 0,
               },
             };
+            // basemap 다중 도어 영속화용 — 메시 코너를 final PLY 좌표계로 보관.
+            // 신규 등록 중에는 pendingRotation + wallAngle 을 적용하고, basemap 수정 모드는 이미 final 이라 identity.
+            try {
+              const rotForBake = basemapEditMode
+                ? { rotX: 0, rotZ: 0, wallAngleRad: 0 }
+                : (getRemainingRotationToAY?.() ?? { rotX: 0, rotZ: 0, wallAngleRad: 0 });
+              const meshCornersAY: [number, number, number][] = doorCornersForMesh.map(c => {
+                const ay = rawToAY([c[0], c[1], c[2]] as Vec3, rotForBake as FrameRotation);
+                return [ay[0], ay[1], ay[2]];
+              });
+              const inwardForSave: [number, number, number] = (() => {
+                const ay = rawToAY(inwardN, rotForBake as FrameRotation);
+                return [ay[0], ay[1], ay[2]];
+              })();
+              lastDoorMeshInputRef.current = {
+                rgba: cut.rgba,
+                width: cut.width,
+                height: cut.height,
+                corners: meshCornersAY,
+                uvs: doorMeshUvs as [number, number][],
+                normalInward: inwardForSave,
+              };
+              lastDoorMeshBboxRef.current = { x: cut.bbox.x, y: cut.bbox.y, w: cut.bbox.w, h: cut.bbox.h };
+              lastDoorMeshWallSurfaceIdRef.current = wallSurfaceId;
+            } catch (e) {
+              console.warn('[DoorRefine] door mesh input capture for persistence failed:', e);
+            }
             const { createWallMeshEntity } = await import('@/lib/gs/wallMesh');
             pendingDoorMeshEnt = createWallMeshEntity(
               pc, app, sd.splatEntity, doorMeshInput as any, `doorMesh_${wallSurfaceId}`,
             );
-            // 도어 mesh corners 는 picked corners 기반 (raw frame). createWallMeshEntity 는 default
-            // Z-180 만 부여하므로 pendingRotation 까지 합쳐서 splatEntity 와 동일 변환으로 맞춤.
+            // 자식 mesh 의 local 은 identity. 회전(Z-180)은 wrapper 가 보유.
+            // createWallMeshEntity default Z-180 무력화.
             if (pendingDoorMeshEnt) {
-              const r = sd.splatEntity.getLocalRotation();
-              pendingDoorMeshEnt.setLocalRotation(r.x, r.y, r.z, r.w);
+              pendingDoorMeshEnt.setLocalRotation(0, 0, 0, 1);
+              pendingDoorMeshEnt.setLocalPosition(0, 0, 0);
             }
           }
         }
       }
 
-      // [Phase C — ATOMIC] 모든 visible 변형을 한 번에. await 없음.
-      //   1) boundary snapshot + wall-side 이동.
-      //   2) doorOrig scale snapshot + 숨김 (-30).
-      //   3) doorOrig alpha snapshot + alpha=0.
-      //   4) wall mesh alpha-punch.
-      //   5) door mesh entity ref 저장.
-      // 페인트 (영역 확인 ON 시) 는 setDoorRefineActive(true) 직후 auto-refresh useEffect 가 처리.
-      // → main PLY 도어 숨김과 동시에 도어 entity / 도어 mesh 가 자연색으로 그 자리를 채움 → 빈 transparent 갭 없음.
+      // 메인 splat 을 도어 가우시안 빠진 새 PLY 로 reload.
+      //   1) 새 메인 PLY: cachedScene 클론 → boundary 슬롯에 wall-side sub 데이터 in-place 적용 →
+      //      doorOriginalIndices / alpha-deleted 제외하고 filter + serialize.
+      //   2) revert snapshot PLY: cachedScene 에서 alpha-deleted 만 제외하고 filter + serialize (도어 포함 상태).
+      //   3) markNextSplatLoadSkipRebake 호출 — 새 PLY 는 A' 프레임이라 onSplatLoaded 의 자동 re-bake 가
+      //      double 회전 일으킴, 한 번만 skip.
+      //   4) core.reloadSplatFromUrl(mainBlob, preserveCamera) await — 카메라 위치 유지하며 메인 교체.
+      {
+        const { cloneScene } = await import('@/lib/ply');
+        const doorSet = new Set(decomp.doorOriginalIndices);
 
-      if (boundarySplitEnabled) {
-        boundarySnapshotRef.current = decomp.boundaryIndices.map(i => ({
-          idx: i,
-          x: sd.posX[i], y: sd.posY[i], z: sd.posZ[i],
-          s0: sc0[i], s1: sc1[i], s2: sc2[i],
-        }));
-        applyBoundaryUpdatesToGPU(sd, decomp.wallSideUpdates, float2Half);
-      } else {
-        boundarySnapshotRef.current = [];
-      }
-
-      const HIDE_LOGSCALE = -30;
-      doorOrigSnapshotRef.current = decomp.doorOriginalIndices.map(i => ({
-        idx: i,
-        s0: sc0[i], s1: sc1[i], s2: sc2[i],
-      }));
-      const hideUpdates: BoundarySubUpdate[] = decomp.doorOriginalIndices.map(i => ({
-        idx: i,
-        wallNewPos: [sd.posX[i], sd.posY[i], sd.posZ[i]],
-        wallNewLogScale: [HIDE_LOGSCALE, HIDE_LOGSCALE, HIDE_LOGSCALE],
-      }));
-      applyBoundaryUpdatesToGPU(sd, hideUpdates, float2Half);
-
-      doorOrigAlphaSnapshotRef.current = [];
-      if (sd.colorTexture) {
-        const td = sd.colorTexture.lock();
-        if (td) {
-          const halfZero = float2Half(0);
-          const snap: Array<{ idx: number; alpha: number }> = [];
-          for (const i of decomp.doorOriginalIndices) {
-            snap.push({ idx: i, alpha: td[i*4 + 3] });
-            td[i*4 + 3] = halfZero;
+        // (1) 새 메인 PLY — 클론 후 boundary 슬롯을 wall-side sub 데이터로 in-place 덮어씀.
+        const sceneForMain = cloneScene(scene);
+        if (boundarySplitEnabled) {
+          const sx = sceneForMain.attrs.get('x')!;
+          const sy = sceneForMain.attrs.get('y')!;
+          const sz = sceneForMain.attrs.get('z')!;
+          const ss0 = sceneForMain.attrs.get('scale_0')!;
+          const ss1 = sceneForMain.attrs.get('scale_1')!;
+          const ss2 = sceneForMain.attrs.get('scale_2')!;
+          for (const u of decomp.wallSideUpdates) {
+            sx[u.idx] = u.wallNewPos[0];
+            sy[u.idx] = u.wallNewPos[1];
+            sz[u.idx] = u.wallNewPos[2];
+            ss0[u.idx] = u.wallNewLogScale[0];
+            ss1[u.idx] = u.wallNewLogScale[1];
+            ss2[u.idx] = u.wallNewLogScale[2];
           }
-          doorOrigAlphaSnapshotRef.current = snap;
-          sd.colorTexture.unlock();
         }
+        const keepMain = new Uint8Array(scene.numSplats);
+        for (let i = 0; i < scene.numSplats; i++) {
+          if (doorSet.has(i)) continue;
+          if (isAlphaDeleted(i)) continue;
+          keepMain[i] = 1;
+        }
+        const mainScene = filterScene(sceneForMain, keepMain);
+        const mainBytes = serializePly(mainScene);
+        const mainBlobUrl = URL.createObjectURL(new Blob([mainBytes], { type: 'application/octet-stream' }));
+
+        // (2) revert 용 snapshot — 도어 추출 전 상태 (alpha-deleted 만 제외).
+        //   revertDoorRefine 이 이걸로 reload 하면 추출 전과 동일 visible 가우시안.
+        if (!revertMainPlyBlobUrlRef.current) {
+          const keepOrig = new Uint8Array(scene.numSplats);
+          for (let i = 0; i < scene.numSplats; i++) {
+            if (!isAlphaDeleted(i)) keepOrig[i] = 1;
+          }
+          const origScene = filterScene(scene, keepOrig);
+          const origBytes = serializePly(origScene);
+          revertMainPlyBlobUrlRef.current = URL.createObjectURL(new Blob([origBytes], { type: 'application/octet-stream' }));
+        }
+
+        // (3) 직전 메인 blob URL revoke (메모리 누수 방지). revert snapshot 과 같은 URL 이면 보존.
+        const prev = currentMainPlyBlobUrlRef.current;
+        if (prev && prev !== revertMainPlyBlobUrlRef.current) {
+          try { URL.revokeObjectURL(prev); } catch {}
+        }
+        currentMainPlyBlobUrlRef.current = mainBlobUrl;
+
+        // (4) re-bake skip 신호 + reload await. 새 splatData 가 onSplatLoaded 콜백으로 refine tool 에 등록.
+        markNextSplatLoadSkipRebake?.();
+        await core.reloadSplatFromUrl(mainBlobUrl, { preserveCamera: true });
+
+        // reload 후 splatData 재획득 — 옛 splatEntity 는 destroy 됨, 이후 코드 (wrapper 회전 기준) 가 새 entity 참조해야 함.
+        const sdNew = core.getSplatData();
+        if (!sdNew) throw new Error('reload 후 splatData 미준비');
+        sd = sdNew;
+        onMainSplatReplaced?.(mainScene);
       }
 
       if (wallMeshTex && wallCorners && wallUvs && wallEntName) {
@@ -1585,18 +1771,29 @@ export default function DoorAlignModal({
           wallTexSnapshotRef.current = new Uint8ClampedArray(rgba);
           wallMeshNameRef.current = wallEntName;
           // wallCorners 는 A' 프레임이므로 doorCorners 도 A' (cornersA) 로 매칭.
-          const touched = punchAlphaZeroInDoorRegion(rgba, wallMeshTex.width, wallMeshTex.height, wallCorners, wallUvs, cornersA);
-          console.log(`[DoorRefine] wall mesh hole: ${touched} pixels`);
+          punchAlphaZeroInDoorRegion(rgba, wallMeshTex.width, wallMeshTex.height, wallCorners, wallUvs, cornersA);
         }
         wallMeshTex.unlock();
+        wallViewTexSnapshotsRef.current = [];
+        for (const tex of wallMeshViewTextures) {
+          const lvl = tex.lock();
+          if (lvl) {
+            const rgba = lvl as Uint8ClampedArray;
+            wallViewTexSnapshotsRef.current.push({ texture: tex, rgba: new Uint8ClampedArray(rgba) });
+            punchAlphaZeroInDoorRegion(rgba, tex.width, tex.height, wallCorners, wallUvs, cornersA);
+          }
+          tex.unlock();
+        }
 
         // CPU rgba 캐시 (lastBakesRef) 에도 동일 punch — 서버 PNG 로 직렬화될 때 punch 가 보존되도록.
         // wallEntName 형식: 'wallMesh_<surfaceId>'. surfaceId 추출.
         const surfaceId = wallEntName.startsWith('wallMesh_') ? wallEntName.slice('wallMesh_'.length) : wallEntName;
         const bake = getBakeRgba?.(surfaceId);
         if (bake) {
-          const touchedCpu = punchAlphaZeroInDoorRegion(bake.rgba, bake.width, bake.height, wallCorners, wallUvs, cornersA);
-          console.log(`[DoorRefine] wall mesh hole (CPU rgba): ${touchedCpu} pixels (surfaceId=${surfaceId})`);
+          punchAlphaZeroInDoorRegion(bake.rgba, bake.width, bake.height, wallCorners, wallUvs, cornersA);
+          for (const variant of bake.viewVariants ?? []) {
+            punchAlphaZeroInDoorRegion(variant.rgba, bake.width, bake.height, wallCorners, wallUvs, cornersA);
+          }
         } else {
           console.warn(`[DoorRefine] CPU rgba 캐시 없음 — surfaceId=${surfaceId} (서버 PNG 에 punch 미반영 가능)`);
         }
@@ -1604,8 +1801,117 @@ export default function DoorAlignModal({
 
       doorMeshEntityRef.current = pendingDoorMeshEnt;
 
+      // 도어 wrapper — mesh + splat 의 부모. wrapper 가 transform 보유 (splatEntity 와 동일 회전 Z-180,
+      // 도어 회전 시 hinge qR 합성). 자식 mesh/splat 의 local 은 identity.
+      //   module: 'moduleDoor' (단일), basemap: 'basemapDoor_<doorId>' (다중).
+      const newDoorId = basemapMode
+        ? `door_${Date.now()}_${Math.floor(Math.random() * 1000)}`
+        : null;
+      const doorWrapperName = basemapMode ? `basemapDoor_${newDoorId}` : 'moduleDoor';
+      const doorWrapper = new pc.Entity(doorWrapperName);
+      {
+        const r = sd.splatEntity.getLocalRotation();
+        doorWrapper.setLocalRotation(r.x, r.y, r.z, r.w);
+      }
+      app.root.addChild(doorWrapper);
+      if (pendingDoorMeshEnt) {
+        try { doorWrapper.addChild(pendingDoorMeshEnt); } catch (e) { console.warn('[DoorRefine] mesh reparent fail:', e); }
+      }
+      if (doorSubGsplatIdRef.current) {
+        const splatEnt = additional.getEntity(doorSubGsplatIdRef.current);
+        if (splatEnt) {
+          try { doorWrapper.addChild(splatEnt); } catch (e) { console.warn('[DoorRefine] splat reparent fail:', e); }
+        }
+      }
+      if (!basemapMode) {
+        if (moduleDoorWrapperRef.current && moduleDoorWrapperRef.current !== doorWrapper) {
+          try { moduleDoorWrapperRef.current.destroy(); } catch {}
+        }
+        moduleDoorWrapperRef.current = doorWrapper;
+      }
+
       setDoorRefineActive(true);
-      console.log('[DoorRefine] apply SUCCESS');
+
+      // basemap 다중 도어: 추출 성공 즉시 메모리 도어 리스트에 push.
+      // 모듈 모드는 그대로 (기존 회전 메타 부여 후 정합 단계로 transition).
+      if (basemapMode) {
+        try {
+          const meshInput = lastDoorMeshInputRef.current;
+          const doorId = newDoorId as string;
+          const splatBlobUrl = doorSubBlobUrlRef.current;
+          const splatLayerId = doorSubGsplatIdRef.current;
+          const doorMeshEnt = pendingDoorMeshEnt;
+          // 엔티티 이름 변경 → 다음 applyDoorRefine 의 revert 가 못 찾게 (개별 도어 보존).
+          if (doorMeshEnt) {
+            try { doorMeshEnt.name = `doorMesh_kept_${doorId}`; } catch {}
+          }
+          // 노란 outline 생성 — RAW 프레임 corners + 엔티티에 Z-180+pendingRotation 부여.
+          // (corners 가 A' 또는 A'+Y 라면 엔티티 rotation 과 함께 pendingRotation 이 이중 적용됨.)
+          let outlineHandle: import('@/lib/gs/doorOutline').DoorOutlineHandle | null = null;
+          try {
+            const { createDoorOutlineEntity } = await import('@/lib/gs/doorOutline');
+            const splatRot = sd.splatEntity.getLocalRotation();
+            outlineHandle = createDoorOutlineEntity(pc, app, {
+              corners: corners.map(c => [c[0], c[1], c[2]] as [number, number, number]),
+              unitName: null,
+              rotation: [splatRot.x, splatRot.y, splatRot.z, splatRot.w],
+            });
+          } catch (e) {
+            console.warn('[DoorRefine] outline 생성 실패:', e);
+          }
+          // doors.json 저장용: final PLY 좌표계.
+          // 신규 등록 중에는 rotR(rotX/rotZ/wallAngleRad)을 적용하고, basemap 수정 모드는 이미 final 이라 identity.
+          const cornersAYpush: Vec3[] = corners.map(c => {
+            const ay = rawToAY([c[0], c[1], c[2]] as Vec3, rotR as FrameRotation);
+            return [ay[0], ay[1], ay[2]] as Vec3;
+          });
+          const newDoor: InMemoryDoor = {
+            doorId,
+            cornersRaw: corners.map(c => [c[0], c[1], c[2]]),
+            cornersAY: cornersAYpush,
+            wallSurfaceId,
+            doorMeshInput: {
+              rgba: meshInput?.rgba ?? new Uint8ClampedArray(0),
+              width: meshInput?.width ?? 0,
+              height: meshInput?.height ?? 0,
+              corners: meshInput?.corners ?? [],
+              uvs: meshInput?.uvs ?? [],
+              normalInward: meshInput?.normalInward ?? [0, 0, 0],
+            },
+            doorSplatBlobUrl: splatBlobUrl,
+            doorMeshEntityName: doorMeshEnt?.name || `doorMesh_kept_${doorId}`,
+            doorSplatLayerId: splatLayerId,
+            outlineHandle,
+            wallTextureSnapshotRect: lastDoorMeshBboxRef.current
+              ? { ...lastDoorMeshBboxRef.current }
+              : null,
+            doorExtractionDepth: doorExtractionDepth,
+            boundarySplitEnabled,
+            unitName: '',  // 미설정 — 휠 피커로 부여.
+            bakeRotation: basemapEditMode
+              ? { rotX: 0, rotZ: 0, wallAngleRad: 0 }
+              : (getRemainingRotationToAY?.() ?? { rotX: 0, rotZ: 0, wallAngleRad: 0 }),
+            doorOriginalIndices: decomp.doorOriginalIndices.slice(),
+          };
+          // 다음 도어 작업을 위해 현재 도어 관련 ref 들 detach (revert 가 영향 안 주도록).
+          doorSubGsplatIdRef.current = null;
+          doorSubBlobUrlRef.current = null;
+          doorMeshEntityRef.current = null;
+          setInMemoryDoors(prev => [...prev, newDoor]);
+          if (basemapEditMode) setBasemapEditDirty(true);
+          // picked 초기화 → 다음 4점 픽 가능
+          setPicked(emptyPicked());
+          setHingeEdge(null);
+          setEdgePickArmed(false);
+          setDoorRotated(false);
+          setRotationApplied(false);
+          setDoorRefineActive(false);
+          // 추출 직후 → 호수 휠 피커 자동 오픈 (자동/수동 무관 — 사용자가 호수 부여 또는 취소 시 placeholder 로 남음).
+          setUnitNamePickerOpen({ doorId, initialSuffix: 1 });
+        } catch (saveErr: any) {
+          console.warn('[DoorRefine] basemap 메모리 push 실패:', saveErr);
+        }
+      }
     } catch (e: any) {
       console.error('[DoorRefine] failed:', e);
       setDoorRefineError(`정제 실패: ${e?.message ?? e}`);
@@ -1614,22 +1920,23 @@ export default function DoorAlignModal({
     } finally {
       setDoorRefining(false);
     }
-  }, [allPicked, picked, currentUrl, coreRef, additional, planes, doorThickness,
-      doorRefineActive, boundarySplitEnabled, applyBoundaryUpdatesToGPU, findEntityByName, revertDoorRefine]);
+  }, [allPicked, picked, currentUrl, coreRef, additional, planes, doorExtractionDepth,
+      doorRefineActive, boundarySplitEnabled, findEntityByName, revertDoorRefine, getCurrentEditorRotation, basemapEditMode, getRemainingRotationToAY, onMainSplatReplaced]);
 
   // 서버에서 corners 복원 후 1회 자동 문 추출 — 다시 들어와도 회전이 바로 활성.
   // 수동 픽 (사용자가 4점 직접 클릭) 일 때는 발동 안 함 (serverHydratedRef 게이트).
   useEffect(() => {
+    if (basemapEditMode) return;
     if (autoExtractedRef.current) return;
     if (!serverHydratedRef.current) return;
     if (!planes || !allPicked) return;
     if (doorRefineActive || doorRefining) return;
     autoExtractedRef.current = true;
     applyDoorRefine();
-  }, [planes, allPicked, doorRefineActive, doorRefining, applyDoorRefine]);
+  }, [planes, allPicked, doorRefineActive, doorRefining, applyDoorRefine, basemapEditMode]);
 
   // 문 내부 가우시안 색칠 (정제 전/후 모두 사용 가능).
-  // ON 시: 4 코너 + 두께 기준 doorOriginalIndices 를 lazy 계산 → 빨강 틴트.
+  // ON 시: 4 코너 + 두께 기준 door region 을 lazy 계산 → 노랑 틴트.
   // OFF 시: origColorData 의 RGB 로 복원.
   // 두께/코너 변경 시 자동 재계산 (아래 useEffect 참조).
   const setDoorInternalShowAsync = useCallback(async (next: boolean) => {
@@ -1710,7 +2017,7 @@ export default function DoorAlignModal({
       }
       const wallPlanePrev = planes?.find(p => p.id === picked[0]!.surfaceId);
       // 좌표 프레임 정합: planes A' → raw (splat/picked 가 raw).
-      const rotRprev = getEditorRotation(uploadId);
+      const rotRprev = getCurrentEditorRotation();
       const wallNormalRawPrev: Vec3 | null = wallPlanePrev
         ? aToRaw(wallPlanePrev.normal as Vec3, rotRprev)
         : null;
@@ -1728,7 +2035,7 @@ export default function DoorAlignModal({
       ];
       // ── 시각화 페인트 set 직접 계산 — 라이브 splat 위치 기준 ──
       // decompose 와 동일한 분류 기준 사용 (isInDoorSlab + 4 edge inside).
-      //   1) 슬랩: 벽 평면 → 방 안쪽 doorThickness 깊이까지 (비대칭).
+      //   1) 슬랩: 벽 평면 → 방 안쪽 doorExtractionDepth 깊이까지 (비대칭).
       //   2) 사각형 안 (4 edge 모두 sd >= 0).
       // 두 경로가 같은 helper 를 쓰므로 hide 와 tint 집합이 정확히 일치.
       const { rectGeom, isInDoorSlab } = await import('@/lib/gs/doorTrim');
@@ -1742,7 +2049,7 @@ export default function DoorAlignModal({
       const en = geom.edgeNormals, eo = geom.edgeOrigins;
       for (let i = 0; i < N; i++) {
         const cx = px[i], cy = py[i], cz = pz[i];
-        if (!isInDoorSlab(cx, cy, cz, pO, wallOutward, doorThickness)) continue;
+        if (!isInDoorSlab(cx, cy, cz, pO, wallOutward, doorExtractionDepth)) continue;
         let inside = true;
         for (let e = 0; e < 4; e++) {
           const n = en[e], o = eo[e];
@@ -1759,12 +2066,15 @@ export default function DoorAlignModal({
     }
 
     const indices = doorPaintedIndicesRef.current;
-    if (indices.length === 0) { setDoorInternalShow(false); return; }
+    // 현재 깊이에서 해당 splat 이 없어도 preview mode 는 유지한다.
+    // 그래야 슬라이더를 다시 키웠을 때 doorExtractionDepth dependency 로 즉시 재계산된다.
+    if (indices.length === 0) { setDoorInternalShow(true); return; }
 
-    // 3. 노랑 틴트 적용 (R,G high, B low — SH DC 공간)
+    // 3. 노랑 틴트 적용.
+    // PlayCanvas splatColor 는 SH 계수가 아니라 표시용 gamma RGB half-float 텍스처다.
     const td = sd.colorTexture.lock();
     if (!td) { setDoorInternalShow(false); return; }
-    const r = f2h(2.0), g = f2h(2.0), b = f2h(-2.0);
+    const r = f2h(1.0), g = f2h(1.0), b = f2h(0.0);
     for (const i of indices) {
       td[i * 4 + 0] = r;
       td[i * 4 + 1] = g;
@@ -1806,19 +2116,14 @@ export default function DoorAlignModal({
           if (!doorGsplatOrigColorsRef.current) {
             doorGsplatOrigColorsRef.current = new Uint16Array(dt);
           }
-          let painted = 0;
           for (let i = 0; i < dt.length; i += 4) {
             dt[i + 0] = r;
             dt[i + 1] = g;
             dt[i + 2] = b;
-            painted++;
           }
           doorColorTex.unlock();
-          console.log(`[DoorPreview] splatColor texture painted: ${painted} pixels (expected ${expectedN} splats, texture ${doorColorTex.width}×${doorColorTex.height}).`);
         }
       }
-    } else {
-      console.log('[DoorPreview] doorSubGsplatIdRef null — 문 추출 안 한 상태이거나 sub-gsplat 미생성.');
     }
 
     // 3c. 도어 mesh material 노랑 emissive 칠 (snapshot 으로 복원 가능).
@@ -1836,7 +2141,7 @@ export default function DoorAlignModal({
       }
     }
     setDoorInternalShow(true);
-  }, [coreRef, doorInternalShow, allPicked, picked, currentUrl, doorThickness, doorRefineActive, additional, planes]);
+  }, [coreRef, doorInternalShow, allPicked, picked, currentUrl, doorExtractionDepth, doorRefineActive, additional, planes, getCurrentEditorRotation]);
 
   const toggleDoorInternalShow = useCallback(() => {
     void setDoorInternalShowAsync(!doorInternalShow);
@@ -1850,38 +2155,35 @@ export default function DoorAlignModal({
     if (!doorInternalShow) return;
     void setDoorInternalShowAsyncRef.current(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [picked, doorThickness, doorRefineActive]);
+  }, [picked, doorExtractionDepth, doorRefineActive]);
 
-  // (제거) 문 추출 활성 중엔 문 두께 슬라이더가 disabled 라서 자동 재적용 useEffect 가 더 이상 필요 없음.
-  // 사용자가 두께를 바꾸려면 문 추출 취소 → 슬라이더 조정 → 문 추출 순서로만 가능.
+  // 두께 슬라이더는 문 추출 활성 중엔 disabled — 변경하려면 추출 취소 → 슬라이더 → 다시 추출.
 
-  // 모달 언마운트 시 정리
-  useEffect(() => {
-    return () => {
-      if (doorSubBlobUrlRef.current) {
-        try { URL.revokeObjectURL(doorSubBlobUrlRef.current); } catch {}
-      }
-    };
-  }, []);
+  // 블롭 URL revoke 는 apply/revert 함수 안에서 명시적으로 처리 (모달 lifecycle 과 무관).
+
+  // 도어 splat 의 lifecycle 은 applyDoorRefine / revertDoorRefine 만 책임. 별도의 mount-time
+  // cleanup 은 두지 않는다 — 공유 additional 자원에 대한 모달 mount 기준 일괄 삭제는 활성 추출의
+  // splat 을 stale 로 오인해 잘못 지울 수 있음 (React StrictMode / Suspense / 상위 state 변화로 인한
+  // 의도치 않은 remount 시 발생). 도어 splat 의 생성/제거는 추출 흐름 안에서만 발생.
 
   // ── 힌지 축 기준 문 회전 (애니메이션) ──
   // 각 프레임에서 angle 만 보간하고 transform 은 그 angle 로 다시 계산 → 힌지 축의 점은 항상 고정.
-  // localRot = baseRot ∘ R(angle), localPos = baseRot * (cA − R(angle)·cA)
-  //   baseRot = splatEntity.localRotation = Z-180 ∘ pendingRotation. 메인과 동일 변환으로 맞춰 일치 유지.
+  // wrapperLocalRot = baseRot ∘ R(angle), wrapperLocalPos = baseRot · (hingeOriginA − R(angle)·hingeOriginA)
+  //   baseRot = splatEntity.localRotation = Z-180 (saveRefined 후). 메인과 동일 변환으로 맞춰 일치 유지.
   const doorAnimRef = useRef<{
     start: number;
     duration: number;
     fromAngleRad: number;
     toAngleRad: number;
-    axis: [number, number, number]; // 힌지 단위 벡터 (raw frame)
-    cA: [number, number, number];   // 힌지 시작점 (raw frame, 고정점)
+    hingeAxisA: [number, number, number]; // 힌지 단위 벡터 (A' 프레임)
+    hingeOriginA: [number, number, number]; // 힌지 시작점 (A' 프레임, 회전 후 위치 고정)
   } | null>(null);
   // 현재 누적 회전각 (rad). 다음 회전의 시작각.
   const doorCurrentAngleRef = useRef<number>(0);
   // 마지막에 사용한 힌지 (resetDoorRotation 이 hingeIndices 변경 후에도 같은 축으로 닫기 위해).
-  const lastDoorHingeRef = useRef<{ axis: [number, number, number]; cA: [number, number, number] } | null>(null);
+  const lastDoorHingeRef = useRef<{ hingeAxisA: [number, number, number]; hingeOriginA: [number, number, number] } | null>(null);
 
-  // 매 프레임 angle(t) → transform 적용. 힌지(cA, axis)는 보간에 영향 안 줌 → 회전축 절대 안 움직임.
+  // 매 프레임 angle(t) → transform 적용. 힌지(hingeOriginA, hingeAxisA)는 보간에 영향 안 줌 → 회전축 절대 안 움직임.
   useEffect(() => {
     const core = coreRef.current;
     if (!core) return;
@@ -1895,8 +2197,8 @@ export default function DoorAlignModal({
       const angle = a.fromAngleRad + (a.toAngleRad - a.fromAngleRad) * u;
       const half = angle / 2;
       const sH = Math.sin(half), cH = Math.cos(half);
-      const qR = new pc.Quat(a.axis[0]*sH, a.axis[1]*sH, a.axis[2]*sH, cH);
-      // baseRot = splatEntity 의 현재 회전 (Z-180 ∘ pendingRotation). 메인과 동일.
+      const qR = new pc.Quat(a.hingeAxisA[0]*sH, a.hingeAxisA[1]*sH, a.hingeAxisA[2]*sH, cH);
+      // baseRot = splatEntity 의 현재 회전 (saveRefined 후 Z-180 만). 메인과 동일.
       const sd = core.getSplatData();
       const sr = sd?.splatEntity?.getLocalRotation();
       const baseRot = sr
@@ -1904,22 +2206,20 @@ export default function DoorAlignModal({
         : (() => { const q = new pc.Quat(); q.setFromEulerAngles(0, 0, 180); return q; })();
       const localRot = new pc.Quat();
       localRot.copy(baseRot).mul(qR);
-      const cAvec = new pc.Vec3(a.cA[0], a.cA[1], a.cA[2]);
-      const rotatedCA = new pc.Vec3();
-      qR.transformVector(cAvec, rotatedCA);
-      const offsetRaw = new pc.Vec3(a.cA[0] - rotatedCA.x, a.cA[1] - rotatedCA.y, a.cA[2] - rotatedCA.z);
+      const hingeVec = new pc.Vec3(a.hingeOriginA[0], a.hingeOriginA[1], a.hingeOriginA[2]);
+      const rotatedHinge = new pc.Vec3();
+      qR.transformVector(hingeVec, rotatedHinge);
+      // A' 프레임에서 hinge 점이 회전 후에도 그 자리에 남도록 보정 → baseRot 으로 world 방향으로 옮김.
+      const offsetA = new pc.Vec3(a.hingeOriginA[0] - rotatedHinge.x, a.hingeOriginA[1] - rotatedHinge.y, a.hingeOriginA[2] - rotatedHinge.z);
       const offsetWorld = new pc.Vec3();
-      baseRot.transformVector(offsetRaw, offsetWorld);
+      baseRot.transformVector(offsetA, offsetWorld);
 
-      const doorEnt = doorSubGsplatIdRef.current ? additional.getEntity(doorSubGsplatIdRef.current) : null;
-      if (doorEnt) {
-        doorEnt.setLocalRotation(localRot.x, localRot.y, localRot.z, localRot.w);
-        doorEnt.setLocalPosition(offsetWorld.x, offsetWorld.y, offsetWorld.z);
+      const wrapper = moduleDoorWrapperRef.current;
+      if (wrapper) {
+        wrapper.setLocalRotation(localRot.x, localRot.y, localRot.z, localRot.w);
+        wrapper.setLocalPosition(offsetWorld.x, offsetWorld.y, offsetWorld.z);
       }
-      if (doorMeshEntityRef.current) {
-        doorMeshEntityRef.current.setLocalRotation(localRot.x, localRot.y, localRot.z, localRot.w);
-        doorMeshEntityRef.current.setLocalPosition(offsetWorld.x, offsetWorld.y, offsetWorld.z);
-      }
+
       if (tNorm >= 1) {
         doorCurrentAngleRef.current = a.toAngleRad;
         doorAnimRef.current = null;
@@ -1934,9 +2234,9 @@ export default function DoorAlignModal({
     }
     if (!allPicked || !planes) return;
 
-    const cA = picked[hingeIndices[0]]!.pos;
-    const cB = picked[hingeIndices[1]]!.pos;
-    const hxv = cB[0] - cA[0], hyv = cB[1] - cA[1], hzv = cB[2] - cA[2];
+    const hingeStart = picked[hingeIndices[0]]!.pos;
+    const hingeEnd = picked[hingeIndices[1]]!.pos;
+    const hxv = hingeEnd[0] - hingeStart[0], hyv = hingeEnd[1] - hingeStart[1], hzv = hingeEnd[2] - hingeStart[2];
     const hLen = Math.hypot(hxv, hyv, hzv) || 1;
     const ax = hxv/hLen, ay = hyv/hLen, az = hzv/hLen;
 
@@ -1944,43 +2244,64 @@ export default function DoorAlignModal({
     const otherIdx = [0,1,2,3].find(i => !hingeIndices.includes(i));
     if (otherIdx === undefined) return;
     const P = picked[otherIdx]!.pos;
-    const dxv = P[0] - cA[0], dyv = P[1] - cA[1], dzv = P[2] - cA[2];
+    const dxv = P[0] - hingeStart[0], dyv = P[1] - hingeStart[1], dzv = P[2] - hingeStart[2];
     const crossX = ay*dzv - az*dyv;
     const crossY = az*dxv - ax*dzv;
     const crossZ = ax*dyv - ay*dxv;
     const wallSurfaceId = picked[0]!.surfaceId;
     const wallPlane = planes.find(p => p.id === wallSurfaceId);
     if (!wallPlane) return;
-    // wallPlane.normal 은 A' 프레임. picked.pos (raw) 와 같은 프레임에서 비교하려면 raw 프레임으로 회전.
-    const wn = aToRaw(wallPlane.normal as Vec3, getEditorRotation(uploadId));
+    // wallPlane.normal 은 평면 프레임. picked.pos 와 같은 프레임에서 비교하려면 현재 rotation 역변환.
+    const wn = aToRaw(wallPlane.normal as Vec3, getCurrentEditorRotation());
     const dotCN = crossX*wn[0] + crossY*wn[1] + crossZ*wn[2];
     // planes.ts 의 normal 은 방 바깥 방향. (axis × d) 가 +wn 방향이면 +θ 회전이 P 를 방 바깥으로 보냄.
-    // doorSwing=1 (안쪽) → -wn 방향 → -θ 가 필요 → insideSign=-1.
-    // (이전 부호 뒤집기는 이번에 picked.pos / wn 의 raw 프레임 정합 후 원복.)
+    // doorSwing=1 (안쪽) → -wn 방향 → -θ 필요 → insideSign=-1.
     const insideSign = dotCN > 0 ? -1 : 1;
     const angleSign = doorSwing * insideSign;
     const angleRad = angleSign * doorAngleDeg * Math.PI / 180;
 
-    const axis: [number, number, number] = [ax, ay, az];
-    const cAvec3: [number, number, number] = [cA[0], cA[1], cA[2]];
-    lastDoorHingeRef.current = { axis, cA: cAvec3 };
+    const hingeAxisA: [number, number, number] = [ax, ay, az];
+    const hingeOriginA: [number, number, number] = [hingeStart[0], hingeStart[1], hingeStart[2]];
+    lastDoorHingeRef.current = { hingeAxisA, hingeOriginA };
 
     doorAnimRef.current = {
       start: performance.now(),
       duration: 800,
       fromAngleRad: doorCurrentAngleRef.current,
       toAngleRad: angleRad,
-      axis,
-      cA: cAvec3,
+      hingeAxisA,
+      hingeOriginA,
     };
     setDoorRotated(true);
     setRotationApplied(true);
     setDoorRefineError(null);
-    console.log(`[DoorRotate] hinge ${hingeIndices[0]}→${hingeIndices[1]}, ${doorAngleDeg}° ${doorSwing === 1 ? '안쪽' : '바깥쪽'} (insideSign=${insideSign}, from=${(doorCurrentAngleRef.current * 180 / Math.PI).toFixed(1)}° → ${(angleRad * 180 / Math.PI).toFixed(1)}°)`);
-  }, [hingeIndices, doorAngleDeg, doorSwing, picked, planes, allPicked]);
+  }, [hingeIndices, doorAngleDeg, doorSwing, picked, planes, allPicked, getCurrentEditorRotation]);
+
+  // 문을 즉시 닫힌 상태(angle=0)로 동기 적용. 애니메이션 없음.
+  // wrapper 에 splatEntity 와 동일 회전(=Z-180) 부여, position = 0.
+  // 호출자: resetDoorRotation 의 lastHinge 없음 분기, "문 설정 완료" 의 force-close.
+  const closeDoorImmediate = useCallback(() => {
+    doorAnimRef.current = null;
+    const core = coreRef.current;
+    const pc = core?.getPC();
+    const sd = core?.getSplatData();
+    const wrapper = moduleDoorWrapperRef.current;
+    if (pc && wrapper) {
+      const sr = sd?.splatEntity?.getLocalRotation();
+      if (sr) {
+        wrapper.setLocalRotation(sr.x, sr.y, sr.z, sr.w);
+      } else {
+        const z180 = new pc.Quat();
+        z180.setFromEulerAngles(0, 0, 180);
+        wrapper.setLocalRotation(z180.x, z180.y, z180.z, z180.w);
+      }
+      wrapper.setLocalPosition(0, 0, 0);
+    }
+    doorCurrentAngleRef.current = 0;
+  }, [coreRef]);
 
   const resetDoorRotation = useCallback(() => {
-    // 마지막 사용한 힌지로 angle=0 까지 보간. 없으면 직접 identity 적용.
+    // 마지막 사용한 힌지로 angle=0 까지 보간. 없으면 즉시 닫기.
     const last = lastDoorHingeRef.current;
     if (last) {
       doorAnimRef.current = {
@@ -1988,114 +2309,28 @@ export default function DoorAlignModal({
         duration: 800,
         fromAngleRad: doorCurrentAngleRef.current,
         toAngleRad: 0,
-        axis: last.axis,
-        cA: last.cA,
+        hingeAxisA: last.hingeAxisA,
+        hingeOriginA: last.hingeOriginA,
       };
     } else {
-      const core = coreRef.current;
-      const pc = core?.getPC();
-      if (pc) {
-        const z180 = new pc.Quat();
-        z180.setFromEulerAngles(0, 0, 180);
-        const doorEnt = doorSubGsplatIdRef.current ? additional.getEntity(doorSubGsplatIdRef.current) : null;
-        if (doorEnt) {
-          doorEnt.setLocalRotation(z180.x, z180.y, z180.z, z180.w);
-          doorEnt.setLocalPosition(0, 0, 0);
-        }
-        if (doorMeshEntityRef.current) {
-          doorMeshEntityRef.current.setLocalRotation(z180.x, z180.y, z180.z, z180.w);
-          doorMeshEntityRef.current.setLocalPosition(0, 0, 0);
-        }
-      }
-      doorCurrentAngleRef.current = 0;
+      closeDoorImmediate();
     }
     setDoorRotated(false);
-  }, [coreRef, additional]);
-
-  // ── 정합 적용 + 저장 (PLY에 변환 적용해 MinIO에 업로드 → 뷰어 리로드) ──
-  const applyAndSave = useCallback(async () => {
-    setError(null);
-    if (!allPicked) { setError('모듈 4 코너를 먼저 추출하세요'); return; }
-    if (!basemapCorners) { setError('basemap 4 코너 JSON이 유효하지 않습니다'); return; }
-    setRunning(true);
-    try {
-      const [{ fetchAndParsePly, serializePly }, { matchCorners, applyRigidToScene }] = await Promise.all([
-        import('@/lib/ply'),
-        import('@/lib/alignment'),
-      ]);
-      const { api } = await import('@/lib/api');
-
-      const scene = await fetchAndParsePly(currentUrl);
-
-      const src = new Float64Array(12);
-      const dst = new Float64Array(12);
-      for (let i = 0; i < 4; i++) {
-        const s = picked[i]!.pos;
-        src[i*3] = s[0]; src[i*3+1] = s[1]; src[i*3+2] = s[2];
-        const t = basemapCorners[i];
-        dst[i*3] = t[0]; dst[i*3+1] = t[1]; dst[i*3+2] = t[2];
-      }
-      const fit = matchCorners(src, dst);
-      setRmsd(fit.rmsd);
-      console.log('[DoorAlign] applying transform:', fit);
-
-      applyRigidToScene(scene, fit);
-      const bytes = serializePly(scene);
-
-      const urlReq = await api.post<{ put_url: string; get_url: string }>(
-        '/refine/refined-upload-url',
-        { upload_id: uploadId, filename: 'aligned.ply' },
-      );
-      const put = await fetch(urlReq.put_url, {
-        method: 'PUT',
-        body: bytes,
-        headers: { 'Content-Type': 'application/octet-stream' },
-      });
-      if (!put.ok) throw new Error(`MinIO PUT failed: ${put.status}`);
-
-      // SPEC: 변환행렬 + basemap/door 매칭을 upload-scoped 로 저장.
-      // fit.R 은 row-major 3x3, fit.t 는 [x,y,z]. 엔드포인트는 position/rotation(quat)/scale 형태.
-      try {
-        const [qw, qx, qy, qz] = rotationMatrixToQuat(fit.R);
-        await api.post(`/uploads/${uploadId}/alignment`, {
-          transform: {
-            position: [fit.t[0], fit.t[1], fit.t[2]],
-            rotation: [qx, qy, qz, qw],
-            scale: [1, 1, 1],
-          },
-          rmsd: fit.rmsd,
-          matches: [{ module_door_id: PRIMARY_DOOR_ID, basemap_id: 'manual' }],
-        });
-      } catch (e: any) {
-        console.warn('[DoorAlign] alignment 저장 실패 (PLY 는 이미 업로드됨)', e);
-      }
-
-      // 모듈 코너는 이제 basemap 좌표계로 옮겨졌으니 다음 작업에서 다시 추출
-      const empty: Array<PickedCorner | null> = [null, null, null, null];
-      setPicked(empty);
-      void clearDoorsOnServer(uploadId);
-
-      onDone(urlReq.get_url);
-    } catch (e: any) {
-      setError(`정합 실패: ${e?.message ?? e}`);
-    } finally {
-      setRunning(false);
-    }
-  }, [allPicked, basemapCorners, picked, currentUrl, uploadId, onDone]);
+  }, [closeDoorImmediate]);
 
   return (
     // 좌측 패널 컬럼 안에 들어가는 일반 블록 — 부모가 layout 결정. 너비 256 (w-64) 로 다듬기 panel 들과 통일.
-    <div className="bg-gray-900/95 border border-gray-700 rounded-lg shadow-2xl text-white text-xs select-none flex flex-col w-72 max-h-[calc(100vh-200px)] overflow-hidden">
+    <div className="bg-black/70 backdrop-blur-sm border border-white/10 rounded-lg shadow-2xl text-[var(--ink)] text-xs select-none flex flex-col w-72 max-h-[calc(100vh-200px)] overflow-hidden">
       {autoExtracting && (
         <div className="px-3 py-2 bg-indigo-900/40 border-b border-indigo-700 text-indigo-200 text-[11px] flex items-center gap-2">
           <span className="inline-block w-3 h-3 border-2 border-indigo-300 border-t-transparent rounded-full animate-spin" />
           <span>자동 문 추출 진행 중...</span>
         </div>
       )}
-      <div className="flex items-center justify-between px-3 py-2 border-b border-gray-700 shrink-0">
-        <div className="font-bold">{view === 'align' ? '문 정합' : '문 설정'}</div>
+      <div className="flex items-center justify-between px-3 py-2 border-b border-[var(--rule)] shrink-0">
+        <div className="font-bold">문 설정</div>
         <div className="flex items-center gap-2">
-          <label className="flex items-center gap-1 cursor-pointer text-[11px] text-gray-300" title="추출된 코너의 화면 마커 표시">
+          <label className="flex items-center gap-1 cursor-pointer text-[11px] text-[var(--ink-2)]" title="추출된 코너의 화면 마커 표시">
             <input
               type="checkbox"
               checked={showMarkers}
@@ -2104,20 +2339,18 @@ export default function DoorAlignModal({
             />
             마커 표시
           </label>
-          <button onClick={onClose} className="text-gray-400 hover:text-white cursor-pointer">✕</button>
+          <button onClick={onClose} className="text-[var(--muted)] hover:text-[var(--ink)] cursor-pointer">✕</button>
         </div>
       </div>
       <div className="p-3 space-y-2 overflow-y-auto">
         {showRefineGuide ? (
           <div className="text-red-400 text-[11px] p-2 bg-red-900/30 border border-red-800 rounded leading-tight">
-            {view === 'setup'
-              ? '다듬기 단계에서 천장/바닥과 벽면을 먼저 확정하세요.'
-              : '다듬기 단계에서 천장/바닥과 벽면을 먼저 확정한 뒤 정합 단계로 진입하세요.'}
+            다듬기 단계에서 천장/바닥과 벽면을 먼저 확정하세요.
           </div>
         ) : null}
 
-        {/* 문 설정 (꼭짓점 / 두께 / 문 추출 / 회전 / 문 설정 완료) — setup view 에서만 표시 */}
-        {view === 'setup' && <>
+        {/* 문 설정 (꼭짓점 / 두께 / 문 추출 / 회전 / 문 설정 완료) */}
+        <>
 
         {/* 단일 순차 픽 토글 + 진행 상태 */}
         <div className="flex items-center gap-2">
@@ -2132,10 +2365,7 @@ export default function DoorAlignModal({
                 return;
               }
               // 새로 시작: 문 추출 활성이면 끄고, 그 뒤에 적용했던 모든 결과 (hinge/회전/도어 entity/mesh/...) 정리.
-              if (doorRefineActive
-                  || boundarySnapshotRef.current.length > 0
-                  || doorSubGsplatIdRef.current
-                  || doorMeshEntityRef.current) {
+              if (doorRefineActive || doorSubGsplatIdRef.current || doorMeshEntityRef.current) {
                 void revertDoorRefine();
               } else {
                 // revert 가 자동으로 처리하지 않는 케이스 — 문 추출 비활성 상태에서도 잔여 hinge 선택만 남아있을 수 있음.
@@ -2152,8 +2382,8 @@ export default function DoorAlignModal({
               onManualPickStart?.();   // 자동 추출 중이면 부모가 autoExtracting=false 로 내림.
             }}
             disabled={!planes}
-            className={`flex-1 w-1/2 px-3 py-1.5 rounded text-[11px] font-bold cursor-pointer disabled:bg-gray-800 disabled:text-gray-600 disabled:cursor-not-allowed ${
-              seqArmed ? 'bg-yellow-500 hover:bg-yellow-400 text-black' : 'bg-blue-600 hover:bg-blue-500 text-white'
+            className={`flex-1 w-1/2 px-3 py-1.5 rounded text-[11px] font-bold cursor-pointer disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted-2)] disabled:cursor-not-allowed ${
+              seqArmed ? 'bg-yellow-500 hover:bg-yellow-400 text-black' : 'bg-blue-600 hover:bg-blue-500 text-[var(--ink)]'
             }`}
           >
             {seqArmed ? '문 수동 지정 중' : '문 수동 지정'}
@@ -2164,7 +2394,7 @@ export default function DoorAlignModal({
             className={`flex-1 w-1/2 px-3 py-1.5 rounded text-[11px] font-bold cursor-pointer ${
               boundaryVisible
                 ? 'bg-yellow-500 hover:bg-yellow-400 text-black'
-                : 'bg-gray-700 hover:bg-gray-600 text-gray-200'
+                : 'bg-[var(--bg-soft)] hover:bg-[var(--rule)] text-[var(--ink)]'
             }`}
             title="4 코너 노란선 + 힌지 원기둥 표시 토글"
           >
@@ -2182,11 +2412,11 @@ export default function DoorAlignModal({
             const isNext = seqArmed && i === nextIdx;
             return (
               <div key={c.id} className={`flex items-center gap-1.5 px-2 py-1 rounded text-[10px] ${
-                isNext ? 'bg-sky-500/25 ring-1 ring-sky-400/60' : 'bg-gray-800/50'
+                isNext ? 'bg-sky-500/25 ring-1 ring-sky-400/60' : 'bg-[var(--bg-soft)]/50'
               }`}>
                 <div className="w-3 h-3 rounded-full shrink-0 border border-white/30" style={{ backgroundColor: c.hex }} />
-                <span className="text-gray-300 flex-1 truncate">{c.label}</span>
-                <span className={p ? 'text-green-400' : 'text-gray-600'}>{p ? '✓' : '—'}</span>
+                <span className="text-[var(--ink-2)] flex-1 truncate">{c.label}</span>
+                <span className={p ? 'text-green-400' : 'text-[var(--muted-2)]'}>{p ? '✓' : '—'}</span>
               </div>
             );
           })}
@@ -2194,37 +2424,45 @@ export default function DoorAlignModal({
 
         {error && <div className="text-red-400 text-[11px]">{error}</div>}
 
-        {!allPicked && (
-          <div className="w-full px-3 py-1.5 rounded text-xs text-center font-bold bg-gray-800 text-gray-500">
-            {picked.filter(Boolean).length}/4 픽
-          </div>
+        {!allPicked && picked.some(Boolean) && (
+          <button
+            type="button"
+            onClick={() => {
+              // 진행 중인 픽 초기화 — 사용자가 잘못 찍었거나 다시 시작하고 싶을 때.
+              setPicked(emptyPicked());
+            }}
+            className="w-full px-3 py-1.5 rounded text-xs text-center font-bold bg-[var(--bg-soft)] text-[var(--ink-2)] hover:bg-[var(--bg-soft)] transition cursor-pointer"
+          >
+            취소
+          </button>
         )}
 
 
         {/* ── 문 추출하기 (메인 PLY 에서 도어 영역 분리 → mesh + 추가 splat group) — 4 점 픽 + 자동 추출 미진행 시에만 활성. */}
-        <div className={`border-t border-gray-700 pt-2 space-y-1.5 ${(!allPicked || autoExtracting) ? 'opacity-40 pointer-events-none' : ''}`}>
+        <div className={`border-t border-[var(--rule)] pt-2 space-y-1.5 ${(!allPicked || autoExtracting) ? 'opacity-40 pointer-events-none' : ''}`}>
           <div className="flex items-center justify-between">
-            <div className="text-[11px] font-bold text-gray-200">문 추출하기</div>
+            <div className="text-[11px] font-bold text-[var(--ink)]">문 추출하기</div>
             <span className="text-[10px]">
               {doorRefineActive
                 ? <span className="text-green-400">추출됨</span>
-                : <span className="text-gray-600">미추출</span>}
+                : <span className="text-[var(--muted-2)]">미추출</span>}
             </span>
           </div>
 
-          {/* 문 두께 — 벽 평면에서 방 안쪽으로 들어가는 단방향 깊이. 문 추출 비활성일 때만 조정 가능. */}
+          {/* 도어 추출 깊이 — 벽 평면에서 방 안쪽으로 들어가는 단방향 깊이.
+              실제 문 두께는 정합 단계의 별도 "정합 문 두께" 슬라이더에서 조절. */}
           <div
             className="flex items-center gap-1.5 text-[10px]"
             title={doorRefineActive ? '문 추출을 비활성화하세요.' : '벽 평면에서 방 안쪽으로 [N]cm 깊이 안의 가우시안을 도어 영역으로 분류. 손잡이/잠금처럼 돌출된 부분이 빠지면 값을 키우세요.'}
           >
-            <span className="text-gray-400 w-16">문 두께 (안쪽)</span>
+            <span className="text-[var(--muted)] w-16">도어 추출 깊이</span>
             <input type="range" min={0.02} max={0.5} step={0.005}
-              value={doorThickness}
+              value={doorExtractionDepth}
               disabled={doorRefineActive}
-              onChange={e => setDoorThickness(parseFloat(e.target.value))}
+              onChange={e => setDoorExtractionDepth(parseFloat(e.target.value))}
               className="flex-1 accent-purple-500 cursor-pointer disabled:cursor-not-allowed disabled:opacity-40" />
-            <span className="text-white font-mono w-12 text-right">
-              {(doorThickness * 100).toFixed(1)}cm
+            <span className="text-[var(--ink)] font-mono w-12 text-right">
+              {(doorExtractionDepth * 100).toFixed(1)}cm
             </span>
           </div>
 
@@ -2232,8 +2470,8 @@ export default function DoorAlignModal({
             <div className="text-red-400 text-[11px]">{doorRefineError}</div>
           )}
 
-          {/* 문 가장자리 정제 — 문 추출 전에 먼저 켜둘 수 있음. ON 시 boundary 가우시안 split (SAGS-style). */}
-          <label className="flex items-center gap-1.5 text-[10px] cursor-pointer text-gray-300">
+          {/* 문 가장자리 정제 — 문 추출 전에 먼저 켜둘 수 있음. ON 시 문 경계 가우시안 split. */}
+          <label className="flex items-center gap-1.5 text-[10px] cursor-pointer text-[var(--ink-2)]">
             <input
               type="checkbox"
               checked={boundarySplitEnabled}
@@ -2248,10 +2486,10 @@ export default function DoorAlignModal({
             <button
               onClick={toggleDoorInternalShow}
               disabled={!allPicked}
-              className={`flex-1 px-3 py-1.5 rounded cursor-pointer text-xs font-bold disabled:bg-gray-700 disabled:text-gray-500 ${
+              className={`flex-1 px-3 py-1.5 rounded cursor-pointer text-xs font-bold disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] ${
                 doorInternalShow
                   ? 'bg-yellow-500 hover:bg-yellow-400 text-black'
-                  : 'bg-gray-700 hover:bg-gray-600 text-gray-200'
+                  : 'bg-[var(--bg-soft)] hover:bg-[var(--rule)] text-[var(--ink)]'
               }`}
               title="현재 문 두께 설정 기준 도어 영역 가우시안 + 메시를 노랑으로 표시"
             >
@@ -2260,10 +2498,10 @@ export default function DoorAlignModal({
             <button
               onClick={() => { if (doorRefineActive) revertDoorRefine(); else applyDoorRefine(); }}
               disabled={!allPicked || doorRefining}
-              className={`flex-1 px-3 py-1.5 rounded cursor-pointer text-xs font-bold disabled:bg-gray-700 disabled:text-gray-500 ${
+              className={`flex-1 px-3 py-1.5 rounded cursor-pointer text-xs font-bold disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] ${
                 doorRefineActive
-                  ? 'bg-amber-600 hover:bg-amber-500 text-white'
-                  : 'bg-blue-600 hover:bg-blue-500 text-white'
+                  ? 'bg-amber-600 hover:bg-amber-500 text-[var(--ink)]'
+                  : 'bg-blue-600 hover:bg-blue-500 text-[var(--ink)]'
               }`}
             >
               {doorRefining ? '처리 중...' : (doorRefineActive ? '문 추출 취소' : '문 추출')}
@@ -2272,17 +2510,18 @@ export default function DoorAlignModal({
 
         </div>
 
-        {/* ── 문 회전 (힌지 + 각도 + 방향) — 문 추출 활성일 때만. autoExtracting 시 잠금. ── */}
-        <div
-          className={`border-t border-gray-700 pt-2 space-y-1.5 ${(doorRefineActive && !autoExtracting) ? '' : 'opacity-40 pointer-events-none'}`}
+        {/* ── 문 회전 (힌지 + 각도 + 방향) — 모듈 등록에서만. ──
+            basemap 등록은 문 위치만 마킹하면 충분 (회전 메타는 모듈측 데이터 — 정합 후 모듈의 회전 파라미터 사용). */}
+        {!basemapMode && <div
+          className={`border-t border-[var(--rule)] pt-2 space-y-1.5 ${(doorRefineActive && !autoExtracting) ? '' : 'opacity-40 pointer-events-none'}`}
           title={doorRefineActive ? '' : '먼저 문 추출 을 누르세요.'}
         >
           <div className="flex items-center justify-between">
-            <div className="text-[11px] font-bold text-gray-200">문 회전</div>
+            <div className="text-[11px] font-bold text-[var(--ink)]">문 회전</div>
             <span className="text-[10px]">
               {doorRotated
                 ? <span className="text-green-400">회전 적용</span>
-                : <span className="text-gray-600">회전 미적용</span>}
+                : <span className="text-[var(--muted-2)]">회전 미적용</span>}
             </span>
           </div>
 
@@ -2298,10 +2537,10 @@ export default function DoorAlignModal({
               }
             }}
             disabled={!allPicked || !doorRefineActive}
-            className={`w-full px-2 py-1.5 rounded text-[11px] font-bold cursor-pointer disabled:bg-gray-800 disabled:text-gray-600 disabled:cursor-not-allowed ${
+            className={`w-full px-2 py-1.5 rounded text-[11px] font-bold cursor-pointer disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted-2)] disabled:cursor-not-allowed ${
               edgePickArmed || hingeEdge !== null
                 ? 'bg-yellow-500 hover:bg-yellow-400 text-black'
-                : 'bg-blue-600 hover:bg-blue-500 text-white'
+                : 'bg-blue-600 hover:bg-blue-500 text-[var(--ink)]'
             }`}
           >
             {hingeEdge !== null && !edgePickArmed ? '회전축 재선택' : '회전축 선택'}
@@ -2309,27 +2548,27 @@ export default function DoorAlignModal({
 
           {/* 회전각 슬라이더 */}
           <div className="flex items-center gap-1.5 text-[10px]">
-            <span className="text-gray-400 w-16">회전각</span>
+            <span className="text-[var(--muted)] w-16">회전각</span>
             <input type="range" min={0} max={120} step={1}
               value={doorAngleDeg}
               disabled={!doorRefineActive}
               onChange={e => setDoorAngleDeg(parseFloat(e.target.value))}
               className="flex-1 accent-cyan-500 cursor-pointer disabled:opacity-40" />
-            <span className="text-white font-mono w-12 text-right">{doorAngleDeg}°</span>
+            <span className="text-[var(--ink)] font-mono w-12 text-right">{doorAngleDeg}°</span>
           </div>
 
           {/* 방향 토글 */}
           <div className="flex items-center gap-1.5 text-[10px]">
-            <span className="text-gray-400 w-16">회전 방향</span>
+            <span className="text-[var(--muted)] w-16">회전 방향</span>
             <button
               onClick={() => setDoorSwing(1)}
               disabled={!doorRefineActive}
-              className={`flex-1 px-2 py-1 rounded text-[10px] font-bold cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${doorSwing === 1 ? 'bg-blue-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'}`}
+              className={`flex-1 px-2 py-1 rounded text-[10px] font-bold cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${doorSwing === 1 ? 'bg-blue-600 text-[var(--ink)]' : 'bg-[var(--bg-soft)] text-[var(--ink-2)] hover:bg-[var(--rule)]'}`}
             >방 안쪽</button>
             <button
               onClick={() => setDoorSwing(-1)}
               disabled={!doorRefineActive}
-              className={`flex-1 px-2 py-1 rounded text-[10px] font-bold cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${doorSwing === -1 ? 'bg-blue-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'}`}
+              className={`flex-1 px-2 py-1 rounded text-[10px] font-bold cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${doorSwing === -1 ? 'bg-blue-600 text-[var(--ink)]' : 'bg-[var(--bg-soft)] text-[var(--ink-2)] hover:bg-[var(--rule)]'}`}
             >방 바깥쪽</button>
           </div>
 
@@ -2337,35 +2576,243 @@ export default function DoorAlignModal({
             onClick={() => { if (doorRotated) resetDoorRotation(); else applyDoorRotation(); }}
             disabled={hingeIndices.length !== 2 || !doorRefineActive}
             title={!doorRefineActive ? '먼저 문 추출 을 누르세요.' : (hingeIndices.length !== 2 ? '회전축 변을 먼저 선택' : '')}
-            className={`w-full px-3 py-1.5 rounded cursor-pointer text-xs font-bold disabled:bg-gray-700 disabled:text-gray-500 ${
-              doorRotated ? 'bg-amber-600 hover:bg-amber-500 text-white' : 'bg-blue-600 hover:bg-blue-500 text-white'
+            className={`w-full px-3 py-1.5 rounded cursor-pointer text-xs font-bold disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] ${
+              doorRotated ? 'bg-amber-600 hover:bg-amber-500 text-[var(--ink)]' : 'bg-blue-600 hover:bg-blue-500 text-[var(--ink)]'
             }`}
           >
             {doorRotated ? '문 닫기' : '문 열기'}
           </button>
-        </div>
+        </div>}
 
-        {/* 저장 정보 + 저장 버튼들은 "문 회전" 래퍼 (pointer-events-none) 밖에 둬야 한다.
-            문 저장 후 doorRefineActive=false 로 돌아가도 basemap 등록 완료 가 클릭 가능해야 하기 때문. */}
+        {/* basemap 다중 도어 목록 — 추출한 도어가 순서대로 누적. 각 항목: 호수 + X. */}
         {basemapMode && (
-          <div className="border-t border-gray-700 pt-2 space-y-1.5">
-            <div className="text-[10px] text-gray-400">저장 이름: {resolvedBasemapUnitName || '미지정'}</div>
-            <div className="text-[10px] text-gray-400">저장된 문: {savedDoorCount}개</div>
+          <div className="border-t border-[var(--rule)] pt-2 space-y-1.5">
+            <div className="flex items-center justify-between">
+              <div className="text-[11px] font-bold text-[var(--ink)]">
+                {basemapEditMode
+                  ? `등록된 문 (${persistedBasemapDoors.length + inMemoryDoors.length}개)`
+                  : `등록된 문 (${inMemoryDoors.length}개)`}
+              </div>
+            </div>
+            {basemapEditMode && (
+              <div className="max-h-36 overflow-y-auto space-y-1 pr-1">
+                {persistedBasemapDoors.length === 0 && inMemoryDoors.length === 0 ? (
+                  <p className="text-[10px] text-[var(--muted)] italic px-1">등록된 문 정보가 없습니다.</p>
+                ) : persistedBasemapDoors.map(({ door, locked }) => {
+                  const unset = !door.unitName;
+                  return (
+                    <div
+                      key={door.id}
+                      className={`flex items-stretch rounded border transition ${
+                        locked
+                          ? 'bg-[var(--bg-soft)]/30 border-[var(--rule)] opacity-65'
+                          : unset
+                            ? 'bg-yellow-900/35 border-yellow-600/60 hover:bg-yellow-900/55 cursor-pointer'
+                            : 'bg-[var(--bg-soft)]/60 border-[var(--rule)] hover:bg-[var(--bg-soft)] cursor-pointer'
+                      }`}
+                      onClick={() => {
+                        if (locked) return;
+                        const current = door.unitName ?? '';
+                        const suffix = Number(current.match(/(\d{2})호$/)?.[1] ?? 1);
+                        setPersistedDoorPickerOpen({ doorId: door.id, initialSuffix: Number.isFinite(suffix) ? suffix : 1 });
+                      }}
+                      title={locked ? '이미 정합된 문은 수정할 수 없습니다.' : '클릭해서 호수 변경'}
+                    >
+                      <div className="flex-1 min-w-0 px-2 py-1.5 flex items-center gap-1.5">
+                        <span className="text-[10px]">{locked ? '🔒' : unset ? '⚠️' : '🚪'}</span>
+                        <div className="flex-1 min-w-0">
+                          <div className={`text-[11px] font-medium truncate ${unset ? 'text-yellow-200' : 'text-[var(--ink)]'}`}>
+                            {door.unitName || '호수 미설정'}
+                          </div>
+                          <div className="text-[9px] text-[var(--muted)] mt-0.5">
+                            {locked ? '정합됨 - 수정 불가' : '수정 가능'}
+                          </div>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        disabled={locked}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (locked) return;
+                          setPersistedBasemapDoors(prev => prev.filter(it => it.door.id !== door.id));
+                          setBasemapEditDirty(true);
+                        }}
+                        className="px-2 flex items-center text-[var(--muted)] hover:text-red-400 hover:bg-red-500/10 disabled:opacity-35 disabled:cursor-not-allowed disabled:hover:bg-transparent transition rounded-r"
+                        aria-label="도어 삭제"
+                        title={locked ? '이미 정합된 문은 삭제할 수 없습니다.' : '도어 목록에서 삭제'}
+                      >
+                        <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                        </svg>
+                      </button>
+                    </div>
+                  );
+                })}
+                {inMemoryDoors.map((d) => {
+                  const unset = !d.unitName;
+                  return (
+                    <div
+                      key={d.doorId}
+                      className={`flex items-stretch rounded border transition cursor-pointer ${
+                        unset
+                          ? 'bg-yellow-900/40 border-yellow-600/60 hover:bg-yellow-900/60'
+                          : 'bg-emerald-900/25 border-emerald-600/50 hover:bg-emerald-900/40'
+                      }`}
+                      onClick={() => setUnitNamePickerOpen({ doorId: d.doorId, initialSuffix: 1 })}
+                      title={unset ? '클릭해서 호수를 설정' : '클릭해서 호수 변경'}
+                    >
+                      <div className="flex-1 min-w-0 px-2 py-1.5 flex items-center gap-1.5">
+                        <span className="text-[10px]">{unset ? '⚠️' : '🚪'}</span>
+                        <div className="flex-1 min-w-0">
+                          <div className={`text-[11px] font-medium truncate ${unset ? 'text-yellow-200' : 'text-[var(--ink)]'}`}>
+                            {d.unitName || '호수 미설정'}
+                          </div>
+                          <div className="text-[9px] text-[var(--muted)] mt-0.5">
+                            {unset ? '저장 대기 - 호수 미설정' : '신규 - 저장 대기'}
+                          </div>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          try { d.outlineHandle?.destroy(); } catch {}
+                          try {
+                            const wrapper = findEntityByName(coreRef.current?.getApp()?.root, `basemapDoor_${d.doorId}`);
+                            if (wrapper) wrapper.destroy();
+                          } catch {}
+                          if (d.doorSplatLayerId) {
+                            try { additional.remove(d.doorSplatLayerId); } catch {}
+                          }
+                          setInMemoryDoors(prev => prev.filter(x => x.doorId !== d.doorId));
+                          setBasemapEditDirty(true);
+                        }}
+                        className="px-2 flex items-center text-[var(--muted)] hover:text-red-400 hover:bg-red-500/10 transition rounded-r"
+                        aria-label="신규 도어 삭제"
+                        title="저장 대기 도어 삭제"
+                      >
+                        <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                        </svg>
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+            {!basemapEditMode && inMemoryDoors.length === 0 ? (
+              <p className="text-[10px] text-[var(--muted)] italic px-1">4점 픽 → 자동 추출 → 자동으로 이 목록에 추가</p>
+            ) : !basemapEditMode ? (
+              <div className="max-h-32 overflow-y-auto space-y-1 pr-1">
+                {inMemoryDoors.map((d) => {
+                  const unset = !d.unitName;
+                  return (
+                    <div
+                      key={d.doorId}
+                      className={`flex items-stretch rounded transition cursor-pointer ${
+                        unset
+                          ? 'bg-yellow-900/40 border border-yellow-600/60 hover:bg-yellow-900/60'
+                          : 'bg-[var(--bg-soft)]/60 border border-[var(--rule)] hover:bg-[var(--bg-soft)]'
+                      }`}
+                      onClick={() => setUnitNamePickerOpen({ doorId: d.doorId, initialSuffix: 1 })}
+                      title={unset ? '클릭해서 호수를 설정' : '클릭해서 호수 변경'}
+                    >
+                      <div className="flex-1 min-w-0 px-2 py-1.5 flex items-center gap-1.5">
+                        <span className="text-yellow-400 text-[10px]">{unset ? '⚠️' : '🚪'}</span>
+                        <div className="flex-1 min-w-0">
+                          <div className={`text-[11px] font-medium truncate ${unset ? 'text-yellow-200' : 'text-[var(--ink)]'}`}>
+                            {d.unitName || '호수 미설정'}
+                          </div>
+                          {unset && (
+                            <div className="text-[9px] text-yellow-400/80 mt-0.5">클릭해서 호수 설정</div>
+                          )}
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          // 도어 entity / outline / splat layer 정리.
+                          try { d.outlineHandle?.destroy(); } catch {}
+                          try {
+                            // wrapper (basemapDoor_<doorId>) 가 mesh + splat 의 부모 — wrapper destroy 시 자식 cascade.
+                            const wrapper = findEntityByName(coreRef.current?.getApp()?.root, `basemapDoor_${d.doorId}`);
+                            if (wrapper) {
+                              wrapper.destroy();
+                            } else {
+                              // fallback (wrapper 가 없으면 mesh 만 정리)
+                              const ent = findEntityByName(coreRef.current?.getApp()?.root, d.doorMeshEntityName);
+                              if (ent) ent.destroy();
+                            }
+                          } catch {}
+                          if (d.doorSplatLayerId) {
+                            try { additional.remove(d.doorSplatLayerId); } catch {}
+                          }
+                          // 벽 텍스처 alpha=0 punch 복원 — cut.rgba 를 원위치 bbox 에 다시 paste.
+                          try {
+                            const bbox = d.wallTextureSnapshotRect;
+                            const meshInput = d.doorMeshInput;
+                            if (bbox && meshInput.rgba.length > 0) {
+                              const wallEntName = `wallMesh_${d.wallSurfaceId}`;
+                              const wallEnt = findEntityByName(coreRef.current?.getApp()?.root, wallEntName);
+                              const tex = wallEnt?.render?.meshInstances?.[0]?.material?.emissiveMap;
+                              if (tex) {
+                                const td = tex.lock() as Uint8ClampedArray | null;
+                                if (td) {
+                                  const W = tex.width;
+                                  for (let y = 0; y < bbox.h; y++) {
+                                    const srcRow = y * bbox.w * 4;
+                                    const dstRow = ((bbox.y + y) * W + bbox.x) * 4;
+                                    for (let x = 0; x < bbox.w * 4; x++) {
+                                      td[dstRow + x] = meshInput.rgba[srcRow + x];
+                                    }
+                                  }
+                                  tex.unlock();
+                                }
+                              }
+                            }
+                          } catch (err) {
+                            console.warn('[basemap door X delete] wall 텍스처 복원 실패:', err);
+                          }
+                          setInMemoryDoors(prev => prev.filter(it => it.doorId !== d.doorId));
+                        }}
+                        className="px-2 flex items-center text-[var(--muted)] hover:text-red-400 hover:bg-red-500/10 transition rounded-r"
+                        aria-label="도어 삭제"
+                        title="도어 목록에서 삭제"
+                      >
+                        <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                        </svg>
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : null}
+            {commitError && (
+              <p className="text-[10px] text-red-400">{commitError}</p>
+            )}
+            {basemapEditError && (
+              <p className="text-[10px] text-red-400">{basemapEditError}</p>
+            )}
           </div>
         )}
 
         <div className="space-y-1.5">
-          {/* 명시적 "문 설정 완료" — debounce 기다리지 않고 즉시 서버 영속. 나갔다가 다시 들어와도 그대로 복원되며,
-              미래 basemap 정합에서 동일 분류 (corners + wallSurfaceId + doorThickness 등) 재현용. */}
-          <button
+          {/* "문 설정 완료" 버튼 — 모듈 모드 전용. basemap 다중 도어는 자동 push + 별도 "Basemap 등록 완료". */}
+          {!basemapMode && <button
             onClick={async () => {
               if (!allPicked) return;
-              if (basemapMode && !resolvedBasemapUnitName) {
-                setError('등록 시작 시 저장할 이름을 입력하세요.');
-                return;
-              }
               setSaveDoorBusy(true);
               try {
+                // 0) 문이 열린 채로 commit 되면 정합 단계에서 회전된 상태가 그대로 적용되므로 강제 닫기.
+                //    resetDoorRotation 은 800ms 애니메이션이라 다음 단계 transition 전에 완료되지 못함 →
+                //    동기적으로 entity 회전·위치를 identity 로 복귀 + 진행 중 애니메이션도 취소.
+                try {
+                  closeDoorImmediate();
+                  setDoorRotated(false);
+                } catch (e) { console.warn('[Commit] 문 닫기 동기 적용 실패:', e); }
                 // 1) 모듈 정보 모달 + uploadId 확정 — 모든 케이스에서 강제. 모달 dismiss 시 작업 유지.
                 let activeUploadId: string | null = null;
                 if (ensureUploadId) {
@@ -2379,7 +2826,7 @@ export default function DoorAlignModal({
                 // 2) 베이크 회전값을 동기 조회 (서버 업로드 await 없이 즉시).
                 //    SPEC: refined PLY 가 A'+Y 프레임 (pendingRotation rotX/rotZ + wallAngle Y) 으로 베이크되므로
                 //    picked 코너 (raw) 도 같은 변환 적용해 doors.json 에 저장.
-                const r = getCurrentBakedRotation?.() ?? { rotX: 0, rotZ: 0, wallAngleRad: 0 };
+                const r = getRemainingRotationToAY?.() ?? { rotX: 0, rotZ: 0, wallAngleRad: 0 };
                 const cx = Math.cos(r.rotX), sx = Math.sin(r.rotX);
                 const cz = Math.cos(r.rotZ), sz = Math.sin(r.rotZ);
                 const cy2 = Math.cos(r.wallAngleRad), sy2 = Math.sin(r.wallAngleRad);
@@ -2397,51 +2844,126 @@ export default function DoorAlignModal({
                   pos: rotYy(rotXZ([p.pos[0], p.pos[1], p.pos[2]])),
                   surfaceId: p.surfaceId,
                 });
+                // basemap persistDoorsToServer 가 A'+Y 프레임 corners 를 요구 — 변환본 보관.
                 const pickedTransformed = picked.map(p => p ? rotateForSave(p) : null);
+                // onSetupCornersFinalized — raw 프레임 4 코너 전달.
+                //   런타임 정합: AlignPanel 이 splatEntity.getWorldTransform() 으로 world 변환 (raw + Z-180 + pendingRotation 자동).
+                //   서버 영속: 부모가 commit-final 시점에 rawToAY 로 A'+Y 변환해 doors.json 저장 (baked PLY 와 동일 프레임).
+                if (onSetupCornersFinalized) {
+                  const cornersOnly = picked
+                    .filter((p): p is PickedCorner => p !== null)
+                    .map((p): [number, number, number] => [p.pos[0], p.pos[1], p.pos[2]]);
+                  if (cornersOnly.length === 4) {
+                    onSetupCornersFinalized(cornersOnly);
+                  }
+                }
+                // 모듈 모드 doorOpts — 회전 메타 (hingeEdge/swing/angleDeg) 포함.
+                //   (basemap 도어 옵션은 "Basemap 등록 완료" 핸들러 안에서 직접 구성.)
                 const doorOpts: PersistOpts = {
-                  doorId: basemapMode ? `door_${Date.now()}` : PRIMARY_DOOR_ID,
-                  unitName: basemapMode ? resolvedBasemapUnitName : undefined,
+                  doorId: PRIMARY_DOOR_ID,
                   hingeEdge,
                   swing: doorSwing,
-                  angleDeg: doorAngleDeg,
+                  // 문 설정 완료 시 정합 단계에 항상 "닫힌 상태" 로 전달. doorAngleDeg state 와 무관.
+                  angleDeg: 0,
                   wallSurfaceId: picked[0]!.surfaceId,
-                  doorThickness,
+                  doorExtractionDepth,
                   boundarySplitEnabled,
-                  safetyMargin: DOOR_SAFETY_MARGIN,
                 };
-
-                if (basemapMode) {
-                  await persistDoorsToServer(activeUploadId, pickedTransformed, doorOpts);
-                  setSavedDoorCount(c => c + 1);
-                  setPicked(emptyPicked());
-                  setHingeEdge(null);
-                  setEdgePickArmed(false);
-                  setDoorRotated(false);
-                  setRotationApplied(false);
-                  setDoorRefineActive(false);
-                  setSaveDoorToast('문 저장 완료');
-                  return;
+                if (deferPersistenceToAlign && onSetupDoorAssetsFinalized) {
+                  if (hingeEdge === null) throw new Error('회전축 정보 없음');
+                  const sourceDoor = inMemoryDoorsRef.current[inMemoryDoorsRef.current.length - 1] ?? null;
+                  let payload: ModuleDoorAssetPayload | null = null;
+                  if (sourceDoor) {
+                    let doorMesh: ModuleDoorAssetPayload['doorMesh'];
+                    if (sourceDoor.doorMeshInput.rgba.length > 0) {
+                      const canvas = document.createElement('canvas');
+                      canvas.width = sourceDoor.doorMeshInput.width;
+                      canvas.height = sourceDoor.doorMeshInput.height;
+                      const ctx = canvas.getContext('2d');
+                      if (!ctx) throw new Error('canvas 2d ctx failed');
+                      ctx.putImageData(
+                        new ImageData(
+                          new Uint8ClampedArray(sourceDoor.doorMeshInput.rgba),
+                          sourceDoor.doorMeshInput.width,
+                          sourceDoor.doorMeshInput.height,
+                        ),
+                        0,
+                        0,
+                      );
+                      const textureBlob = await new Promise<Blob>((res, rej) => {
+                        canvas.toBlob(b => b ? res(b) : rej(new Error('toBlob null')), 'image/png');
+                      });
+                      doorMesh = {
+                        corners: sourceDoor.doorMeshInput.corners.map(c => [c[0], c[1], c[2]]),
+                        uvs: sourceDoor.doorMeshInput.uvs.map(u => [u[0], u[1]]),
+                        normalInward: [
+                          sourceDoor.doorMeshInput.normalInward[0],
+                          sourceDoor.doorMeshInput.normalInward[1],
+                          sourceDoor.doorMeshInput.normalInward[2],
+                        ],
+                        textureWidth: sourceDoor.doorMeshInput.width,
+                        textureHeight: sourceDoor.doorMeshInput.height,
+                        textureBlob,
+                      };
+                    }
+                    let doorSplat: ModuleDoorAssetPayload['doorSplat'];
+                    if (sourceDoor.doorSplatBlobUrl) {
+                      const blobResp = await fetch(sourceDoor.doorSplatBlobUrl);
+                      const arrayBuf = await blobResp.arrayBuffer();
+                      const { parsePly, serializePly } = await import('@/lib/ply');
+                      const { rotateScene, rotateSceneY } = await import('@/lib/gs');
+                      const doorScene = parsePly(arrayBuf);
+                      const br = sourceDoor.bakeRotation;
+                      if (br.rotX !== 0 || br.rotZ !== 0) rotateScene(doorScene, br.rotX, br.rotZ);
+                      if (br.wallAngleRad !== 0) rotateSceneY(doorScene, br.wallAngleRad);
+                      const bakedBytes = serializePly(doorScene);
+                      doorSplat = {
+                        plyBlob: new Blob([bakedBytes as unknown as BlobPart], { type: 'application/octet-stream' }),
+                      };
+                    }
+                    payload = {
+                      wallSurfaceId: doorOpts.wallSurfaceId ?? sourceDoor.wallSurfaceId,
+                      doorExtractionDepth,
+                      boundarySplitEnabled,
+                      hingeEdge,
+                      swing: doorSwing,
+                      angleDeg: 0,
+                      ...(doorMesh ? { doorMesh } : {}),
+                      ...(doorSplat ? { doorSplat } : {}),
+                    };
+                  }
+                  onSetupDoorAssetsFinalized(payload);
                 }
 
-                // 3) 화면 즉시 정합 단계로 전환 — 메모리 자산 그대로 사용.
+                // 3) 정합 단계 전환 — 모듈측 4 코너 raw 프레임 그대로 전달.
+                //    AlignPanel 이 splatEntity.getWorldTransform() 으로 world 변환 (Z-180 + pendingRotation 자동).
+                //    wallAngle Y 는 entity 에 안 들어가므로 raw 가 시각 위치와 일치.
+                const cornersForParent = !basemapMode && picked.every(c => c !== null)
+                  ? (picked as PickedCorner[]).map(c => [c.pos[0], c.pos[1], c.pos[2]] as [number, number, number])
+                  : null;
                 if (onSetupSaveDone) {
-                  try { await onSetupSaveDone(activeUploadId); }
+                  try { await onSetupSaveDone(activeUploadId, cornersForParent); }
                   catch { setSaveDoorBusy(false); return; }
                 }
                 setSaveDoorToast('정합 단계로 이동 ✓');
 
-                // 4) 백그라운드 저장 — PLY/mesh/tex 업로드 + doors.json 업로드. 사용자 대기 X.
-                const idForBg = activeUploadId;
-                void (async () => {
-                  try {
-                    if (onCommitRefined) {
-                      await onCommitRefined(idForBg);
+                // 4) 백그라운드 저장 — 모듈 등록 흐름에선 스킵. 정합 완료 시 일괄 영속화.
+                if (!deferPersistenceToAlign) {
+                  const idForBg = activeUploadId;
+                  void (async () => {
+                    try {
+                      if (onCommitRefined) {
+                        await onCommitRefined(idForBg);
+                      }
+                      await persistDoorsToServer(idForBg, pickedTransformed, doorOpts);
+                    } catch (e: any) {
+                      console.warn('[Setup] 백그라운드 저장 실패:', e);
                     }
-                    await persistDoorsToServer(idForBg, pickedTransformed, doorOpts);
-                  } catch (e: any) {
-                    console.warn('[Setup] 백그라운드 저장 실패:', e);
-                  }
-                })();
+                  })();
+                } else {
+                  // pickedTransformed 와 doorOpts 를 ref 에 보관 → 정합 완료 시 onCommitFinal 페이로드 구성.
+                  pendingDoorPersistenceRef.current = { pickedTransformed, doorOpts };
+                }
               } catch (e: any) {
                 setSaveDoorToast(`실패: ${e?.message ?? e}`);
               } finally {
@@ -2449,53 +2971,372 @@ export default function DoorAlignModal({
                 setTimeout(() => setSaveDoorToast(null), 2000);
               }
             }}
-            disabled={!allPicked || hingeEdge === null || !rotationApplied || saveDoorBusy || autoExtracting}
+            // 본 버튼은 모듈 모드 전용 (basemap 은 "Basemap 등록 완료" 버튼 별도).
+            disabled={!allPicked || saveDoorBusy || autoExtracting || hingeEdge === null || !rotationApplied}
             title={
               autoExtracting ? '자동 문 추출 진행 중...' :
               !allPicked ? '4 꼭짓점을 모두 찍은 후 저장' :
               hingeEdge === null ? '회전축을 먼저 선택하세요' :
               !rotationApplied ? '문 열기를 한 번 눌러 회전각/회전 방향을 확정하세요' :
-              '도어 설정 (corners, hinge, 회전각, 회전방향, doorThickness 등) 즉시 영속화'
+              '도어 설정 (corners, hinge, 회전각, 회전방향, doorExtractionDepth 등) 즉시 영속화'
             }
-            className="w-full px-3 py-1.5 rounded cursor-pointer text-xs font-bold bg-green-700 hover:bg-green-600 text-white disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed"
+            className="w-full px-3 py-1.5 rounded cursor-pointer text-xs font-bold bg-green-700 hover:bg-green-600 text-[var(--ink)] disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] disabled:cursor-not-allowed"
           >
-            {saveDoorBusy ? '저장 중...' : (saveDoorToast ?? (basemapMode ? '문 저장' : '문 설정 완료'))}
-          </button>
-          {basemapMode && (
+            {saveDoorBusy ? '저장 중...' : (saveDoorToast ?? '문 설정 완료')}
+          </button>}
+          {basemapMode && basemapEditMode && (
             <button
+              type="button"
+              disabled={basemapEditSaving || (!basemapEditDirty && inMemoryDoors.length === 0) || inMemoryDoors.some(d => !d.unitName)}
               onClick={async () => {
-                setSaveDoorBusy(true);
-                let activeUploadId: string | null = null;
+                if (!uploadId) return;
+                setBasemapEditSaving(true);
+                setBasemapEditError(null);
                 try {
-                  if (ensureUploadId) {
-                    activeUploadId = await ensureUploadId();
-                  } else {
-                    activeUploadId = uploadId || null;
-                  }
-                  if (!activeUploadId || !onSetupSaveDone) return;
-                  if (savedDoorCount === 0) {
-                    await persistEmptyDoorsToServer(activeUploadId);
-                  }
-                  await onSetupSaveDone(activeUploadId);
+                  const path = basemapId
+                    ? `/admin/basemaps/${basemapId}/doors`
+                    : `/uploads/${uploadId}/doors`;
+                  const pendingDoorEntries = await buildDoorEntriesForUpload(uploadId, inMemoryDoorsRef.current);
+                  await api.put(path, {
+                    doors: [
+                      ...persistedBasemapDoors.map(({ door }) => door),
+                      ...pendingDoorEntries,
+                    ],
+                  });
+                  setPersistedBasemapDoors(prev => [
+                    ...prev,
+                    ...pendingDoorEntries.map(door => ({ door, locked: false })),
+                  ]);
+                  setInMemoryDoors([]);
+                  setBasemapEditDirty(false);
+                  setCompletionModalOpen(true);
                 } catch (e: any) {
-                  setSaveDoorToast(`실패: ${e?.message ?? e}`);
+                  setBasemapEditError(`저장 실패: ${e?.message ?? e}`);
                 } finally {
-                  setSaveDoorBusy(false);
-                  setTimeout(() => setSaveDoorToast(null), 2000);
+                  setBasemapEditSaving(false);
                 }
               }}
-              disabled={saveDoorBusy}
-              className="w-full px-3 py-1.5 rounded cursor-pointer text-xs font-bold bg-green-700 hover:bg-green-600 text-white disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed"
+              className="w-full px-3 py-2 rounded cursor-pointer text-xs font-bold bg-emerald-600 hover:bg-emerald-500 text-[var(--ink)] disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] disabled:cursor-not-allowed"
             >
-              basemap 등록 완료
+              {basemapEditSaving ? '저장 중...' : 'Basemap 수정 저장'}
             </button>
           )}
+          {basemapMode && !basemapEditMode && (() => {
+            const unsetCount = inMemoryDoors.filter(d => !d.unitName).length;
+            const noDoor = inMemoryDoors.length === 0;
+            const disabled = committing || noDoor || unsetCount > 0;
+            return (
+              <button
+                type="button"
+                onClick={async () => {
+                  setCommitError(null);
+                  setCommitting(true);
+                  try {
+                    // 1) uploadId 확보 (register-local-basemap)
+                    let activeUploadId: string | null = uploadId || null;
+                    if (!activeUploadId && ensureUploadId) {
+                      activeUploadId = await ensureUploadId();
+                    }
+                    if (!activeUploadId) throw new Error('uploadId 확보 실패');
+
+                    // 2) basemap PLY 저장 전 — 모든 inMemoryDoors 의 doorOriginalIndices 를 origColorData alpha=0 으로 일괄 마킹.
+                    //    각 도어 추출 후 다음 도어 추출 시 revertDoorRefine 가 마킹을 풀어버리므로 저장 직전 재적용 필요.
+                    //    이게 적용돼야 commitRefinedToServer 의 keep 마스크가 도어 영역 가우시안을 자동으로 PLY 에서 제외.
+                    try {
+                      const sd = coreRef.current?.getSplatData?.();
+                      const core = coreRef.current;
+                      const float2HalfFn = core?.float2Half;
+                      if (sd?.origColorData && float2HalfFn) {
+                        const halfZero = float2HalfFn(0);
+                        for (const d of inMemoryDoorsRef.current) {
+                          for (const idx of d.doorOriginalIndices) {
+                            sd.origColorData[idx * 4 + 3] = halfZero;
+                          }
+                        }
+                      }
+                    } catch (e) {
+                      console.warn('[BasemapCommit] origColorData 마킹 실패:', e);
+                    }
+
+                    // 3) basemap PLY + mesh.json + tex_*.png 업로드 (onCommitRefined 가 처리)
+                    if (onCommitRefined) {
+                      await onCommitRefined(activeUploadId);
+                    }
+
+                    // 3) 각 도어의 자산 (PNG + PLY) 업로드 + DoorMeta 작성
+                    const doorMetas: PickedCorner[][] = [];  // placeholder — 실제론 doors.json 페이로드 만듦
+                    const allDoors = inMemoryDoorsRef.current;
+                    const doorEntries: Array<{
+                      id: string;
+                      corners: number[][];
+                      unitName: string;
+                      wallSurfaceId: string;
+                      doorExtractionDepth: number;
+                      boundarySplitEnabled: boolean;
+                      doorMesh?: { corners: number[][]; uvs: number[][]; normalInward: number[]; textureFilename: string; textureWidth: number; textureHeight: number };
+                      doorSplat?: { filename: string };
+                    }> = [];
+                    for (const d of allDoors) {
+                      const entry: typeof doorEntries[0] = {
+                        id: d.doorId,
+                        corners: d.cornersAY.map(c => [c[0], c[1], c[2]]),
+                        unitName: d.unitName,
+                        wallSurfaceId: d.wallSurfaceId,
+                        doorExtractionDepth: d.doorExtractionDepth,
+                        boundarySplitEnabled: d.boundarySplitEnabled,
+                      };
+                      // 도어 mesh 텍스처 PNG 업로드
+                      if (d.doorMeshInput.rgba.length > 0) {
+                        const rgbaToPng = async (rgba: Uint8ClampedArray, w: number, h: number): Promise<Blob> => {
+                          const canvas = document.createElement('canvas');
+                          canvas.width = w; canvas.height = h;
+                          const ctx = canvas.getContext('2d');
+                          if (!ctx) throw new Error('canvas 2d ctx failed');
+                          ctx.putImageData(new ImageData(new Uint8ClampedArray(rgba), w, h), 0, 0);
+                          return await new Promise<Blob>((res, rej) => {
+                            canvas.toBlob(b => b ? res(b) : rej(new Error('toBlob null')), 'image/png');
+                          });
+                        };
+                        const pngBlob = await rgbaToPng(d.doorMeshInput.rgba, d.doorMeshInput.width, d.doorMeshInput.height);
+                        const texUrl = await api.post<{ put_url: string; key: string }>(
+                          '/refine/refined-upload-url',
+                          { upload_id: activeUploadId, filename: `tex_${d.doorId}.png` },
+                        );
+                        const texResp = await fetch(texUrl.put_url, {
+                          method: 'PUT', body: pngBlob, headers: { 'Content-Type': 'image/png' },
+                        });
+                        if (!texResp.ok) throw new Error(`도어 ${d.doorId} 텍스처 업로드 실패: ${texResp.status}`);
+                        entry.doorMesh = {
+                          corners: d.doorMeshInput.corners.map(c => [c[0], c[1], c[2]]),
+                          uvs: d.doorMeshInput.uvs.map(u => [u[0], u[1]]),
+                          normalInward: [d.doorMeshInput.normalInward[0], d.doorMeshInput.normalInward[1], d.doorMeshInput.normalInward[2]],
+                          textureFilename: texUrl.key,
+                          textureWidth: d.doorMeshInput.width,
+                          textureHeight: d.doorMeshInput.height,
+                        };
+                      }
+                      // 도어 splat PLY 업로드 — raw 프레임 데이터를 A'+Y 로 베이크 후 업로드.
+                      // (basemap 메인 PLY 가 A'+Y 베이크되므로 도어 splat 도 같은 프레임 유지 → 재로드 시 정렬됨)
+                      if (d.doorSplatBlobUrl) {
+                        const blobResp = await fetch(d.doorSplatBlobUrl);
+                        const arrayBuf = await blobResp.arrayBuffer();
+                        const { parsePly, serializePly } = await import('@/lib/ply');
+                        const { rotateScene, rotateSceneY } = await import('@/lib/gs');
+                        const doorScene = parsePly(arrayBuf);
+                        const br = d.bakeRotation;
+                        if (br.rotX !== 0 || br.rotZ !== 0) rotateScene(doorScene, br.rotX, br.rotZ);
+                        if (br.wallAngleRad !== 0) rotateSceneY(doorScene, br.wallAngleRad);
+                        const bakedBytes = serializePly(doorScene);
+                        const plyUrl = await api.post<{ put_url: string; key: string }>(
+                          '/refine/refined-upload-url',
+                          { upload_id: activeUploadId, filename: `${d.doorId}.ply` },
+                        );
+                        const plyResp = await fetch(plyUrl.put_url, {
+                          method: 'PUT', body: bakedBytes as unknown as BlobPart, headers: { 'Content-Type': 'application/octet-stream' },
+                        });
+                        if (!plyResp.ok) throw new Error(`도어 ${d.doorId} splat 업로드 실패: ${plyResp.status}`);
+                        entry.doorSplat = { filename: plyUrl.key };
+                      }
+                      doorEntries.push(entry);
+                    }
+
+                    // 4) doors.json PUT
+                    await api.put(`/uploads/${activeUploadId}/doors`, { doors: doorEntries });
+
+                    // 5) /basemaps/register 직접 호출.
+                    //    (onSetupSaveDone 의 basemap 분기는 /dashboard 자동 redirect 라 완료 모달과 충돌 — 우회.)
+                    await api.post('/basemaps/register', { upload_id: activeUploadId });
+
+                    // 6) 완료 모달 표시 — 사용자가 라우팅 선택 (onBasemapDone 콜백).
+                    setCompletionModalOpen(true);
+                    void doorMetas;  // unused — 위 placeholder
+                  } catch (e: any) {
+                    setCommitError(`등록 실패: ${e?.message ?? e}`);
+                  } finally {
+                    setCommitting(false);
+                  }
+                }}
+                disabled={disabled}
+                title={
+                  noDoor ? '먼저 문을 1개 이상 추출하세요' :
+                  unsetCount > 0 ? `${unsetCount}개 도어의 호수가 미설정입니다` :
+                  committing ? '저장 중...' :
+                  '모든 도어를 일괄 영속화하고 basemap 활성화'
+                }
+                className="w-full px-3 py-2 rounded cursor-pointer text-xs font-bold bg-emerald-600 hover:bg-emerald-500 text-[var(--ink)] disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] disabled:cursor-not-allowed"
+              >
+                {committing ? '저장 중...' : 'Basemap 등록 완료'}
+              </button>
+            );
+          })()}
         </div>
 
-        </>}
+        </>
+      </div>
 
-        {/* 정합 단계 UI 는 새 AlignPanel (UnifiedSplatEditor 측) 으로 이전됨.
-            DoorAlignModal 은 'setup' view 만 사용. (구 view='align' UI 는 제거됨.) */}
+      {/* basemap 다중 도어 — 호수 휠 피커 모달 */}
+      {basemapMode && unitNamePickerOpen && (
+        <DoorUnitNamePickerModal
+          floorNumber={basemapFloorNumber ?? 1}
+          initialSuffix={unitNamePickerOpen.initialSuffix}
+          onConfirm={(unitName) => {
+            const did = unitNamePickerOpen.doorId;
+            setInMemoryDoors(prev => prev.map(d => d.doorId === did ? { ...d, unitName } : d));
+            if (basemapEditMode) setBasemapEditDirty(true);
+            setUnitNamePickerOpen(null);
+          }}
+          onCancel={() => setUnitNamePickerOpen(null)}
+        />
+      )}
+      {basemapMode && basemapEditMode && persistedDoorPickerOpen && (
+        <DoorUnitNamePickerModal
+          floorNumber={basemapFloorNumber ?? 1}
+          initialSuffix={persistedDoorPickerOpen.initialSuffix}
+          onConfirm={(unitName) => {
+            const did = persistedDoorPickerOpen.doorId;
+            setPersistedBasemapDoors(prev => prev.map((item) => (
+              item.door.id === did
+                ? { ...item, door: { ...item.door, unitName } }
+                : item
+            )));
+            setBasemapEditDirty(true);
+            setPersistedDoorPickerOpen(null);
+          }}
+          onCancel={() => setPersistedDoorPickerOpen(null)}
+        />
+      )}
+
+      {/* basemap 등록/수정 완료 — 페이지 이동 선택 모달 */}
+      {basemapMode && completionModalOpen && typeof document !== 'undefined' && createPortal((
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/75 backdrop-blur-sm">
+          <div className="bg-black/85 border border-white/10 rounded-2xl px-10 py-9 w-full max-w-2xl shadow-2xl">
+            <div className="flex items-center justify-center mb-5">
+              <div className="w-16 h-16 rounded-full bg-green-500/15 border border-green-500/50 flex items-center justify-center">
+                <svg className="w-9 h-9 text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" />
+                </svg>
+              </div>
+            </div>
+            <h3 className="text-2xl font-bold text-white text-center">
+              {basemapEditMode ? 'Basemap 수정이 저장되었습니다' : 'Basemap 등록이 완료되었습니다'}
+            </h3>
+            <p className="mt-3 text-base text-white/75 text-center">
+              {basemapEditMode ? '다음 작업을 선택해주세요' : '이동할 페이지를 선택해주세요'}
+            </p>
+            {basemapEditMode ? (
+              <div className="mt-8 flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => onBasemapDone?.('building')}
+                  className="flex-1 px-4 py-4 rounded-xl bg-blue-600 hover:bg-blue-500 text-[var(--ink)] text-base font-bold transition"
+                >건물 페이지</button>
+                <button
+                  type="button"
+                  onClick={() => onBasemapDone?.('dashboard')}
+                  className="flex-1 px-4 py-4 rounded-xl bg-blue-600 hover:bg-blue-500 text-[var(--ink)] text-base font-bold transition"
+                >대시보드</button>
+                <button
+                  type="button"
+                  onClick={() => setCompletionModalOpen(false)}
+                  className="flex-1 px-4 py-4 rounded-xl bg-[var(--bg-soft)] hover:bg-[var(--rule)] text-[var(--ink)] text-base font-bold transition"
+                >계속 수정</button>
+              </div>
+            ) : (
+              <div className="mt-8 flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => onBasemapDone?.('building')}
+                  className="flex-1 px-4 py-4 rounded-xl bg-blue-600 hover:bg-blue-500 text-[var(--ink)] text-base font-bold transition"
+                >건물 페이지</button>
+                <button
+                  type="button"
+                  onClick={() => onBasemapDone?.('dashboard')}
+                  className="flex-1 px-4 py-4 rounded-xl bg-blue-600 hover:bg-blue-500 text-[var(--ink)] text-base font-bold transition"
+                >대시보드</button>
+                <button
+                  type="button"
+                  onClick={() => setCompletionModalOpen(false)}
+                  className="flex-1 px-4 py-4 rounded-xl bg-[var(--bg-soft)] hover:bg-[var(--rule)] text-[var(--ink)] text-base font-bold transition"
+                >계속 작업</button>
+              </div>
+            )}
+          </div>
+        </div>
+      ), document.body)}
+    </div>
+  );
+}
+
+// ── basemap 다중 도어 호수 휠 피커 (iOS 알람 스타일) ──
+const ROOM_PICKER_ITEM_HEIGHT = 44;
+const ROOM_PICKER_VISIBLE_PADDING = ROOM_PICKER_ITEM_HEIGHT * 2;
+
+function DoorUnitNamePickerModal({
+  floorNumber, initialSuffix, onConfirm, onCancel,
+}: {
+  floorNumber: number;
+  initialSuffix: number;
+  onConfirm: (unitName: string) => void;
+  onCancel: () => void;
+}) {
+  const listRef = useRef<HTMLUListElement>(null);
+  const settleTimerRef = useRef<number | null>(null);
+  const [suffix, setSuffix] = useState(initialSuffix);
+  const items = Array.from({ length: 99 }, (_, i) => i + 1);
+
+  useEffect(() => {
+    if (listRef.current) {
+      listRef.current.scrollTop = (initialSuffix - 1) * ROOM_PICKER_ITEM_HEIGHT;
+    }
+  }, [initialSuffix]);
+
+  const handleScroll = () => {
+    if (!listRef.current) return;
+    if (settleTimerRef.current) window.clearTimeout(settleTimerRef.current);
+    settleTimerRef.current = window.setTimeout(() => {
+      if (!listRef.current) return;
+      const idx = Math.round(listRef.current.scrollTop / ROOM_PICKER_ITEM_HEIGHT);
+      setSuffix(Math.max(1, Math.min(99, idx + 1)));
+    }, 60);
+  };
+
+  const unitName = `${floorNumber}${String(suffix).padStart(2, '0')}호`;
+
+  return (
+    <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={onCancel}>
+      <div className="w-[320px] rounded-xl bg-[var(--paper)] border border-[var(--rule)] p-5 shadow-2xl" onClick={(e) => e.stopPropagation()}>
+        <h3 className="text-base font-semibold text-[var(--ink)] text-center">호수를 선택하세요</h3>
+        <p className="text-xs text-[var(--muted)] text-center mt-1">Floor {floorNumber}</p>
+        <div className="mt-4 relative h-[220px] w-40 mx-auto select-none">
+          <div className="pointer-events-none absolute inset-x-0 top-1/2 -translate-y-1/2 h-[44px] rounded-md border-y border-blue-500/60 bg-blue-500/10" />
+          <ul
+            ref={listRef}
+            onScroll={handleScroll}
+            className="h-full overflow-y-auto"
+            style={{ scrollSnapType: 'y mandatory', scrollbarWidth: 'none', paddingTop: ROOM_PICKER_VISIBLE_PADDING, paddingBottom: ROOM_PICKER_VISIBLE_PADDING }}
+          >
+            {items.map((s) => {
+              const display = `${floorNumber}${String(s).padStart(2, '0')}호`;
+              const active = suffix === s;
+              return (
+                <li
+                  key={s}
+                  style={{ height: ROOM_PICKER_ITEM_HEIGHT, scrollSnapAlign: 'center' }}
+                  className={`flex items-center justify-center text-lg transition ${active ? 'text-[var(--ink)] font-bold' : 'text-[var(--muted)]'}`}
+                  onClick={() => {
+                    listRef.current?.scrollTo({ top: (s - 1) * ROOM_PICKER_ITEM_HEIGHT, behavior: 'smooth' });
+                  }}
+                >
+                  {display}
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+        <div className="mt-5 flex gap-2">
+          <button type="button" onClick={onCancel} className="flex-1 rounded-md border border-[var(--rule)] hover:bg-[var(--bg-soft)] py-2 text-sm text-[var(--ink-2)]">취소</button>
+          <button type="button" onClick={() => onConfirm(unitName)} className="flex-1 rounded-md bg-blue-600 hover:bg-blue-500 py-2 text-sm font-semibold text-[var(--ink)]">{unitName} 설정</button>
+        </div>
       </div>
     </div>
   );

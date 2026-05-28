@@ -1,27 +1,25 @@
 # 3DGS Digital Twin Platform - Codebase Reference
 
-Last updated: 2026-05-05
-Canonical scope: `refactored_modutwin/`
+Last updated: 2026-05-27
+Canonical scope: `modutwin/`
 
-This document is the short architecture reference for the current refactored
-codebase. It replaces older review notes and duplicate references that
-described the pre-refactor state.
+This document is the short architecture reference for the current codebase.
 
 ## Current Runtime Identity
 
-- Compose project: `refactored_modutwin`
-- Working directory: `/home/pjhserver/refactored_modutwin`
+- Compose project: `modutwin` when the checkout directory is named `modutwin`
+- Working directory: `~/modutwin` or the local checkout path
 - Fixed container names remain `3dgs-*` because `container_name` is set in
   `docker-compose.yml`.
 - Active named volumes:
-  - `refactored_modutwin_pgdata`
-  - `refactored_modutwin_redisdata`
-  - `refactored_modutwin_rabbitmqdata`
-  - `refactored_modutwin_miniodata`
+  - `modutwin_pgdata`
+  - `modutwin_redisdata`
+  - `modutwin_rabbitmqdata`
+  - `modutwin_miniodata`
 - Standard startup command:
 
 ```bash
-cd ~/refactored_modutwin
+cd ~/modutwin
 docker compose up -d --build
 docker compose exec backend alembic upgrade head
 ```
@@ -103,7 +101,8 @@ Key refactor results:
   prefixes.
 - Refine save validates that `source_key` is under the owning upload's refined
   prefix.
-- SAM3 dispatch is protected by `ENABLE_SAM3_DISPATCH=false` by default.
+- The viewer's automatic door designation uses the SAM3/door-ml HTTP path when
+  the service is available, and falls back to manual door picking on failure.
 
 Backend validation:
 
@@ -126,13 +125,16 @@ python -m pytest -q
 6. `POST /api/auth/ws-ticket` issues short-lived WebSocket tickets.
 
 Login sessions are reset whenever the PostgreSQL volume is recreated. Users
-must log in again after a fresh `refactored_modutwin_pgdata` volume is created.
+must log in again after a fresh PostgreSQL volume is created.
 
 ### Upload / Register Local
 
-- Multipart upload uses MinIO presigned URLs.
-- Local file flow can create an upload row through `/api/uploads/register-local`
-  before refined assets are uploaded.
+- Multipart upload uses MinIO presigned URLs (basemap flow).
+- Basemap flow: local file creates an upload row through `/api/uploads/register-local-basemap`
+  at 문 설정 완료 prior to MinIO writes.
+- Module flow (new, since 2026-05-13): no `register-local` call at all. PLY is pre-uploaded
+  to a temp directory (`/var/lib/sam3-temp`) for SAM3 forwarding only. All DB+MinIO writes
+  happen atomically at align-complete via `POST /api/uploads/commit-final`.
 - Uploads are scoped to authenticated users.
 
 ### Refine / Door / Alignment
@@ -140,9 +142,17 @@ must log in again after a fresh `refactored_modutwin_pgdata` volume is created.
 1. User opens a PLY/SOG scene in `/viewer`.
 2. Refine mode edits points, wall meshes, textures, and sidecars in the browser.
 3. "다듬기 완료" switches to door setup without committing alignment data early.
-4. Door setup saves `doors.json` under the upload path.
-5. Alignment loads the refined bundle only after entering align mode.
-6. Alignment transform is persisted through upload/module APIs.
+4. Door setup — flow-specific:
+   - Basemap flow: saves `doors.json` under the upload path at 문 설정 완료.
+   - Module flow: keeps door corners in memory (`onSetupCornersFinalized` callback hands
+     them off to the parent for later commit-final).
+5. Alignment loads the refined bundle:
+   - Basemap flow: refreshes from server after background upload.
+   - Module flow: alignment runs on in-memory bundle.
+6. Alignment persistence:
+   - Basemap flow: alignment transform saved through upload/module APIs separately.
+   - Module flow: `POST /uploads/commit-final` multipart submits PLY + mesh + tex + doors +
+     alignment transform atomically. Overwrites existing module assets if same user+room.
 
 Important stability fixes:
 
@@ -151,21 +161,25 @@ Important stability fixes:
   `404`s.
 - Refine brush/rect/transparent handlers are disabled outside refine mode.
 
-## SAM3 Status
+## Automatic Door Detection
 
-SAM3 is not a completed production worker path yet.
+The viewer-facing automatic door designation path is:
 
-Current safe state:
+```text
+Sam3PromptModal -> /api/uploads/sam3/prepare -> /api/uploads/sam3/detect-temp -> door-ml
+```
 
-- Backend API and DB columns exist.
-- Feature flag defaults to `ENABLE_SAM3_DISPATCH=false`.
-- When disabled, the system should fall back to manual door selection/alignment.
-- `worker/` currently has `training` and `alignment` tasks, but no
-  `worker/tasks/sam3.py`.
-- `door_ml/` is not present, so `docker-compose.gpu.yml` is not a default
-  deploy target.
+The backend stores the picked file temporarily for SAM3 forwarding. The final
+module assets are still committed only at alignment completion through
+`POST /api/uploads/commit-final`.
 
-Canonical SAM3 details are in `docs/sam3_worker_callback_plan.md`.
+`core/door_detection` is the SAM3-based detection pipeline used by the door-ml
+side of this feature. It should not be treated as an unrelated experiment.
+
+`/api/uploads/{upload_id}/sam3/start` is the older async worker-style path. Keep
+that path documented separately from the current viewer flow so future changes
+do not mix callback-worker assumptions into the synchronous module registration
+flow. Details are in `docs/sam3_worker_callback_plan.md`.
 
 ## Storage Layout
 

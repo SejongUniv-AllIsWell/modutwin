@@ -9,3 +9,5 @@ export { matchCorners } from './corners';
 export type { PlaneFitOptions, PlaneFitResult } from './plane';
 export { ransacPlaneFit, fitOrientedRectangle } from './plane';
 export { applyRigidToScene } from './apply';
+export type { RectFitResult } from './rectFit';
+export { rectFit } from './rectFit';

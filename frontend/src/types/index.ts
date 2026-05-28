@@ -24,6 +24,10 @@ export interface Building {
   created_at: string;
 }
 
+export interface BuildingListItem extends Building {
+  floor_count: number;
+}
+
 export interface Floor {
   id: string;
   building_id: string;
@@ -53,6 +57,7 @@ export interface FloorOverviewManifestEntry {
   meta_url: string | null;
   module_count: number;
   has_active_basemap: boolean;
+  has_pending_basemap?: boolean;
 }
 
 export interface FloorOverviewManifest {
@@ -66,6 +71,7 @@ export interface FloorOverviewManifest {
 export interface FloorDetailBasemapEntry {
   id: string;
   version: number;
+  source_upload_id: string | null;
   url: string | null;
   filename: string;
 }
@@ -79,6 +85,7 @@ export interface FloorDetailModuleEntry {
   is_visible: boolean;
   version: string | null;
   url: string | null;
+  source_upload_id: string | null;
 }
 
 export interface FloorDetailManifest {
@@ -87,6 +94,8 @@ export interface FloorDetailManifest {
   floor_id: string;
   floor_number: number;
   basemap: FloorDetailBasemapEntry | null;
+  /** 활성 basemap 이 없을 때 pending basemap (관리자 승인 대기) 존재 여부. */
+  basemap_pending_approval?: boolean;
   modules: FloorDetailModuleEntry[];
 }
 

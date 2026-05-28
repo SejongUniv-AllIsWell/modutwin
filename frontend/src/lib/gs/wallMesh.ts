@@ -16,6 +16,147 @@ export interface WallMeshOptions {
   solidWhite?: boolean;
 }
 
+export interface ViewTextureVariant {
+  id: string;
+  viewpoint: [number, number, number];
+  textureImage?: HTMLImageElement;
+  rgba?: Uint8ClampedArray;
+  width?: number;
+  height?: number;
+}
+
+function averageOpaqueColor(rgba: Uint8ClampedArray | Uint8Array): [number, number, number] | null {
+  let r = 0, g = 0, b = 0, n = 0;
+  for (let i = 0; i < rgba.length; i += 4) {
+    const a = rgba[i + 3];
+    if (a <= 0) continue;
+    r += rgba[i];
+    g += rgba[i + 1];
+    b += rgba[i + 2];
+    n++;
+  }
+  return n > 0 ? [r / (255 * n), g / (255 * n), b / (255 * n)] : null;
+}
+
+function applyBakedTextureCutout(pc: any, mat: any, tex: any): void {
+  mat.opacityMap = tex;
+  mat.opacityMapChannel = 'a';
+  // wall mesh alpha 는 "투명 재질"이 아니라 도어 punch / polygon 외부를 버리는 cutout mask 다.
+  // translucent blend 로 보내면 splat 과 transparent sort/depth 순서가 카메라 각도마다 바뀐다.
+  mat.alphaTest = 1 / 255;
+  mat.blendType = pc.BLEND_NONE;
+  mat.depthWrite = true;
+}
+
+function createTextureFromRgba(
+  pc: any,
+  device: any,
+  name: string,
+  width: number,
+  height: number,
+  rgba: Uint8ClampedArray | Uint8Array,
+): any {
+  const fmt = pc.PIXELFORMAT_SRGBA8 ?? pc.PIXELFORMAT_RGBA8;
+  const tex = new pc.Texture(device, {
+    width,
+    height,
+    format: fmt,
+    mipmaps: false,
+    addressU: pc.ADDRESS_CLAMP_TO_EDGE,
+    addressV: pc.ADDRESS_CLAMP_TO_EDGE,
+    magFilter: pc.FILTER_LINEAR,
+    minFilter: pc.FILTER_LINEAR,
+    name,
+  });
+  const lvl = tex.lock();
+  lvl.set(rgba);
+  tex.unlock();
+  return tex;
+}
+
+function createTextureFromImage(pc: any, device: any, name: string, image: HTMLImageElement): any {
+  const tex = new pc.Texture(device, {
+    width: image.naturalWidth,
+    height: image.naturalHeight,
+    format: pc.PIXELFORMAT_SRGBA8 ?? pc.PIXELFORMAT_RGBA8,
+    mipmaps: false,
+    addressU: pc.ADDRESS_CLAMP_TO_EDGE,
+    addressV: pc.ADDRESS_CLAMP_TO_EDGE,
+    magFilter: pc.FILTER_LINEAR,
+    minFilter: pc.FILTER_LINEAR,
+    name,
+  });
+  if (typeof tex.setSource === 'function') {
+    tex.setSource(image);
+  } else {
+    const canvas = document.createElement('canvas');
+    canvas.width = image.naturalWidth;
+    canvas.height = image.naturalHeight;
+    const ctx = canvas.getContext('2d')!;
+    ctx.drawImage(image, 0, 0);
+    const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const lvl = tex.lock();
+    lvl.set(imgData.data);
+    tex.unlock();
+  }
+  return tex;
+}
+
+function findActiveCamera(app: any): any | null {
+  const cams = app?.root?.findComponents?.('camera') ?? [];
+  for (const c of cams) {
+    const ent = c?.entity;
+    if (ent?.enabled !== false && c?.enabled !== false) return ent;
+  }
+  return null;
+}
+
+function installViewTextureSwitcher(
+  pc: any,
+  app: any,
+  ent: any,
+  mat: any,
+  variants: Array<{ id: string; viewpoint: [number, number, number]; texture: any }>,
+): void {
+  if (variants.length <= 1 || typeof app?.on !== 'function' || typeof app?.off !== 'function') return;
+  const localPoint = new pc.Vec3();
+  const worldPoint = new pc.Vec3();
+  let activeIdx = -1;
+  const choose = () => {
+    const cam = findActiveCamera(app);
+    if (!cam) return;
+    const cp = cam.getPosition ? cam.getPosition() : cam.getLocalPosition();
+    const wt = ent.getWorldTransform?.();
+    let bestIdx = 0;
+    let bestD2 = Infinity;
+    for (let i = 0; i < variants.length; i++) {
+      const p = variants[i].viewpoint;
+      localPoint.set(p[0], p[1], p[2]);
+      if (wt?.transformPoint) wt.transformPoint(localPoint, worldPoint);
+      else worldPoint.copy(localPoint);
+      const dx = cp.x - worldPoint.x;
+      const dy = cp.y - worldPoint.y;
+      const dz = cp.z - worldPoint.z;
+      const d2 = dx * dx + dy * dy + dz * dz;
+      if (d2 < bestD2) { bestD2 = d2; bestIdx = i; }
+    }
+    if (bestIdx === activeIdx) return;
+    activeIdx = bestIdx;
+    const tex = variants[bestIdx].texture;
+    mat.emissiveMap = tex;
+    mat.opacityMap = tex;
+    mat.update();
+  };
+  app.on('update', choose);
+  choose();
+
+  const prevDestroy = ent.destroy?.bind(ent);
+  ent.destroy = (...args: any[]) => {
+    try { app.off('update', choose); } catch {}
+    return prevDestroy?.(...args);
+  };
+}
+
 export function createWallMeshEntity(
   pc: any,
   app: any,
@@ -37,43 +178,13 @@ export function createWallMeshEntity(
     mat.emissive.set(1, 1, 1);
   } else {
     // ── 텍스처 ──
-    const fmt = pc.PIXELFORMAT_SRGBA8 ?? pc.PIXELFORMAT_RGBA8;
-    const tex = new pc.Texture(device, {
-      width: bake.width,
-      height: bake.height,
-      format: fmt,
-      mipmaps: false, // mipmap 미생성 — raw 데이터만 사용. mip alpha 평균으로 컷되는 문제 회피
-      addressU: pc.ADDRESS_CLAMP_TO_EDGE,
-      addressV: pc.ADDRESS_CLAMP_TO_EDGE,
-      magFilter: pc.FILTER_LINEAR,
-      minFilter: pc.FILTER_LINEAR,
-      name,
-    });
-    const lvl = tex.lock();
-    lvl.set(bake.rgba);
-    tex.unlock();
+    const tex = createTextureFromRgba(pc, device, name, bake.width, bake.height, bake.rgba);
 
     mat.emissive.set(1, 1, 1);
     mat.emissiveMap = tex;
-    // 알파 컷오프: 사용자가 투명 영역으로 페인트한 픽셀(alpha=0) 만 discard.
-    // 임계값은 8-bit 알파 기준 "정확히 0인 픽셀만 컷" 에 해당하는 1/255.
-    // 0.5 같은 표준 cutout 임계값을 쓰면 베이크의 부분 알파 (가장자리/sparse coverage)
-    // 까지 통째로 잘려서 검은 구멍 아티팩트 발생.
-    mat.opacityMap = tex;
-    mat.opacityMapChannel = 'a';
-    mat.alphaTest = 1 / 255;
-    mat.blendType = pc.BLEND_NONE;
+    applyBakedTextureCutout(pc, mat, tex);
   }
   mat.update();
-
-  // 진단 로깅 — 텍스처 모드 시 alpha 분포 확인
-  if (!opts.solidWhite) {
-    let nOpaque = 0;
-    for (let i = 3; i < bake.rgba.length; i += 4) {
-      if (bake.rgba[i] > 0) nOpaque++;
-    }
-    console.log(`[wallMesh:${name}] tex ${bake.width}×${bake.height}, opaque texels: ${nOpaque} / ${bake.width * bake.height} (${(100 * nOpaque / (bake.width * bake.height)).toFixed(1)}%)`);
-  }
 
   // ── Quad 메시 ──
   // corners: TL, TR, BR, BL
@@ -115,9 +226,20 @@ export function createWallMeshEntity(
 
   const ent = new pc.Entity(name);
   ent.addComponent('render', { meshInstances: [meshInstance] });
+  (ent as any).__averageColor = opts.solidWhite ? [1, 1, 1] : averageOpaqueColor(bake.rgba);
   // Z-180만 직접 부여.
   ent.setLocalEulerAngles(0, 0, 180);
   app.root.addChild(ent);
+
+  if (!opts.solidWhite && bake.viewVariants?.length) {
+    const variants = bake.viewVariants.map((variant) => ({
+      id: variant.id,
+      viewpoint: variant.viewpoint,
+      texture: createTextureFromRgba(pc, device, `${name}_${variant.id}`, bake.width, bake.height, variant.rgba),
+    }));
+    (ent as any).__viewTextureVariants = variants;
+    installViewTextureSwitcher(pc, app, ent, mat, variants);
+  }
 
   return ent;
 }
@@ -135,12 +257,17 @@ export interface PersistedMeshData {
   uvs: number[][];          // 4 × 2 (TL, TR, BR, BL)
   normalInward: [number, number, number];
   textureImage: HTMLImageElement;
+  viewTextures?: ViewTextureVariant[];
 }
 
 export function createWallMeshFromPersisted(
   pc: any,
   app: any,
   data: PersistedMeshData,
+  opts: {
+    mutableTexture?: boolean;
+    onTextureData?: (texture: { rgba: Uint8ClampedArray; width: number; height: number }) => void;
+  } = {},
 ): any {
   const device = app.graphicsDevice;
   const name = `wallMesh_${data.surfaceId}`;
@@ -152,43 +279,34 @@ export function createWallMeshFromPersisted(
   mat.cull = pc.CULLFACE_NONE;
 
   // PNG 이미지를 PlayCanvas Texture 로 변환
-  const fmt = pc.PIXELFORMAT_SRGBA8 ?? pc.PIXELFORMAT_RGBA8;
-  const tex = new pc.Texture(device, {
-    width: data.textureImage.naturalWidth,
-    height: data.textureImage.naturalHeight,
-    format: fmt,
-    mipmaps: false,
-    addressU: pc.ADDRESS_CLAMP_TO_EDGE,
-    addressV: pc.ADDRESS_CLAMP_TO_EDGE,
-    magFilter: pc.FILTER_LINEAR,
-    minFilter: pc.FILTER_LINEAR,
-    name,
-  });
-  // 항상 canvas → ImageData → lock/set/unlock 경로 사용.
-  // setSource(img) 는 텍스처 _levels byte buffer 를 채우지 않아서, 도어 정합 단계에서
-  // tex.lock() 으로 RGBA 를 직접 수정할 때 변경이 GPU 로 반영되지 않음 (도어 영역
-  // alpha=0 punch 가 무효화됨). lvl.set(bytes) 로 _levels 를 명시 채우면 이후 lock/unlock
-  // 사이클이 정상 동작.
-  {
+  let tex: any;
+  // 문 설정/정합 단계처럼 텍스처 alpha punch 를 수정해야 하는 화면은 mutableTexture=true
+  // 기본 경로를 사용한다. 층 overview 처럼 read-only 로 보기만 하는 화면은 setSource 로
+  // 업로드해 큰 ImageData 복사를 피한다.
+  let averageColor: [number, number, number] | null = null;
+  if (opts.mutableTexture !== false) {
     const canvas = document.createElement('canvas');
     canvas.width = data.textureImage.naturalWidth;
     canvas.height = data.textureImage.naturalHeight;
     const ctx = canvas.getContext('2d')!;
     ctx.drawImage(data.textureImage, 0, 0);
     const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    const lvl = tex.lock();
-    lvl.set(imgData.data);
-    tex.unlock();
+    averageColor = averageOpaqueColor(imgData.data);
+    opts.onTextureData?.({
+      rgba: new Uint8ClampedArray(imgData.data),
+      width: canvas.width,
+      height: canvas.height,
+    });
+    tex = createTextureFromRgba(pc, device, name, canvas.width, canvas.height, imgData.data);
+  } else {
+    tex = createTextureFromImage(pc, device, name, data.textureImage);
   }
 
   mat.emissive.set(1, 1, 1);
   mat.emissiveMap = tex;
   // 도어 정합 단계에서 wall mesh 텍스처에 도어 영역 alpha=0 punch 가 들어옴 →
-  // alphaTest cutout 이 있어야 punch 된 픽셀이 실제로 사라짐. (createWallMeshEntity 와 동일.)
-  mat.opacityMap = tex;
-  mat.opacityMapChannel = 'a';
-  mat.alphaTest = 1 / 255;
-  mat.blendType = pc.BLEND_NONE;
+  // alphaTest 로 punch 픽셀만 버리고 나머지는 opaque 로 렌더한다.
+  applyBakedTextureCutout(pc, mat, tex);
   mat.update();
 
   // Quad 메시
@@ -226,9 +344,32 @@ export function createWallMeshFromPersisted(
 
   const ent = new pc.Entity(name);
   ent.addComponent('render', { meshInstances: [meshInstance] });
+  (ent as any).__averageColor = averageColor;
   // Z-180 (저장된 corners 는 raw PLY 프레임 기준)
   ent.setLocalEulerAngles(0, 0, 180);
   app.root.addChild(ent);
+
+  if (data.viewTextures?.length) {
+    const variants = data.viewTextures.flatMap((variant) => {
+      if (variant.textureImage) {
+        return [{
+          id: variant.id,
+          viewpoint: variant.viewpoint,
+          texture: createTextureFromImage(pc, device, `${name}_${variant.id}`, variant.textureImage),
+        }];
+      }
+      if (variant.rgba && variant.width && variant.height) {
+        return [{
+          id: variant.id,
+          viewpoint: variant.viewpoint,
+          texture: createTextureFromRgba(pc, device, `${name}_${variant.id}`, variant.width, variant.height, variant.rgba),
+        }];
+      }
+      return [];
+    });
+    (ent as any).__viewTextureVariants = variants;
+    installViewTextureSwitcher(pc, app, ent, mat, variants);
+  }
 
   return ent;
 }

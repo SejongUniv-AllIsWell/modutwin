@@ -1,4 +1,3 @@
-import json
 from uuid import UUID
 from typing import Optional
 
@@ -7,15 +6,13 @@ from pydantic import BaseModel
 from datetime import datetime
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-import redis.asyncio as aioredis
 
-from app.core.config import get_settings
 from app.core.database import get_db
 from app.core.security import get_current_user
-from app.models import User, Task, TaskStatus
+from app.models import User, Task
+from app.services.task_progress_service import read_task_progress
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
-settings = get_settings()
 
 
 class TaskResponse(BaseModel):
@@ -85,19 +82,14 @@ async def get_task_progress(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="태스크를 찾을 수 없습니다.")
 
     # Redis에서 실시간 진행률 조회
-    redis_client = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
-    try:
-        data = await redis_client.get(f"task:progress:{task.celery_task_id}")
-        if data:
-            progress_data = json.loads(data)
-            return TaskProgressResponse(
-                task_id=task.id,
-                progress=progress_data.get("progress", task.progress),
-                module=progress_data.get("module", ""),
-                status=task.status.value,
-            )
-    finally:
-        await redis_client.aclose()
+    progress_data = await read_task_progress(task.celery_task_id)
+    if progress_data:
+        return TaskProgressResponse(
+            task_id=task.id,
+            progress=progress_data.get("progress", task.progress),
+            module=progress_data.get("module", ""),
+            status=task.status.value,
+        )
 
     return TaskProgressResponse(
         task_id=task.id,

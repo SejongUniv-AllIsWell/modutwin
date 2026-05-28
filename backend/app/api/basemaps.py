@@ -1,5 +1,7 @@
 from uuid import UUID
 from datetime import datetime, timezone
+from io import BytesIO
+import json
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, field_validator
@@ -18,6 +20,7 @@ from app.services.metadata_options import (
     parse_module_name_input,
     validate_floor_number as validate_floor_number_value,
 )
+from app.services.storage_paths import doors_json_key
 
 router = APIRouter(prefix="/admin/basemaps", tags=["basemaps"])
 
@@ -35,6 +38,10 @@ class ActiveBasemapResponse(BaseModel):
     # basemap 의 원본 upload — 클라이언트가 basemap 의 doors.json 을 가져와
     # 모듈 정합 시 호수 매칭 (basemap door 의 wallSurfaceId/모듈명 → 정합 대상 4점) 에 사용.
     source_upload_id: UUID | None = None
+
+
+class BasemapDoorsUpdateRequest(BaseModel):
+    doors: list[dict]
 
 
 @public_router.get("/active", response_model=ActiveBasemapResponse)
@@ -130,6 +137,47 @@ async def get_basemap_doors(
         return {"doors": doors}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"doors.json 파싱 실패: {e}")
+
+
+@router.put("/{basemap_id}/doors")
+async def update_basemap_doors(
+    basemap_id: UUID,
+    body: BasemapDoorsUpdateRequest,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """활성/승인 basemap 의 doors.json 메타를 관리자 권한으로 갱신한다.
+
+    기존 doorMesh/doorSplat 파일은 그대로 두고 doors.json 만 덮어쓴다. 정합된 문을
+    잠그는 판단은 클라이언트가 하며, 서버는 관리자 전용 쓰기 권한만 보장한다.
+    """
+    bm_result = await db.execute(select(Basemap).where(Basemap.id == basemap_id))
+    basemap = bm_result.scalar_one_or_none()
+    if basemap is None:
+        raise HTTPException(status_code=404, detail="basemap 을 찾을 수 없습니다.")
+
+    source_upload_id = await _resolve_source_upload_id(db, basemap)
+    if source_upload_id is None:
+        raise HTTPException(status_code=400, detail="basemap 원본 upload 정보가 없습니다.")
+
+    up_q = await db.execute(select(Upload).where(Upload.id == source_upload_id))
+    upload = up_q.scalar_one_or_none()
+    if upload is None:
+        raise HTTPException(status_code=404, detail="업로드를 찾을 수 없습니다.")
+
+    key = upload.door_corners_json_path or doors_json_key(upload.minio_path)
+    payload = json.dumps({"doors": body.doors}, ensure_ascii=False).encode("utf-8")
+    minio = get_minio_service()
+    minio.client.put_object(
+        minio.bucket,
+        key,
+        data=BytesIO(payload),
+        length=len(payload),
+        content_type="application/json",
+    )
+    upload.door_corners_json_path = key
+    await db.commit()
+    return {"doors": body.doors}
 
 
 class BasemapResponse(BaseModel):
@@ -835,13 +883,11 @@ async def activate_basemap(
     new_basemap.is_active = True
     floor.overview_dirty = True
 
-    # 활성 basemap을 공용 경로에 복사 (basemap/basemap.ply)
-    # TODO: MinIO copy_object 구현
-    # active_key = f"buildings/{floor.building_id}/{floor.id}/basemap/basemap.ply"
+    # 활성 basemap 은 Basemap row 의 minio_path 를 직접 조회한다.
+    # 공용 고정 key 로 복사하지 않아도 현재 조회 경로와 충돌하지 않는다.
 
     await db.commit()
 
-    # TODO: basemap_realign 태스크 발행
     return {
         "message": "활성화 완료. 기존 모듈 재정렬이 필요합니다.",
         "basemap_id": str(new_basemap.id),

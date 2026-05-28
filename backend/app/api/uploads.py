@@ -1,4 +1,5 @@
 import json
+import logging
 import math
 import os
 from typing import Any
@@ -38,10 +39,12 @@ from app.services.sam3_service import (
     mark_sam3_disabled,
     mark_sam3_dispatch_pending,
 )
+from app.services.storage_access import delete_storage_best_effort
 from app.services.storage_paths import doors_json_key, module_base_path, refined_prefix
 
 router = APIRouter(prefix="/uploads", tags=["uploads"])
 settings = get_settings()
+logger = logging.getLogger(__name__)
 
 # 사용자당 업로드 제한 (개수 / 총 용량)
 MAX_UPLOADS_PER_USER = 100
@@ -98,7 +101,7 @@ async def init_upload(
             detail="building_id / floor_id / module_id 조합이 유효하지 않습니다.",
         )
 
-    # 업로드 서브폴더 결정
+    # 업로드 서브폴더 결정 — ply_target 기반. 예: "gsplat" → "gsplat_uploads/"
     subfolder = get_upload_subfolder(body.filename, body.ply_target or "gsplat")
 
     # MinIO 오브젝트 키 생성 — UUID 기반 (원본 파일명은 DB에만 저장)
@@ -309,6 +312,7 @@ def _upload_to_response(
     upload: Upload,
     has_scene_output: bool = False,
     is_basemap_source: bool = False,
+    has_alignment: bool = False,
 ) -> UploadResponse:
     """Upload ORM → UploadResponse (SAM3 파이프라인 파생 플래그 포함).
 
@@ -327,7 +331,7 @@ def _upload_to_response(
         sam3_prompt=upload.sam3_prompt,
         has_refined=bool(upload.refined_ply_path) or has_scene_output,
         has_doors_json=bool(upload.door_corners_json_path),
-        has_alignment=bool(upload.alignment_transform),
+        has_alignment=has_alignment,
         has_gsplat_ply=bool(upload.gsplat_ply_path),
         is_basemap_source=is_basemap_source,
     )
@@ -338,10 +342,10 @@ async def list_uploads(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """내 업로드 목록 조회"""
+    """내 업로드 목록 조회 — 사용자가 직접 숨김 처리한 항목은 제외."""
     result = await db.execute(
         select(Upload)
-        .where(Upload.user_id == user.id)
+        .where(Upload.user_id == user.id, Upload.hidden_from_history.is_(False))
         .order_by(Upload.uploaded_at.desc())
     )
     uploads = result.scalars().all()
@@ -363,11 +367,18 @@ async def list_uploads(
         .distinct()
     )
     basemap_source_ids = {row[0] for row in basemap_rows.all() if row[0] is not None}
+    module_ids = {u.module_id for u in uploads}
+    aligned_module_rows = await db.execute(
+        select(Module.id)
+        .where(Module.id.in_(module_ids), Module.alignment_transform.is_not(None))
+    )
+    aligned_module_ids = {row[0] for row in aligned_module_rows.all()}
     return [
         _upload_to_response(
             u,
             has_scene_output=(u.id in has_scene),
             is_basemap_source=(u.id in basemap_source_ids),
+            has_alignment=(u.module_id in aligned_module_ids),
         )
         for u in uploads
     ]
@@ -402,10 +413,15 @@ async def get_upload(
         select(Basemap.id).where(Basemap.source_upload_id == upload_id).limit(1)
     )
     is_basemap_source = basemap_check.scalar_one_or_none() is not None
+    module_check = await db.execute(
+        select(Module.alignment_transform).where(Module.id == upload.module_id).limit(1)
+    )
+    has_alignment = module_check.scalar_one_or_none() is not None
     return _upload_to_response(
         upload,
         has_scene_output=has_scene,
         is_basemap_source=is_basemap_source,
+        has_alignment=has_alignment,
     )
 
 
@@ -484,17 +500,45 @@ async def delete_upload(
     await db.execute(sa_delete(Upload).where(Upload.id == upload.id))
     await db.commit()
 
-    minio = get_minio_service()
-    for prefix in prefixes:
-        try:
-            minio.delete_prefix(prefix)
-        except Exception:
-            pass
-    for key in keys:
-        try:
-            minio.delete_object(key)
-        except Exception:
-            pass
+    delete_storage_best_effort(get_minio_service(), prefixes, keys)
+
+    return None
+
+
+@router.post("/{upload_id}/hide", status_code=status.HTTP_204_NO_CONTENT)
+async def hide_upload(
+    upload_id: UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """basemap 으로 채택되어 삭제가 막힌 업로드를 내 업로드 내역에서만 숨김.
+
+    파일과 DB row 는 그대로 유지되며, /uploads 목록에서만 제외된다. basemap 의
+    원본으로 등록되지 않은 업로드는 일반 DELETE 로 완전 삭제하면 되므로 이
+    엔드포인트가 거부한다.
+    """
+    stmt = select(Upload).where(Upload.id == upload_id)
+    if user.role != UserRole.admin:
+        stmt = stmt.where(Upload.user_id == user.id)
+    upload = (await db.execute(stmt)).scalar_one_or_none()
+    if upload is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="업로드를 찾을 수 없습니다.",
+        )
+
+    basemap_exists = (await db.execute(
+        select(Basemap.id).where(Basemap.source_upload_id == upload.id).limit(1)
+    )).scalar_one_or_none()
+    if basemap_exists is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="basemap 원본이 아닌 업로드는 숨김 대신 삭제하세요.",
+        )
+
+    if not upload.hidden_from_history:
+        upload.hidden_from_history = True
+        await db.commit()
 
     return None
 
@@ -834,7 +878,7 @@ async def start_sam3(
     except Exception as e:
         # broker/worker 비가용 — failed 로 두면 사용자가 정합 단계에서 수동 지정 가능.
         upload.sam3_status = Sam3Status.failed
-        print(f"[sam3] dispatch failed: {e}")
+        logger.exception(f"[sam3] dispatch failed: {e}")
 
     if celery_task_id:
         task = Task(
@@ -892,12 +936,33 @@ async def get_sam3_status(
 
 # ── doors.json: SAM3 결과 + 사용자 보정 ─────────────────────────────────────
 
+class DoorMeshMeta(BaseModel):
+    """도어 quad mesh 의 영속화 메타 — wall 텍스처에서 도어 영역을 잘라낸 별도 PNG + corners.
+
+    basemap 재로드 시 wall mesh quad entity 재생성에 필요한 정보 전부 포함.
+    """
+    corners: list[list[float]]  # 4 × [x, y, z] — A'+Y 프레임 mesh 코너
+    uvs: list[list[float]]      # 4 × [u, v]   — 텍스처 매핑
+    normalInward: list[float]   # [x, y, z]    — 방 안쪽 normal
+    textureFilename: str        # MinIO 키: "tex_door_<doorId>.png"
+    textureWidth: int
+    textureHeight: int
+
+
+class DoorSplatMeta(BaseModel):
+    """도어 영역 가우시안 splat PLY 의 영속화 메타 (boundary split sub + doorOrig)."""
+    filename: str               # MinIO 키: "door_<doorId>.ply"
+
+
 class DoorEntry(BaseModel):
     """doors.json 의 한 문 엔트리.
 
-    corners 외 나머지 메타 (회전축/회전각/회전방향/벽 surfaceId/두께/분할 옵션 등) 는
+    corners 외 나머지 메타 (회전축/회전각/방향/벽 surfaceId/두께/분할 옵션 등) 는
     문 설정 단계에서 사용자가 확정한 값. 정합·재진입·basemap 매칭 시 모두 활용되므로
     스키마에 명시해 라운드트립 시 손실되지 않게 한다.
+
+    선택 자산 `doorMesh` / `doorSplat`: basemap 의 경우 도어별 텍스처/가우시안을 별도
+    파일로 영속화하면 로드 시 그대로 재생성 가능. 없으면 corners 만으로 정합 매칭 등에 사용.
     """
     id: str
     corners: list[list[float]]  # 4 × [x, y, z]
@@ -905,13 +970,13 @@ class DoorEntry(BaseModel):
     swing: int | None = None
     angleDeg: float | None = None
     wallSurfaceId: str | None = None
-    doorThickness: float | None = None
+    doorExtractionDepth: float | None = None
     boundarySplitEnabled: bool | None = None
-    safetyMargin: float | None = None
-    # basemap 등록 시 admin 이 각 문에 입력하는 호수 (예: "302호").
-    # 정합 단계에서 모듈의 호수 (Module.name) 와 매칭해 basemap 의 어느 문에 정합할지 결정.
-    # 모듈측 doors.json 에서는 보통 비어있음 (모듈은 단일 호라 호수 = Module.name 으로 자명).
+    # basemap 등록 시 각 문에 부여하는 호수 (예: "302호"). 정합 단계에서 모듈의
+    # 호수 (Module.name) 와 매칭해 basemap 의 어느 문에 정합할지 결정. 모듈측에서는 비어있음.
     unitName: str | None = None
+    doorMesh: DoorMeshMeta | None = None
+    doorSplat: DoorSplatMeta | None = None
 
 
 class DoorsJson(BaseModel):
@@ -955,19 +1020,27 @@ async def get_doors(
                 for c in corners
             )
             if not ok: continue
-            entry = DoorEntry(
+            entry_kwargs = dict(
                 id=str(d.get("id") or f"door_{len(clean)+1}"),
                 corners=corners,
                 hingeEdge=d.get("hingeEdge") if isinstance(d.get("hingeEdge"), int) else None,
                 swing=d.get("swing") if isinstance(d.get("swing"), int) else None,
                 angleDeg=d.get("angleDeg") if isinstance(d.get("angleDeg"), (int, float)) else None,
                 wallSurfaceId=d.get("wallSurfaceId") if isinstance(d.get("wallSurfaceId"), str) else None,
-                doorThickness=d.get("doorThickness") if isinstance(d.get("doorThickness"), (int, float)) else None,
+                doorExtractionDepth=d.get("doorExtractionDepth") if isinstance(d.get("doorExtractionDepth"), (int, float)) else None,
                 boundarySplitEnabled=d.get("boundarySplitEnabled") if isinstance(d.get("boundarySplitEnabled"), bool) else None,
-                safetyMargin=d.get("safetyMargin") if isinstance(d.get("safetyMargin"), (int, float)) else None,
                 unitName=d.get("unitName") if isinstance(d.get("unitName"), str) else None,
             )
-            clean.append(entry)
+            # doorMesh / doorSplat — 옵션. Pydantic 가 형식 검증; 실패 시 그냥 패스 (corners 만으로 사용 가능).
+            dm = d.get("doorMesh")
+            if isinstance(dm, dict):
+                try: entry_kwargs["doorMesh"] = DoorMeshMeta(**dm)
+                except Exception: pass
+            ds = d.get("doorSplat")
+            if isinstance(ds, dict):
+                try: entry_kwargs["doorSplat"] = DoorSplatMeta(**ds)
+                except Exception: pass
+            clean.append(DoorEntry(**entry_kwargs))
         return DoorsJson(doors=clean)
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"doors.json 파싱 실패: {e}")
@@ -1005,51 +1078,3 @@ async def put_doors(
     upload.door_corners_json_path = key
     await db.commit()
     return body
-
-
-# ── 정합 결과 저장 (변환행렬 + basemap/door 매칭) ────────────────────────────
-
-class AlignmentMatch(BaseModel):
-    """모듈 문 ID(doors.json 의 id) ↔ basemap 의 매칭."""
-    module_door_id: str
-    basemap_id: str
-    basemap_door_id: str | None = None  # basemap 측 문 식별자(있으면)
-
-
-class AlignmentSaveRequest(BaseModel):
-    transform: dict[str, Any]            # {position:[x,y,z], rotation:[x,y,z,w], scale:[x,y,z]}
-    rmsd: float | None = None
-    matches: list[AlignmentMatch] = Field(default_factory=list)
-
-
-class AlignmentSaveResponse(BaseModel):
-    upload_id: UUID
-    saved_at: str
-
-
-@router.post("/{upload_id}/alignment", response_model=AlignmentSaveResponse)
-async def save_alignment(
-    upload_id: UUID,
-    body: AlignmentSaveRequest,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """정합 결과(변환행렬 + 매칭 정보) 를 upload-scoped 로 저장."""
-    from datetime import datetime, timezone
-
-    result = await db.execute(
-        select(Upload).where(Upload.id == upload_id, Upload.user_id == user.id)
-    )
-    upload = result.scalar_one_or_none()
-    if not upload:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="업로드를 찾을 수 없습니다.")
-
-    now = datetime.now(timezone.utc)
-    upload.alignment_transform = {
-        "transform": body.transform,
-        "rmsd": body.rmsd,
-        "matches": [m.model_dump() for m in body.matches],
-        "saved_at": now.isoformat(),
-    }
-    await db.commit()
-    return AlignmentSaveResponse(upload_id=upload.id, saved_at=now.isoformat())

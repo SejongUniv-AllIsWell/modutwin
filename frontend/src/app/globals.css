@@ -2,12 +2,60 @@
 @tailwind components;
 @tailwind utilities;
 
-/* 다크 테마(bg-gray-950)에 맞춘 커스텀 스크롤바.
-   Firefox 는 scrollbar-color / scrollbar-width, 그 외는 ::-webkit-scrollbar 로 처리. */
+/* Shared application palette. */
+:root {
+  --bg: #000000;
+  --bg-soft: #0a0a0a;
+  --paper: #1c1c1e;
+  --ink: #f5f5f7;
+  --ink-2: #c7c7cc;
+  --muted: #86868b;
+  --muted-2: #6e6e73;
+  --rule: #38383a;
+  --rule-soft: #2c2c2e;
+  --accent: #38bdf8;
+  --accent-2: #8b5cf6;
+  --accent-soft: rgba(56, 189, 248, 0.16);
+}
+
+/* 뷰어 영역: 어두운 캔버스 위에서 같은 토큰 이름을 쓰지만 색을 반전.
+   라이트 토큰을 그대로 두면 ink:#1a1a1a 가 어두운 배경 위에 깔려 가독성 0. */
+.viewer-dark {
+  --bg: #141414;
+  --bg-soft: #1f1d1a;
+  --paper: #1c1a17;
+  --ink: #f5f1e6;
+  --ink-2: #d8d3c4;
+  --muted: #b8b3a4;
+  --muted-2: #8a8676;
+  --rule: #3b3833;
+  --rule-soft: #2a2824;
+  --accent: #38bdf8;
+  --accent-2: #8b5cf6;
+  --accent-soft: rgba(56, 189, 248, 0.16);
+}
+
 @layer base {
+  html, body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--font-noto-sans-kr), 'Noto Sans KR', Helvetica, 'Helvetica Neue', Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  /* Display and monospace helpers. */
+  .serif {
+    font-family: var(--font-source-serif-4), 'Source Serif 4', Georgia, serif;
+  }
+  .mono {
+    font-family: var(--font-jetbrains-mono), 'JetBrains Mono', ui-monospace, Menlo, monospace;
+  }
+
+  /* Keep scrollbars subdued across dark viewer and landing surfaces. */
   * {
     scrollbar-width: thin;
-    scrollbar-color: #374151 transparent; /* thumb: gray-700, track: 투명 */
+    scrollbar-color: var(--rule) transparent;
   }
 
   *::-webkit-scrollbar {
@@ -20,21 +68,50 @@
   }
 
   *::-webkit-scrollbar-thumb {
-    background-color: #374151; /* gray-700 */
+    background-color: var(--rule);
     border-radius: 8px;
     border: 2px solid transparent;
     background-clip: padding-box;
   }
 
   *::-webkit-scrollbar-thumb:hover {
-    background-color: #4b5563; /* gray-600 */
+    background-color: var(--muted-2);
   }
 
   *::-webkit-scrollbar-thumb:active {
-    background-color: #6b7280; /* gray-500 */
+    background-color: var(--muted);
   }
 
   *::-webkit-scrollbar-corner {
     background: transparent;
+  }
+}
+
+@layer components {
+  .modutwin-logo {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 0;
+    text-decoration: none;
+    font-weight: 650;
+    letter-spacing: 0;
+  }
+
+  .modutwin-logo-dot {
+    position: relative;
+    display: inline-block;
+  }
+
+  .modutwin-logo-dot::before {
+    content: '';
+    position: absolute;
+    left: 50%;
+    top: -0.24em;
+    width: 0.28em;
+    height: 0.28em;
+    transform: translateX(-50%);
+    border-radius: 999px;
+    background: var(--accent);
+    box-shadow: 0 0 12px rgba(56, 189, 248, 0.45);
   }
 }

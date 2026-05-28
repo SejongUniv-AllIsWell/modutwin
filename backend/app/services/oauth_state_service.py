@@ -10,11 +10,7 @@ import hashlib
 import json
 import secrets
 
-import redis.asyncio as aioredis
-
-from app.core.config import get_settings
-
-settings = get_settings()
+from app.services.redis_one_time_store import getdel_raw, set_json_with_ttl
 
 OAUTH_STATE_TTL_SECONDS = 600
 _KEY_PREFIX = "oauth_state:"
@@ -40,19 +36,12 @@ async def issue_oauth_state(redirect_uri: str) -> dict[str, str]:
     state = secrets.token_urlsafe(32)
     code_verifier = generate_code_verifier()
     nonce = secrets.token_urlsafe(32)
-    payload = json.dumps(
-        {
-            "code_verifier": code_verifier,
-            "nonce": nonce,
-            "redirect_uri": redirect_uri,
-        }
-    )
-
-    client = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
-    try:
-        await client.set(_key(state), payload, ex=OAUTH_STATE_TTL_SECONDS)
-    finally:
-        await client.aclose()
+    payload = {
+        "code_verifier": code_verifier,
+        "nonce": nonce,
+        "redirect_uri": redirect_uri,
+    }
+    await set_json_with_ttl(_key(state), payload, OAUTH_STATE_TTL_SECONDS)
 
     return {
         "state": state,
@@ -66,11 +55,7 @@ async def consume_oauth_state(state: str | None) -> dict | None:
     if not state:
         return None
 
-    client = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
-    try:
-        raw = await client.getdel(_key(state))
-    finally:
-        await client.aclose()
+    raw = await getdel_raw(_key(state))
 
     if raw is None:
         return None

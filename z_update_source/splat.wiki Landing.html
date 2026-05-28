@@ -1,0 +1,707 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>splat.wiki — the collaborative encyclopedia of 3D Gaussian Splatting</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:        #f4f1ea;
+    --bg-soft:   #ede9df;
+    --paper:     #faf7f0;
+    --ink:       #1a1a1a;
+    --ink-2:     #2c2a26;
+    --muted:     #6b665e;
+    --muted-2:   #908a7e;
+    --rule:      #d9d3c4;
+    --rule-soft: #e7e1d1;
+    --link:      #1a1a1a;
+    --accent:    #1a1a1a;
+  }
+  *{ box-sizing: border-box; }
+  html, body{ margin:0; padding:0; background: var(--bg); color: var(--ink); }
+  body{
+    font-family: Helvetica, "Helvetica Neue", Arial, sans-serif;
+    font-size: 15px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  .serif{ font-family: "Source Serif 4", Georgia, serif; }
+  .mono{ font-family: "JetBrains Mono", ui-monospace, Menlo, monospace; }
+
+  a{ color: var(--link); text-decoration: underline; text-underline-offset: 3px; text-decoration-thickness: 1px; text-decoration-color: var(--muted-2);}
+  a:hover{ text-decoration-color: var(--ink); }
+
+  .wrap{ max-width: 1200px; margin: 0 auto; padding: 0 28px; }
+
+  /* ───────────── NAV ───────────── */
+  header.nav{
+    border-bottom: 1px solid var(--rule);
+    background: var(--bg);
+    position: sticky; top: 0; z-index: 10;
+    backdrop-filter: saturate(140%);
+  }
+  .nav-inner{
+    display: flex; align-items: center; justify-content: space-between;
+    height: 56px;
+  }
+  .brand{
+    display:flex; align-items:baseline; gap: 10px;
+    font-family: "Source Serif 4", serif;
+    font-weight: 600; font-size: 20px; letter-spacing: -0.01em;
+    text-decoration: none; color: var(--ink);
+  }
+  .brand .dot{ width:6px; height:6px; background: var(--ink); border-radius: 0; display:inline-block; transform: translateY(-3px); }
+  .brand-tag{
+    font-family: "JetBrains Mono", monospace;
+    font-size: 10.5px; color: var(--muted); letter-spacing: 0.06em; text-transform: uppercase;
+    margin-left: 4px;
+  }
+  nav.primary{ display:flex; align-items:center; gap: 22px; font-size: 13.5px;}
+  nav.primary a{ text-decoration: none; color: var(--ink-2); }
+  nav.primary a:hover{ color: var(--ink); text-decoration: underline; text-underline-offset: 3px; text-decoration-color: var(--ink); }
+  .search{
+    display:flex; align-items:center; gap:8px;
+    border: 1px solid var(--rule);
+    background: var(--paper);
+    border-radius: 2px;
+    padding: 6px 10px; width: 260px;
+    font-size: 13px;
+  }
+  .search input{
+    border: 0; outline: 0; background: transparent; flex:1; font: inherit; color: var(--ink);
+  }
+  .search .kbd{
+    font-family: "JetBrains Mono", monospace; font-size: 10.5px;
+    color: var(--muted); border: 1px solid var(--rule); border-radius: 2px;
+    padding: 1px 5px; background: var(--bg);
+  }
+  .btn{
+    display:inline-flex; align-items:center; gap:8px;
+    padding: 8px 14px; border-radius: 2px;
+    border: 1px solid var(--ink); background: var(--ink); color: var(--bg);
+    text-decoration: none; font-size: 13.5px; cursor: pointer;
+  }
+  .btn:hover{ background: #000; }
+  .btn.ghost{ background: transparent; color: var(--ink); }
+  .btn.ghost:hover{ background: var(--bg-soft); }
+
+  /* ───────────── HERO ───────────── */
+  .hero{
+    border-bottom: 1px solid var(--rule);
+    padding: 64px 0 56px;
+  }
+  .hero-grid{
+    display: grid;
+    grid-template-columns: 1.15fr 0.85fr;
+    gap: 56px;
+    align-items: center;
+  }
+  .eyebrow{
+    font-family: "JetBrains Mono", monospace;
+    font-size: 11.5px; letter-spacing: 0.12em; text-transform: uppercase;
+    color: var(--muted);
+    display:flex; align-items:center; gap:10px;
+    margin-bottom: 22px;
+  }
+  .eyebrow .pip{ width:6px; height:6px; background: var(--ink); border-radius:50%;}
+  h1.title{
+    font-family: "Source Serif 4", serif;
+    font-weight: 500;
+    font-size: clamp(40px, 5.4vw, 68px);
+    line-height: 1.02;
+    letter-spacing: -0.02em;
+    margin: 0 0 22px;
+    color: var(--ink);
+    text-wrap: balance;
+  }
+  h1.title em{ font-style: italic; font-weight: 500; }
+  .lede{
+    font-size: 17px; line-height: 1.6;
+    color: var(--ink-2);
+    max-width: 700px;
+    margin: 0 0 28px;
+  }
+  .cta-row{ display:flex; gap:12px; flex-wrap: wrap; align-items:center; margin-bottom: 28px;}
+  .hero-meta{
+    display: flex; gap: 24px; align-items: center;
+    font-family: "JetBrains Mono", monospace; font-size: 11.5px;
+    color: var(--muted); letter-spacing: 0.06em;
+  }
+  .hero-meta b{ color: var(--ink); font-weight: 600; font-family: "Source Serif 4", serif; font-size: 14px; letter-spacing: 0; }
+
+  /* Globe column */
+  .globe-col{
+    display:flex; align-items:center; justify-content:center;
+    position: relative;
+  }
+  .globe-card{
+    width: 100%;
+    aspect-ratio: 1 / 1;
+    max-width: 420px;
+    background: transparent;
+    border: 0;
+    position: relative;
+    display:grid; place-items:center;
+  }
+  .globe-wrap{ position: relative; width: 320px; height: 320px; cursor: pointer; transition: transform 700ms cubic-bezier(0.7, 0, 0.3, 1); transform-origin: center; will-change: transform; }
+  canvas.globe{ position: absolute; inset: 0; width: 320px; height: 320px; transition: opacity 600ms ease, filter 600ms ease; }
+  canvas#mono{ opacity: 1; }
+  canvas#digital{ opacity: 0; filter: drop-shadow(0 0 10px rgba(30,144,255,0.85)) drop-shadow(0 0 2px rgba(30,144,255,0.6)); }
+  .globe-wrap.is-digital canvas#mono{ opacity: 0; }
+  .globe-wrap.is-digital canvas#digital{ opacity: 1; }
+  .globe-wrap.is-zooming{ pointer-events: none; }
+
+  .page-fade{
+    position: fixed; inset: 0; background: var(--bg);
+    opacity: 0; pointer-events: none; z-index: 9999;
+    transition: opacity 500ms ease;
+  }
+  .page-fade.show{ opacity: 1; }
+
+  /* ───────────── ABOUT ───────────── */
+  section{ padding: 72px 0; border-bottom: 1px solid var(--rule); }
+  section.card-section{ padding: 10px 0; border-bottom: 0; }
+  section.card-section:first-of-type{ padding-top: 56px; }
+  section.card-section:last-of-type{ padding-bottom: 56px; }
+  section.card-section > .wrap{
+    background: var(--paper);
+    border: 1px solid var(--rule);
+    border-radius: 20px;
+    padding: 56px 48px;
+  }
+  .section-head{
+    display:flex; align-items: baseline; justify-content: space-between;
+    margin-bottom: 36px; gap: 20px;
+  }
+  .section-head .num{
+    font-family: "JetBrains Mono", monospace; font-size: 11.5px;
+    color: var(--muted); letter-spacing: 0.14em; text-transform: uppercase;
+  }
+  h2{
+    font-family: "Source Serif 4", serif;
+    font-weight: 500; font-size: clamp(28px, 3vw, 40px);
+    letter-spacing: -0.015em; line-height: 1.1; margin: 0;
+    color: var(--ink); text-wrap: balance;
+  }
+  .about-grid{
+    display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0;
+    border-top: 1px solid var(--rule);
+  }
+  .about-cell{
+    padding: 28px 24px 28px 0;
+    border-right: 1px solid var(--rule);
+    transition: transform 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+  .about-cell:hover{ transform: translateY(-3px) scale(1.015); }
+  .about-cell:last-child{ border-right: 0; padding-right: 0; padding-left: 0; }
+  .about-cell:not(:first-child){ padding-left: 24px; }
+  .about-cell .k{
+    font-family: "JetBrains Mono", monospace; font-size: 11px;
+    color: var(--muted); letter-spacing: 0.1em; text-transform: uppercase;
+    margin-bottom: 10px;
+  }
+  .about-cell h3{
+    font-family: "Source Serif 4", serif; font-weight: 500; font-size: 22px;
+    margin: 0 0 10px; letter-spacing: -0.01em;
+  }
+  .about-cell p{ margin: 0; color: var(--ink-2); font-size: 14.5px; }
+
+  /* ───────────── HOW IT WORKS ───────────── */
+  .steps{
+    display: grid; grid-template-columns: repeat(3, 1fr);
+    gap: 14px;
+  }
+  .step{
+    padding: 28px 24px 30px;
+    background: #ffffff;
+    border: 1px solid var(--rule-soft);
+    border-radius: 12px;
+    display:flex; flex-direction: column; gap: 14px;
+    transition: transform 220ms cubic-bezier(0.2, 0.8, 0.2, 1), border-color 160ms ease, box-shadow 220ms ease;
+  }
+  .step:hover{
+    transform: translateY(-4px) scale(1.025);
+    box-shadow: 0 10px 24px -12px rgba(0,0,0,0.18);
+  }
+  .step .n{
+    font-family: "Source Serif 4", serif; font-style: italic;
+    font-size: 56px; line-height: 1; color: var(--ink);
+    letter-spacing: -0.02em;
+  }
+  .step h3{
+    font-family: "Source Serif 4", serif; font-weight: 500;
+    font-size: 24px; margin: 0; letter-spacing: -0.01em;
+  }
+  .step p{ margin: 0; color: var(--ink-2); }
+  .step .link{
+    margin-top: auto; font-family: "JetBrains Mono", monospace;
+    font-size: 11.5px; letter-spacing: 0.08em; text-transform: uppercase;
+  }
+
+  /* ───────────── RECENT ENTRIES ───────────── */
+  .entries-grid{
+    display: grid; grid-template-columns: 2fr 1fr; gap: 56px;
+  }
+  ul.entries{
+    list-style: none; padding: 0; margin: 0;
+    display: grid; gap: 12px;
+  }
+  ul.entries li{
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    gap: 22px; align-items: start;
+    padding: 18px 22px;
+    background: #ffffff;
+    border: 1px solid var(--rule-soft);
+    border-radius: 12px;
+    transition: transform 220ms cubic-bezier(0.2, 0.8, 0.2, 1), border-color 160ms ease, box-shadow 220ms ease;
+  }
+  ul.entries li:hover{
+    transform: translateY(-3px) scale(1.012);
+    box-shadow: 0 10px 24px -12px rgba(0,0,0,0.18);
+  }
+  ul.entries .date{
+    font-family: "JetBrains Mono", monospace; font-size: 11.5px;
+    color: var(--muted); letter-spacing: 0.06em;
+    white-space: nowrap;
+    padding-top: 5px;
+  }
+  ul.entries .title{
+    font-family: "Source Serif 4", serif; font-size: 19px; font-weight: 500;
+    letter-spacing: -0.005em;
+  }
+  ul.entries .title a{ text-decoration: none; color: var(--ink); }
+  ul.entries .title a:hover{ text-decoration: underline; text-underline-offset: 3px;}
+  ul.entries .meta{
+    font-family: "JetBrains Mono", monospace; font-size: 11px;
+    color: var(--muted); letter-spacing: 0.06em; text-transform: uppercase;
+  }
+  ul.entries .meta.star{
+    display:inline-flex; align-items:center; gap:5px;
+    color: var(--ink); letter-spacing: 0.02em;
+    font-family: "JetBrains Mono", monospace;
+  }
+  ul.entries .meta.star svg{ color: #c9a227; }
+  ul.entries .meta.star{ padding-top: 5px; }
+
+  .side-card{
+    border: 1px solid var(--rule);
+    background: var(--paper);
+    padding: 22px;
+    border-radius: 2px;
+  }
+  .side-card h4{
+    font-family: "JetBrains Mono", monospace; font-size: 11px;
+    color: var(--muted); letter-spacing: 0.12em; text-transform: uppercase;
+    margin: 0 0 14px;
+  }
+  .side-card ul{ list-style: none; padding: 0; margin: 0; display:flex; flex-direction: column; gap: 10px; }
+  .side-card li{ display:flex; justify-content: space-between; align-items: baseline; gap: 10px; font-size: 14px;}
+  .side-card li a{ text-decoration: none; color: var(--ink); }
+  .side-card li a:hover{ text-decoration: underline; text-underline-offset: 3px;}
+  .side-card li .count{
+    font-family: "JetBrains Mono", monospace; font-size: 11px; color: var(--muted);
+  }
+  .side-card + .side-card{ margin-top: 18px; }
+
+  /* ───────────── CTA STRIP ───────────── */
+  .cta-strip{
+    padding: 72px 0;
+    border-bottom: 1px solid var(--rule);
+  }
+  .cta-strip .inner{
+    display:flex; justify-content: space-between; align-items: center; gap: 40px;
+  }
+  .cta-strip h2{ max-width: 22ch; }
+  .cta-strip p{ color: var(--ink-2); max-width: 48ch; margin: 12px 0 0;}
+
+  /* ───────────── FOOTER ───────────── */
+  footer{
+    padding: 36px 0 48px;
+    color: var(--muted);
+    font-size: 12.5px;
+  }
+  .foot-grid{
+    display:grid; grid-template-columns: 1fr; gap: 40px;
+    margin-bottom: 28px;
+  }
+  .foot-grid h5{
+    font-family: "JetBrains Mono", monospace; font-size: 10.5px;
+    color: var(--muted-2); letter-spacing: 0.12em; text-transform: uppercase;
+    margin: 0 0 10px;
+  }
+  .foot-grid ul{ list-style: none; padding: 0; margin: 0; display:flex; flex-direction: column; gap: 6px;}
+  .foot-grid a{ color: var(--ink-2); text-decoration: none; font-size: 13px;}
+  .foot-grid a:hover{ text-decoration: underline; text-underline-offset: 3px;}
+  .foot-bottom{
+    padding-top: 0;
+    display:flex; justify-content: space-between; gap: 20px; flex-wrap: wrap;
+    font-family: "JetBrains Mono", monospace; font-size: 14px;
+    letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink);
+  }
+
+  /* ───────────── Responsive ───────────── */
+  @media (max-width: 900px){
+    .hero-grid{ grid-template-columns: 1fr; gap: 36px; }
+    .about-grid{ grid-template-columns: 1fr; }
+    .about-cell{ border-right: 0; border-bottom: 1px solid var(--rule); padding: 22px 0; }
+    .about-cell:last-child{ border-bottom: 0; }
+    .about-cell:not(:first-child){ padding-left: 0; }
+    .steps{ grid-template-columns: 1fr; }
+    .entries-grid{ grid-template-columns: 1fr; }
+    .search{ display:none; }
+    nav.primary a:nth-child(n+3){ display:none; }
+    .cta-strip .inner{ flex-direction: column; align-items: flex-start; }
+  }
+</style>
+</head>
+<body style="font-family: &quot;Noto Sans KR&quot;">
+
+<!-- NAV -->
+<header class="nav" style="font-family: &quot;Noto Sans KR&quot;">
+  <div class="wrap nav-inner">
+    <a href="#" class="brand" style="font-family: serif">
+      splat<span class="dot"></span>wiki
+      <span class="brand-tag">
+</span>
+    </a>
+    <nav class="primary">
+      <a href="#about">About</a>
+      <a href="#entries">Browse</a>
+      <a href="#participate">Contribute</a>
+      <a href="#" class="btn ghost">Sign in</a>
+    </nav>
+  </div>
+</header>
+
+<!-- HERO -->
+<section class="hero" style="border-top:0;">
+  <div class="wrap hero-grid">
+    <div>
+      <h1 class="title serif" style="font-family: &quot;Noto Sans KR&quot;; font-size: 58px; width: 700px">The collaborative wiki for<br>
+<em style='font-family: "Times New Roman"'>3D Gaussian Splatting</em></h1>
+      <p class="lede" style="font-family: &quot;Noto Sans KR&quot;; width: 650px">splat.wiki is a crowdsourced platform for building digital twins of the real world with 3D Gaussian Splatting. 
+Upload a video, place it on the map, and it becomes part of a public atlas.</p>
+      <div class="cta-row">
+        <a href="#" class="btn" id="startNow">Start now →</a>
+      </div>
+      <div class="hero-meta">
+        <div><b>3,418</b> site</div>
+        <div><b>1,287</b> scenes catalogued</div>
+        <div><b>612</b> contributors</div>
+      </div>
+    </div>
+
+    <div class="globe-col">
+      <div class="globe-card">
+        <div class="globe-wrap" id="globeWrap">
+          <canvas class="globe" id="mono" width="640" height="640"></canvas>
+          <canvas class="globe" id="digital" width="640" height="640"></canvas>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- HOW TO PARTICIPATE (§01) -->
+<section id="about" class="card-section">
+  <div class="wrap">
+    <div class="section-head">
+      <span class="num">01 · How to participate</span>
+      <h2 class="serif">Ways to add your record</h2>
+    </div>
+    <div class="steps">
+      <div class="step">
+        <div class="n serif">i.</div>
+        <h3>Upload a video</h3>
+        <p>Drop in a phone or drone clip — we run frame extraction, SfM, and training. Your scene joins the atlas as soon as it converges.</p>
+        <a href="#" class="link">Upload video →</a>
+      </div>
+      <div class="step">
+        <div class="n serif">ii.</div>
+        <h3>Submit a point cloud</h3>
+        <p style='font-family: "Noto Sans KR"'>Already trained your splat? Upload the artefact directly — .ply, .sog, or .splat. Geo-tag it and it's instantly viewable.</p>
+        <a href="#" class="link">Upload point cloud →</a>
+      </div>
+      <div class="step">
+        <div class="n serif">iii.</div>
+        <h3>Contribute images + SfM</h3>
+        <p>Bring your own captures and COLMAP / OpenSfM output. We pick up the reconstruction from there and credit you on the resulting scene.</p>
+        <a href="#" class="link">Upload images &amp; SfM →</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- MOST LIKED (§02) -->
+<section id="participate" class="card-section">
+  <div class="wrap">
+    <div class="section-head">
+      <span class="num">02 · Community favourites</span>
+      <h2 class="serif">Most liked</h2>
+    </div>
+    <ul class="entries">
+      <li>
+        <span class="date">#1</span>
+        <div>
+          <div class="title"><a href="#">3DGS, explained without the math</a></div>
+          <div class="blurb">A reader-first walkthrough of what a Gaussian splat actually is, why it renders fast, and where its limits show.</div>
+        </div>
+        <span class="meta star"><svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path fill="currentColor" d="M8 1.2 9.93 5.46l4.67.48-3.5 3.16.99 4.6L8 11.3l-4.09 2.4.99-4.6L1.4 5.94l4.67-.48L8 1.2z"/></svg>4.2k</span>
+      </li>
+      <li>
+        <span class="date">#2</span>
+        <div>
+          <div class="title"><a href="#">Capture rigs for outdoor scenes</a></div>
+          <div class="blurb">Drone tracks, handheld 360 capture, and synchronised multi-camera arrays — with overlap, exposure, and COLMAP hygiene.</div>
+        </div>
+        <span class="meta star"><svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path fill="currentColor" d="M8 1.2 9.93 5.46l4.67.48-3.5 3.16.99 4.6L8 11.3l-4.09 2.4.99-4.6L1.4 5.94l4.67-.48L8 1.2z"/></svg>3.6k</span>
+      </li>
+      <li>
+        <span class="date">#3</span>
+        <div>
+          <div class="title"><a href="#">Anisotropic Gaussian primitives</a></div>
+          <div class="blurb">Covariance parameterisation, the 3×3 → quaternion+scale decomposition, and how anisotropy affects rasterisation order.</div>
+        </div>
+        <span class="meta star"><svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path fill="currentColor" d="M8 1.2 9.93 5.46l4.67.48-3.5 3.16.99 4.6L8 11.3l-4.09 2.4.99-4.6L1.4 5.94l4.67-.48L8 1.2z"/></svg>2.9k</span>
+      </li>
+      <li>
+        <span class="date">#4</span>
+        <div>
+          <div class="title"><a href="#">Comparison: 3DGS viewers (web)</a></div>
+          <div class="blurb">SuperSplat, gsplat-web, antimatter15/splat, Brush, Niantic Scaniverse — feature matrix, performance, and license summary.</div>
+        </div>
+        <span class="meta star"><svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path fill="currentColor" d="M8 1.2 9.93 5.46l4.67.48-3.5 3.16.99 4.6L8 11.3l-4.09 2.4.99-4.6L1.4 5.94l4.67-.48L8 1.2z"/></svg>2.4k</span>
+      </li>
+      <li>
+        <span class="date">#5</span>
+        <div>
+          <div class="title"><a href="#">Pruning &amp; densification heuristics</a></div>
+          <div class="blurb">Gradient thresholds, split vs. clone, opacity reset cadence — the gardening choices that decide whether a scene converges or explodes.</div>
+        </div>
+        <span class="meta star"><svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path fill="currentColor" d="M8 1.2 9.93 5.46l4.67.48-3.5 3.16.99 4.6L8 11.3l-4.09 2.4.99-4.6L1.4 5.94l4.67-.48L8 1.2z"/></svg>1.8k</span>
+      </li>
+    </ul>
+  </div>
+</section>
+
+<!-- RECENT ENTRIES -->
+<section id="entries" class="card-section">
+  <div class="wrap">
+    <div class="section-head">
+      <span class="num">03 · From the wiki</span>
+      <h2 class="serif">Recently edited</h2>
+    </div>
+    <ul class="entries">
+      <li>
+        <span class="date">2026 · 05 · 18</span>
+        <div>
+          <div class="title"><a href="#">Anisotropic Gaussian primitives</a></div>
+          <div class="blurb">Covariance parameterisation, the 3×3 → quaternion+scale decomposition, and how anisotropy affects rasterisation order.</div>
+        </div>
+      </li>
+      <li>
+        <span class="date">2026 · 05 · 17</span>
+        <div>
+          <div class="title"><a href="#">Comparison: 3DGS viewers (web)</a></div>
+          <div class="blurb">SuperSplat, gsplat-web, antimatter15/splat, Brush, Niantic Scaniverse — feature matrix, performance, and license summary.</div>
+        </div>
+      </li>
+      <li>
+        <span class="date">2026 · 05 · 15</span>
+        <div>
+          <div class="title"><a href="#">Capture rigs for outdoor scenes</a></div>
+          <div class="blurb">Drone tracks, handheld 360 capture, and synchronised multi-camera arrays. With suggested overlap, exposure locking, and COLMAP hygiene.</div>
+        </div>
+      </li>
+      <li>
+        <span class="date">2026 · 05 · 12</span>
+        <div>
+          <div class="title"><a href="#">Spherical harmonics for view-dependent colour</a></div>
+          <div class="blurb">Why splatting uses SH coefficients, what the band-limit trade-off looks like in practice, and how to bake to RGB for mobile viewers.</div>
+        </div>
+      </li>
+      <li>
+        <span class="date">2026 · 05 · 09</span>
+        <div>
+          <div class="title"><a href="#">Pruning &amp; densification heuristics</a></div>
+          <div class="blurb">Gradient thresholds, split vs. clone, opacity reset cadence — the gardening choices that decide whether a scene converges or explodes.</div>
+        </div>
+      </li>
+    </ul>
+  </div>
+</section>
+
+<!-- FOOTER -->
+<footer>
+  <div class="wrap">
+    <div class="foot-bottom">
+      <span>© 2024–2026 splat.wiki</span>
+      <span>v0.9.3 · public beta · build 2026.05.18</span>
+    </div>
+  </div>
+</footer>
+
+<!-- ───────────── Globe (monochrome, real country outlines) ───────────── -->
+<script src="https://unpkg.com/d3@7.9.0/dist/d3.min.js"></script>
+<script src="https://unpkg.com/topojson-client@3.1.0/dist/topojson-client.min.js"></script>
+<script>
+(async function(){
+  const monoCanvas = document.getElementById('mono');
+  const digCanvas  = document.getElementById('digital');
+  const wrap       = document.getElementById('globeWrap');
+  if (!monoCanvas || !digCanvas) return;
+
+  // CSS px 320, backing 640 for HiDPI
+  const CSS = 320;
+  const SIZE = 640;
+  const R = (316 / 2) * (SIZE / CSS);
+  const cx = SIZE/2, cy = SIZE/2;
+  const monoCtx = monoCanvas.getContext('2d');
+  const digCtx  = digCanvas.getContext('2d');
+
+  const projection = d3.geoOrthographic()
+    .scale(R)
+    .translate([cx, cy])
+    .clipAngle(90)
+    .rotate([0, -12, 0]);
+
+  const pathMono = d3.geoPath(projection, monoCtx);
+  const pathDig  = d3.geoPath(projection, digCtx);
+
+  let world, land, borderMesh;
+  try {
+    world = await fetch('https://unpkg.com/world-atlas@2.0.2/countries-110m.json').then(r => r.json());
+    land = topojson.feature(world, world.objects.land);
+    borderMesh = topojson.mesh(world, world.objects.countries, (a,b) => a !== b);
+  } catch (e) {
+    console.error('Failed to load world data', e);
+    return;
+  }
+
+  const sphere = { type: 'Sphere' };
+  const graticule = d3.geoGraticule10();
+
+  function drawMono(){
+    monoCtx.clearRect(0,0,SIZE,SIZE);
+
+    // very subtle sphere tint
+    monoCtx.beginPath();
+    pathMono(sphere);
+    monoCtx.fillStyle = 'rgba(0,0,0,0.03)';
+    monoCtx.fill();
+
+    // land in ink
+    monoCtx.beginPath();
+    pathMono(land);
+    monoCtx.fillStyle = '#1a1a1a';
+    monoCtx.fill();
+
+    // country seams (off-white)
+    monoCtx.beginPath();
+    pathMono(borderMesh);
+    monoCtx.lineWidth = 1.1;
+    monoCtx.strokeStyle = 'rgba(244,241,234,0.65)';
+    monoCtx.stroke();
+
+    // sphere outline
+    monoCtx.beginPath();
+    pathMono(sphere);
+    monoCtx.lineWidth = 1.4;
+    monoCtx.strokeStyle = 'rgba(0,0,0,0.85)';
+    monoCtx.stroke();
+  }
+
+  function drawDigital(){
+    digCtx.clearRect(0,0,SIZE,SIZE);
+
+    // country borders
+    digCtx.beginPath();
+    pathDig(borderMesh);
+    digCtx.lineWidth = 1.1;
+    digCtx.strokeStyle = 'rgba(80,170,255,1)';
+    digCtx.stroke();
+
+    // coastlines brighter
+    digCtx.beginPath();
+    pathDig(land);
+    digCtx.lineWidth = 1.4;
+    digCtx.strokeStyle = '#7ec8ff';
+    digCtx.stroke();
+
+    // sphere ring
+    digCtx.beginPath();
+    pathDig(sphere);
+    digCtx.lineWidth = 1.4;
+    digCtx.strokeStyle = 'rgba(30,144,255,1)';
+    digCtx.stroke();
+  }
+
+  let t0 = performance.now();
+  const spinDegPerSec = 14;
+  function tick(now){
+    const dt = (now - t0) / 1000;
+    const lambda = -10 + dt * spinDegPerSec;
+    projection.rotate([lambda, -12, 0]);
+    drawMono();
+    drawDigital();
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+
+  // Hover swap
+  wrap.addEventListener('mouseenter', () => wrap.classList.add('is-digital'));
+  wrap.addEventListener('mouseleave', () => wrap.classList.remove('is-digital'));
+
+  // Click → zoom to fullscreen → redirect to explore
+  const fade = document.createElement('div');
+  fade.className = 'page-fade';
+  document.body.appendChild(fade);
+
+  function zoomAndGo(){
+    if (wrap.classList.contains('is-zooming')) return;
+    wrap.classList.add('is-zooming', 'is-digital');
+
+    const rect = wrap.getBoundingClientRect();
+    const vw = window.innerWidth, vh = window.innerHeight;
+    const cxScreen = rect.left + rect.width / 2;
+    const cyScreen = rect.top + rect.height / 2;
+    const dx = Math.max(cxScreen, vw - cxScreen);
+    const dy = Math.max(cyScreen, vh - cyScreen);
+    const maxDist = Math.hypot(dx, dy);
+    const scale = (maxDist * 2.2) / rect.width;
+
+    const tx = (vw / 2) - cxScreen;
+    const ty = (vh / 2) - cyScreen;
+
+    // Scroll back to top so the zoom origin matches the user's mental model
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+
+    wrap.style.transition = 'transform 900ms cubic-bezier(0.7, 0, 0.3, 1)';
+    wrap.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`;
+
+    setTimeout(() => fade.classList.add('show'), 350);
+    setTimeout(() => {
+      window.location.href = 'Globe Explore.html';
+    }, 900);
+  }
+
+  wrap.addEventListener('click', zoomAndGo);
+
+  const startBtn = document.getElementById('startNow');
+  if (startBtn) {
+    startBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      zoomAndGo();
+    });
+  }
+})();
+</script>
+
+</body>
+</html>
