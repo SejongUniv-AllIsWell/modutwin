@@ -39,6 +39,11 @@ interface Props {
 }
 
 type ManualMode = 'translate' | 'rotate' | 'scale';
+type LocalTransformSnapshot = {
+  position: [number, number, number];
+  rotation: [number, number, number, number];
+  scale: [number, number, number];
+};
 
 const ANIM_MAX_MS = 2500;
 const ANIM_BASE_MS = 400;
@@ -88,6 +93,25 @@ function reparentPreserveWorld(pc: any, ent: any, newParent: any): void {
   ent.setLocalPosition(t.x, t.y, t.z);
   ent.setLocalRotation(r.x, r.y, r.z, r.w);
   ent.setLocalScale(s.x, s.y, s.z);
+}
+
+function captureLocalTransform(ent: any): LocalTransformSnapshot {
+  const p = ent.getLocalPosition();
+  const r = ent.getLocalRotation();
+  const s = ent.getLocalScale();
+  return {
+    position: [p.x, p.y, p.z],
+    rotation: [r.x, r.y, r.z, r.w],
+    scale: [s.x, s.y, s.z],
+  };
+}
+
+function restoreParentAndLocal(ent: any, oldParent: any, local: LocalTransformSnapshot): void {
+  if (!ent || !oldParent) return;
+  oldParent.addChild(ent);
+  ent.setLocalPosition(local.position[0], local.position[1], local.position[2]);
+  ent.setLocalRotation(local.rotation[0], local.rotation[1], local.rotation[2], local.rotation[3]);
+  ent.setLocalScale(local.scale[0], local.scale[1], local.scale[2]);
 }
 
 function anisotropicRectToMat4(pc: any, R: number[], scale: [number, number, number], t: number[]): any {
@@ -261,7 +285,7 @@ export default function AlignPanel({
   // doorPivot 준비 상태 — UI 슬라이더 노출 조건. ref 만으론 re-render 트리거 안 되므로 별도 state.
   const [doorPivotReady, setDoorPivotReady] = useState(false);
   // doorPivotGroup 에 reparent 된 entity 들의 원래 부모 정보 (revert 용).
-  const doorPivotMembersRef = useRef<Array<{ ent: any; oldParent: any }>>([]);
+  const doorPivotMembersRef = useRef<Array<{ ent: any; oldParent: any; oldLocal: LocalTransformSnapshot }>>([]);
   // hinge 회전 상태 (Phase 4).
   const [doorAngleDeg, setDoorAngleDeg] = useState(0);
   // hinge 축 (world frame) — basemap door corner [0]→[3] 변 기준 (왼쪽 변, 수직축).
@@ -444,7 +468,7 @@ export default function AlignPanel({
           if (doorPivotGroupRef.current) {
             for (const m of doorPivotMembersRef.current) {
               if (m.ent && m.oldParent) {
-                try { reparentPreserveWorld(pc, m.ent, m.oldParent); } catch {}
+                try { restoreParentAndLocal(m.ent, m.oldParent, m.oldLocal); } catch {}
               }
             }
             doorPivotMembersRef.current = [];
@@ -471,7 +495,8 @@ export default function AlignPanel({
             const isFrame = name === 'doorFrame';
             if (isModuleDoorWrapper || isBasemapDoorWrapper || isFrame) {
               const oldParent = c.parent;
-              doorPivotMembersRef.current.push({ ent: c, oldParent });
+              const oldLocal = captureLocalTransform(c);
+              doorPivotMembersRef.current.push({ ent: c, oldParent, oldLocal });
               reparentPreserveWorld(pc, c, doorPivot);
             }
           }
@@ -572,18 +597,11 @@ export default function AlignPanel({
     group.setLocalPosition(0, 0, 0);
     group.setLocalEulerAngles(0, 0, 0);
     group.setLocalScale(1, 1, 1);
-    if (frameEntityRef.current) {
-      try { frameEntityRef.current.destroy(); } catch {}
-      frameEntityRef.current = null;
-    }
     // doorPivotGroup 정리 — 멤버들을 원래 부모로 복원하고 그룹 destroy.
     if (doorPivotGroupRef.current) {
-      const pc = coreRef.current?.getPC();
-      if (pc) {
-        for (const m of doorPivotMembersRef.current) {
-          if (m.ent && m.oldParent) {
-            try { reparentPreserveWorld(pc, m.ent, m.oldParent); } catch {}
-          }
+      for (const m of doorPivotMembersRef.current) {
+        if (m.ent && m.oldParent) {
+          try { restoreParentAndLocal(m.ent, m.oldParent, m.oldLocal); } catch {}
         }
       }
       doorPivotMembersRef.current = [];
@@ -593,6 +611,10 @@ export default function AlignPanel({
       setDoorAngleDeg(0);
       setDoorPivotReady(false);
     }
+    if (frameEntityRef.current) {
+      try { frameEntityRef.current.destroy(); } catch {}
+      frameEntityRef.current = null;
+    }
     setAligned(false);
     setRmsd(null);
     setError(null);
@@ -601,13 +623,19 @@ export default function AlignPanel({
   // 모달/패널 언마운트 시 frame + doorPivot 정리.
   useEffect(() => {
     return () => {
+      if (doorPivotGroupRef.current) {
+        for (const m of doorPivotMembersRef.current) {
+          if (m.ent && m.oldParent) {
+            try { restoreParentAndLocal(m.ent, m.oldParent, m.oldLocal); } catch {}
+          }
+        }
+        doorPivotMembersRef.current = [];
+        try { doorPivotGroupRef.current.destroy(); } catch {}
+        doorPivotGroupRef.current = null;
+      }
       if (frameEntityRef.current) {
         try { frameEntityRef.current.destroy(); } catch {}
         frameEntityRef.current = null;
-      }
-      if (doorPivotGroupRef.current) {
-        try { doorPivotGroupRef.current.destroy(); } catch {}
-        doorPivotGroupRef.current = null;
       }
     };
   }, []);
