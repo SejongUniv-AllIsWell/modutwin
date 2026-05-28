@@ -62,7 +62,7 @@ export function wallSurfaceIds(numEdges: number): string[] {
 
 export type OpRecord =
   | { type: 'rotation'; prevRotation: { rotX: number; rotZ: number } }
-  | { type: 'flatten'; prevMask: Uint8Array | null; prevActive: boolean }
+  | { type: 'boundaryCull'; prevMask: Uint8Array | null; prevActive: boolean }
   | { type: 'floater'; prevMask: Uint8Array | null; prevActive: boolean }
   | { type: 'clipping'; prevSnapshot: Array<{ idx: number; s0: number; s1: number; s2: number }>; prevActive: boolean }
   | { type: 'wallMesh'; prevEntities: any[]; prevActive: boolean };

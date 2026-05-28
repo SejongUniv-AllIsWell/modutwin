@@ -91,6 +91,7 @@ export function useRefinedMeshLoader(
           ply_url: string;
           mesh_meta_url: string | null;
           textures: Record<string, string>;
+          texture_variants?: Record<string, Record<string, string>>;
           scene_id: string;
           doors?: Array<{
             id: string;
@@ -214,6 +215,28 @@ export function useRefinedMeshLoader(
             });
           });
           const images = await Promise.all(imgPromises);
+          const viewImageMatrix = await Promise.all(
+            surfaces.map((surface: any) => Promise.all(
+              ((surface.textureVariants ?? []) as any[]).map((variant: any) => {
+                const url = bundle.texture_variants?.[surface.surfaceId]?.[variant.id];
+                if (!url) return Promise.resolve(null);
+                return new Promise<{ id: string; viewpoint: [number, number, number]; image: HTMLImageElement } | null>((res) => {
+                  const img = new Image();
+                  img.crossOrigin = 'anonymous';
+                  img.onload = () => res({
+                    id: String(variant.id),
+                    viewpoint: variant.viewpoint as [number, number, number],
+                    image: img,
+                  });
+                  img.onerror = () => {
+                    console.warn(`[useRefinedMeshLoader] view texture load failed: ${surface.surfaceId}/${variant.id}`);
+                    res(null);
+                  };
+                  img.src = url;
+                });
+              }),
+            )),
+          );
           if (cancelled) return;
 
           for (let i = 0; i < surfaces.length; i++) {
@@ -226,6 +249,13 @@ export function useRefinedMeshLoader(
               uvs: surface.uvs,
               normalInward: surface.normalInward,
               textureImage: img,
+              viewTextures: viewImageMatrix[i]
+                .filter(Boolean)
+                .map((variant: any) => ({
+                  id: variant.id,
+                  viewpoint: variant.viewpoint,
+                  textureImage: variant.image,
+                })),
             }, {
               mutableTexture: mutableTextures,
               onTextureData: (texture) => onWallTextureData?.({

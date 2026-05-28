@@ -18,15 +18,10 @@ export default function Navbar() {
       <div className="px-4 sm:px-10 flex items-center justify-between h-14 gap-4">
         <Link
           href="/"
-          className="flex items-baseline gap-[10px] no-underline serif font-semibold text-xl whitespace-nowrap"
-          style={{ color: 'var(--ink)', letterSpacing: 0 }}
+          className="modutwin-logo text-xl whitespace-nowrap"
+          style={{ color: 'var(--ink)' }}
         >
-          modu
-          <span
-            className="inline-block w-[6px] h-[6px] -translate-y-[3px]"
-            style={{ background: 'var(--ink)' }}
-          />
-          twin
+          m<span className="modutwin-logo-dot">o</span>d<span className="modutwin-logo-dot">u</span>twin
         </Link>
 
         <div className="flex items-center gap-4">
@@ -34,8 +29,11 @@ export default function Navbar() {
             <>
               <Link
                 href="/dashboard"
-                className="text-sm whitespace-nowrap hover:underline underline-offset-4"
-                style={{ color: 'var(--ink-2)' }}
+                className="text-sm whitespace-nowrap rounded-sm px-2.5 py-1.5 hover:bg-sky-400/10"
+                style={{
+                  color: pathname.startsWith('/dashboard') ? 'var(--accent)' : 'var(--ink-2)',
+                  background: pathname.startsWith('/dashboard') ? 'var(--accent-soft)' : undefined,
+                }}
               >
                 마이페이지
               </Link>
@@ -44,7 +42,7 @@ export default function Navbar() {
               </span>
               <button
                 onClick={logout}
-                className="text-sm whitespace-nowrap hover:underline underline-offset-4"
+                className="text-sm whitespace-nowrap rounded-sm px-2.5 py-1.5 hover:bg-sky-400/10"
                 style={{ color: 'var(--muted)' }}
               >
                 로그아웃
@@ -53,7 +51,7 @@ export default function Navbar() {
           ) : (
             <button
               onClick={login}
-              className="text-sm px-4 py-1.5 rounded-sm whitespace-nowrap border"
+              className="text-sm px-4 py-1.5 rounded-sm whitespace-nowrap border hover:brightness-110 active:brightness-95"
               style={{
                 background: 'var(--accent)',
                 color: '#04131f',

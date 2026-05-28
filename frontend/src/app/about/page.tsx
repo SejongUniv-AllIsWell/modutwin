@@ -131,28 +131,23 @@ export default function AboutPage() {
         <div className="max-w-[1200px] mx-auto px-7 h-14 flex items-center justify-between">
           <a
             href="/"
-            className="flex items-baseline gap-[10px] no-underline serif font-semibold text-xl"
-            style={{ color: 'var(--ink)', letterSpacing: 0 }}
+            className="modutwin-logo text-xl"
+            style={{ color: 'var(--ink)' }}
           >
-            modu
-            <span
-              className="inline-block w-[6px] h-[6px] -translate-y-[3px]"
-              style={{ background: 'var(--ink)' }}
-            />
-            twin
+            m<span className="modutwin-logo-dot">o</span>d<span className="modutwin-logo-dot">u</span>twin
           </a>
           <nav className="flex items-center gap-6 text-[13.5px]">
             <a
               href="/about"
-              className="hover:underline underline-offset-4"
-              style={{ color: 'var(--ink)', fontWeight: 500 }}
+              className="rounded-sm px-2.5 py-1.5"
+              style={{ color: 'var(--accent)', background: 'var(--accent-soft)', fontWeight: 600 }}
             >
               About
             </a>
             <button
               type="button"
               onClick={goExplore}
-              className="hover:underline underline-offset-4"
+              className="rounded-sm px-2.5 py-1.5 hover:bg-sky-400/10 active:bg-sky-400/20 focus-visible:outline focus-visible:outline-2 focus-visible:outline-sky-400/60"
               style={{ color: 'var(--ink-2)' }}
             >
               Browse
@@ -160,7 +155,7 @@ export default function AboutPage() {
             <button
               type="button"
               onClick={requireLoginThenExplore}
-              className="hover:underline underline-offset-4"
+              className="rounded-sm px-2.5 py-1.5 hover:bg-sky-400/10 active:bg-sky-400/20 focus-visible:outline focus-visible:outline-2 focus-visible:outline-sky-400/60"
               style={{ color: 'var(--ink-2)' }}
             >
               Contribute
@@ -176,7 +171,7 @@ export default function AboutPage() {
               <button
                 type="button"
                 onClick={login}
-                className="px-3 py-1.5 rounded-sm hover:bg-[var(--bg-soft)]"
+                className="px-3 py-1.5 rounded-sm hover:bg-sky-400/10"
                 style={{ color: 'var(--ink)' }}
               >
                 Sign in
@@ -192,8 +187,8 @@ export default function AboutPage() {
       >
         <div className="max-w-[1200px] mx-auto px-7">
           <span
-            className="mono text-[11.5px] uppercase tracking-[0.14em] block mb-6"
-            style={{ color: 'var(--muted)' }}
+            className="mono text-[11.5px] uppercase block mb-6"
+            style={{ color: 'var(--muted)', letterSpacing: 0 }}
           >
             About · ModuTwin
           </span>
@@ -227,13 +222,13 @@ export default function AboutPage() {
         >
           <div className="flex items-baseline justify-between gap-5 mb-9 flex-wrap">
             <span
-              className="mono text-[11.5px] uppercase tracking-[0.14em]"
-              style={{ color: 'var(--muted)' }}
+            className="mono text-[11.5px] uppercase"
+            style={{ color: 'var(--muted)', letterSpacing: 0 }}
             >
               01 · 3D Gaussian Splatting
             </span>
             <h2
-              className="serif font-medium m-0 text-balance"
+              className="font-semibold m-0 text-balance"
               style={{ fontSize: 'clamp(28px, 3vw, 40px)', color: 'var(--ink)' }}
             >
               수백만 개의 작은 빛 덩어리
@@ -254,13 +249,13 @@ export default function AboutPage() {
                 style={{ background: 'var(--paper)', border: '1px solid var(--rule-soft)', borderRadius: 8 }}
               >
                 <div
-                  className="serif italic text-[14px] mb-3"
+                  className="text-[14px] mb-3"
                   style={{ color: 'var(--muted)' }}
                 >
                   {f.eyebrow}
                 </div>
                 <h3
-                  className="serif font-medium m-0 mb-3"
+                  className="font-semibold m-0 mb-3"
                   style={{ fontSize: 22, letterSpacing: 0 }}
                 >
                   {f.title}
@@ -286,13 +281,13 @@ export default function AboutPage() {
         >
           <div className="flex items-baseline justify-between gap-5 mb-9 flex-wrap">
             <span
-              className="mono text-[11.5px] uppercase tracking-[0.14em]"
-              style={{ color: 'var(--muted)' }}
+              className="mono text-[11.5px] uppercase"
+              style={{ color: 'var(--muted)', letterSpacing: 0 }}
             >
               02 · The platform
             </span>
             <h2
-              className="serif font-medium m-0 text-balance"
+              className="font-semibold m-0 text-balance"
               style={{ fontSize: 'clamp(28px, 3vw, 40px)', color: 'var(--ink)' }}
             >
               실내를 위한, 모두가 함께 쓰는 지도
@@ -316,7 +311,7 @@ export default function AboutPage() {
                 style={{ background: 'var(--paper)', border: '1px solid var(--rule-soft)', borderRadius: 8 }}
               >
                 <h3
-                  className="serif font-medium m-0 mb-3"
+                  className="font-semibold m-0 mb-3"
                   style={{ fontSize: 22, letterSpacing: 0 }}
                 >
                   {p.title}
@@ -342,13 +337,13 @@ export default function AboutPage() {
         >
           <div className="flex items-baseline justify-between gap-5 mb-9 flex-wrap">
             <span
-              className="mono text-[11.5px] uppercase tracking-[0.14em]"
-              style={{ color: 'var(--muted)' }}
+              className="mono text-[11.5px] uppercase"
+              style={{ color: 'var(--muted)', letterSpacing: 0 }}
             >
               03 · From video to digital twin
             </span>
             <h2
-              className="serif font-medium m-0 text-balance"
+              className="font-semibold m-0 text-balance"
               style={{ fontSize: 'clamp(28px, 3vw, 40px)', color: 'var(--ink)' }}
             >
               영상이 디지털 트윈이 되기까지
@@ -368,10 +363,10 @@ export default function AboutPage() {
                 }}
               >
                 <span
-                  className="serif italic leading-none"
+                  className="mono leading-none font-semibold"
                   style={{
                     fontSize: 44,
-                    color: 'var(--ink)',
+                    color: 'var(--accent)',
                     letterSpacing: 0,
                     minWidth: 56,
                   }}
@@ -380,7 +375,7 @@ export default function AboutPage() {
                 </span>
                 <div className="min-w-0">
                   <h3
-                    className="serif font-medium m-0 mb-3"
+                    className="font-semibold m-0 mb-3"
                     style={{ fontSize: 22, letterSpacing: 0 }}
                   >
                     {s.title}
@@ -428,8 +423,8 @@ export default function AboutPage() {
       <footer style={{ padding: '36px 0 48px', color: 'var(--muted)' }}>
         <div className="max-w-[1200px] mx-auto px-7">
           <div
-            className="flex justify-between gap-5 flex-wrap mono text-[14px] uppercase tracking-[0.08em]"
-            style={{ color: 'var(--ink)' }}
+            className="flex justify-between gap-5 flex-wrap mono text-[14px] uppercase"
+            style={{ color: 'var(--ink)', letterSpacing: 0 }}
           >
             <span>© 2024–2026 ModuTwin</span>
             <span>public beta · build {process.env.NEXT_PUBLIC_BUILD_TAG ?? '2026.05.21'}</span>

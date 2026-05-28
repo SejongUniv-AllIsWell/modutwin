@@ -3,7 +3,6 @@
  *
  * 두 가지 용도:
  *   - 안전거리 (globalOffset): 각 면 중심에서 ±normal 양방향. 면별 색.
- *   - 알파 블렌딩 시작 (depthGate): 각 면 중심에서 -normal 방향(방 안쪽)만. 단일 색.
  *
  * 좌표는 A' 프레임 (raw + pendingRotation) — wallMesh와 동일하게
  * Z-180만 직접 부여하여 splat과 정렬.

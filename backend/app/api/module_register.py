@@ -247,13 +247,25 @@ async def commit_final(
     # ceiling/floor 필수 + w0..w(N-1) 폴리곤 변 수만큼. multipart form 한 번 읽음 (cached).
     form = await request.form()
     tex_uploads: dict[str, UploadFile] = {}
+    tex_variant_uploads: dict[str, UploadFile] = {}
+    door_tex_uploads: dict[str, UploadFile] = {}
+    door_splat_uploads: dict[str, UploadFile] = {}
     for key, value in form.multi_items():
+        if not hasattr(value, "read") or not hasattr(value, "filename"):
+            continue
+        if key.startswith("door_tex_"):
+            door_tex_uploads[key] = value  # type: ignore[assignment]
+            continue
+        if key.startswith("door_splat_"):
+            door_splat_uploads[key] = value  # type: ignore[assignment]
+            continue
+        if key.startswith("texview_"):
+            tex_variant_uploads[key[len("texview_"):]] = value  # type: ignore[assignment]
+            continue
         if not key.startswith("tex_"):
             continue
         sid = key[len("tex_"):]
         if not (sid in REQUIRED_TEXTURE_KEYS or _WALL_KEY_RE.match(sid)):
-            continue
-        if not hasattr(value, "read") or not hasattr(value, "filename"):
             continue
         tex_uploads[sid] = value  # type: ignore[assignment]
     missing = [k for k in REQUIRED_TEXTURE_KEYS if k not in tex_uploads]
@@ -334,6 +346,10 @@ async def commit_final(
     mesh_key = f"{refined_dir}/mesh.json"
     doors_key = f"{base}/alignment/refined/doors.json"  # CLAUDE.md 규약과 일관 (doors 는 refined 디렉터리 직속)
     tex_keys = {tid: f"{refined_dir}/tex_{tid}.png" for tid in tex_uploads.keys()}
+    tex_variant_keys = {tid: f"{refined_dir}/tex_{tid}.png" for tid in tex_variant_uploads.keys()}
+    door_asset_dir = f"{base}/alignment/refined/door_assets"
+    door_tex_keys = {field: f"{door_asset_dir}/{field}.png" for field in door_tex_uploads.keys()}
+    door_splat_keys = {field: f"{door_asset_dir}/{field}.ply" for field in door_splat_uploads.keys()}
 
     # ── Upload 행 생성 ──
     final_ply_bytes = await final_ply.read()
@@ -351,19 +367,55 @@ async def commit_final(
     db.add(upload)
     await db.flush()
 
-    # ── MinIO 업로드 (final.ply + mesh.json + tex_*.png + doors.json) ──
+    # ── doors.json 의 multipart placeholder 를 최종 MinIO key 로 치환 ──
+    try:
+        doors_payload = json.loads((await doors_json.read()).decode("utf-8"))
+        for door in doors_payload.get("doors", []):
+            if not isinstance(door, dict):
+                continue
+            door_mesh = door.get("doorMesh")
+            if isinstance(door_mesh, dict):
+                tex_ref = door_mesh.get("textureFilename")
+                if isinstance(tex_ref, str) and tex_ref.startswith("form:"):
+                    field = tex_ref[len("form:"):]
+                    if field not in door_tex_uploads:
+                        raise HTTPException(status_code=400, detail=f"도어 텍스처 파일 누락: {field}")
+                    door_mesh["textureFilename"] = door_tex_keys[field]
+            door_splat = door.get("doorSplat")
+            if isinstance(door_splat, dict):
+                splat_ref = door_splat.get("filename")
+                if isinstance(splat_ref, str) and splat_ref.startswith("form:"):
+                    field = splat_ref[len("form:"):]
+                    if field not in door_splat_uploads:
+                        raise HTTPException(status_code=400, detail=f"도어 splat 파일 누락: {field}")
+                    door_splat["filename"] = door_splat_keys[field]
+        doors_bytes = json.dumps(doors_payload, ensure_ascii=False).encode("utf-8")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"doors_json 형식 오류: {e}")
+
+    # ── MinIO 업로드 (final.ply + mesh.json + tex_*.png + doors.json + door assets) ──
     try:
         minio.put_object_bytes(final_ply_key, final_ply_bytes, "application/octet-stream")
 
         mesh_bytes = await mesh_json.read()
         minio.put_object_bytes(mesh_key, mesh_bytes, "application/json")
 
-        doors_bytes = await doors_json.read()
         minio.put_object_bytes(doors_key, doors_bytes, "application/json")
 
         for tid, f in tex_uploads.items():
             data = await f.read()
             minio.put_object_bytes(tex_keys[tid], data, "image/png")
+        for tid, f in tex_variant_uploads.items():
+            data = await f.read()
+            minio.put_object_bytes(tex_variant_keys[tid], data, "image/png")
+        for field, f in door_tex_uploads.items():
+            data = await f.read()
+            minio.put_object_bytes(door_tex_keys[field], data, "image/png")
+        for field, f in door_splat_uploads.items():
+            data = await f.read()
+            minio.put_object_bytes(door_splat_keys[field], data, "application/octet-stream")
     except Exception as e:
         # 부분 실패 — 이미 일부 객체가 올라갔을 수 있어 정리 시도.
         try:

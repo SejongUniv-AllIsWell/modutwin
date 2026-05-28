@@ -110,7 +110,10 @@ export function useAdditionalGsplats(
         return;
       }
 
-      const asset = new pc.Asset(`add_splat_${id}`, 'gsplat', { url });
+      const ext = url.split('?')[0].split('.').pop()?.toLowerCase();
+      const isBlob = url.startsWith('blob:');
+      const filename = isBlob ? 'splat.ply' : (ext ?? 'ply');
+      const asset = new pc.Asset(`add_splat_${id}`, 'gsplat', { url, filename }, { reorder: false } as any);
       app.assets.add(asset);
       assetMapRef.current.set(id, asset);
 
@@ -126,7 +129,6 @@ export function useAdditionalGsplats(
           if (r) { r.reject(new Error('cancelled')); readyMapRef.current.delete(id); }
           return;
         }
-        const ext = url.split('?')[0].split('.').pop()?.toLowerCase();
         const ent = new pc.Entity(`add_splat_${id}`);
         if (ext !== 'spz') {
           // PLY 컨벤션: Z축 180° 회전 (SuperSplat과 동일)

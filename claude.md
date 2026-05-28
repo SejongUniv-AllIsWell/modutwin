@@ -7,7 +7,7 @@ A web platform that creates digital twins of building interiors using 3D Gaussia
 Flow: 사용자가 외부에서 학습한 `.ply` 업로드 → 브라우저에서 정제·정합 → 서버에 결과 저장 → 웹 뷰어 서빙.
 
 컴퓨트 책임 분배:
-- 클라이언트: PLY 파싱·편집, 외부 가우시안 제거 + 경계면 정제, 텍스처 베이크 (WebGPU), 문 정합, 렌더링.
+- 클라이언트: PLY 파싱·편집, 경계 가우시안 제거(boundaryCull) + 경계면 정제, 텍스처 베이크 (WebGPU), 문 정합, 렌더링.
 - 서버: 인증, MinIO 객체 스토리지 릴레이(프리사인드 URL), 메타데이터 CRUD, 실시간 알림. COLMAP→3DGS 전처리는 Celery 워커.
 - GPU 서버: 사용자가 외부에서 학습한 PLY 직접 업로드 / COLMAP zip 업로드 시 worker 가 자동 수행.
 
@@ -100,7 +100,7 @@ localZ = -(target - pos),  localY = up,  localX = cross(localY, localZ)
 `buildings/{building_id}/{floor_id}/modules/{module_id}_{module_name}/alignment/`:
 - `{uuid}_local.ply` — placeholder 원본 PLY 키 (register-local).
 - `refined/{session_id}/`
-  - `final.ply` — 정제 PLY (회전 + flatten/brush 마스크 적용).
+  - `final.ply` — 정제 PLY (회전 + boundaryCull/brush 마스크 적용).
   - `mesh.json` — wall mesh 메타 (corners, uvs, normalInward, textureFilename).
   - `tex_{surfaceId}.png` — 면별 베이크 텍스처 (ceiling/floor + `w0..w(N-1)`).
 - `refined/doors.json` — 도어 corners + 메타 + doorFrame 직렬화 데이터 + (basemap 한정) doorMesh/doorSplat 자산 참조.
@@ -186,9 +186,9 @@ wrapper.enabled 토글로 자식 mesh+splat 동시 hide/show.
 브라우저에서 수행:
 
 1. **사용자 수동 정렬** — Y축 up 회전/반전 + 천장/바닥 (`CeilingFloorModal`) + 벽면 폴리곤 (`WallModal`).
-2. **외부 가우시안 제거** (`lib/gs/floaters.ts`) — 경계면 바깥 가우시안 삭제.
+2. **경계 가우시안 제거** (`useRefineTool`, boundaryCull) — 중심이 경계 밖이거나 PlayCanvas visible extent 가 경계를 관통하는 splat 을 최종 PLY 에서 제외.
 3. **Wall mesh + 텍스처 베이크** (`lib/gs/textureBake.ts`, `textureBakeGPU.ts`, `wallMesh.ts`) — 정사영 + alpha 컴포지팅. 메시는 사용자 경계 평면 (sd=0) 에 정확히 배치. GPU 컴퓨트 + 타일 binning, WebGPU 실패 시 CPU 폴백.
-4. **경계면 정제** (`lib/gs/clipping.ts`) — 가우시안 scale shrink. **법선 방향 mahalanobis `kSigma · σ` 가 평면 안에 들어오게** 강제. default `kSigma = √12 + 0.001 ≈ 3.4651` — textureBake render hard cutoff (exponent<-6 → √12 ≈ 3.464σ) 보다 살짝 큼. 결과: 렌더 픽셀이 벽 평면을 안 넘음.
+4. **경계면 정제** (`lib/gs/clipping.ts`) — 가우시안 scale shrink. **법선 방향 mahalanobis `kSigma · σ` 가 평면 안에 들어오게** 강제. PlayCanvas gsplat hard cutoff 는 최대 `√8 ≈ 2.828σ` 이고, fragment alpha `< 1/255` discard 때문에 실제 visible radius 는 opacity 에 따라 더 작아진다. 결과: 렌더 픽셀이 벽 평면을 안 넘음.
 5. **다듬기 완료** → `bakeSplatRotation` 으로 `splatData` 메모리에 pendingRotation in-place 적용 (raw → A') 후 삭제 마스크까지 반영한 canonical PLY scene 을 만든다. 이후 문 설정/정합은 이 scene 을 기준으로 동작.
 6. **문 설정** (`DoorAlignModal`) — SAM3 또는 수동 4점 → 문 추출 (boundary split + wall mesh α punch + wall 텍스처 crop 으로 도어 mesh) → 회전축/각도/방향.
 7. **문 설정 완료** — 문 열린 상태였으면 자동 닫기 + `angleDeg=0` 강제. 모듈은 메모리 유지, 베이스맵은 백그라운드 일괄 업로드. 둘 다 정합 단계로 transition.

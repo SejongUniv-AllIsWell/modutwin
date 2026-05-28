@@ -10,17 +10,17 @@ interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
   size?: Size;
 }
 
-// Why: 페이지마다 bg-blue-600 / bg-green-600 / bg-red-600 가 흩어져 cream/paper 팔레트와
-// 충돌했다. 모든 인터랙티브 액션을 이 컴포넌트로 라우팅해서 토큰화한 색만 쓰도록 강제한다.
+// Why: 페이지마다 직접 지정한 색이 흩어지면 테마가 쉽게 어긋난다.
+// 공통 버튼은 토큰화한 색만 쓰도록 이 컴포넌트로 모은다.
 const variantClass: Record<Variant, string> = {
   primary:
-    'bg-[var(--ink)] text-[var(--bg)] border border-[var(--ink)] hover:opacity-90 disabled:opacity-50',
+    'bg-[var(--accent)] text-[#04131f] border border-[var(--accent)] hover:brightness-110 active:brightness-95 disabled:opacity-50',
   secondary:
-    'bg-[var(--paper)] text-[var(--ink)] border border-[var(--rule)] hover:bg-[var(--bg-soft)] disabled:opacity-50',
+    'bg-[var(--paper)] text-[var(--ink)] border border-[var(--rule)] hover:bg-sky-400/10 disabled:opacity-50',
   danger:
-    'bg-[var(--paper)] text-[#b04646] border border-[#d9a0a0] hover:bg-[#f6e6e6] disabled:opacity-50',
+    'bg-[var(--paper)] text-red-300 border border-red-400/40 hover:bg-red-500/10 disabled:opacity-50',
   ghost:
-    'bg-transparent text-[var(--ink)] hover:bg-[var(--bg-soft)] disabled:opacity-50',
+    'bg-transparent text-[var(--ink)] hover:bg-sky-400/10 disabled:opacity-50',
 };
 
 const sizeClass: Record<Size, string> = {

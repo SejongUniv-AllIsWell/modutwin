@@ -40,7 +40,7 @@ const STAGE_COLOR: Record<ProgressStage, string> = {
   failed:        'text-red-400',
   aligned:       'text-cyan-400',
   doors:         'text-purple-400',
-  refined:       'text-blue-400',
+  refined:       'text-cyan-300',
   uploaded_only: 'text-green-400',
   uploaded:      'text-[var(--muted)]',
   processing:    'text-yellow-400',
@@ -156,10 +156,10 @@ export default function UserDashboard({ showHeader = true }: Props) {
         <div className="flex items-center justify-between mb-8">
           <h1 className="text-2xl font-bold">대시보드</h1>
           <div className="flex items-center gap-2">
-            <Link href="/viewer" className="bg-[var(--bg-soft)] hover:bg-[var(--rule)] text-[var(--ink)] text-sm px-4 py-2 rounded">
+            <Link href="/viewer" className="bg-[var(--paper)] hover:bg-sky-400/10 border border-[var(--rule)] text-[var(--ink)] text-sm px-4 py-2 rounded">
               뷰어
             </Link>
-            <Link href="/upload" className="bg-blue-600 hover:bg-blue-700 text-[var(--ink)] text-sm px-4 py-2 rounded">
+            <Link href="/upload" className="bg-[var(--accent)] hover:brightness-110 text-[#04131f] text-sm px-4 py-2 rounded">
               업로드
             </Link>
           </div>
@@ -170,7 +170,7 @@ export default function UserDashboard({ showHeader = true }: Props) {
         <div className="mb-6 bg-[var(--paper)] border border-[var(--rule)] rounded-lg p-4">
           <div className="flex justify-between items-center mb-3">
             <h2 className="text-sm font-semibold text-[var(--ink-2)]">알림 ({notifications.length})</h2>
-            <button onClick={markAllRead} className="text-xs text-blue-400 hover:text-blue-300">모두 읽음</button>
+            <button onClick={markAllRead} className="text-xs text-cyan-300 hover:text-cyan-200">모두 읽음</button>
           </div>
           {notifications.slice(0, 5).map(n => (
             <div key={n.id} className="text-sm text-[var(--muted)] py-1 border-b border-[var(--rule)] last:border-0">
@@ -215,7 +215,7 @@ export default function UserDashboard({ showHeader = true }: Props) {
                             type="button"
                             disabled={fetchingColmapId === u.id}
                             onClick={() => handleColmapSelect(u.id)}
-                            className="text-blue-400 hover:underline disabled:opacity-60 disabled:cursor-wait"
+                            className="text-cyan-300 hover:underline disabled:opacity-60 disabled:cursor-wait"
                           >
                             {u.original_filename}
                           </button>
@@ -224,7 +224,7 @@ export default function UserDashboard({ showHeader = true }: Props) {
                             href={u.has_refined
                               ? `/viewer?upload_id=${u.id}&mode=align`
                               : `/viewer?upload_id=${u.id}`}
-                            className="text-blue-400 hover:underline"
+                            className="text-cyan-300 hover:underline"
                           >
                             {u.original_filename}
                           </Link>
@@ -234,7 +234,7 @@ export default function UserDashboard({ showHeader = true }: Props) {
                       </td>
                       <td className={`py-3 pr-4 ${
                         isColmap
-                          ? (colmapFailed ? 'text-red-400' : (colmapDone ? 'text-blue-400' : 'text-emerald-400'))
+                          ? (colmapFailed ? 'text-red-400' : (colmapDone ? 'text-cyan-300' : 'text-emerald-400'))
                           : STAGE_COLOR[stage]
                       }`}>
                         {isColmap
@@ -258,7 +258,7 @@ export default function UserDashboard({ showHeader = true }: Props) {
                               type="button"
                               disabled={fetchingColmapId === u.id}
                               onClick={() => handleColmapSelect(u.id)}
-                              className="inline-block px-3 py-1 rounded bg-emerald-600 hover:bg-emerald-500 disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] text-[var(--ink)] text-xs font-bold"
+                              className="inline-block px-3 py-1 rounded bg-[var(--accent)] hover:brightness-110 disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] text-[#04131f] text-xs font-bold"
                               title="PLY를 PC에 저장하고 다듬기 단계로 이동"
                             >
                               {fetchingColmapId === u.id ? '준비 중...' : '파일 선택'}
@@ -266,7 +266,7 @@ export default function UserDashboard({ showHeader = true }: Props) {
                           ) : (
                             <Link
                               href={`/colmap-viewer?upload_id=${u.id}`}
-                              className="inline-block px-3 py-1 rounded bg-[var(--bg-soft)] hover:bg-[var(--rule)] text-[var(--ink)] text-xs font-bold"
+                              className="inline-block px-3 py-1 rounded bg-[var(--paper)] hover:bg-sky-400/10 border border-[var(--rule)] text-[var(--ink)] text-xs font-bold"
                             >
                               처리 중...
                             </Link>
@@ -276,7 +276,7 @@ export default function UserDashboard({ showHeader = true }: Props) {
                             {canAlign && (
                               <Link
                                 href={`/viewer?upload_id=${u.id}&mode=align`}
-                                className="inline-block px-3 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-[var(--ink)] text-xs font-bold"
+                                className="inline-block px-3 py-1 rounded bg-[var(--accent)] hover:brightness-110 text-[#04131f] text-xs font-bold"
                                 title={sam === 'done' ? 'SAM3 결과로 정합 시작' : '수동으로 문 꼭짓점을 지정해 정합'}
                               >
                                 정합하기
@@ -336,7 +336,7 @@ export default function UserDashboard({ showHeader = true }: Props) {
                   onClick={handleDelete}
                   disabled={deleting}
                   className={`rounded px-4 py-2 text-sm font-semibold text-[var(--ink)] disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] ${
-                    isHide ? 'bg-blue-600 hover:bg-blue-700' : 'bg-red-600 hover:bg-red-700'
+                    isHide ? 'bg-[var(--accent)] hover:brightness-110 text-[#04131f]' : 'bg-red-600 hover:bg-red-700'
                   }`}
                 >
                   {deleting ? (isHide ? '숨김 처리 중...' : '삭제 중...') : (isHide ? '숨김' : '삭제')}
@@ -345,7 +345,7 @@ export default function UserDashboard({ showHeader = true }: Props) {
                   type="button"
                   onClick={() => { if (!deleting) { setDeleteTarget(null); setDeleteError(null); } }}
                   disabled={deleting}
-                  className="rounded bg-[var(--bg-soft)] px-4 py-2 text-sm text-[var(--ink)] hover:bg-[var(--rule)] disabled:opacity-50"
+                  className="rounded bg-[var(--paper)] border border-[var(--rule)] px-4 py-2 text-sm text-[var(--ink)] hover:bg-sky-400/10 disabled:opacity-50"
                 >
                   취소
                 </button>

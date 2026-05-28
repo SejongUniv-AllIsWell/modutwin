@@ -3,6 +3,11 @@
 const TILE_SIZE = 16;
 
 const SHADER = /* wgsl */ `
+const GSPLAT_Q_CUTOFF: f32 = 8.0;
+const GSPLAT_EDGE_EXP: f32 = exp(-4.0);
+const GSPLAT_INV_EDGE_NORM: f32 = 1.0 / (1.0 - GSPLAT_EDGE_EXP);
+const GSPLAT_ALPHA_CUTOFF: f32 = 1.0 / 255.0;
+
 struct Params {
   width: u32,
   height: u32,
@@ -60,10 +65,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let du = pxF - sp.tu;
     let dv = pyF - sp.tv;
     if (abs(du) > sp.bbR || abs(dv) > sp.bbR) { continue; }
-    let exponent = -0.5 * (du * du * sp.inv00 + 2.0 * du * dv * sp.inv01 + dv * dv * sp.inv11);
-    if (exponent < -6.0) { continue; }
-    let ag = sp.alpha * exp(exponent);
-    if (ag < 0.001) { continue; }
+    let q = du * du * sp.inv00 + 2.0 * du * dv * sp.inv01 + dv * dv * sp.inv11;
+    if (q > GSPLAT_Q_CUTOFF) { continue; }
+    let profile = (exp(-0.5 * q) - GSPLAT_EDGE_EXP) * GSPLAT_INV_EDGE_NORM;
+    let ag = sp.alpha * profile;
+    if (ag < GSPLAT_ALPHA_CUTOFF) { continue; }
     let w = T * ag;
     rgb = rgb + w * vec3<f32>(sp.r, sp.g, sp.b);
     T = T * (1.0 - ag);
@@ -139,7 +145,7 @@ function makeBuf(device: GPUDevice, data: ArrayBuffer, usage: GPUBufferUsageFlag
  * @param tileOffsets - 길이 (numTiles+1) prefix-sum
  * @param tileSplatList - flat splat 인덱스 리스트, 타일별 그룹화 + sd 순서 보존
  *
- * 반환값: width*height*4 의 Float32 (linear RGBA, un-premultiplied).
+ * 반환값: width*height*4 의 Float32 (PlayCanvas gsplat gamma RGB premultiplied + alpha).
  * GPU 미지원 / 한계 초과 / 에러 시 null 반환 → 호출자가 CPU fallback.
  */
 export async function compositeTextureGPU(

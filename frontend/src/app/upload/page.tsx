@@ -40,11 +40,12 @@ function UploadContent() {
       }
     : null;
 
-  if (loading || !user) return <div className="flex items-center justify-center h-64 text-[var(--muted)]">로딩 중...</div>;
+  if (loading || !user) return <div className="flex items-center justify-center h-64 bg-[var(--bg)] text-[var(--muted)]">로딩 중...</div>;
 
   if (!fixedContext) {
     return (
-      <div className="max-w-2xl mx-auto px-4 py-16 text-center">
+      <div className="min-h-[calc(100vh-56px)] bg-[var(--bg)] text-[var(--ink)] px-4 py-16">
+        <div className="max-w-2xl mx-auto text-center rounded-md border p-8" style={{ background: 'var(--paper)', borderColor: 'var(--rule)' }}>
         <h1 className="text-2xl font-bold mb-3">업로드</h1>
         <p className="text-[var(--muted)] text-sm mb-6">
           업로드는 건물 상세 페이지의 등록 버튼을 통해 시작할 수 있습니다.
@@ -52,29 +53,34 @@ function UploadContent() {
         <Button type="button" onClick={() => router.push('/explore')}>
           건물 둘러보기로 이동
         </Button>
+        </div>
       </div>
     );
   }
 
   return (
-    <div className="max-w-2xl mx-auto px-4 py-8">
-      <h1 className="text-2xl font-bold mb-2">업로드</h1>
-      <p className="text-[var(--muted)] text-sm mb-2">
-        .ply / .splat / .sog 또는 사진 묶음(.zip) 파일을 업로드하세요.
-      </p>
-      <p className="text-[var(--muted)] text-xs mb-8">
-        {fixedContext.purpose === 'basemap' ? 'Basemap' : 'Module'} · {fixedContext.building_name} ·{' '}
-        {floorLabelKo(fixedContext.floor_number)} ·{' '}
-        {fixedContext.module_name}
-      </p>
-      <MultipartUploader fixedContext={fixedContext} />
+    <div className="min-h-[calc(100vh-56px)] bg-[var(--bg)] text-[var(--ink)] px-4 py-8">
+      <div className="max-w-2xl mx-auto">
+        <div className="rounded-md border p-6 mb-5" style={{ background: 'var(--paper)', borderColor: 'var(--rule)' }}>
+          <h1 className="text-2xl font-bold mb-2">업로드</h1>
+          <p className="text-[var(--muted)] text-sm mb-2">
+            .ply / .splat / .sog 또는 사진 묶음(.zip) 파일을 업로드하세요.
+          </p>
+          <p className="text-[var(--muted)] text-xs">
+            {fixedContext.purpose === 'basemap' ? 'Basemap' : 'Module'} · {fixedContext.building_name} ·{' '}
+            {floorLabelKo(fixedContext.floor_number)} ·{' '}
+            {fixedContext.module_name}
+          </p>
+        </div>
+        <MultipartUploader fixedContext={fixedContext} />
+      </div>
     </div>
   );
 }
 
 export default function UploadPage() {
   return (
-    <Suspense fallback={<div className="flex items-center justify-center h-64 text-[var(--muted)]">로딩 중...</div>}>
+    <Suspense fallback={<div className="flex items-center justify-center h-64 bg-[var(--bg)] text-[var(--muted)]">로딩 중...</div>}>
       <UploadContent />
     </Suspense>
   );

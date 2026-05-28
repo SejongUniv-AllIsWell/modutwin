@@ -15,6 +15,7 @@ import { ActiveBasemapResponse } from '@/types';
 import { useRouter } from 'next/navigation';
 import { copyRefineState } from '@/lib/refine/persistence';
 import { rawToAY, ayToRaw, type FrameRotation } from '@/lib/refine/coordFrames';
+import type { ModuleDoorAssetPayload } from './tools/DoorAlignModal';
 
 const DoorAlignModal = lazy(() => import('./tools/DoorAlignModal'));
 const Sam3PromptModal = lazy(() => import('./tools/Sam3PromptModal'));
@@ -100,6 +101,7 @@ export default function UnifiedSplatEditor({
   // 문 설정 완료 시 DoorAlignModal 이 콜백으로 넘긴 최종 4 corners (A'+Y 프레임).
   // 자동 검출이든 수동 4점이든 동일 경로로 채워짐. 정합 완료 시 commit-final 의 doors.json 으로 직렬화.
   const setupDoorCornersRef = useRef<Array<[number, number, number]> | null>(null);
+  const setupDoorAssetsRef = useRef<ModuleDoorAssetPayload | null>(null);
 
   // ── 현재 작업 메타데이터 (문 설정 완료 시 register-local 결과 또는 정합 진입 시 채워짐) ──
   const [metadata, setMetadata] = useState<MetadataResult | null>(null);
@@ -879,6 +881,9 @@ export default function UnifiedSplatEditor({
                   setModuleDoorCorners(corners);
                 }
               }}
+              onSetupDoorAssetsFinalized={(payload) => {
+                setupDoorAssetsRef.current = payload;
+              }}
               onManualPickStart={() => { setAutoExtracting(false); setSam3DispatchSent(false); setAutoExtractedCorners(null); }}
               ensureUploadId={async () => {
                 // 모듈 등록 흐름: register-local 안 함. placeholder ID 반환.
@@ -1156,12 +1161,38 @@ export default function UnifiedSplatEditor({
                     // 서버 저장 시점엔 baked PLY 와 일관되게 A'+Y 로 변환.
                     const bake = refine.getRemainingRotationToAY?.() ?? { rotX: 0, rotZ: 0, wallAngleRad: 0 };
                     const doorCornersAY = doorCornersRaw.map(c => rawToAY(c as [number, number, number], bake as FrameRotation));
+                    const doorAssets = setupDoorAssetsRef.current;
+                    const doorTextureField = 'door_tex_door_1';
+                    const doorSplatField = 'door_splat_door_1';
                     const doorsJson = JSON.stringify({
                       version: 1,
                       doors: [{
                         id: 'door_1',
                         corners: doorCornersAY,
                         unitName: initialRegistrationContext.module_name.trim(),
+                        ...(doorAssets ? {
+                          wallSurfaceId: doorAssets.wallSurfaceId,
+                          doorExtractionDepth: doorAssets.doorExtractionDepth,
+                          boundarySplitEnabled: doorAssets.boundarySplitEnabled,
+                          hingeEdge: doorAssets.hingeEdge,
+                          swing: doorAssets.swing,
+                          angleDeg: doorAssets.angleDeg,
+                        } : {}),
+                        ...(doorAssets?.doorMesh ? {
+                          doorMesh: {
+                            corners: doorAssets.doorMesh.corners,
+                            uvs: doorAssets.doorMesh.uvs,
+                            normalInward: doorAssets.doorMesh.normalInward,
+                            textureFilename: `form:${doorTextureField}`,
+                            textureWidth: doorAssets.doorMesh.textureWidth,
+                            textureHeight: doorAssets.doorMesh.textureHeight,
+                          },
+                        } : {}),
+                        ...(doorAssets?.doorSplat ? {
+                          doorSplat: {
+                            filename: `form:${doorSplatField}`,
+                          },
+                        } : {}),
                         ...(doorFrame ? { doorFrame } : {}),
                       }],
                     });
@@ -1191,11 +1222,20 @@ export default function UnifiedSplatEditor({
                     form.append('final_ply', new Blob([assets.plyBytes as unknown as BlobPart], { type: 'application/octet-stream' }), assets.plyFilename);
                     form.append('mesh_json', new Blob([assets.meshJson], { type: 'application/json' }), 'mesh.json');
                     form.append('doors_json', new Blob([doorsJson], { type: 'application/json' }), 'doors.json');
+                    if (doorAssets?.doorMesh) {
+                      form.append(doorTextureField, doorAssets.doorMesh.textureBlob, 'door_1.png');
+                    }
+                    if (doorAssets?.doorSplat) {
+                      form.append(doorSplatField, doorAssets.doorSplat.plyBlob, 'door_1.ply');
+                    }
                     // ceiling/floor + 폴리곤 변 수만큼의 wN. assets.textures 에 들어있는 모든 surfaceId 전송.
                     for (const sid of Array.from(assets.textures.keys())) {
                       const tex = assets.textures.get(sid);
                       if (!tex) throw new Error(`텍스처 누락: ${sid} (다듬기 단계에서 모든 면 베이크 필요)`);
                       form.append(`tex_${sid}`, tex, `tex_${sid}.png`);
+                    }
+                    for (const [key, tex] of Array.from(assets.textureVariants.entries())) {
+                      form.append(`texview_${key}`, tex, `tex_${key}.png`);
                     }
                     if (sam3PrepareSessionIdRef.current) {
                       form.append('sam3_session_id', sam3PrepareSessionIdRef.current);

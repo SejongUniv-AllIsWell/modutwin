@@ -260,11 +260,42 @@ export default function LandingPage() {
           transform-origin: center;
           will-change: transform;
         }
+        .globe-wrap::after {
+          content: '';
+          position: absolute;
+          inset: 10px;
+          border: 1px solid rgba(56, 189, 248, 0);
+          border-radius: 999px;
+          box-shadow: 0 0 0 rgba(56, 189, 248, 0);
+          pointer-events: none;
+          transition: border-color 180ms ease, box-shadow 180ms ease;
+        }
+        .globe-wrap:hover::after,
+        .globe-wrap:focus-visible::after {
+          border-color: rgba(56, 189, 248, 0.7);
+          box-shadow: 0 0 42px rgba(56, 189, 248, 0.22);
+        }
         .globe-wrap > div,
         .globe-wrap canvas {
           width: 100% !important;
           height: 100% !important;
           display: block;
+        }
+        .emphasis-dots {
+          position: relative;
+          display: inline-block;
+        }
+        .emphasis-dots::before {
+          content: '';
+          position: absolute;
+          left: 0;
+          right: 0;
+          top: -0.2em;
+          height: 0.16em;
+          background:
+            radial-gradient(circle, var(--accent) 45%, transparent 50%) 28% 0 / 0.16em 0.16em no-repeat,
+            radial-gradient(circle, var(--accent) 45%, transparent 50%) 72% 0 / 0.16em 0.16em no-repeat;
+          pointer-events: none;
         }
       `}</style>
 
@@ -275,21 +306,16 @@ export default function LandingPage() {
         <div className="max-w-[1200px] mx-auto px-7 h-14 flex items-center justify-between">
           <a
             href="/"
-            className="flex items-baseline gap-[10px] no-underline serif font-semibold text-xl"
-            style={{ color: 'var(--ink)', letterSpacing: 0 }}
+            className="modutwin-logo text-xl"
+            style={{ color: 'var(--ink)' }}
           >
-            modu
-            <span
-              className="inline-block w-[6px] h-[6px] -translate-y-[3px]"
-              style={{ background: 'var(--ink)' }}
-            />
-            twin
+            m<span className="modutwin-logo-dot">o</span>d<span className="modutwin-logo-dot">u</span>twin
           </a>
           <nav className="flex items-center gap-6 text-[13.5px]">
             <button
               type="button"
               onClick={() => router.push('/about')}
-              className="hover:underline underline-offset-4"
+              className="rounded-sm px-2.5 py-1.5 hover:bg-sky-400/10 active:bg-sky-400/20 focus-visible:outline focus-visible:outline-2 focus-visible:outline-sky-400/60"
               style={{ color: 'var(--ink-2)' }}
             >
               About
@@ -297,7 +323,7 @@ export default function LandingPage() {
             <button
               type="button"
               onClick={goExplore}
-              className="hover:underline underline-offset-4"
+              className="rounded-sm px-2.5 py-1.5 hover:bg-sky-400/10 active:bg-sky-400/20 focus-visible:outline focus-visible:outline-2 focus-visible:outline-sky-400/60"
               style={{ color: 'var(--ink-2)' }}
             >
               Browse
@@ -305,7 +331,7 @@ export default function LandingPage() {
             <button
               type="button"
               onClick={requireLoginThenExplore}
-              className="hover:underline underline-offset-4"
+              className="rounded-sm px-2.5 py-1.5 hover:bg-sky-400/10 active:bg-sky-400/20 focus-visible:outline focus-visible:outline-2 focus-visible:outline-sky-400/60"
               style={{ color: 'var(--ink-2)' }}
             >
               Contribute
@@ -314,7 +340,7 @@ export default function LandingPage() {
               <button
                 type="button"
                 onClick={() => router.push('/dashboard')}
-                className="px-3 py-1.5 rounded-sm border text-[13.5px] hover:bg-[var(--bg-soft)]"
+                className="px-3 py-1.5 rounded-sm border text-[13.5px] hover:bg-sky-400/10"
                 style={{ borderColor: 'var(--rule)', color: 'var(--ink-2)' }}
               >
                 {user.name}
@@ -323,7 +349,7 @@ export default function LandingPage() {
               <button
                 type="button"
                 onClick={login}
-                className="px-3 py-1.5 rounded-sm hover:bg-[var(--bg-soft)]"
+                className="px-3 py-1.5 rounded-sm hover:bg-sky-400/10"
                 style={{ color: 'var(--ink)' }}
               >
                 Sign in
@@ -337,40 +363,39 @@ export default function LandingPage() {
         className="border-b"
         style={{ borderColor: 'var(--rule)', padding: '64px 0 56px' }}
       >
-        <div className="max-w-[1200px] mx-auto px-7 grid grid-cols-1 md:grid-cols-[1.15fr_0.85fr] gap-14 items-center">
+        <div className="max-w-[1200px] mx-auto px-7 grid grid-cols-1 md:grid-cols-[1.45fr_0.75fr] gap-10 items-center">
           <div>
             <h1
-              className="font-medium leading-[1.02] mb-6 text-balance"
-              style={{ fontSize: 'clamp(40px, 5.4vw, 58px)', color: 'var(--ink)' }}
+              className="font-medium leading-[1.08] mb-6 text-balance md:whitespace-nowrap"
+              style={{ fontSize: 'clamp(24px, 2.1vw, 30px)', color: 'var(--ink)' }}
             >
-              The collaborative wiki for<br />
-              <em className="serif italic">3D Gaussian Splatting</em>
+              <span className="emphasis-dots">모두</span>가 함께 참여하는{' '}
+              <span className="emphasis-dots">모듈</span>형 실내 디지털 트윈 구축 플랫폼
             </h1>
             <p
               className="text-[17px] leading-[1.6] mb-7 max-w-[650px]"
               style={{ color: 'var(--ink-2)' }}
             >
-              ModuTwin 은 누구나 영상 한 편으로 건물 내부를 3D 로 복원해 지도에 올릴 수 있는,
-              크라우드소싱 기반 실내 디지털 트윈 플랫폼입니다. 영상을 올리고, 지도 위에 두면,
-              공개 아틀라스의 일부가 됩니다.
+              ModuTwin은 3D Gaussian Splatting으로 실내 영상을 공간형 3D 지도로 복원하고,
+              건물·층·호수 단위로 정렬해 누구나 탐색하고 확장할 수 있는 플랫폼입니다.
             </p>
             <div className="flex gap-3 flex-wrap items-center mb-7">
               <button
                 type="button"
                 onClick={zoomAndGo}
-                className="inline-flex items-center gap-2 px-4 py-2.5 rounded-sm text-[13.5px] border"
+                className="inline-flex items-center gap-2 px-4 py-2.5 rounded-sm text-[13.5px] border transition hover:brightness-110 active:brightness-95 focus-visible:outline focus-visible:outline-2 focus-visible:outline-sky-400/60"
                 style={{
                   background: 'var(--accent)',
                   color: '#04131f',
                   borderColor: 'var(--accent)',
                 }}
               >
-                Start now →
+                시작하기 →
               </button>
             </div>
             <div
-              className="flex gap-6 items-center mono text-[11.5px] tracking-wider"
-              style={{ color: 'var(--muted)', letterSpacing: '0.06em' }}
+              className="flex gap-6 items-center mono text-[11.5px]"
+              style={{ color: 'var(--muted)', letterSpacing: 0 }}
             >
               <div>
                 <b
@@ -403,7 +428,20 @@ export default function LandingPage() {
           </div>
 
           <div className="flex items-center justify-center relative">
-            <div ref={globeWrapRef} className="globe-wrap" onClick={zoomAndGo}>
+            <div
+              ref={globeWrapRef}
+              className="globe-wrap"
+              onClick={zoomAndGo}
+              role="button"
+              tabIndex={0}
+              aria-label="지도 둘러보기"
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' || event.key === ' ') {
+                  event.preventDefault();
+                  zoomAndGo();
+                }
+              }}
+            >
               <Earth3D size={418} />
             </div>
           </div>
@@ -431,13 +469,13 @@ export default function LandingPage() {
               >
                 <div className="flex items-baseline justify-between gap-5 mb-9">
                   <span
-                    className="mono text-[11.5px] uppercase tracking-[0.14em]"
-                    style={{ color: 'var(--muted)' }}
+                    className="mono text-[11.5px] uppercase"
+                    style={{ color: 'var(--muted)', letterSpacing: 0 }}
                   >
                     {section.eyebrow}
                   </span>
                   <h2
-                    className="serif font-medium m-0 text-balance min-h-[1.2em]"
+                    className="font-semibold m-0 text-balance min-h-[1.2em]"
                     style={{
                       fontSize: 'clamp(28px, 3vw, 40px)',
                       color: 'var(--ink)',
@@ -460,13 +498,13 @@ export default function LandingPage() {
                           }}
                         >
                           <div
-                            className="serif italic text-[56px] leading-none"
+                            className="mono text-[42px] leading-none font-semibold"
                             style={{ color: 'var(--accent)', letterSpacing: 0 }}
                           >
                             {card.numeral}
                           </div>
                           <h3
-                            className="serif font-medium m-0 min-h-[1.2em]"
+                            className="font-semibold m-0 min-h-[1.2em]"
                             style={{ fontSize: 24, letterSpacing: 0 }}
                           >
                             {card.title}
@@ -501,7 +539,7 @@ export default function LandingPage() {
                                 `/buildings/${entry.building_id}/floors/${entry.floor_number}`,
                               );
                             }}
-                            className={`grid items-start gap-[22px] py-[18px] px-[22px] transition ${entry ? 'cursor-pointer hover:bg-[var(--bg-soft)]' : ''
+                            className={`grid items-start gap-[22px] py-[18px] px-[22px] transition ${entry ? 'cursor-pointer hover:bg-sky-400/10' : ''
                               }`}
                             style={{
                               background: 'var(--paper)',
@@ -512,13 +550,13 @@ export default function LandingPage() {
                           >
                             <span
                               className="mono text-[11.5px] whitespace-nowrap pt-[5px]"
-                              style={{ color: 'var(--muted)', letterSpacing: '0.06em' }}
+                              style={{ color: 'var(--muted)', letterSpacing: 0 }}
                             >
                               {leading}
                             </span>
                             <div className="min-w-0">
                               <div
-                                className="serif font-medium min-h-[1.2em] truncate"
+                                className="font-semibold min-h-[1.2em] truncate"
                                 style={{
                                   fontSize: 19,
                                   color: 'var(--ink)',
@@ -539,7 +577,7 @@ export default function LandingPage() {
                             {showTrailing && (
                               <span
                                 className="mono text-[11px] inline-flex items-center gap-1 pt-[5px]"
-                                style={{ color: 'var(--ink)', letterSpacing: '0.02em' }}
+                                style={{ color: 'var(--ink)', letterSpacing: 0 }}
                               >
                                 <svg
                                   viewBox="0 0 16 16"
@@ -571,8 +609,8 @@ export default function LandingPage() {
       <footer style={{ padding: '36px 0 48px', color: 'var(--muted)' }}>
         <div className="max-w-[1200px] mx-auto px-7">
           <div
-            className="flex justify-between gap-5 flex-wrap mono text-[14px] uppercase tracking-[0.08em]"
-            style={{ color: 'var(--ink)' }}
+            className="flex justify-between gap-5 flex-wrap mono text-[14px] uppercase"
+            style={{ color: 'var(--ink)', letterSpacing: 0 }}
           >
             <span>© 2024–2026 ModuTwin</span>
             <span>public beta · build {process.env.NEXT_PUBLIC_BUILD_TAG ?? '2026.05.21'}</span>

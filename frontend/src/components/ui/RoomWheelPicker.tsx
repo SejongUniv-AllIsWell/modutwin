@@ -15,11 +15,13 @@ function WheelPicker({
   value,
   onChange,
   format,
+  enabledItems,
 }: {
   items: number[];
   value: number;
   onChange: (next: number) => void;
   format: (item: number) => string;
+  enabledItems?: Set<number>;
 }) {
   const listRef = useRef<HTMLUListElement>(null);
   // 스크롤 중 rAF 로 강조 인덱스만 갱신하고, 정지(idle) 가 감지되면
@@ -89,19 +91,25 @@ function WheelPicker({
       >
         {items.map((item, idx) => {
           const active = item === value;
+          const enabled = !enabledItems || enabledItems.has(item);
           return (
             <li
               key={item}
               style={{
                 height: ITEM_HEIGHT,
                 transform: active ? 'scale(1.08)' : 'scale(1)',
-                opacity: active ? 1 : 0.55,
+                opacity: enabled ? (active ? 1 : 0.55) : 0.22,
                 transition: 'transform 120ms ease-out, opacity 120ms ease-out, color 120ms ease-out',
               }}
               className={`flex items-center justify-center text-lg ${
-                active ? 'text-[var(--ink)] font-bold' : 'text-[var(--muted)]'
+                !enabled
+                  ? 'text-[var(--muted-2)] line-through'
+                  : active
+                    ? 'text-[var(--ink)] font-bold'
+                    : 'text-[var(--muted)]'
               }`}
               onClick={() => {
+                if (!enabled) return;
                 listRef.current?.scrollTo({
                   top: idx * ITEM_HEIGHT,
                   behavior: 'smooth',
@@ -121,17 +129,21 @@ export default function RoomWheelPicker({
   floorNumber,
   value,
   onChange,
+  enabledSuffixes,
 }: {
   floorNumber: number;
   value: number;
   onChange: (next: number) => void;
+  enabledSuffixes?: number[];
 }) {
+  const enabledItems = enabledSuffixes ? new Set(enabledSuffixes) : undefined;
   return (
     <WheelPicker
       items={Array.from({ length: 99 }, (_, i) => i + 1)}
       value={value}
       onChange={onChange}
       format={(suffix) => roomNumberLabel(floorNumber, suffix)}
+      enabledItems={enabledItems}
     />
   );
 }

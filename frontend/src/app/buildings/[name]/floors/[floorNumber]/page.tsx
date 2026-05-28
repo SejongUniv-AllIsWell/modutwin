@@ -14,9 +14,13 @@ import RoomWheelPicker, { roomNumberLabel } from '@/components/ui/RoomWheelPicke
 type Vec3 = [number, number, number];
 type Quat = [number, number, number, number];
 type Scale3 = [number, number, number];
-type ModuleGroup = {
+type BasemapDoorListResponse = {
+  doors: Array<{ id?: string; unitName?: string | null }>;
+};
+type RoomModuleGroup = {
   name: string;
   modules: FloorDetailModuleEntry[];
+  fromBasemap: boolean;
 };
 type ModuleOverlayRecord = {
   group: any | null;
@@ -63,6 +67,15 @@ function formatModuleVersion(value: string | null): string {
 
 function moduleUploaderLabel(module: FloorDetailModuleEntry): string {
   return module.uploader_name?.trim() || module.user_id.slice(0, 8);
+}
+
+function roomSuffixFromLabel(floorNumber: number, roomName: string): number | null {
+  const normalized = roomName.trim().replace(/호$/, '');
+  const prefix = String(floorNumber);
+  if (!normalized.startsWith(prefix)) return null;
+  const suffix = Number(normalized.slice(prefix.length));
+  if (!Number.isInteger(suffix) || suffix < 1 || suffix > 99) return null;
+  return suffix;
 }
 
 function readVec3(value: unknown): Vec3 | null {
@@ -274,6 +287,7 @@ function FloorCompositeViewer({
           const bundle = await api.get<{
             mesh_meta_url: string | null;
             textures: Record<string, string>;
+            texture_variants?: Record<string, Record<string, string>>;
             doors?: Array<{
               id: string;
               unitName?: string | null;
@@ -307,6 +321,17 @@ function FloorCompositeViewer({
                   return url ? loadHtmlImage(url) : Promise.resolve(null);
                 }),
               );
+              const viewImageMatrix = await Promise.all(
+                surfaces.map((surface: any) => Promise.all(
+                  ((surface.textureVariants ?? []) as any[]).map(async (variant: any) => {
+                    const url = bundle.texture_variants?.[surface.surfaceId]?.[variant.id];
+                    const image = url ? await loadHtmlImage(url) : null;
+                    return image
+                      ? { id: String(variant.id), viewpoint: variant.viewpoint as [number, number, number], image }
+                      : null;
+                  }),
+                )),
+              );
               if (record.cancelled || !record.group) return;
               for (let i = 0; i < surfaces.length; i++) {
                 const surface = surfaces[i];
@@ -318,6 +343,13 @@ function FloorCompositeViewer({
                   uvs: surface.uvs,
                   normalInward: surface.normalInward,
                   textureImage: img,
+                  viewTextures: viewImageMatrix[i]
+                    .filter(Boolean)
+                    .map((variant: any) => ({
+                      id: variant.id,
+                      viewpoint: variant.viewpoint,
+                      textureImage: variant.image,
+                    })),
                 }, { mutableTexture: false });
                 record.group.addChild(ent);
                 resetPlyLocalFrame(ent);
@@ -440,6 +472,7 @@ export default function FloorDetailPage() {
   const [creatingModule, setCreatingModule] = useState(false);
   const [addModuleError, setAddModuleError] = useState<string | null>(null);
   const [expandedModuleNames, setExpandedModuleNames] = useState<Set<string>>(() => new Set());
+  const [basemapRoomNames, setBasemapRoomNames] = useState<string[]>([]);
 
   const reloadManifest = () => {
     if (!buildingId || !floorNumber) return Promise.resolve();
@@ -465,44 +498,70 @@ export default function FloorDetailPage() {
     reloadManifest();
   }, [buildingId, floorNumber]);
 
+  useEffect(() => {
+    const basemapId = manifest?.basemap?.id;
+    if (!basemapId) {
+      setBasemapRoomNames([]);
+      return;
+    }
+    let disposed = false;
+    api
+      .get<BasemapDoorListResponse>(`/basemaps/${basemapId}/doors`)
+      .then((data) => {
+        if (disposed) return;
+        const names = Array.from(
+          new Set(
+            (data.doors ?? [])
+              .map((door) => door.unitName?.trim())
+              .filter((name): name is string => !!name),
+          ),
+        ).sort(moduleNameCollator.compare);
+        setBasemapRoomNames(names);
+      })
+      .catch(() => {
+        if (!disposed) setBasemapRoomNames([]);
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [manifest?.basemap?.id]);
+
   const moduleRows = useMemo(() => manifest?.modules ?? [], [manifest]);
   // 모듈을 호수별로 그룹화 + 호수명 자연 정렬 (101 < 102 < 1001).
   // 각 호수 안 모듈은 등록 시점 오름차순 (가장 오래된 위) — moduleVersionTime 헬퍼 기반.
-  const moduleGroups = useMemo(() => {
+  const groupedModules = useMemo(() => {
     const grouped = new Map<string, FloorDetailModuleEntry[]>();
     moduleRows.forEach((module) => {
       const modules = grouped.get(module.name) ?? [];
       modules.push(module);
       grouped.set(module.name, modules);
     });
-    return Array.from(grouped.entries())
-      .map(([name, modules]) => [name, [...modules].sort(compareModuleVersionAsc)] as [string, FloorDetailModuleEntry[]])
-      .sort(([a], [b]) => moduleNameCollator.compare(a, b));
+    return grouped;
   }, [moduleRows]);
+  const moduleGroups = useMemo<RoomModuleGroup[]>(() => {
+    const basemapRoomSet = new Set(basemapRoomNames);
+    const primaryRooms = basemapRoomNames.length > 0
+      ? basemapRoomNames
+      : Array.from(groupedModules.keys()).sort(moduleNameCollator.compare);
+    const extraModuleRooms = Array.from(groupedModules.keys())
+      .filter((name) => !basemapRoomSet.has(name))
+      .sort(moduleNameCollator.compare);
+    return [...primaryRooms, ...extraModuleRooms].map((name) => ({
+      name,
+      modules: [...(groupedModules.get(name) ?? [])].sort(compareModuleVersionAsc),
+      fromBasemap: basemapRoomNames.length === 0 || basemapRoomSet.has(name),
+    }));
+  }, [basemapRoomNames, groupedModules]);
   const hasBasemap = !!manifest?.basemap?.url;
+  const allowedRoomSuffixes = useMemo(() => {
+    if (!manifest || basemapRoomNames.length === 0) return undefined;
+    return basemapRoomNames
+      .map((name) => roomSuffixFromLabel(manifest.floor_number, name))
+      .filter((suffix): suffix is number => suffix !== null);
+  }, [basemapRoomNames, manifest]);
+  const selectedRoomName = manifest ? roomNumberLabel(manifest.floor_number, pickerRoomSuffix) : '';
+  const selectedRoomAllowed = !allowedRoomSuffixes || allowedRoomSuffixes.includes(pickerRoomSuffix);
 
-  const goRegisterModule = (moduleName: string) => {
-    const qs = new URLSearchParams({
-      purpose: 'module',
-      building_id: buildingId,
-      building_name: manifest?.building_name ?? 'Building',
-      floor_number: String(manifest?.floor_number ?? floorNumber),
-      module_name: moduleName,
-    });
-    if (manifest?.floor_id) qs.set('floor_id', manifest.floor_id);
-    router.push(`/upload?${qs.toString()}`);
-  };
-  const toggleModuleGroup = (moduleName: string) => {
-    setExpandedModuleNames((prev) => {
-      const next = new Set(prev);
-      if (next.has(moduleName)) {
-        next.delete(moduleName);
-      } else {
-        next.add(moduleName);
-      }
-      return next;
-    });
-  };
   const renderableModules = useMemo(
     () => moduleRows.filter((module) => module.url && module.is_visible !== false),
     [moduleRows],
@@ -539,22 +598,24 @@ export default function FloorDetailPage() {
         </p>
 
         <div
-          className="mt-4 text-[11px] font-semibold uppercase tracking-wider shrink-0"
-          style={{ color: 'var(--muted)', fontFamily: 'ui-monospace, Menlo, monospace' }}
+          className="mt-4 text-[11px] font-semibold uppercase shrink-0"
+          style={{ color: 'var(--muted)', fontFamily: 'ui-monospace, Menlo, monospace', letterSpacing: 0 }}
         >
-          Modules ({moduleGroups.length})
+          Rooms ({moduleGroups.length})
         </div>
         <div className="mt-3 space-y-2 overflow-y-auto flex-1 min-h-0 pr-1">
-          {moduleGroups.map(([roomName, mods]) => {
+          {moduleGroups.map(({ name: roomName, modules: mods, fromBasemap }) => {
             const expanded = expandedModuleNames.has(roomName);
             const anySelected = mods.some((m) => m.id === selectedModuleId);
             const activeCount = mods.filter((m) => m.url).length;
             const totalCount = mods.length;
+            const registered = activeCount > 0;
             return (
               <div key={roomName} className="rounded-md overflow-hidden">
                 <button
                   type="button"
                   onClick={() => {
+                    if (mods.length === 0) return;
                     setExpandedModuleNames((prev) => {
                       const next = new Set(prev);
                       if (next.has(roomName)) next.delete(roomName);
@@ -564,11 +625,20 @@ export default function FloorDetailPage() {
                   }}
                   className={`w-full px-4 py-3 text-left transition border ${
                     expanded ? 'rounded-t-md' : 'rounded-md'
-                  } hover:bg-[var(--bg-soft)]`}
+                  } ${
+                    mods.length > 0
+                      ? 'hover:brightness-125 hover:shadow-[0_0_0_1px_rgba(56,189,248,0.32)]'
+                      : 'cursor-default'
+                  }`}
                   style={{
-                    borderColor: anySelected ? 'var(--ink)' : 'var(--rule)',
-                    background: anySelected ? 'var(--bg-soft)' : 'var(--bg)',
-                    color: 'var(--ink)',
+                    borderColor: anySelected ? 'var(--accent)' : registered ? 'rgba(56,189,248,0.35)' : 'var(--rule)',
+                    background: anySelected
+                      ? 'var(--accent-soft)'
+                      : registered
+                        ? 'rgba(56,189,248,0.08)'
+                        : 'rgba(255,255,255,0.025)',
+                    color: registered ? 'var(--ink)' : 'var(--muted)',
+                    opacity: fromBasemap ? 1 : 0.72,
                   }}
                 >
                   <div className="flex items-center gap-3">
@@ -576,29 +646,35 @@ export default function FloorDetailPage() {
                       <div className="text-base font-semibold truncate">{roomName}</div>
                       <div
                         className="text-[11px] mt-0.5"
-                        style={{ color: 'var(--muted)' }}
+                        style={{ color: registered ? 'var(--accent)' : 'var(--muted)' }}
                       >
-                        {totalCount}개 등록 {activeCount < totalCount ? `· ${activeCount}개 활성` : ''}
+                        {registered
+                          ? `${activeCount}개 등록${activeCount < totalCount ? ` · ${totalCount}개 중` : ''}`
+                          : '모듈 미등록'}
                       </div>
                     </div>
-                    <svg
-                      className={`w-4 h-4 shrink-0 transition-transform ${
-                        expanded ? 'rotate-90' : ''
-                      }`}
-                      style={{ color: 'var(--muted)' }}
-                      fill="none"
-                      stroke="currentColor"
-                      viewBox="0 0 24 24"
-                    >
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M9 5l7 7-7 7" />
-                    </svg>
+                    {mods.length > 0 ? (
+                      <svg
+                        className={`w-4 h-4 shrink-0 transition-transform ${
+                          expanded ? 'rotate-90' : ''
+                        }`}
+                        style={{ color: registered ? 'var(--accent)' : 'var(--muted)' }}
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
+                      >
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M9 5l7 7-7 7" />
+                      </svg>
+                    ) : (
+                      <span className="text-[11px] shrink-0" style={{ color: 'var(--muted-2)' }}>비활성</span>
+                    )}
                   </div>
                 </button>
                 {expanded && (
                   <div
                     className="border border-t-0 rounded-b-md divide-y"
                     style={{
-                      borderColor: anySelected ? 'var(--ink)' : 'var(--rule)',
+                      borderColor: anySelected ? 'var(--accent)' : 'var(--rule)',
                       background: 'var(--paper)',
                     }}
                   >
@@ -611,7 +687,7 @@ export default function FloorDetailPage() {
                           key={module.id}
                           className="group flex items-stretch transition"
                           style={{
-                            background: isSelected ? 'var(--bg-soft)' : undefined,
+                            background: isSelected ? 'var(--accent-soft)' : undefined,
                             color: disabled ? 'var(--muted-2)' : 'var(--ink)',
                             borderColor: 'var(--rule-soft)',
                           }}
@@ -625,7 +701,7 @@ export default function FloorDetailPage() {
                               if (!hasBasemap) setPrimaryUrl(module.url);
                             }}
                             className={`flex-1 min-w-0 px-4 py-2.5 text-left ${
-                              disabled ? 'cursor-not-allowed' : 'hover:bg-[var(--bg-soft)]'
+                              disabled ? 'cursor-not-allowed' : 'hover:bg-sky-400/10'
                             }`}
                           >
                             <div className="flex items-center gap-2">
@@ -641,7 +717,7 @@ export default function FloorDetailPage() {
                               {isSelected && (
                                 <svg
                                   className="w-4 h-4 shrink-0"
-                                  style={{ color: 'var(--ink)' }}
+                                  style={{ color: 'var(--accent)' }}
                                   fill="none" stroke="currentColor" viewBox="0 0 24 24"
                                 >
                                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" />
@@ -680,7 +756,7 @@ export default function FloorDetailPage() {
             );
           })}
           {moduleGroups.length === 0 && (
-            <p className="text-sm px-1" style={{ color: 'var(--muted)' }}>등록된 모듈이 없습니다.</p>
+            <p className="text-sm px-1" style={{ color: 'var(--muted)' }}>basemap에 등록된 호수가 없습니다.</p>
           )}
         </div>
 
@@ -688,16 +764,16 @@ export default function FloorDetailPage() {
           type="button"
           onClick={() => {
             setAddModuleError(null);
-            setPickerRoomSuffix(1);
+            setPickerRoomSuffix(allowedRoomSuffixes?.[0] ?? 1);
             setShowAddModuleModal(true);
           }}
           disabled={!manifest?.floor_id || !user}
           title={!user ? '로그인 후 등록 가능합니다' : undefined}
           className="mt-4 shrink-0 w-full inline-flex items-center justify-center gap-2 rounded-sm border py-3 text-sm font-semibold transition active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed"
           style={{
-            background: 'var(--ink)',
-            color: 'var(--bg)',
-            borderColor: 'var(--ink)',
+            background: 'var(--accent)',
+            color: '#04131f',
+            borderColor: 'var(--accent)',
           }}
           aria-label="모듈 추가"
         >
@@ -734,12 +810,23 @@ export default function FloorDetailPage() {
               <RoomWheelPicker
                 floorNumber={manifest.floor_number}
                 value={pickerRoomSuffix}
+                enabledSuffixes={allowedRoomSuffixes}
                 onChange={(next) => {
                   setPickerRoomSuffix(next);
                   setAddModuleError(null);
                 }}
               />
             </div>
+            {allowedRoomSuffixes && allowedRoomSuffixes.length > 0 && !selectedRoomAllowed && (
+              <p className="mt-2 text-xs text-center" style={{ color: 'var(--muted)' }}>
+                basemap에 등록된 호수만 선택할 수 있습니다.
+              </p>
+            )}
+            {allowedRoomSuffixes?.length === 0 && (
+              <p className="mt-2 text-xs text-center" style={{ color: '#fca5a5' }}>
+                basemap에 등록된 호수가 없습니다.
+              </p>
+            )}
 
             {addModuleError && (
               <p className="mt-3 text-xs text-center" style={{ color: '#b04646' }}>{addModuleError}</p>
@@ -750,14 +837,14 @@ export default function FloorDetailPage() {
                 type="button"
                 disabled={creatingModule}
                 onClick={() => setShowAddModuleModal(false)}
-                className="flex-1 rounded-sm border hover:bg-[var(--bg-soft)] disabled:opacity-50 py-2 text-sm"
+                className="flex-1 rounded-sm border hover:bg-sky-400/10 disabled:opacity-50 py-2 text-sm"
                 style={{ borderColor: 'var(--rule)', color: 'var(--ink)' }}
               >
                 취소
               </button>
               <button
                 type="button"
-                disabled={creatingModule}
+                disabled={creatingModule || !selectedRoomAllowed || allowedRoomSuffixes?.length === 0}
                 onClick={async () => {
                   if (!manifest?.floor_id || !manifest?.building_id) return;
                   const name = roomNumberLabel(manifest.floor_number, pickerRoomSuffix);
@@ -795,12 +882,12 @@ export default function FloorDetailPage() {
                 }}
                 className="flex-1 rounded-sm border disabled:opacity-60 py-2 text-sm font-semibold"
                 style={{
-                  background: 'var(--ink)',
-                  color: 'var(--bg)',
-                  borderColor: 'var(--ink)',
+                  background: 'var(--accent)',
+                  color: '#04131f',
+                  borderColor: 'var(--accent)',
                 }}
               >
-                {creatingModule ? '확인 중...' : `${roomNumberLabel(manifest.floor_number, pickerRoomSuffix)} 등록`}
+                {creatingModule ? '확인 중...' : `${selectedRoomName} 등록`}
               </button>
             </div>
           </div>
@@ -862,9 +949,9 @@ export default function FloorDetailPage() {
                 title={!user ? '로그인 후 등록 가능합니다' : undefined}
                 className="inline-flex items-center gap-2 px-5 py-2.5 rounded-sm border text-sm font-semibold transition cursor-pointer disabled:cursor-not-allowed disabled:opacity-50"
                 style={{
-                  background: 'var(--ink)',
-                  color: 'var(--bg)',
-                  borderColor: 'var(--ink)',
+                  background: 'var(--accent)',
+                  color: '#04131f',
+                  borderColor: 'var(--accent)',
                 }}
               >
                 <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">

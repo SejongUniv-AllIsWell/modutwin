@@ -723,7 +723,7 @@ export default function ExplorePage() {
                 if (e.key === 'Enter') handleSearch();
               }}
               placeholder="건물 검색"
-              className="w-full border rounded-sm pl-9 pr-3 py-2 text-sm focus:outline-none transition"
+              className="w-full border rounded-sm pl-9 pr-3 py-2 text-sm focus:outline-none transition focus:border-sky-400/70 focus:bg-sky-400/10"
               style={{
                 background: 'var(--bg)',
                 borderColor: 'var(--rule)',
@@ -752,8 +752,8 @@ export default function ExplorePage() {
 
         <div className="px-4 py-2.5 border-b" style={{ borderColor: 'var(--rule)' }}>
           <p
-            className="text-xs font-medium uppercase tracking-wider"
-            style={{ color: 'var(--muted)', fontFamily: 'ui-monospace, Menlo, monospace' }}
+            className="text-xs font-medium uppercase"
+            style={{ color: 'var(--muted)', fontFamily: 'ui-monospace, Menlo, monospace', letterSpacing: 0 }}
           >
             {placeResults.length > 0 ? `카카오 검색 결과 (${placeResults.length})` : '건물 목록'}
           </p>
@@ -766,7 +766,7 @@ export default function ExplorePage() {
                 <button
                   key={place.id}
                   onClick={() => handlePlaceSelect(place)}
-                  className="w-full text-left px-4 py-3.5 hover:bg-[var(--bg-soft)] transition group"
+                  className="w-full text-left px-4 py-3.5 hover:bg-sky-400/10 transition group"
                   style={{ borderColor: 'var(--rule-soft)' }}
                 >
                   <p
@@ -787,7 +787,7 @@ export default function ExplorePage() {
                 <button
                   onClick={handleLoadMore}
                   disabled={loadingMore}
-                  className="w-full px-4 py-3 text-sm hover:bg-[var(--bg-soft)] transition disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="w-full px-4 py-3 text-sm hover:bg-sky-400/10 transition disabled:opacity-50 disabled:cursor-not-allowed"
                   style={{ color: 'var(--muted)' }}
                 >
                   {loadingMore ? '불러오는 중...' : '더 보기'}
@@ -812,12 +812,12 @@ export default function ExplorePage() {
                 <button
                   key={building.id}
                   onClick={() => router.push(`/buildings/${building.id}`)}
-                  className="w-full text-left px-4 py-3.5 hover:bg-[var(--bg-soft)] transition group"
+                  className="w-full text-left px-4 py-3.5 hover:bg-sky-400/10 transition group"
                 >
                   <div className="flex items-center gap-3">
                     <div
                       className="shrink-0 w-9 h-9 rounded-md flex items-center justify-center"
-                      style={{ background: 'var(--bg-soft)', color: 'var(--ink)' }}
+                      style={{ background: 'var(--accent-soft)', color: 'var(--accent)' }}
                     >
                       <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-2 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4" />

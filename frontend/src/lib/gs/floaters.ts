@@ -1,4 +1,5 @@
 import type { GaussianScene } from '../ply/types';
+import { sigmoidOpacity } from './playcanvasGsplat';
 
 export interface FloaterOptions {
   voxelSize: number;
@@ -12,8 +13,6 @@ export const DEFAULT_FLOATER_OPTIONS: FloaterOptions = {
   minNeighbors: 3,
 };
 
-const sigmoid = (x: number) => 1 / (1 + Math.exp(-x));
-
 export interface FloaterDetectResult {
   mask: Uint8Array;
   deletedCount: number;
@@ -21,7 +20,7 @@ export interface FloaterDetectResult {
 }
 
 /**
- * 외부 가우시안 제거가 끝난 뒤 남은 가우시안에 대해서만 floater 후보를 마킹.
+ * boundaryCull 이 끝난 뒤 남은 가우시안에 대해서만 floater 후보를 마킹.
  *
  * 알고리즘:
  *  1) `excludeMask[i]==1` (= shell/brush 등으로 이미 지워질 예정) 인 입자는 skip.
@@ -71,7 +70,7 @@ export function detectFloaters(
   let deletedCount = 0;
   for (let i = 0; i < N; i++) {
     if (excludeMask && excludeMask[i]) continue;
-    const alpha = sigmoid(op[i]);
+    const alpha = sigmoidOpacity(op[i]);
     if (alpha >= opts.opacityThreshold) continue;
 
     const ix = Math.floor(px[i] * inv);

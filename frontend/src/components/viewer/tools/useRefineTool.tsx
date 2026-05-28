@@ -6,6 +6,7 @@ import { useDepthNormal } from './useDepthNormal';
 import { surfacePlanesFromPolygon, signedDistance, type SurfacePlane, type PolygonPoint } from '@/lib/gs/planes';
 import { loadRefineState, saveRefineState, clearRefineState } from '@/lib/refine/persistence';
 import type { GaussianScene } from '@/lib/ply/types';
+import { gsplatVisibleSigmaRadius, sigmoidOpacity } from '@/lib/gs/playcanvasGsplat';
 import {
   AXIS_COLORS,
   AXIS_COLORS_DIM,
@@ -60,6 +61,86 @@ function buildFinalSurfacePlanes(
         }
       : undefined,
   }));
+}
+
+function gaussianNormalSigma(
+  normal: Vec3,
+  qw0: number,
+  qx0: number,
+  qy0: number,
+  qz0: number,
+  sc0: number,
+  sc1: number,
+  sc2: number,
+): number {
+  const qLen = Math.hypot(qw0, qx0, qy0, qz0) || 1;
+  const qw = qw0 / qLen, qx = qx0 / qLen, qy = qy0 / qLen, qz = qz0 / qLen;
+  const xx = qx * qx, yy = qy * qy, zz = qz * qz;
+  const xy = qx * qy, xz = qx * qz, yz = qy * qz;
+  const wx = qw * qx, wy = qw * qy, wz = qw * qz;
+  const R00 = 1 - 2 * (yy + zz), R01 = 2 * (xy - wz), R02 = 2 * (xz + wy);
+  const R10 = 2 * (xy + wz),     R11 = 1 - 2 * (xx + zz), R12 = 2 * (yz - wx);
+  const R20 = 2 * (xz - wy),     R21 = 2 * (yz + wx),     R22 = 1 - 2 * (xx + yy);
+  const [nx, ny, nz] = normal;
+  const anX = R00 * nx + R10 * ny + R20 * nz;
+  const anY = R01 * nx + R11 * ny + R21 * nz;
+  const anZ = R02 * nx + R12 * ny + R22 * nz;
+  const s0 = Math.exp(sc0), s1 = Math.exp(sc1), s2 = Math.exp(sc2);
+  return Math.sqrt(anX * anX * s0 * s0 + anY * anY * s1 * s1 + anZ * anZ * s2 * s2);
+}
+
+function visibleExtentCrossesPlane(sd: number, sigmaN: number, visibleSigma: number, threshold: number): boolean {
+  return sd <= threshold && sd + visibleSigma * sigmaN > threshold;
+}
+
+function buildSurfaceBakeViewpoints(surfaceId: Surface, polygon: PolygonPoint[], ceilingY: number, floorY: number): Array<{ id: string; point: Vec3 }> {
+  const cx = polygon.reduce((sum, p) => sum + p.x, 0) / polygon.length;
+  const cz = polygon.reduce((sum, p) => sum + p.z, 0) / polygon.length;
+  const y = (ceilingY + floorY) / 2;
+  const center: Vec3 = [cx, y, cz];
+  if (!isWallSurface(surfaceId)) return [{ id: 'center', point: center }];
+
+  const i = Number(surfaceId.slice(1));
+  if (!Number.isInteger(i) || i < 0 || i >= polygon.length) return [{ id: 'center', point: center }];
+
+  const a = polygon[i];
+  const b = polygon[(i + 1) % polygon.length];
+  const dx = b.x - a.x;
+  const dz = b.z - a.z;
+  const len = Math.hypot(dx, dz);
+  if (len < 1e-6) return [{ id: 'center', point: center }];
+
+  const tx = dx / len;
+  const tz = dz / len;
+  const mx = (a.x + b.x) / 2;
+  const mz = (a.z + b.z) / 2;
+  const towardWallX = mx - cx;
+  const towardWallZ = mz - cz;
+  const nearX = cx + towardWallX * 0.65;
+  const nearZ = cz + towardWallZ * 0.65;
+  const lateral = Math.min(len * 0.28, Math.max(len * 0.12, 0.45));
+
+  const views: Array<{ id: string; point: Vec3 }> = [
+    { id: 'center', point: center },
+    { id: 'near', point: [nearX, y, nearZ] },
+  ];
+  if (len >= 1.2) {
+    views.push(
+      { id: 'left', point: [nearX - tx * lateral, y, nearZ - tz * lateral] },
+      { id: 'right', point: [nearX + tx * lateral, y, nearZ + tz * lateral] },
+    );
+  }
+  return views;
+}
+
+function bakeTargetForPlane(input: import('@/lib/gs/textureBake').PlaneBakeInput): Vec3 {
+  const u = (input.uMin + input.uMax) / 2;
+  const v = (input.vMin + input.vMax) / 2;
+  return [
+    input.origin[0] + input.uAxis[0] * u + input.vAxis[0] * v,
+    input.origin[1] + input.uAxis[1] * u + input.vAxis[1] * v,
+    input.origin[2] + input.uAxis[2] * u + input.vAxis[2] * v,
+  ];
 }
 import {
   CF_SURFACES,
@@ -142,9 +223,9 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   const wallModeRef = useRef<'none' | 'confirmed'>('none');
   const selectedSurfacesRef = useRef<Set<string>>(new Set());
 
-  // ── Surface selection for flatten/remove ──
+  // ── Surface selection for boundary cull/remove ──
   const [selectedSurfaces, setSelectedSurfaces] = useState<Set<Surface>>(new Set());
-  const [flattening, setFlattening] = useState(false);
+  const [boundaryCulling, setBoundaryCulling] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   // 다듬기 완료 → 문 설정 (SAM3 프롬프트 팝업) → 문 설정 완료에서 일괄 영속.
@@ -152,7 +233,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   const [uploadProgressOpen, setUploadProgressOpen] = useState(false);
   const [uploadProgressMessage, setUploadProgressMessage] = useState('');
   // 단일 안전거리 — 모든 경계면(천장/바닥/N벽)이 공유
-  // 외부 splat 제거 임계값 (m). 0 이면 평면(sd=0) 보다 바깥(sd>0)인 모든 splat 을 제거.
+  // boundaryCull 안전거리 (m). 0 이면 경계면(sd=0) 기준으로 밖에 있거나 경계를 관통하는 splat 을 제외.
   // 사용자가 추가 안전거리 (e.g., 평면이 약간 부정확할 때 일부 보호) 원하면 양수 값으로 미세 조정.
   const [globalOffset, setGlobalOffset] = useState(0);
   const [globalOffsetText, setGlobalOffsetText] = useState('0');
@@ -201,15 +282,15 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   const skipNextSplatRebakeRef = useRef<boolean>(false);
   const [bakedRotation, setBakedRotation] = useState<{ rotX: number; rotZ: number }>({ rotX: 0, rotZ: 0 });
 
-  // flatten 마스크: 1=삭제(현재 회전된 프레임 기준 평면 외부). null=아직 적용 안 됨.
-  const flattenMaskRef = useRef<Uint8Array | null>(null);
-  const [flattenActive, setFlattenActive] = useState(false);
-  const flattenActiveRef = useRef(false);
-  const [flattenVisible, setFlattenVisible] = useState(true);
-  const flattenVisibleRef = useRef(true);
+  // boundaryCull 마스크: 1=최종 PLY에서 제외할 경계 밖/경계 관통 splat. null=아직 적용 안 됨.
+  const boundaryCullMaskRef = useRef<Uint8Array | null>(null);
+  const [boundaryCullActive, setBoundaryCullActive] = useState(false);
+  const boundaryCullActiveRef = useRef(false);
+  const [boundaryCullVisible, setBoundaryCullVisible] = useState(true);
+  const boundaryCullVisibleRef = useRef(true);
 
-  // floater 마스크: 1=삭제(저불투명 + 희소 가우시안). 모듈 외부 제거(flatten) 활성 상태에서만 적용 가능.
-  // excludeMask = brush 삭제 ∪ flatten 마스크 — 이 둘로 가린 상태에서 남은 가우시안만 후보.
+  // floater 마스크: 1=삭제(저불투명 + 희소 가우시안). boundaryCull 활성 상태에서만 적용 가능.
+  // excludeMask = brush 삭제 ∪ boundaryCull 마스크 — 이 둘로 가린 상태에서 남은 가우시안만 후보.
   const floaterMaskRef = useRef<Uint8Array | null>(null);
   const [floaterActive, setFloaterActive] = useState(false);
   const floaterActiveRef = useRef(false);
@@ -231,6 +312,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   const [wallMeshActive, setWallMeshActive] = useState(false);
   const [wallMeshBaking, setWallMeshBaking] = useState(false);
   const [wallMeshDebugWhite, setWallMeshDebugWhite] = useState(false);
+  const [textureBakeProjection, setTextureBakeProjection] = useState<'view-independent' | 'view-dependent'>('view-independent');
   const wallMeshEntitiesRef = useRef<any[]>([]);
   // 가장 최근 베이크 결과 (텍스처 다운로드 / 영속화용)
   const lastBakesRef = useRef<Map<string, {
@@ -240,6 +322,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     input: import('@/lib/gs/textureBake').PlaneBakeInput;
     corners: import('@/lib/gs/textureBake').TextureBakeResult['corners'];
     uvs: import('@/lib/gs/textureBake').TextureBakeResult['uvs'];
+    viewVariants?: import('@/lib/gs/textureBake').TextureBakeResult['viewVariants'];
   }>>(new Map());
 
 
@@ -247,16 +330,13 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   const [splatHidden, setSplatHidden] = useState(false);
 
   // 안전거리 실시간 미리보기 — 토글 ON 시 globalOffset / selectedSurfaces 변할 때마다
-  // 삭제될 가우시안을 즉시 투명 처리 (paintFlattenMask 재활용, 별도 preview 마스크).
-  const [flattenPreviewActive, setFlattenPreviewActive] = useState(false);
-  const flattenPreviewActiveRef = useRef(false);
-  const flattenPreviewMaskRef = useRef<Uint8Array | null>(null);
+  // boundaryCull 대상 가우시안을 즉시 표시 (paintBoundaryCullMask 재활용, 별도 preview 마스크).
+  const [boundaryCullPreviewActive, setBoundaryCullPreviewActive] = useState(false);
+  const boundaryCullPreviewActiveRef = useRef(false);
+  const boundaryCullPreviewMaskRef = useRef<Uint8Array | null>(null);
 
   // ── 안전거리 시각화 (화살표) ──
   const [safetyVizActive, setSafetyVizActive] = useState(false);
-  // depthGate (방 안쪽 alpha blending start 경계). 사용자가 모달에서 정의한 경계면(sd=0) 에서 시작 →
-  // 막 위치 (사용자 경계면 sd=0) 와 정확히 일치 → "층 두 개" 잔상 제거. 0 으로 고정.
-  const bakeInnerGate = 0;
   const safetyVizEntityRef = useRef<any>(null);
 
   // 옵션 A: 막 생성 후 CF 모달의 회전 슬라이더 lock
@@ -299,10 +379,10 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     data.splatEntity.setLocalRotation(qTotal);
   }, []);
 
-  // ── flatten 마스크를 colorTexture에 페인트 ──
+  // ── boundaryCull 마스크를 colorTexture에 페인트 ──
   // origColorData(브러시 삭제 누적)를 베이스로, 마스크된 곳만 alpha=0.
-  // showFlatten=false면 마스크 무시하고 origColorData 그대로 복원.
-  const paintFlattenMask = useCallback(() => {
+  // boundaryCullVisible=false면 마스크 무시하고 origColorData 그대로 복원.
+  const paintBoundaryCullMask = useCallback(() => {
     const data = splatDataRef.current;
     const core = coreRef.current;
     if (!data || !core || !data.colorTexture || !data.origColorData) return;
@@ -311,21 +391,21 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     if (!td) return;
     // preview: 빨강으로 표시 (alpha 유지). applied: alpha=0 (실제 삭제 시각화).
     // 둘 다 켜져있으면 preview가 우선.
-    const previewMask = flattenPreviewActiveRef.current ? flattenPreviewMaskRef.current : null;
-    const appliedMask = (flattenActiveRef.current && flattenVisibleRef.current) ? flattenMaskRef.current : null;
+    const previewMask = boundaryCullPreviewActiveRef.current ? boundaryCullPreviewMaskRef.current : null;
+    const appliedMask = (boundaryCullActiveRef.current && boundaryCullVisibleRef.current) ? boundaryCullMaskRef.current : null;
     const floaterMask = floaterActiveRef.current ? floaterMaskRef.current : null;
     // 빨강 (R=1, G=0, B=0)
     const redR = f2h(1.0), redG = f2h(0.0), redB = f2h(0.0);
     for (let i = 0; i < data.numSplats; i++) {
       const idx = i * 4;
       if (previewMask && previewMask[i]) {
-        // 삭제될 가우시안 미리보기 — 빨강 + 원본 alpha 유지
+        // boundaryCull 대상 미리보기 — 빨강 + 원본 alpha 유지
         td[idx]   = redR;
         td[idx+1] = redG;
         td[idx+2] = redB;
         td[idx+3] = data.origColorData[idx+3];
       } else if (appliedMask && appliedMask[i]) {
-        // 실제 적용된 flatten — alpha=0으로 가림
+        // 실제 적용된 boundaryCull — alpha=0으로 가림
         td[idx]   = data.origColorData[idx];
         td[idx+1] = data.origColorData[idx+1];
         td[idx+2] = data.origColorData[idx+2];
@@ -431,21 +511,21 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
 
   // ── 안전거리 실시간 미리보기: globalOffset/selectedSurfaces 변할 때마다 마스크 재계산 + 페인트 ──
   useEffect(() => {
-    if (!flattenPreviewActive) {
+    if (!boundaryCullPreviewActive) {
       // 끄기 — 마스크 비우고 paint 한번 (applied 마스크 / 원본 복원)
-      flattenPreviewActiveRef.current = false;
-      flattenPreviewMaskRef.current = null;
-      paintFlattenMask();
+      boundaryCullPreviewActiveRef.current = false;
+      boundaryCullPreviewMaskRef.current = null;
+      paintBoundaryCullMask();
       return;
     }
-    flattenPreviewActiveRef.current = true;
+    boundaryCullPreviewActiveRef.current = true;
 
     const data = splatDataRef.current;
     if (!data) return;
     if (selectedSurfaces.size === 0) {
       // 면 미선택 — 빈 마스크 (아무것도 가림 없음)
-      flattenPreviewMaskRef.current = new Uint8Array(data.numSplats);
-      paintFlattenMask();
+      boundaryCullPreviewMaskRef.current = new Uint8Array(data.numSplats);
+      paintBoundaryCullMask();
       return;
     }
     const hasWall = Array.from(selectedSurfaces).some(s => isWallSurface(s));
@@ -454,7 +534,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     let cancelled = false;
     (async () => {
       if (cancelled) return;
-      // applyFlatten 과 동일 알고리즘 — wall 선택 시 polygon-inside test, ceiling/floor 는 Y 비교.
+      // applyBoundaryCull 과 동일 알고리즘 — wall 선택 시 polygon-inside test, ceiling/floor 는 Y 비교.
       const cutThreshold = globalOffset;
       const selectsCeiling = selectedSurfaces.has('ceiling');
       const selectsFloor = selectedSurfaces.has('floor');
@@ -485,11 +565,46 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
           }
         : null;
 
-      const rotPos = buildRotatedPositions(data.posX, data.posY, data.posZ);
+      const boundaryPlanes: SurfacePlane[] = [];
+      if (selectsCeiling) boundaryPlanes.push({ id: 'ceiling', normal: [0, 1, 0], d: ceilingY });
+      if (selectsFloor) boundaryPlanes.push({ id: 'floor', normal: [0, -1, 0], d: -floorY });
+      if (selectsAnyWall && polygonReady) {
+        boundaryPlanes.push(
+          ...surfacePlanesFromPolygon({ polygon: wallPolygon!, ceilingY, floorY }).filter(p => isWallSurface(p.id)),
+        );
+      }
+
+      const r0 = data.gsplatData?.getProp('rot_0') as Float32Array | undefined;
+      const r1 = data.gsplatData?.getProp('rot_1') as Float32Array | undefined;
+      const r2 = data.gsplatData?.getProp('rot_2') as Float32Array | undefined;
+      const r3 = data.gsplatData?.getProp('rot_3') as Float32Array | undefined;
+      const sc0 = data.gsplatData?.getProp('scale_0') as Float32Array | undefined;
+      const sc1 = data.gsplatData?.getProp('scale_1') as Float32Array | undefined;
+      const sc2 = data.gsplatData?.getProp('scale_2') as Float32Array | undefined;
+      const op = data.gsplatData?.getProp('opacity') as Float32Array | undefined;
+      const canCheckExtent = !!(r0 && r1 && r2 && r3 && sc0 && sc1 && sc2 && op && boundaryPlanes.length);
+      const rotatedScene = canCheckExtent
+        ? await buildRotatedSceneForRotation({
+            numSplats: data.numSplats,
+            propertyOrder: ['x', 'y', 'z', 'rot_0', 'rot_1', 'rot_2', 'rot_3', 'scale_0', 'scale_1', 'scale_2', 'opacity'],
+            attrs: new Map<string, Float32Array>([
+              ['x', data.posX], ['y', data.posY], ['z', data.posZ],
+              ['rot_0', r0!], ['rot_1', r1!], ['rot_2', r2!], ['rot_3', r3!],
+              ['scale_0', sc0!], ['scale_1', sc1!], ['scale_2', sc2!], ['opacity', op!],
+            ]),
+          }, pendingRotationRef.current)
+        : null;
+      const rx = rotatedScene?.attrs.get('x') ?? buildRotatedPositions(data.posX, data.posY, data.posZ).x;
+      const ry = rotatedScene?.attrs.get('y') ?? buildRotatedPositions(data.posX, data.posY, data.posZ).y;
+      const rz = rotatedScene?.attrs.get('z') ?? buildRotatedPositions(data.posX, data.posY, data.posZ).z;
+      const rr0 = rotatedScene?.attrs.get('rot_0');
+      const rr1 = rotatedScene?.attrs.get('rot_1');
+      const rr2 = rotatedScene?.attrs.get('rot_2');
+      const rr3 = rotatedScene?.attrs.get('rot_3');
       const N = data.numSplats;
       const mask = new Uint8Array(N);
       for (let i = 0; i < N; i++) {
-        const x = rotPos.x[i], y = rotPos.y[i], z = rotPos.z[i];
+        const x = rx[i], y = ry[i], z = rz[i];
         let outside = false;
         if (selectsCeiling && y > ceilingY + cutThreshold) outside = true;
         if (!outside && selectsFloor && y < floorY - cutThreshold) outside = true;
@@ -497,32 +612,42 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
           const sd = polygonSD(x, z);
           if (sd > cutThreshold) outside = true;
         }
+        if (!outside && canCheckExtent && rr0 && rr1 && rr2 && rr3) {
+          const visibleSigma = gsplatVisibleSigmaRadius(sigmoidOpacity(op![i]));
+          if (visibleSigma > 0) {
+            for (const plane of boundaryPlanes) {
+              const sd = signedDistance(plane, x, y, z);
+              const sigmaN = gaussianNormalSigma(plane.normal as Vec3, rr0[i], rr1[i], rr2[i], rr3[i], sc0![i], sc1![i], sc2![i]);
+              if (visibleExtentCrossesPlane(sd, sigmaN, visibleSigma, cutThreshold)) { outside = true; break; }
+            }
+          }
+        }
         if (outside) mask[i] = 1;
       }
       if (cancelled) return;
-      flattenPreviewMaskRef.current = mask;
-      paintFlattenMask();
+      boundaryCullPreviewMaskRef.current = mask;
+      paintBoundaryCullMask();
     })();
 
     return () => { cancelled = true; };
   }, [
-    flattenPreviewActive, globalOffset, selectedSurfaces,
+    boundaryCullPreviewActive, globalOffset, selectedSurfaces,
     wallPolygon, ceilingY, floorY,
-    buildRotatedPositions, paintFlattenMask,
+    buildRotatedPositions, paintBoundaryCullMask,
   ]);
 
-  // ── applyFlatten: 토글식 — 비활성 → 마스크 계산 + 활성. 활성 → 비활성(복원). ──
+  // ── applyBoundaryCull: 토글식 — 비활성 → 마스크 계산 + 활성. 활성 → 비활성(복원). ──
   // 저장 시 활성 상태일 때만 마스크가 베이크에 반영됨.
-  const applyFlatten = useCallback(async () => {
+  const applyBoundaryCull = useCallback(async () => {
     // 이미 활성 → 복원 (비활성화 + 시각 복원)
-    if (flattenActiveRef.current) {
+    if (boundaryCullActiveRef.current) {
       pushOp({
-        type: 'flatten',
-        prevMask: flattenMaskRef.current ? new Uint8Array(flattenMaskRef.current) : null,
+        type: 'boundaryCull',
+        prevMask: boundaryCullMaskRef.current ? new Uint8Array(boundaryCullMaskRef.current) : null,
         prevActive: true,
       });
-      flattenActiveRef.current = false; setFlattenActive(false);
-      // floater 는 flatten 위에서만 의미 있어서 같이 해제
+      boundaryCullActiveRef.current = false; setBoundaryCullActive(false);
+      // floater 는 boundaryCull 이후 남은 splat 기준이라 같이 해제
       if (floaterActiveRef.current) {
         pushOp({
           type: 'floater',
@@ -532,15 +657,15 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         floaterActiveRef.current = false; setFloaterActive(false);
         floaterMaskRef.current = null;
       }
-      paintFlattenMask();
+      paintBoundaryCullMask();
       // 마스크 자체는 보관해 둘 수도 있지만, 다음 클릭에서 어차피 재계산하므로 비움 → 의도 명확화
-      flattenMaskRef.current = null;
+      boundaryCullMaskRef.current = null;
       // dirty/op 히스토리는 그대로. 토글 자체도 히스토리에 남음.
       setSaved(false);
       const stillDirty = opHistoryRef.current.length > 0
         || pendingRotationRef.current.rotX !== 0
         || pendingRotationRef.current.rotZ !== 0
-        || flattenActiveRef.current;
+        || boundaryCullActiveRef.current;
       dirtyRef.current = stillDirty; setDirty(stillDirty);
       return;
     }
@@ -553,7 +678,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     const data = splatDataRef.current;
     if (!data) return;
 
-    setFlattening(true);
+    setBoundaryCulling(true);
     try {
       const polygon = wallPolygonRef.current;
       const cy = ceilingYRef.current;
@@ -590,8 +715,42 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
           }
         : null;
 
-      // splatData posX/Y/Z (A 프레임)을 회전 → A' 프레임. 이 프레임에서 평면과 비교.
-      const rotPos = buildRotatedPositions(data.posX, data.posY, data.posZ);
+      const boundaryPlanes: SurfacePlane[] = [];
+      if (selectsCeiling) boundaryPlanes.push({ id: 'ceiling', normal: [0, 1, 0], d: cy });
+      if (selectsFloor) boundaryPlanes.push({ id: 'floor', normal: [0, -1, 0], d: -fy });
+      if (selectsAnyWall && polygonReady) {
+        boundaryPlanes.push(
+          ...surfacePlanesFromPolygon({ polygon: polygon!, ceilingY: cy, floorY: fy }).filter(p => isWallSurface(p.id)),
+        );
+      }
+
+      const r0 = data.gsplatData?.getProp('rot_0') as Float32Array | undefined;
+      const r1 = data.gsplatData?.getProp('rot_1') as Float32Array | undefined;
+      const r2 = data.gsplatData?.getProp('rot_2') as Float32Array | undefined;
+      const r3 = data.gsplatData?.getProp('rot_3') as Float32Array | undefined;
+      const sc0 = data.gsplatData?.getProp('scale_0') as Float32Array | undefined;
+      const sc1 = data.gsplatData?.getProp('scale_1') as Float32Array | undefined;
+      const sc2 = data.gsplatData?.getProp('scale_2') as Float32Array | undefined;
+      const op = data.gsplatData?.getProp('opacity') as Float32Array | undefined;
+      const canCheckExtent = !!(r0 && r1 && r2 && r3 && sc0 && sc1 && sc2 && op && boundaryPlanes.length);
+      const rotatedScene = canCheckExtent
+        ? await buildRotatedSceneForRotation({
+            numSplats: data.numSplats,
+            propertyOrder: ['x', 'y', 'z', 'rot_0', 'rot_1', 'rot_2', 'rot_3', 'scale_0', 'scale_1', 'scale_2', 'opacity'],
+            attrs: new Map<string, Float32Array>([
+              ['x', data.posX], ['y', data.posY], ['z', data.posZ],
+              ['rot_0', r0!], ['rot_1', r1!], ['rot_2', r2!], ['rot_3', r3!],
+              ['scale_0', sc0!], ['scale_1', sc1!], ['scale_2', sc2!], ['opacity', op!],
+            ]),
+          }, pendingRotationRef.current)
+        : null;
+      const rotPos = rotatedScene
+        ? { x: rotatedScene.attrs.get('x')!, y: rotatedScene.attrs.get('y')!, z: rotatedScene.attrs.get('z')! }
+        : buildRotatedPositions(data.posX, data.posY, data.posZ);
+      const rr0 = rotatedScene?.attrs.get('rot_0');
+      const rr1 = rotatedScene?.attrs.get('rot_1');
+      const rr2 = rotatedScene?.attrs.get('rot_2');
+      const rr3 = rotatedScene?.attrs.get('rot_3');
 
       const N = data.numSplats;
       const newMask = new Uint8Array(N);
@@ -609,24 +768,36 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
           const sd = polygonSD(x, z);
           if (sd > cutThreshold) outside = true;
         }
+        // 중심은 방 안쪽이어도 PlayCanvas visible extent 가 선택 경계 밖으로 나가면
+        // main GS 에 남기지 않고 wall/ceiling/floor bake 로 넘긴다.
+        if (!outside && canCheckExtent && rr0 && rr1 && rr2 && rr3) {
+          const visibleSigma = gsplatVisibleSigmaRadius(sigmoidOpacity(op![i]));
+          if (visibleSigma > 0) {
+            for (const plane of boundaryPlanes) {
+              const sd = signedDistance(plane, x, y, z);
+              const sigmaN = gaussianNormalSigma(plane.normal as Vec3, rr0[i], rr1[i], rr2[i], rr3[i], sc0![i], sc1![i], sc2![i]);
+              if (visibleExtentCrossesPlane(sd, sigmaN, visibleSigma, cutThreshold)) { outside = true; break; }
+            }
+          }
+        }
         if (outside) { newMask[i] = 1; deletedCount++; }
       }
 
       // undo 기록 (이전 상태 = 비활성 + 마스크 없음)
-      pushOp({ type: 'flatten', prevMask: null, prevActive: false });
+      pushOp({ type: 'boundaryCull', prevMask: null, prevActive: false });
 
-      flattenMaskRef.current = newMask;
-      flattenActiveRef.current = true; setFlattenActive(true);
-      flattenVisibleRef.current = true; setFlattenVisible(true);
-      paintFlattenMask();
+      boundaryCullMaskRef.current = newMask;
+      boundaryCullActiveRef.current = true; setBoundaryCullActive(true);
+      boundaryCullVisibleRef.current = true; setBoundaryCullVisible(true);
+      paintBoundaryCullMask();
       dirtyRef.current = true; setDirty(true);
       setSaved(false);
     } catch (e: any) {
       alert(`처리 실패: ${e.message || e}`);
     } finally {
-      setFlattening(false);
+      setBoundaryCulling(false);
     }
-  }, [selectedSurfaces, globalOffset, buildRotatedPositions, paintFlattenMask, pushOp]);
+  }, [selectedSurfaces, globalOffset, buildRotatedPositions, paintBoundaryCullMask, pushOp]);
 
   // ── applyClipping: 토글식 — 비등방 scale 축소로 가우시안 extent 가 6 평면을 넘지 않게.
   // ON: 평면별 g_i² = 1 - a_in² (1 - f²), f = |sd|/ext. axis 별 min(g²) 적용.
@@ -718,8 +889,8 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     }
   }, [coreRef, ensureOriginalScene, buildRotatedScene, wallMode, cfMode, pushOp]);
 
-  // ── applyFloater: 토글식. flatten(모듈 외부 제거) 활성 상태일 때만 호출 가능.
-  // brush 삭제 ∪ flatten 마스크 = excludeMask. 남은 가우시안에 대해 voxel 카운트 + opacity 컷으로 floater 검출.
+  // ── applyFloater: 토글식. boundaryCull 활성 상태일 때만 호출 가능.
+  // brush 삭제 ∪ boundaryCull 마스크 = excludeMask. 남은 가우시안에 대해 voxel 카운트 + opacity 컷으로 floater 검출.
   const applyFloater = useCallback(async () => {
     // 활성 → 복원
     if (floaterActiveRef.current) {
@@ -730,19 +901,19 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       });
       floaterActiveRef.current = false; setFloaterActive(false);
       floaterMaskRef.current = null;
-      paintFlattenMask();
+      paintBoundaryCullMask();
       setSaved(false);
       const stillDirty = opHistoryRef.current.length > 0
         || pendingRotationRef.current.rotX !== 0
         || pendingRotationRef.current.rotZ !== 0
-        || flattenActiveRef.current
+        || boundaryCullActiveRef.current
         || floaterActiveRef.current;
       dirtyRef.current = stillDirty; setDirty(stillDirty);
       return;
     }
 
-    if (!flattenActiveRef.current) {
-      alert('먼저 "모듈 외부 제거" 를 적용해주세요. floater 는 그 이후 남은 가우시안 중에서만 찾습니다.');
+    if (!boundaryCullActiveRef.current) {
+      alert('먼저 "경계 가우시안 제거" 를 적용해주세요. floater 는 그 이후 남은 가우시안 중에서만 찾습니다.');
       return;
     }
 
@@ -755,7 +926,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       const { detectFloaters } = await import('@/lib/gs/floaters');
 
       const N = data.numSplats;
-      // excludeMask = brush 삭제 (origColorData alpha=0) ∪ flatten 마스크
+      // excludeMask = brush 삭제 (origColorData alpha=0) ∪ boundaryCull 마스크
       const exclude = new Uint8Array(N);
       if (data.origColorData && core) {
         const h2f = core.half2Float;
@@ -764,8 +935,8 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
           if (a < 1e-3) exclude[i] = 1;
         }
       }
-      if (flattenMaskRef.current) {
-        for (let i = 0; i < N; i++) if (flattenMaskRef.current[i]) exclude[i] = 1;
+      if (boundaryCullMaskRef.current) {
+        for (let i = 0; i < N; i++) if (boundaryCullMaskRef.current[i]) exclude[i] = 1;
       }
 
       // detectFloaters 의 SplatData 시그니처 — opacity 는 원본 PLY 의 logit (sigmoid 전).
@@ -787,7 +958,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       pushOp({ type: 'floater', prevMask: null, prevActive: false });
       floaterMaskRef.current = mask;
       floaterActiveRef.current = true; setFloaterActive(true);
-      paintFlattenMask();
+      paintBoundaryCullMask();
       dirtyRef.current = true; setDirty(true);
       setSaved(false);
     } catch (e: any) {
@@ -795,7 +966,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     } finally {
       setFloatering(false);
     }
-  }, [floaterVoxelSize, floaterOpacityCut, floaterMinNeighbors, ensureOriginalScene, paintFlattenMask, pushOp]);
+  }, [floaterVoxelSize, floaterOpacityCut, floaterMinNeighbors, ensureOriginalScene, paintBoundaryCullMask, pushOp]);
 
   // ── Wall mesh: 선택된 면을 텍스처 메시로 굽고 scene 에 추가
   const bakeWallMesh = useCallback(async () => {
@@ -821,7 +992,9 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       const { filterScene } = await import('@/lib/ply');
 
       // 텍스처 굽기에 사용할 source scene 구성:
-      //  - flatten(모듈 외부 제거) 마스크: ❌ 미적용 (depthGate가 표면 근방만 채택하므로 외부 floater 영향 X)
+      //  - boundaryCull 마스크: ❌ 미적용.
+      //    벽/천장/바닥을 가로지르는 Gaussian 기여를 wall mesh 텍스처에 옮겨 담기 위해,
+      //    textureBake 가 평면 교차 covariance 기준으로 필요한 splat 만 채택한다.
       //  - 브러시/bbox 삭제: ✅ 적용 (origColorData alpha=0으로 누적돼 있음)
       const original = await ensureOriginalScene();
       const splatData0 = coreRef.current?.getSplatData();
@@ -866,8 +1039,35 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       lastBakesRef.current.clear();
       for (const surfaceId of Array.from(selectedSurfaces)) {
         const input = planeBakeInputForSurface(surfaceId, room);
-        // autoMargin: 0 → 사용자 경계면을 strict 하게 사용. paintSd 기반 자동 확장 비활성화.
-        const bake = await bakeTextureForPlane(input, source, { depthGate: bakeInnerGate, autoMargin: 0 });
+        let bake = await bakeTextureForPlane(input, source);
+        if (textureBakeProjection === 'view-dependent') {
+          const target = bakeTargetForPlane(input);
+          const bakeFromView = (view: { point: Vec3 }) => {
+            const viewDirection = normalize3([
+              target[0] - view.point[0],
+              target[1] - view.point[1],
+              target[2] - view.point[2],
+            ]);
+            return bakeTextureForPlane(input, source, { viewpoint: view.point, viewDirection });
+          };
+          const bakeViewpoints = buildSurfaceBakeViewpoints(surfaceId, polygon, cy, fy);
+          const centerView = bakeViewpoints[0];
+          bake = await bakeFromView(centerView);
+          const viewVariants = [{
+            id: centerView.id,
+            viewpoint: centerView.point,
+            rgba: bake.rgba,
+          }];
+          for (const view of bakeViewpoints.slice(1)) {
+            const variant = await bakeFromView(view);
+            viewVariants.push({
+              id: view.id,
+              viewpoint: view.point,
+              rgba: variant.rgba,
+            });
+          }
+          bake.viewVariants = viewVariants;
+        }
         const ent = createWallMeshEntity(
           pc, app, splatData.splatEntity, bake, `wallMesh_${surfaceId}`,
           { solidWhite: wallMeshDebugWhite },
@@ -876,7 +1076,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         // 디버그: 베이크 결과 보관 (PNG 다운로드용)
         lastBakesRef.current.set(surfaceId, {
           rgba: bake.rgba, width: bake.width, height: bake.height, input: bake.input,
-          corners: bake.corners, uvs: bake.uvs,
+          corners: bake.corners, uvs: bake.uvs, viewVariants: bake.viewVariants,
         });
       }
       // undo 기록 — 이전 상태 (막 없음).
@@ -889,7 +1089,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     } finally {
       setWallMeshBaking(false);
     }
-  }, [selectedSurfaces, globalOffset, ensureOriginalScene, buildRotatedScene, coreRef, wallMeshDebugWhite, bakeInnerGate, pushOp]);
+  }, [selectedSurfaces, globalOffset, ensureOriginalScene, buildRotatedScene, coreRef, wallMeshDebugWhite, textureBakeProjection, pushOp]);
 
   // 가장 최근 베이크 결과를 PNG로 다운로드 (디버그)
   const downloadBakedTextures = useCallback(() => {
@@ -1065,9 +1265,9 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     const data = splatDataRef.current; const core = coreRef.current;
     if (!data || !core || planesRef.current.length === 0) {
       setOutsideCount(0); setClosed(false);
-      // origColorData 로 단순 복원하면 flatten 마스크 (alpha=0) 가 사라져 외부 가우시안이 다시 보임.
-      // paintFlattenMask 는 base 색 + flatten 상태를 함께 복원.
-      paintFlattenMask();
+      // origColorData 로 단순 복원하면 boundaryCull 마스크 (alpha=0) 가 사라져
+      // 경계 밖/관통 splat 이 다시 보임. paintBoundaryCullMask 는 base 색 + cull 상태를 함께 복원.
+      paintBoundaryCullMask();
       return;
     }
     const codes = computeCellCodes(data.posX, data.posY, data.posZ, data.numSplats, planesRef.current);
@@ -1091,10 +1291,10 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       } else { td[idx]=orig[idx]; td[idx+1]=orig[idx+1]; td[idx+2]=orig[idx+2]; td[idx+3]=orig[idx+3]; }
     }
     try { data.colorTexture.unlock(); } catch {}
-  }, [coreRef, paintFlattenMask]);
+  }, [coreRef, paintBoundaryCullMask]);
 
   // ── Highlight: brush/bbox selection → red ──
-  // flatten 마스크가 활성이면 alpha=0 유지해서 모듈 외부 제거 효과 보존.
+  // boundaryCull 마스크가 활성이면 alpha=0 유지해서 경계 가우시안 제거 효과 보존.
   const refreshSelection = useCallback(() => {
     const data = splatDataRef.current; const core = coreRef.current; const sel = selectionRef.current;
     if (!data || !core || !sel) return;
@@ -1105,19 +1305,19 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     try { td = data.colorTexture.lock(); } catch { return; }
     if (!td) return;
     const orig = data.origColorData; const f2h = core.float2Half; const h2f = core.half2Float;
-    // flatten 적용 마스크 — refreshSelection이 origColorData로 alpha 복원하면서 사라지지 않게 보존
-    const previewMask = flattenPreviewActiveRef.current ? flattenPreviewMaskRef.current : null;
-    const appliedMask = (flattenActiveRef.current && flattenVisibleRef.current) ? flattenMaskRef.current : null;
+    // boundaryCull 적용 마스크 — refreshSelection이 origColorData로 alpha 복원하면서 사라지지 않게 보존
+    const previewMask = boundaryCullPreviewActiveRef.current ? boundaryCullPreviewMaskRef.current : null;
+    const appliedMask = (boundaryCullActiveRef.current && boundaryCullVisibleRef.current) ? boundaryCullMaskRef.current : null;
     const zeroAlpha = f2h(0);
     const redR = f2h(1.0), redG = f2h(0.0), redB = f2h(0.0);
     for (let i = 0; i < data.numSplats; i++) {
       const idx = i * 4;
       if (previewMask && previewMask[i]) {
-        // flatten preview: 삭제될 가우시안 빨강 + alpha 유지
+        // boundaryCull preview: 제외될 가우시안 빨강 + alpha 유지
         td[idx] = redR; td[idx+1] = redG; td[idx+2] = redB;
         td[idx+3] = orig[idx+3];
       } else if (sel[i]) {
-        // brush/bbox 선택: 빨강 톤 mix + alpha 보존 (flatten applied면 0으로 override)
+        // brush/bbox 선택: 빨강 톤 mix + alpha 보존 (boundaryCull applied면 0으로 override)
         const r = h2f(orig[idx]), g = h2f(orig[idx+1]), b = h2f(orig[idx+2]);
         td[idx] = f2h(r*0.3+1.0*0.7); td[idx+1] = f2h(g*0.3+0.1*0.7); td[idx+2] = f2h(b*0.3+0.1*0.7);
         td[idx+3] = (appliedMask && appliedMask[i]) ? zeroAlpha : orig[idx+3];
@@ -1163,13 +1363,13 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     if (!td) return;
     const orig = data.origColorData;
     const f2h = core.float2Half, h2f = core.half2Float;
-    // flatten 마스크 — surface highlight가 alpha를 origColorData로 복원할 때 함께 보존
-    const previewMask = flattenPreviewActiveRef.current ? flattenPreviewMaskRef.current : null;
-    const appliedMask = (flattenActiveRef.current && flattenVisibleRef.current) ? flattenMaskRef.current : null;
+    // boundaryCull 마스크 — surface highlight가 alpha를 origColorData로 복원할 때 함께 보존
+    const previewMask = boundaryCullPreviewActiveRef.current ? boundaryCullPreviewMaskRef.current : null;
+    const appliedMask = (boundaryCullActiveRef.current && boundaryCullVisibleRef.current) ? boundaryCullMaskRef.current : null;
     const zeroAlpha = f2h(0);
     const redR = f2h(1.0), redG = f2h(0.0), redB = f2h(0.0);
     if (sel.size === 0) {
-      // 선택 없음 → 기본 (orig + flatten)
+      // 선택 없음 → 기본 (orig + boundaryCull)
       for (let i = 0; i < data.numSplats; i++) {
         const idx = i * 4;
         if (previewMask && previewMask[i]) {
@@ -1208,7 +1408,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     }
     const wallsReady = wallSegs.length > 0;
 
-    // pendingRotation을 가우시안 좌표에 적용해서 평면(A' 프레임)과 비교 — flatten/막과 동일한 프레임
+    // pendingRotation을 가우시안 좌표에 적용해서 평면(A' 프레임)과 비교 — boundaryCull/막과 동일한 프레임
     const { rotX, rotZ } = pendingRotationRef.current;
     const rotActive = rotX !== 0 || rotZ !== 0;
     const rcx = Math.cos(rotX), rsx = Math.sin(rotX);
@@ -1266,7 +1466,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         }
       }
 
-      // flatten preview 우선 (빨강) > surface highlight (혼합) > 기본 + flatten alpha
+      // boundaryCull preview 우선 (빨강) > surface highlight (혼합) > 기본 + boundaryCull alpha
       if (previewMask && previewMask[i]) {
         td[idx] = redR; td[idx+1] = redG; td[idx+2] = redB; td[idx+3] = orig[idx+3];
       } else if (bestSurf) {
@@ -1289,11 +1489,11 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   }, [selectedSurfaces, applySurfaceHighlight, globalOffset, ceilingY, floorY, wallAngle, wallPolygon]);
 
   // ── Restore original colors (mode switch) ──
-  // 단순히 origColorData로 덮어쓰면 flatten 마스크(alpha=0)가 사라지므로,
-  // paintFlattenMask로 base 색 + flatten 상태를 함께 복원.
+  // 단순히 origColorData로 덮어쓰면 boundaryCull 마스크(alpha=0)가 사라지므로,
+  // paintBoundaryCullMask로 base 색 + cull 상태를 함께 복원.
   const clearHighlight = useCallback(() => {
-    paintFlattenMask();
-  }, [paintFlattenMask]);
+    paintBoundaryCullMask();
+  }, [paintBoundaryCullMask]);
 
   // ── Mode switch handler ──
   const switchMode = useCallback((mode: RefineMode) => {
@@ -1411,9 +1611,9 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         if (a < 1e-3) keep[i] = 0;
       }
     }
-    if (flattenMaskRef.current) {
+    if (boundaryCullMaskRef.current) {
       for (let i = 0; i < N; i++) {
-        if (flattenMaskRef.current[i] && keep[i]) keep[i] = 0;
+        if (boundaryCullMaskRef.current[i] && keep[i]) keep[i] = 0;
       }
     }
     if (floaterActiveRef.current && floaterMaskRef.current) {
@@ -1441,9 +1641,9 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     await core.reloadSplatFromUrl(blobUrl, { preserveCamera: true });
 
     // 삭제는 canonical PLY geometry 에 반영됐으므로 이후 단계에서는 별도 mask 를 더 들고 가지 않는다.
-    flattenMaskRef.current = null;
-    flattenActiveRef.current = false;
-    setFlattenActive(false);
+    boundaryCullMaskRef.current = null;
+    boundaryCullActiveRef.current = false;
+    setBoundaryCullActive(false);
     floaterMaskRef.current = null;
     floaterActiveRef.current = false;
     setFloaterActive(false);
@@ -1453,14 +1653,14 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   // 서버 영속 타이밍:
   //   - 모듈 등록 흐름: 정합 완료 시점 `commit-final` 일괄.
   //   - 베이스맵 등록 흐름: 문 설정 완료 시점 `register-local-basemap` + commitRefinedToServer + persistDoors.
-  // 시각 가이드 (면 하이라이트 틴트, flatten preview 빨강) 는 다듬기 단계에서만 의미 있으니
+  // 시각 가이드 (면 하이라이트 틴트, boundaryCull preview 빨강) 는 다듬기 단계에서만 의미 있으니
   // transition 직전 정리. 가우시안 본체와 baked wall mesh quad 는 그대로 유지.
   const saveRefined = useCallback(async () => {
     // 평면 선택 해제 → applySurfaceHighlight 가 origColorData 로 복원 (틴트 제거)
     setSelectedSurfaces(new Set());
-    // flatten preview 빨강도 해제
-    setFlattenPreviewActive(false);
-    flattenPreviewActiveRef.current = false;
+    // boundaryCull preview 빨강도 해제
+    setBoundaryCullPreviewActive(false);
+    boundaryCullPreviewActiveRef.current = false;
     // pendingRotation 을 splatData 에 in-place 베이크 → 이후 코드는 단일 frame (A') 가정.
     await bakeSplatRotation();
     await rebuildCanonicalPlyFromMemory();
@@ -1472,7 +1672,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     baked: GaussianScene;
     sourceCount: number;
     brushDeleted: number;
-    flattenDeleted: number;
+    boundaryCulled: number;
     floaterDeleted: number;
     rotX: number;
     rotZ: number;
@@ -1493,7 +1693,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         baked,
         sourceCount: canonical.numSplats,
         brushDeleted: 0,
-        flattenDeleted: 0,
+        boundaryCulled: 0,
         floaterDeleted: 0,
         rotX,
         rotZ,
@@ -1516,10 +1716,10 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         if (a < 1e-3) { keep[i] = 0; brushDeleted++; }
       }
     }
-    let flattenDeleted = 0;
-    if (flattenMaskRef.current) {
+    let boundaryCulled = 0;
+    if (boundaryCullMaskRef.current) {
       for (let i = 0; i < N; i++) {
-        if (flattenMaskRef.current[i] && keep[i]) { keep[i] = 0; flattenDeleted++; }
+        if (boundaryCullMaskRef.current[i] && keep[i]) { keep[i] = 0; boundaryCulled++; }
       }
     }
     let floaterDeleted = 0;
@@ -1539,7 +1739,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       baked: filterScene(toRotate, keep),
       sourceCount: N,
       brushDeleted,
-      flattenDeleted,
+      boundaryCulled,
       floaterDeleted,
       rotX,
       rotZ,
@@ -1554,6 +1754,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     plyBytes: ArrayBuffer | Uint8Array;
     meshJson: string;
     textures: Map<string, Blob>;
+    textureVariants: Map<string, Blob>;
     rotX: number;
     rotZ: number;
     wallAngleRad: number;
@@ -1577,6 +1778,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     })();
 
     const textures = new Map<string, Blob>();
+    const textureVariants = new Map<string, Blob>();
     const meshSurfaces: Array<{
       surfaceId: string;
       corners: number[][];
@@ -1585,6 +1787,11 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       textureFilename: string;
       textureWidth: number;
       textureHeight: number;
+      textureVariants?: Array<{
+        id: string;
+        viewpoint: [number, number, number];
+        textureFilename: string;
+      }>;
     }> = [];
 
     if (lastBakesRef.current.size > 0) {
@@ -1608,6 +1815,20 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         const texFilename = `tex_${surfaceId}.png`;
         const pngBlob = await rgbaToPng(bake.rgba, bake.width, bake.height);
         textures.set(surfaceId, pngBlob);
+        const variants: Array<{
+          id: string;
+          viewpoint: [number, number, number];
+          textureFilename: string;
+        }> = [];
+        for (const variant of bake.viewVariants ?? []) {
+          const filename = `tex_${surfaceId}_view_${variant.id}.png`;
+          textureVariants.set(`${surfaceId}_view_${variant.id}`, await rgbaToPng(variant.rgba, bake.width, bake.height));
+          variants.push({
+            id: variant.id,
+            viewpoint: rotateY([variant.viewpoint[0], variant.viewpoint[1], variant.viewpoint[2]]),
+            textureFilename: filename,
+          });
+        }
         const inwardRaw: [number, number, number] = [
           -bake.input.normal[0], -bake.input.normal[1], -bake.input.normal[2],
         ];
@@ -1621,6 +1842,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
           textureFilename: texFilename,
           textureWidth: bake.width,
           textureHeight: bake.height,
+          ...(variants.length > 0 ? { textureVariants: variants } : {}),
         });
       }
     }
@@ -1632,7 +1854,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       planes: buildFinalSurfacePlanes(wallPolygonRef.current, ceilingYRef.current, floorYRef.current, wallAngleRad),
     });
 
-    return { plyBytes, meshJson, textures, rotX, rotZ, wallAngleRad, plyFilename };
+    return { plyBytes, meshJson, textures, textureVariants, rotX, rotZ, wallAngleRad, plyFilename };
   }, [buildFinalPlyScene, options?.originalFilename]);
 
   // 베이스맵 등록 흐름의 문 설정 완료 시점에 호출됨 — refined PLY + mesh.json + tex_*.png 일괄 업로드 + SceneOutput 등록.
@@ -1715,6 +1937,11 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         textureFilename: string;
         textureWidth: number;
         textureHeight: number;
+        textureVariants?: Array<{
+          id: string;
+          viewpoint: [number, number, number];
+          textureFilename: string;
+        }>;
       }> = [];
 
       if (lastBakesRef.current.size > 0) {
@@ -1759,6 +1986,28 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
           const cornersOut = bake.corners.map(
             c => rotateY([c[0], c[1], c[2]]),
           );
+          const variants: Array<{
+            id: string;
+            viewpoint: [number, number, number];
+            textureFilename: string;
+          }> = [];
+          for (const variant of bake.viewVariants ?? []) {
+            const variantFilename = `tex_${surfaceId}_view_${variant.id}.png`;
+            const variantUrl = await api.post<{ put_url: string; key: string }>(
+              '/refine/refined-upload-url',
+              { upload_id: activeUploadId, filename: variantFilename, session_id: sessionId },
+            );
+            const variantBlob = await rgbaToPng(variant.rgba, bake.width, bake.height);
+            const variantResp = await fetch(variantUrl.put_url, {
+              method: 'PUT', body: variantBlob, headers: { 'Content-Type': 'image/png' },
+            });
+            if (!variantResp.ok) throw new Error(`tex variant PUT failed (${surfaceId}/${variant.id}): ${variantResp.status}`);
+            variants.push({
+              id: variant.id,
+              viewpoint: rotateY([variant.viewpoint[0], variant.viewpoint[1], variant.viewpoint[2]]),
+              textureFilename: variantFilename,
+            });
+          }
           meshSurfaces.push({
             surfaceId,
             corners: cornersOut,
@@ -1767,6 +2016,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
             textureFilename: texFilename,
             textureWidth: bake.width,
             textureHeight: bake.height,
+            ...(variants.length > 0 ? { textureVariants: variants } : {}),
           });
         }
 
@@ -1814,12 +2064,12 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     const td = data.colorTexture.lock(); if (!td) return;
     const f2h = core.float2Half;
     const zeroH = f2h(0);
-    // flatten mask 보존: origColorData 에는 flatten 결과가 commit 되어있지 않으므로
-    // non-selected splat 의 alpha 를 origColorData 그대로 쓰면 flatten 으로 가려둔 외부 가우시안이 복원됨.
-    // → fmask 가 1 인 splat 은 GPU alpha=0 유지. origColorData 에는 selected splat 의 alpha=0 만 commit.
-    const fmask = flattenMaskRef.current;
-    const flattenVisible = flattenVisibleRef.current;
-    const fmaskActive = fmask !== null && flattenActiveRef.current && flattenVisible;
+    // boundaryCull mask 보존: origColorData 에는 boundaryCull 결과가 commit 되어있지 않으므로
+    // non-selected splat 의 alpha 를 origColorData 그대로 쓰면 cull 로 가려둔 경계 splat 이 복원됨.
+    // → cullMask 가 1 인 splat 은 GPU alpha=0 유지. origColorData 에는 selected splat 의 alpha=0 만 commit.
+    const cullMask = boundaryCullMaskRef.current;
+    const boundaryCullVisible = boundaryCullVisibleRef.current;
+    const cullMaskActive = cullMask !== null && boundaryCullActiveRef.current && boundaryCullVisible;
     for (let i = 0; i < data.numSplats; i++) {
       const idx = i * 4;
       if (sel[i]) {
@@ -1830,7 +2080,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         td[idx]   = data.origColorData[idx];
         td[idx+1] = data.origColorData[idx+1];
         td[idx+2] = data.origColorData[idx+2];
-        td[idx+3] = (fmaskActive && fmask![i]) ? zeroH : data.origColorData[idx+3];
+        td[idx+3] = (cullMaskActive && cullMask![i]) ? zeroH : data.origColorData[idx+3];
       }
     }
     data.colorTexture.unlock();
@@ -1856,7 +2106,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   }, [pushHistory, refreshSelection]);
 
   // ── Reset all (pristine) ──
-  // 모든 의도(회전 / flatten / 막) 초기화 + GPU 색 복원 + 메인 entity transform 베이스로 복귀.
+  // 모든 의도(회전 / boundaryCull / 막) 초기화 + GPU 색 복원 + 메인 entity transform 베이스로 복귀.
   // 메인 씬 reload는 안 함 (PLY 데이터는 절대 안 건드리는 모델이라 reload 필요 없음).
   const resetAll = useCallback(async () => {
     // 1) GPU 색 텍스처 복원 (in-place)
@@ -1887,9 +2137,9 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     bakedRotationRef.current = { rotX: 0, rotZ: 0 };
     setBakedRotation({ rotX: 0, rotZ: 0 });
     refinedCanonicalSceneRef.current = null;
-    flattenMaskRef.current = null;
-    flattenActiveRef.current = false; setFlattenActive(false);
-    flattenVisibleRef.current = true; setFlattenVisible(true);
+    boundaryCullMaskRef.current = null;
+    boundaryCullActiveRef.current = false; setBoundaryCullActive(false);
+    boundaryCullVisibleRef.current = true; setBoundaryCullVisible(true);
     floaterMaskRef.current = null;
     floaterActiveRef.current = false; setFloaterActive(false);
     // 7) 메인 entity transform 베이스 회전(180Z)으로 복귀
@@ -1924,14 +2174,14 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       pendingRotationRef.current = rec.prevRotation;
       setPendingRotation(rec.prevRotation);
       applyEntityRotation();
-    } else if (rec.type === 'flatten') {
-      flattenMaskRef.current = rec.prevMask;
-      flattenActiveRef.current = rec.prevActive; setFlattenActive(rec.prevActive);
-      paintFlattenMask();
+    } else if (rec.type === 'boundaryCull') {
+      boundaryCullMaskRef.current = rec.prevMask;
+      boundaryCullActiveRef.current = rec.prevActive; setBoundaryCullActive(rec.prevActive);
+      paintBoundaryCullMask();
     } else if (rec.type === 'floater') {
       floaterMaskRef.current = rec.prevMask;
       floaterActiveRef.current = rec.prevActive; setFloaterActive(rec.prevActive);
-      paintFlattenMask();
+      paintBoundaryCullMask();
     } else if (rec.type === 'clipping') {
       // clipping 토글 OFF — 현재 활성이면 snapshot 으로 복원.
       if (clippingActiveRef.current) {
@@ -1948,11 +2198,11 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     const stillDirty = opHistoryRef.current.length > 0
       || pendingRotationRef.current.rotX !== 0
       || pendingRotationRef.current.rotZ !== 0
-      || flattenActiveRef.current
+      || boundaryCullActiveRef.current
       || floaterActiveRef.current;
     dirtyRef.current = stillDirty;
     setDirty(stillDirty);
-  }, [applyEntityRotation, paintFlattenMask]);
+  }, [applyEntityRotation, paintBoundaryCullMask]);
 
   // ── BBox selection apply ──
   const applyBboxSel = useCallback((mn: Vec3, mx: Vec3) => {
@@ -1985,7 +2235,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     if (data.origColorData) pristineRef.current = new Uint16Array(data.origColorData);
     selectionRef.current = new Uint8Array(data.numSplats);
 
-    // 새 splatData 수신 시 누적 회전 / flatten 마스크가 있으면 즉시 시각 동기화
+    // 새 splatData 수신 시 누적 회전 / boundaryCull 마스크가 있으면 즉시 시각 동기화
     // (페이지 새로고침 후 persistence 복원이나 reset 후 등에서 호출됨)
     setTimeout(async () => {
       // bakedRotation 이 0 이 아니면 새 splatData 에 in-place 적용 → A' 상태로 정렬.
@@ -2017,19 +2267,19 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         }
       }
       applyEntityRotation();
-      if (flattenActiveRef.current && flattenMaskRef.current) {
+      if (boundaryCullActiveRef.current && boundaryCullMaskRef.current) {
         // splatData가 새로 로드된 경우, 이전 마스크의 길이가 다를 수 있으니 검사
-        if (flattenMaskRef.current.length === data.numSplats) {
-          paintFlattenMask();
+        if (boundaryCullMaskRef.current.length === data.numSplats) {
+          paintBoundaryCullMask();
         } else {
           // 길이 불일치 → 마스크 무효
-          flattenMaskRef.current = null;
-          flattenActiveRef.current = false; setFlattenActive(false);
+          boundaryCullMaskRef.current = null;
+          boundaryCullActiveRef.current = false; setBoundaryCullActive(false);
         }
       }
       if (floaterActiveRef.current && floaterMaskRef.current) {
         if (floaterMaskRef.current.length === data.numSplats) {
-          paintFlattenMask();
+          paintBoundaryCullMask();
         } else {
           floaterMaskRef.current = null;
           floaterActiveRef.current = false; setFloaterActive(false);
@@ -3023,39 +3273,69 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
               </button>
               {(() => {
                 const notAllConfirmed = cfMode !== 'confirmed' || wallMode !== 'confirmed';
-                const previewDisabled = !flattenPreviewActive && notAllConfirmed;
-                const applyDisabled = flattening || (!flattenActive && (notAllConfirmed || selectedSurfaces.size === 0));
+                const previewDisabled = !boundaryCullPreviewActive && notAllConfirmed;
+                const applyDisabled = boundaryCulling || (!boundaryCullActive && (notAllConfirmed || selectedSurfaces.size === 0));
                 const gateTitle = notAllConfirmed ? '천장/바닥과 벽면을 모두 설정하세요.' : '';
                 return (
                   <>
                     <button
-                      onClick={() => setFlattenPreviewActive(v => !v)}
+                      onClick={() => setBoundaryCullPreviewActive(v => !v)}
                       disabled={previewDisabled}
                       title={previewDisabled ? gateTitle : ''}
-                      className={`px-2 py-1 rounded text-[10px] font-bold disabled:bg-gray-800 disabled:text-gray-500 disabled:cursor-not-allowed ${flattenPreviewActive ? 'bg-red-600 hover:bg-red-500 text-white cursor-pointer' : 'bg-gray-700 hover:bg-gray-600 text-gray-300 cursor-pointer'}`}>
-                      {flattenPreviewActive ? '삭제될 가우시안 숨기기' : '삭제될 가우시안 확인'}
+                      className={`px-2 py-1 rounded text-[10px] font-bold disabled:bg-gray-800 disabled:text-gray-500 disabled:cursor-not-allowed ${boundaryCullPreviewActive ? 'bg-red-600 hover:bg-red-500 text-white cursor-pointer' : 'bg-gray-700 hover:bg-gray-600 text-gray-300 cursor-pointer'}`}>
+                      {boundaryCullPreviewActive ? '경계 제거 미리보기 숨기기' : '경계 제거 미리보기'}
                     </button>
-                    <button onClick={() => applyFlatten()}
+                    <button onClick={() => applyBoundaryCull()}
                       disabled={applyDisabled}
-                      title={!flattenActive && notAllConfirmed ? gateTitle : ''}
+                      title={!boundaryCullActive && notAllConfirmed ? gateTitle : ''}
                       className={`w-full px-2 py-1.5 rounded cursor-pointer text-xs font-bold disabled:bg-gray-600 disabled:text-gray-400 disabled:cursor-not-allowed ${
-                        flattenActive
+                        boundaryCullActive
                           ? 'bg-amber-600 hover:bg-amber-500 text-white'
                           : 'bg-red-600 hover:bg-red-500 text-white'
                       }`}>
-                      {flattening ? '처리 중...' : (flattenActive ? '외부 가우시안 복원' : '외부 가우시안 제거')}
+                      {boundaryCulling ? '처리 중...' : (boundaryCullActive ? '경계 가우시안 복원' : '경계 가우시안 제거')}
                     </button>
                   </>
                 );
               })()}
 
-              {/* 막 생성하기 — 외부 가우시안 제거 활성 후 사용 가능 (의존성: flatten 적용 후 막 생성 의미). */}
-              <div className={`border-t border-gray-700 pt-2 mt-1 space-y-1.5 ${flattenActive ? '' : 'opacity-50 pointer-events-none'}`}>
+              {/* 막 생성하기 — 경계 가우시안 제거 활성 후 사용 가능. */}
+              <div className={`border-t border-gray-700 pt-2 mt-1 space-y-1.5 ${boundaryCullActive ? '' : 'opacity-50 pointer-events-none'}`}>
+                {!wallMeshActive && (
+                  <div className="grid grid-cols-2 gap-1">
+                    <button
+                      type="button"
+                      onClick={() => setTextureBakeProjection('view-independent')}
+                      disabled={wallMeshBaking}
+                      className={`px-2 py-1 rounded text-[10px] font-bold disabled:opacity-50 ${
+                        textureBakeProjection === 'view-independent'
+                          ? 'bg-cyan-600 text-white'
+                          : 'bg-gray-700 hover:bg-gray-600 text-gray-300'
+                      }`}
+                      title="기존 방식: 면 법선 기준 수직투영으로 단일 텍스처를 굽습니다."
+                    >
+                      수직투영
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setTextureBakeProjection('view-dependent')}
+                      disabled={wallMeshBaking}
+                      className={`px-2 py-1 rounded text-[10px] font-bold disabled:opacity-50 ${
+                        textureBakeProjection === 'view-dependent'
+                          ? 'bg-cyan-600 text-white'
+                          : 'bg-gray-700 hover:bg-gray-600 text-gray-300'
+                      }`}
+                      title="대표 카메라 위치/방향별로 여러 텍스처를 굽고, 런타임 카메라 위치에 맞춰 전환합니다."
+                    >
+                      View dependent
+                    </button>
+                  </div>
+                )}
                 {!wallMeshActive ? (
                   <button onClick={() => bakeWallMesh()}
-                    disabled={!flattenActive || wallMeshBaking || selectedSurfaces.size === 0 || wallMode !== 'confirmed' || cfMode !== 'confirmed'}
+                    disabled={!boundaryCullActive || wallMeshBaking || selectedSurfaces.size === 0 || wallMode !== 'confirmed' || cfMode !== 'confirmed'}
                     title={
-                      !flattenActive ? '먼저 외부 가우시안 제거를 적용하세요.'
+                      !boundaryCullActive ? '먼저 경계 가우시안 제거를 적용하세요.'
                       : cfMode !== 'confirmed' ? '천장/바닥 설정을 먼저 확정하세요.'
                       : wallMode !== 'confirmed' ? '벽면 (X/Z) 설정을 먼저 확정하세요.'
                       : selectedSurfaces.size === 0 ? '면을 하나 이상 선택하세요.'
@@ -3087,21 +3367,6 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
                     </button>
                   </div>
                 )}
-              </div>
-
-              {/* 경계면 가우시안 다듬기 — 막 생성 후 사용 가능. */}
-              <div className={`border-t border-gray-700 pt-2 mt-1 space-y-1.5 ${wallMeshActive ? '' : 'opacity-50 pointer-events-none'}`}>
-                <div className="text-[10px] text-gray-400 font-bold">경계면 가우시안 다듬기</div>
-                <button onClick={() => applyClipping()}
-                  disabled={!wallMeshActive || clipping}
-                  title={!wallMeshActive ? '먼저 막을 생성하세요.' : ''}
-                  className={`w-full px-2 py-1.5 rounded cursor-pointer text-xs font-bold disabled:bg-gray-600 disabled:text-gray-400 disabled:cursor-not-allowed ${
-                    clippingActive
-                      ? 'bg-amber-600 hover:bg-amber-500 text-white'
-                      : 'bg-cyan-600 hover:bg-cyan-500 text-white'
-                  }`}>
-                  {clipping ? '처리 중...' : (clippingActive ? '경계면 다듬기 취소' : '경계면 다듬기')}
-                </button>
               </div>
             </div>
 
@@ -3276,7 +3541,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
             onClick={undoLast}
             disabled={undoDepth === 0}
             className="flex-1 px-3 py-1.5 bg-amber-700 hover:bg-amber-600 disabled:bg-gray-700 disabled:text-gray-500 text-white rounded cursor-pointer disabled:cursor-not-allowed text-xs"
-            title="마지막 파괴적 작업(회전/모듈 외부 제거/막 생성) 되돌리기"
+            title="마지막 파괴적 작업(회전/경계 가우시안 제거/막 생성) 되돌리기"
           >
             되돌리기 {undoDepth > 0 ? `(${undoDepth})` : ''}
           </button>
@@ -3338,12 +3603,12 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
                 setSaved(false);
               }
 
-              // 회전 변경 후 flatten 마스크 / 벽 정의 무효화 (이전 회전 프레임 기준이라 stale).
+              // 회전 변경 후 boundaryCull 마스크 / 벽 정의 무효화 (이전 회전 프레임 기준이라 stale).
               if (rotChanged) {
-                if (flattenMaskRef.current) {
-                  flattenMaskRef.current = null;
-                  flattenActiveRef.current = false; setFlattenActive(false);
-                  paintFlattenMask();
+                if (boundaryCullMaskRef.current) {
+                  boundaryCullMaskRef.current = null;
+                  boundaryCullActiveRef.current = false; setBoundaryCullActive(false);
+                  paintBoundaryCullMask();
                 }
                 if (wallModeRef.current === 'confirmed') {
                   setWallMode('none'); wallModeRef.current = 'none';
@@ -3416,7 +3681,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     </>
   ) : null;
 
-  // 현재 keep mask 반환 — flatten/floater/brush 삭제 모두 반영. 문 설정 단계에서 cachedScene 에 적용해
+  // 현재 keep mask 반환 — boundaryCull/floater/brush 삭제 모두 반영. 문 설정 단계에서 cachedScene 에 적용해
   // refined 상태와 동기화된 가우시안 집합으로 도어 추출 작업 수행하도록 사용.
   const getCurrentKeepMask = useCallback((): Uint8Array | null => {
     const data = splatDataRef.current;
@@ -3431,9 +3696,9 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         if (a < 1e-3) keep[i] = 0;
       }
     }
-    if (flattenMaskRef.current) {
+    if (boundaryCullMaskRef.current) {
       for (let i = 0; i < N; i++) {
-        if (flattenMaskRef.current[i] && keep[i]) keep[i] = 0;
+        if (boundaryCullMaskRef.current[i] && keep[i]) keep[i] = 0;
       }
     }
     if (floaterActiveRef.current && floaterMaskRef.current) {
@@ -3446,10 +3711,20 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
 
   // 문 설정 단계의 alpha-punch 가 lastBakesRef CPU rgba 까지 반영되도록 외부에서 접근 가능하게 노출.
   // (DoorAlignModal 이 GPU colorTexture 만 punch 하는 한, 같은 punch 를 여기서도 호출해 서버 PNG 와 일관 유지.)
-  const getBakeRgba = useCallback((surfaceId: string): { rgba: Uint8ClampedArray; width: number; height: number } | null => {
+  const getBakeRgba = useCallback((surfaceId: string): {
+    rgba: Uint8ClampedArray;
+    width: number;
+    height: number;
+    viewVariants?: Array<{ rgba: Uint8ClampedArray }>;
+  } | null => {
     const b = lastBakesRef.current.get(surfaceId);
     if (!b) return null;
-    return { rgba: b.rgba, width: b.width, height: b.height };
+    return {
+      rgba: b.rgba,
+      width: b.width,
+      height: b.height,
+      viewVariants: b.viewVariants?.map((variant) => ({ rgba: variant.rgba })),
+    };
   }, []);
 
   const registerPersistedBake = useCallback((surface: {

@@ -38,6 +38,7 @@ basemap 수정 모드에서 도어를 추가/삭제할 때 `doors.json`, 도어 
 ### 8. 창문 segmentation + 투명 텍스처
 
 텍스처 베이크 시 창문 영역 자동 segmentation (SAM3 등) → 알파 0 으로 punch → 창문 너머 보이도록.
+창문 영역은 방 밖 풍경/외부 가우시안을 벽 텍스처에 함께 bake 하면 안 되므로, 일반 벽/천장/바닥의 coverage 보정과 분리해서 다룬다.
 
 ## Cleanup and UX
 
@@ -69,43 +70,47 @@ basemap 도어 X 삭제 시 wall 텍스처의 alpha=0 punch 영역에 원본 `cu
 
 현재 "정합 문 두께" 슬라이더 변경 후 "정합" 버튼 다시 눌러야 frame mesh 두께 갱신. 실시간 또는 디바운스 자동 재정합 검토.
 
+### 16. 불 켜고 끄기 효과
+
+층/뷰어 화면에서 공간 또는 모듈 단위로 조명 on/off 상태를 토글하고, 켜짐/꺼짐이 즉시 체감되도록 밝기·emissive·색 보정 효과를 적용한다. 실제 조명 모델을 도입하기 전에는 wall mesh/material 과 viewer post-process 수준의 시각 효과로 시작하고, 상태 저장이 필요해지면 SceneOutput 또는 별도 room state metadata 로 확장한다.
+
 ## Refactoring Opportunities
 
-### 16. `useRegistrationContext` 커스텀 훅
+### 17. `useRegistrationContext` 커스텀 훅
 
 `UnifiedSplatEditor` 의 `autoFinalizeFromContext` + `ensureUploadForLocal` + `requestMetadata` 가 한 덩어리. `useRegistrationContext(initialContext)` 훅으로 추출하면 모듈/베이스맵 흐름의 등록 처리 일원화.
 
-### 17. DoorAlignModal 파일 분할
+### 18. DoorAlignModal 파일 분할
 
 3000+줄 거대 파일. `applyDoorRefine` / `revertDoorRefine` / `applyDoorRotation` 등 독립 함수들을 `doorAlignActions.ts` 등으로 분리.
 
-### 18. useRefineTool 파일 분할
+### 19. useRefineTool 파일 분할
 
 다듬기 도구가 canonical PLY, 삭제 마스크, wall mesh bake, UI state 를 한 파일에서 모두 관리한다. 동작 안정화 후 `useCanonicalPly`, `useWallMeshBake`, `useRefineDeletionMasks` 같은 작은 훅/헬퍼로 분리하되, 좌표계와 저장 포맷은 변경하지 않는다.
 
-### 19. AlignPanel rectFit 호출 helper
+### 20. AlignPanel rectFit 호출 helper
 
 AlignPanel 의 rectFit 호출 + gap push + 애니메이션 셋업 코드가 `runAutoAlign` 안에 집중. `lib/alignment/doorAlign.ts` 같은 모듈에 helper 로 분리.
 
 ## Performance and Operations
 
-### 20. Floor overview 대용량 로딩
+### 21. Floor overview 대용량 로딩
 
 층 화면에서 basemap 과 모든 정합 모듈의 PLY, wall mesh, door mesh/splat 을 한 번에 로드하면 브라우저 메모리가 부족해질 수 있다. 기본은 basemap + 가벼운 module preview 를 먼저 표시하고, 선택/근접/토글 시 module 상세 자산을 lazy load 하는 구조를 검토한다.
 
 현재 QA 범위에서 문제가 재발하지 않으면 유지한다. 만약 여러 모듈을 한 층에 올렸을 때 `Array buffer allocation failed`, `getImageData out of memory`, viewer 로드 실패가 다시 발생하면 전체 동시 로딩을 중단하고 다음 구조로 바꾼다: basemap 은 즉시 로드, module PLY/door splat/wall mesh 는 사용자가 선택하거나 카메라가 근접했을 때만 lazy load, 비선택 module 은 경량 bbox/label/thumbnail 로 대체.
 
-### 21. SceneOutput migration 적용 확인
+### 22. SceneOutput migration 적용 확인
 
 `scene_outputs.sog_path` 는 더 이상 필수 저장값이 아니다. 배포와 QA 전 `0015_nullable_scene_output_sog_path` migration 이 적용되었는지 확인한다. migration 미적용 DB 에서는 `/api/refine/save` 또는 `/api/uploads/commit-final` 이 `sog_path NOT NULL` 제약으로 500 을 낼 수 있다.
 
 조회 경로는 SOG 가 있으면 뷰어용 경량 자산으로 우선 사용하고, 없으면 canonical PLY 로 fallback 한다. `sog_path=final_ply_key` 처럼 PLY 를 SOG 컬럼에 중복 저장하는 임시 호환 코드는 migration 적용 후 제거해야 한다.
 
-### 22. SceneOutput 버전 선택 정책
+### 23. SceneOutput 버전 선택 정책
 
 정제/정합 저장은 새 `SceneOutput` row 를 계속 생성한다. 이는 같은 모듈에 여러 버전의 에셋이 쌓일 수 있게 하려는 의도된 설계다. 현재 조회는 최신 row 를 사용하지만, 장기적으로는 좋아요/평가/관리자 선택 기준으로 대표 에셋을 고르는 정책을 추가한다. 시연 단계에서는 관리자 계정으로 최신/승인 에셋을 직접 보여주는 운영으로 충분하므로 후순위로 둔다.
 
-### 23. Basemap 교체 후 기존 모듈 재정렬
+### 24. Basemap 교체 후 기존 모듈 재정렬
 
 활성 basemap 을 교체하면 기존 모듈의 정합 기준이 바뀔 수 있다. 현재는 활성 basemap 의 `minio_path` 를 직접 조회하고, 교체 시 기존 모듈 재정렬이 필요하다는 응답만 반환한다. 실제 basemap 재정렬 작업이 필요해지면 `basemap_realign` 태스크를 추가해 기존 모듈 transform 을 새 basemap 기준으로 재계산한다.
 

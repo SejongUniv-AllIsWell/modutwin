@@ -10,8 +10,8 @@ import { useToast } from '@/components/ui/Toast';
 import RoomWheelPicker, { FloorWheelPicker, roomNumberLabel } from '@/components/ui/RoomWheelPicker';
 import type { Module } from '@/types';
 
-const INACTIVE_FLOOR_BG_TOP = '#ded7c9';
-const INACTIVE_FLOOR_BG = '#d2cabb';
+const INACTIVE_FLOOR_BG_TOP = '#222428';
+const INACTIVE_FLOOR_BG = '#17191d';
 
 export default function BuildingOverviewPage() {
   const router = useRouter();
@@ -317,7 +317,7 @@ export default function BuildingOverviewPage() {
           </h1>
         </div>
 
-        <div className="mt-4 text-[11px] font-semibold tracking-[0.12em]" style={{ color: 'var(--muted)' }}>
+        <div className="mt-4 text-[11px] font-semibold" style={{ color: 'var(--muted)', letterSpacing: 0 }}>
           FLOORS ({floors.length})
         </div>
 
@@ -325,6 +325,7 @@ export default function BuildingOverviewPage() {
           {floors.map((floor) => {
             const isPendingFloor = floor.floor_id.startsWith('pending-');
             const hasBasemapWarning = !floor.has_active_basemap;
+            const activeFloor = floor.has_active_basemap && !isPendingFloor;
             const warningText = floor.has_pending_basemap
               ? 'basemap 관리자 승인 대기중입니다.'
               : '등록된 basemap 이 없습니다.';
@@ -334,79 +335,86 @@ export default function BuildingOverviewPage() {
             return (
               <div
                 key={floor.floor_id}
-                className="relative rounded-md border transition overflow-visible"
-                style={{ background: 'var(--bg)', borderColor: 'var(--rule)' }}
+                className="relative rounded-md overflow-visible"
+                data-floor-menu-root="true"
               >
-                <div className="flex items-stretch">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      if (isPendingFloor) return;
-                      router.push(`/buildings/${buildingId}/floors/${floor.floor_number}`);
-                    }}
-                    disabled={isPendingFloor}
-                    className="flex-1 min-w-0 h-[74px] px-4 py-3 text-left disabled:opacity-60 disabled:cursor-default hover:bg-[var(--bg-soft)] transition"
-                    style={{ color: 'var(--ink)' }}
-                  >
-                    <div className="flex items-center gap-3">
-                      <div className="flex-1 min-w-0">
-                        <div className="text-base font-semibold truncate">{floorLabel(floor.floor_number)}</div>
-                        <div className="text-[11px] mt-0.5" style={{ color: 'var(--muted)' }}>
-                          {floor.module_count}개 모듈
-                        </div>
-                      </div>
-                      <div className="flex h-7 w-7 shrink-0 items-center justify-center">
-                        {hasBasemapWarning && (
-                          <span
-                            className="group/warn relative inline-flex h-7 w-7 items-center justify-center rounded-md border shadow-sm"
-                            style={{ background: iconBg, borderColor: iconBorder, color: iconColor }}
-                            aria-label={warningText}
-                          >
-                            <svg
-                              className="h-4 w-4"
-                              viewBox="0 0 24 24"
-                              fill="none"
-                              stroke="currentColor"
-                              strokeWidth={2.4}
-                              strokeLinecap="round"
-                              strokeLinejoin="round"
-                              aria-hidden="true"
-                            >
-                              <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z" />
-                              <path d="M12 9v4" />
-                              <path d="M12 17h.01" />
-                            </svg>
-                            <span
-                              className="pointer-events-none absolute right-0 top-8 z-20 w-max max-w-[220px] rounded-sm border px-2 py-1 text-[11px] font-medium opacity-0 shadow-lg transition-opacity delay-300 duration-100 group-hover/warn:opacity-100"
-                              style={{
-                                background: 'var(--paper)',
-                                borderColor: 'var(--rule)',
-                                color: 'var(--ink)',
-                              }}
-                            >
-                              {warningText}
-                            </span>
-                          </span>
-                        )}
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (isPendingFloor) return;
+                    router.push(`/buildings/${buildingId}/floors/${floor.floor_number}`);
+                  }}
+                  disabled={isPendingFloor}
+                  className="w-full px-4 py-3 pr-16 text-left transition border rounded-md disabled:cursor-default hover:brightness-125 hover:shadow-[0_0_0_1px_rgba(56,189,248,0.32)]"
+                  style={{
+                    borderColor: activeFloor ? 'rgba(56,189,248,0.35)' : 'var(--rule)',
+                    background: activeFloor ? 'rgba(56,189,248,0.08)' : 'rgba(255,255,255,0.025)',
+                    color: activeFloor ? 'var(--ink)' : 'var(--muted)',
+                    opacity: hasBasemapWarning ? 0.7 : 1,
+                  }}
+                >
+                  <div className="flex items-center gap-3">
+                    <div className="flex-1 min-w-0">
+                      <div className="text-base font-semibold truncate">{floorLabel(floor.floor_number)}</div>
+                      <div
+                        className="text-[11px] mt-0.5"
+                        style={{ color: activeFloor ? 'var(--accent)' : 'var(--muted)' }}
+                      >
+                        {floor.module_count}개 모듈
                       </div>
                     </div>
+                    <div className="flex h-6 w-6 shrink-0 items-center justify-center">
+                      {hasBasemapWarning && (
+                        <span
+                          className="group/warn relative inline-flex h-6 w-6 items-center justify-center rounded-md border shadow-sm"
+                          style={{ background: iconBg, borderColor: iconBorder, color: iconColor }}
+                          aria-label={warningText}
+                        >
+                          <svg
+                            className="h-3.5 w-3.5"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth={2.4}
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            aria-hidden="true"
+                          >
+                            <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z" />
+                            <path d="M12 9v4" />
+                            <path d="M12 17h.01" />
+                          </svg>
+                          <span
+                            className="pointer-events-none absolute right-0 top-8 z-20 w-max max-w-[220px] rounded-sm border px-2 py-1 text-[11px] font-medium opacity-0 shadow-lg transition-opacity delay-300 duration-100 group-hover/warn:opacity-100"
+                            style={{
+                              background: 'var(--paper)',
+                              borderColor: 'var(--rule)',
+                              color: 'var(--ink)',
+                            }}
+                          >
+                            {warningText}
+                          </span>
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                </button>
+                <div className="absolute right-2 top-1/2 -translate-y-1/2">
+                  <button
+                    type="button"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      setOpenFloorMenuId((prev) => (prev === floor.floor_id ? null : floor.floor_id));
+                    }}
+                    className="flex h-8 w-8 items-center justify-center rounded-sm hover:bg-sky-400/10"
+                    style={{ color: activeFloor ? 'var(--accent)' : 'var(--muted)' }}
+                    aria-label={`${floorLabel(floor.floor_number)} 메뉴`}
+                  >
+                    ⋮
                   </button>
-                  <div className="relative" data-floor-menu-root="true">
-                    <button
-                      type="button"
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        setOpenFloorMenuId((prev) => (prev === floor.floor_id ? null : floor.floor_id));
-                      }}
-                      className="h-full px-3 flex items-center justify-center rounded-r-md hover:bg-[var(--bg-soft)]"
-                      style={{ color: 'var(--muted)' }}
-                      aria-label={`${floorLabel(floor.floor_number)} 메뉴`}
-                    >
-                      ⋮
-                    </button>
                     {openFloorMenuId === floor.floor_id && (
                       <div
-                        className="absolute right-0 top-8 z-10 w-28 rounded-sm border shadow-lg p-1"
+                        className="absolute right-0 top-9 z-10 w-28 rounded-sm border shadow-lg p-1"
                         style={{ background: 'var(--paper)', borderColor: 'var(--rule)' }}
                       >
                         {!floor.has_active_basemap && (
@@ -416,7 +424,7 @@ export default function BuildingOverviewPage() {
                               setOpenFloorMenuId(null);
                               openRegisterModal(floor, 'basemap');
                             }}
-                            className="w-full text-left text-xs px-2 py-1.5 rounded-sm hover:bg-[var(--bg-soft)]"
+                            className="w-full text-left text-xs px-2 py-1.5 rounded-sm hover:bg-sky-400/10"
                             style={{ color: 'var(--ink)' }}
                           >
                             basemap 등록
@@ -429,7 +437,7 @@ export default function BuildingOverviewPage() {
                               disabled={user?.role !== 'admin'}
                               title={user?.role !== 'admin' ? '관리자만 수정할 수 있습니다.' : undefined}
                               onClick={() => handleEditBasemap(floor)}
-                              className="w-full text-left text-xs px-2 py-1.5 rounded-sm transition disabled:cursor-not-allowed disabled:opacity-40 disabled:grayscale hover:bg-[var(--bg-soft)] disabled:hover:bg-transparent"
+                              className="w-full text-left text-xs px-2 py-1.5 rounded-sm transition disabled:cursor-not-allowed disabled:opacity-40 disabled:grayscale hover:bg-sky-400/10 disabled:hover:bg-transparent"
                               style={{
                                 color: user?.role === 'admin' ? 'var(--ink)' : 'var(--muted)',
                                 textDecoration: user?.role === 'admin' ? undefined : 'line-through',
@@ -473,7 +481,6 @@ export default function BuildingOverviewPage() {
                         </button>
                       </div>
                     )}
-                  </div>
                 </div>
               </div>
             );
@@ -487,9 +494,9 @@ export default function BuildingOverviewPage() {
           title={!user ? '로그인 후 등록 가능합니다' : undefined}
           className="mt-4 shrink-0 w-full inline-flex items-center justify-center gap-2 rounded-sm border py-3 text-sm font-semibold transition active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed"
           style={{
-            background: 'var(--ink)',
-            color: 'var(--bg)',
-            borderColor: 'var(--ink)',
+            background: 'var(--accent)',
+            color: '#04131f',
+            borderColor: 'var(--accent)',
           }}
           aria-label="층 추가"
         >
@@ -583,7 +590,7 @@ export default function BuildingOverviewPage() {
                 type="button"
                 onClick={closeAddFloor}
                 disabled={addFloorBusy}
-                className="flex-1 rounded-sm border hover:bg-[var(--bg-soft)] disabled:opacity-50 py-2 text-sm"
+                className="flex-1 rounded-sm border hover:bg-sky-400/10 disabled:opacity-50 py-2 text-sm"
                 style={{ borderColor: 'var(--rule)', color: 'var(--ink)' }}
               >
                 취소
@@ -594,9 +601,9 @@ export default function BuildingOverviewPage() {
                 disabled={addFloorBusy}
                 className="flex-1 rounded-sm border disabled:opacity-60 py-2 text-sm font-semibold"
                 style={{
-                  background: 'var(--ink)',
-                  color: 'var(--bg)',
-                  borderColor: 'var(--ink)',
+                  background: 'var(--accent)',
+                  color: '#04131f',
+                  borderColor: 'var(--accent)',
                 }}
               >
                 {addFloorBusy ? '추가 중...' : `${floorLabelKo(addFloorPick)} 추가`}
@@ -655,7 +662,7 @@ export default function BuildingOverviewPage() {
                 type="button"
                 disabled={registerBusy}
                 onClick={closeRegisterModal}
-                className="flex-1 rounded-sm border hover:bg-[var(--bg-soft)] disabled:opacity-50 py-2 text-sm"
+                className="flex-1 rounded-sm border hover:bg-sky-400/10 disabled:opacity-50 py-2 text-sm"
                 style={{ borderColor: 'var(--rule)', color: 'var(--ink)' }}
               >
                 취소
@@ -666,9 +673,9 @@ export default function BuildingOverviewPage() {
                 onClick={handleRegister}
                 className="flex-1 rounded-sm border disabled:opacity-60 py-2 text-sm font-semibold"
                 style={{
-                  background: 'var(--ink)',
-                  color: 'var(--bg)',
-                  borderColor: 'var(--ink)',
+                  background: 'var(--accent)',
+                  color: '#04131f',
+                  borderColor: 'var(--accent)',
                 }}
               >
                 {registerBusy
@@ -719,9 +726,9 @@ function FloorSlab({
         imageUrl ? 'rounded-sm' : 'rounded-md border'
       } ${dimmed ? 'opacity-40' : inactive ? 'opacity-55 grayscale' : 'opacity-100'} ${!interactive ? 'cursor-default' : ''}`}
       style={{
-        borderColor: hovered && interactive ? 'var(--ink)' : imageUrl ? undefined : 'var(--rule)',
-        boxShadow: hovered && interactive ? '0 10px 24px -12px rgba(0,0,0,0.25)' : undefined,
-        outline: imageUrl ? (hovered && interactive ? '2px solid var(--ink)' : '1px solid var(--rule)') : undefined,
+        borderColor: hovered && interactive ? 'var(--accent)' : imageUrl ? undefined : 'var(--rule)',
+        boxShadow: hovered && interactive ? '0 12px 26px -14px rgba(56,189,248,0.42)' : undefined,
+        outline: imageUrl ? (hovered && interactive ? '2px solid var(--accent)' : '1px solid var(--rule)') : undefined,
         outlineOffset: imageUrl ? '-1px' : undefined,
       }}
     >

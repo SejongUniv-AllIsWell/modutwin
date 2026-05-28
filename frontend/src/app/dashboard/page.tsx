@@ -8,12 +8,14 @@ export default function DashboardPage() {
   const { user, loading } = useRequireAuth();
 
   if (loading || !user) {
-    return <div className="flex items-center justify-center h-64 text-[var(--muted)]">로딩 중...</div>;
+    return <div className="flex items-center justify-center h-64 bg-[var(--bg)] text-[var(--muted)]">로딩 중...</div>;
   }
 
   return (
-    <div className="max-w-5xl mx-auto px-4 py-8">
+    <div className="min-h-[calc(100vh-56px)] bg-[var(--bg)] text-[var(--ink)]">
+      <div className="max-w-5xl mx-auto px-4 py-8">
       {user.role === 'admin' ? <AdminDashboard /> : <UserDashboard />}
+      </div>
     </div>
   );
 }

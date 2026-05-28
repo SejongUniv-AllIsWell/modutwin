@@ -396,7 +396,7 @@ export default function VisibilityManager() {
       onClick={onClick}
       disabled={busy}
       className={`text-xs px-3 py-1 rounded text-[var(--ink)] disabled:bg-[var(--bg-soft)] shrink-0 ${
-        visible ? 'bg-[var(--bg-soft)] hover:bg-[var(--rule)]' : 'bg-blue-600 hover:bg-blue-700'
+        visible ? 'bg-[var(--paper)] hover:bg-sky-400/10 border border-[var(--rule)]' : 'bg-[var(--accent)] hover:brightness-110 text-[#04131f]'
       }`}
     >
       {busy ? '...' : visible ? '숨기기' : '표시'}
@@ -423,7 +423,7 @@ export default function VisibilityManager() {
         <div className="flex items-center gap-3">
           <button
             onClick={openAddBuilding}
-            className="text-xs px-3 py-1 rounded bg-blue-600 hover:bg-blue-700 text-[var(--ink)]"
+            className="text-xs px-3 py-1 rounded bg-[var(--accent)] hover:brightness-110 text-[#04131f]"
           >
             + 건물 추가
           </button>
@@ -511,13 +511,13 @@ export default function VisibilityManager() {
                           <button
                             onClick={() => submitAddFloor(b.id)}
                             disabled={busyKey === `addFloor:${b.id}`}
-                            className="text-xs px-2 py-1 rounded bg-blue-600 hover:bg-blue-700 text-[var(--ink)] disabled:bg-[var(--bg-soft)]"
+                            className="text-xs px-2 py-1 rounded bg-[var(--accent)] hover:brightness-110 text-[#04131f] disabled:bg-[var(--bg-soft)]"
                           >
                             {busyKey === `addFloor:${b.id}` ? '...' : '추가'}
                           </button>
                           <button
                             onClick={cancelAddFloor}
-                            className="text-xs px-2 py-1 rounded bg-[var(--bg-soft)] hover:bg-[var(--rule)] text-[var(--ink)]"
+                            className="text-xs px-2 py-1 rounded bg-[var(--paper)] hover:bg-sky-400/10 border border-[var(--rule)] text-[var(--ink)]"
                           >
                             취소
                           </button>
@@ -591,13 +591,13 @@ export default function VisibilityManager() {
                                       <button
                                         onClick={() => submitAddModule(f.id)}
                                         disabled={busyKey === `addModule:${f.id}`}
-                                        className="text-xs px-2 py-1 rounded bg-blue-600 hover:bg-blue-700 text-[var(--ink)] disabled:bg-[var(--bg-soft)]"
+                                        className="text-xs px-2 py-1 rounded bg-[var(--accent)] hover:brightness-110 text-[#04131f] disabled:bg-[var(--bg-soft)]"
                                       >
                                         {busyKey === `addModule:${f.id}` ? '...' : '추가'}
                                       </button>
                                       <button
                                         onClick={cancelAddModule}
-                                        className="text-xs px-2 py-1 rounded bg-[var(--bg-soft)] hover:bg-[var(--rule)] text-[var(--ink)]"
+                                        className="text-xs px-2 py-1 rounded bg-[var(--paper)] hover:bg-sky-400/10 border border-[var(--rule)] text-[var(--ink)]"
                                       >
                                         취소
                                       </button>
@@ -669,7 +669,7 @@ export default function VisibilityManager() {
               placeholder="건물 이름 / 주소 검색..."
               autoFocus
               disabled={addBuildingBusy}
-              className="w-full bg-[var(--bg-soft)] border border-[var(--rule)] rounded px-3 py-2 text-[var(--ink)] text-sm focus:outline-none focus:border-blue-500 disabled:opacity-50"
+              className="w-full bg-[var(--bg-soft)] border border-[var(--rule)] rounded px-3 py-2 text-[var(--ink)] text-sm focus:outline-none focus:border-sky-400 disabled:opacity-50"
             />
             <div className="mt-3 max-h-80 overflow-y-auto border border-[var(--rule)] rounded">
               {searchLoading && (
@@ -687,7 +687,7 @@ export default function VisibilityManager() {
                   type="button"
                   onClick={() => addBuildingFromKakao(place)}
                   disabled={addBuildingBusy}
-                  className="w-full text-left px-3 py-2 hover:bg-[var(--bg-soft)] transition-colors border-t border-[var(--rule)] first:border-t-0 disabled:opacity-50"
+                  className="w-full text-left px-3 py-2 hover:bg-sky-400/10 transition-colors border-t border-[var(--rule)] first:border-t-0 disabled:opacity-50"
                 >
                   <div className="text-[var(--ink)] text-sm font-medium truncate">{place.place_name}</div>
                   <div className="text-[var(--muted)] text-xs mt-0.5 truncate">
@@ -726,7 +726,7 @@ export default function VisibilityManager() {
                 type="button"
                 onClick={() => setDeleteTarget(null)}
                 disabled={busyKey === `delete:${deleteTarget.scope}:${deleteTarget.id}`}
-                className="rounded bg-[var(--bg-soft)] px-4 py-2 text-sm text-[var(--ink)] hover:bg-[var(--rule)] disabled:opacity-50"
+                className="rounded bg-[var(--paper)] border border-[var(--rule)] px-4 py-2 text-sm text-[var(--ink)] hover:bg-sky-400/10 disabled:opacity-50"
               >
                 취소
               </button>

@@ -86,3 +86,32 @@
     background: transparent;
   }
 }
+
+@layer components {
+  .modutwin-logo {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 0;
+    text-decoration: none;
+    font-weight: 650;
+    letter-spacing: 0;
+  }
+
+  .modutwin-logo-dot {
+    position: relative;
+    display: inline-block;
+  }
+
+  .modutwin-logo-dot::before {
+    content: '';
+    position: absolute;
+    left: 50%;
+    top: -0.24em;
+    width: 0.28em;
+    height: 0.28em;
+    transform: translateX(-50%);
+    border-radius: 999px;
+    background: var(--accent);
+    box-shadow: 0 0 12px rgba(56, 189, 248, 0.45);
+  }
+}

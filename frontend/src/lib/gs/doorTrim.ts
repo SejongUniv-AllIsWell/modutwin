@@ -6,17 +6,18 @@
  * 비대칭 — sd 위치 그대로, 1/2 강제 X.
  *
  * 분할된 sub 의 새 center / scale (수식, n_e = inward edge normal):
- *   ext   = 3σ along n_e (원본).
+ *   ext   = PlayCanvas visible radius along n_e (원본).
  *   door:  center += (ext − sd)/2 · n_e,   scale_ratio = (sd + ext)/(2·ext)
  *   wall:  center −= (ext + sd)/2 · n_e,   scale_ratio = (ext − sd)/(2·ext)
  * 이 비율은 원본 가우시안의 모든 axis scale 에 곱해짐 (uniform shrink).
  *
  * 가우시안 총 수: N → N + N_boundary.
- * - 메인 PLY 의 boundary slot 들은 wall-side sub 데이터로 in-place 덮어쓰기 (caller 가 GPU sync).
+ * - 메인 PLY 에 남는 원본 slot 들은 wall-side sub 데이터로 in-place 덮어쓰기 (caller 가 GPU sync).
  * - door-side sub 들은 별도 GaussianScene 으로 반환 (additional splat group 용).
  */
 
 import type { GaussianScene } from '../ply/types';
+import { gsplatVisibleSigmaRadius, sigmoidOpacity } from './playcanvasGsplat';
 
 export type Vec3 = [number, number, number];
 
@@ -72,8 +73,8 @@ export function rectGeom(corners: [Vec3, Vec3, Vec3, Vec3]): RectGeom {
 export interface DecomposeOptions {
   /**
    * "boundary 에서 얼마나 떨어져야 fully inside/outside 로 판정하는지" 에 사용하는 σ 배수.
-   * 기본 3 — 3DGS 렌더링이 2D projected footprint 를 3σ 에서 컷하므로 시각 한계 일치.
-   * 코너 부근에서 드물게 새어나오는 경우 4 등으로 올려서 더 보수적 판정 가능.
+   * 미지정 시 PlayCanvas visible radius 를 opacity 별로 계산한다.
+   * 지정하면 디버그/보수 판정용 고정 σ 배수로 강제한다.
    */
   sigmaMultiplier?: number;
   /**
@@ -98,7 +99,7 @@ export interface DecomposeOptions {
  * 슬랩: 벽 평면에서 방 안쪽으로 doorExtractionDepth 깊이까지의 단방향 영역.
  * - sdOut = (c - pO) · wallOutward.  방 안쪽 → 음수, 방 바깥 → 양수.
  * - 허용: -doorExtractionDepth ≤ sdOut ≤ 0.
- *   다듬기 단계의 외부 가우시안 제거 (flatten) 가 이미 sd > 0 splat 을 모두 alpha=0 시켰으므로
+ *   다듬기 단계의 boundaryCull 이 이미 경계 밖/경계 관통 splat 을 alpha=0 시켰으므로
  *   엄격 컷 (0 강제) 으로 충분.
  *
  * doorExtractionDepth ≤ 0 이면 깊이 필터 없음 (true 항상).
@@ -162,7 +163,7 @@ export function decomposeBoundaryGaussians(
   rect: DoorRectangle,
   opts: DecomposeOptions = {},
 ): DecomposeResult {
-  const kSigma = Math.max(2, opts.sigmaMultiplier ?? 3);
+  const forcedKSigma = opts.sigmaMultiplier !== undefined ? Math.max(1, opts.sigmaMultiplier) : null;
   const doorExtractionDepth = (opts.doorExtractionDepth !== undefined && opts.doorExtractionDepth > 0)
     ? opts.doorExtractionDepth
     : 0; // 0 = 깊이 필터 비활성.
@@ -180,6 +181,7 @@ export function decomposeBoundaryGaussians(
   const sc0 = scene.attrs.get('scale_0');
   const sc1 = scene.attrs.get('scale_1');
   const sc2 = scene.attrs.get('scale_2');
+  const op = scene.attrs.get('opacity');
   if (!px || !py || !pz || !r0 || !r1 || !r2 || !r3 || !sc0 || !sc1 || !sc2) {
     throw new Error('decomposeBoundaryGaussians: required attrs missing');
   }
@@ -204,6 +206,8 @@ export function decomposeBoundaryGaussians(
     const R10 = 2*(xy+wz),   R11 = 1-2*(xx+zz), R12 = 2*(yz-wx);
     const R20 = 2*(xz-wy),   R21 = 2*(yz+wx),   R22 = 1-2*(xx+yy);
     const s0 = Math.exp(sc0[i]), s1 = Math.exp(sc1[i]), s2 = Math.exp(sc2[i]);
+    const kSigma = forcedKSigma ?? gsplatVisibleSigmaRadius(op ? sigmoidOpacity(op[i]) : 1);
+    if (kSigma <= 0) continue;
 
     // 4 edge 검사: fully outside (한 edge 라도 sd <= -ext) 인지, 아니면 가로지르는 edge 가 있는지.
     let isOutside = false;
