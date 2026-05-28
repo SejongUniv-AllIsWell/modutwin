@@ -1,9 +1,10 @@
 # 원격 GPU 머신 전용 (DGX Spark 등 "별도" GPU 머신)
 # ===========================================================================
 # 브로커/스토리지(RabbitMQ·Redis·MinIO)와 백엔드는 PC(웹서버)에서 돌고,
-# 이 파일은 GPU 머신에서 worker + door-ml(SAM3) 을 띄운다.
-#   - worker  : celery training/alignment → PC 를 PC_HOST_IP 로 바라봄
-#   - door-ml : SAM3 문검출 HTTP 서버. PC 백엔드가 DGX:8000 으로 호출
+# 이 파일은 GPU 머신에서 worker + sog-worker + door-ml(SAM3) 을 띄운다.
+#   - worker     : celery training/alignment → PC 를 PC_HOST_IP 로 바라봄
+#   - sog-worker : celery 'sog' 큐 전용 (PLY→SOG 변환). training 을 굶기지 않도록 분리.
+#   - door-ml    : SAM3 문검출 HTTP 서버. PC 백엔드가 DGX:8000 으로 호출
 # (base docker-compose.yml 과 합치지 말고 이 파일 "단독"으로 실행할 것.)
 #
 # 사용법 (GPU 머신에서):
@@ -16,6 +17,18 @@
 #        nc -zv $PC_HOST_IP 5673 && nc -zv $PC_HOST_IP 6379 && nc -zv $PC_HOST_IP 9000
 #   3) NVIDIA Container Toolkit 설치
 #
+# ★ SOG GPU(Vulkan) 가속: splat-transform 은 WebGPU(Dawn)=Vulkan 백엔드를 쓴다(CUDA 아님).
+#   GB10 을 쓰려면 (a) Dockerfile 에 libvulkan1 설치(되어있음), (b) 아래 환경의
+#   NVIDIA_DRIVER_CAPABILITIES=all 로 드라이버의 graphics/vulkan 부분을 컨테이너에 마운트.
+#   배포 후 `docker exec 3dgs-sog-worker vulkaninfo | head` 로 GB10 이 잡히는지 확인.
+#   잡히면 SOG_DEVICE=auto 가 GPU 사용, 실패하면 tasks/sog.py 가 자동으로 CPU 폴백한다.
+#
+# ★ 배포 순서(중요): SOG 발행 큐가 'sog' 로 바뀌었다(backend celery_service + worker celery_app).
+#   소비는 worker 의 -Q 플래그로만 결정되므로, 'sog' 를 소비하는 건 여기 sog-worker 뿐이다.
+#   따라서 **이 파일(DGX)을 먼저 `up -d --build` 해 sog-worker 를 띄운 뒤, PC 백엔드를 재배포**할 것.
+#   순서가 바뀌면(PC 가 queue="sog" 로 먼저 publish + DGX 구버전) SOG 메시지가 소비자 없는
+#   durable 'sog' 큐에 잠깐 적체된다(유실은 아님 — sog-worker 기동 즉시 처리, 그 사이 sog_path NULL→PLY 폴백).
+#
 # ★ SAM3 를 실제로 쓰려면 PC 백엔드 .env 에서도:
 #     ENABLE_SAM3_DISPATCH=true
 #     DOOR_ML_URL=http://<이 DGX 의 IP>:8000   (예: Tailscale IP)
@@ -23,50 +36,70 @@
 #   백그라운드 스레드가 HTTP 로 직접 호출한다.)
 # ===========================================================================
 
+# worker / sog-worker 가 공유하는 환경 — env_file 을 쓰지 않는다(웹서버용 비밀을 GPU 머신에
+# 노출하지 않기 위해 워커가 실제로 쓰는 변수만 명시). ${VAR} 는 프로젝트 .env 에서 보간된다.
+x-worker-environment: &worker-environment
+  # 브로커/스토리지는 PC 를 PC_HOST_IP 로 가리킨다 (도커 서비스 이름 사용 X).
+  - RABBITMQ_URL=amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@${PC_HOST_IP}:5673//
+  - REDIS_URL=redis://:${REDIS_PASSWORD}@${PC_HOST_IP}:6379/0
+  - MINIO_ENDPOINT=${PC_HOST_IP}:9000
+  - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY}
+  - MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
+  - MINIO_BUCKET=${MINIO_BUCKET}
+  - MINIO_SECURE=false
+  # 백엔드 콜백도 PC 로. nginx 경유면 http://${PC_HOST_IP}, 8000 직노출이면 :8000.
+  - BACKEND_CALLBACK_URL=${BACKEND_CALLBACK_URL}
+  - WORKER_CALLBACK_TOKEN=${WORKER_CALLBACK_TOKEN}
+  # notify_upload_progress 용 (backend_callback.py). 미설정 시 BACKEND_CALLBACK_URL 재사용.
+  - BACKEND_INTERNAL_URL=${BACKEND_INTERNAL_URL:-${BACKEND_CALLBACK_URL}}
+  - INTERNAL_API_TOKEN=${INTERNAL_API_TOKEN:-}
+  # SOG 변환 디바이스: auto = WebGPU(Vulkan)로 GB10 사용 시도, 실패 시 tasks/sog.py 가 CPU 폴백.
+  - SOG_DEVICE=${SOG_DEVICE:-auto}
+  - SOG_ITERATIONS=${SOG_ITERATIONS:-10}
+  - SOG_TIMEOUT=${SOG_TIMEOUT:-3600}
+  # NVIDIA 드라이버의 graphics/vulkan 부분까지 컨테이너에 마운트(Dawn→Vulkan→GB10).
+  - NVIDIA_DRIVER_CAPABILITIES=all
+  # gsplat 경로/스텝 (기본값은 DGX(imlabdgx1) 기준; 필요시 .env 로 오버라이드).
+  - GSPLAT_PYTHON=${GSPLAT_PYTHON:-/home/imlabdgx1/miniforge3/envs/gsplat/bin/python}
+  - GSPLAT_TRAINER=${GSPLAT_TRAINER:-/home/imlabdgx1/Development/gsplat/examples/simple_trainer.py}
+  - GSPLAT_MAX_STEPS=${GSPLAT_MAX_STEPS:-7000}
+
+x-worker-volumes: &worker-volumes
+  - ./core:/app/core:ro
+  - ./utilities:/app/utilities:ro
+  # gsplat 학습은 gsplat_module.py 가 호스트 conda 환경/레포를 subprocess 로 호출한다.
+  # 컨테이너에서 그 경로가 보이도록 마운트(DGX 사용자=imlabdgx1). 경로 다르면 .env 로 오버라이드.
+  - /home/imlabdgx1/miniforge3:/home/imlabdgx1/miniforge3:ro
+  - /home/imlabdgx1/Development/gsplat:/home/imlabdgx1/Development/gsplat:ro
+
+x-gpu-deploy: &gpu-deploy
+  resources:
+    reservations:
+      devices:
+        - driver: nvidia
+          count: all
+          capabilities: [gpu]
+
 services:
+  # training + alignment 전용 워커 (Dockerfile CMD: -Q training,alignment -c 1).
   worker:
     build: ./worker
+    image: modutwin-worker          # sog-worker 와 동일 이미지 공유 (중복 빌드 방지)
     container_name: 3dgs-worker
-    # env_file 을 쓰지 않는다 — 웹서버용 비밀(JWT/Google/Postgres 등)을 GPU 머신에
-    # 노출하지 않기 위해 워커가 실제로 쓰는 변수만 아래에 명시한다 (최소 권한).
-    # ${VAR} 들은 프로젝트 .env 에서 보간되어 채워진다(컨테이너 주입은 이 목록만).
-    environment:
-      # 브로커/스토리지는 PC 를 PC_HOST_IP 로 가리킨다 (도커 서비스 이름 사용 X).
-      - RABBITMQ_URL=amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@${PC_HOST_IP}:5673//
-      - REDIS_URL=redis://:${REDIS_PASSWORD}@${PC_HOST_IP}:6379/0
-      - MINIO_ENDPOINT=${PC_HOST_IP}:9000
-      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY}
-      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
-      - MINIO_BUCKET=${MINIO_BUCKET}
-      - MINIO_SECURE=false
-      # 백엔드 콜백도 PC 로. nginx 경유면 http://${PC_HOST_IP}, 8000 직노출이면 :8000.
-      - BACKEND_CALLBACK_URL=${BACKEND_CALLBACK_URL}
-      - WORKER_CALLBACK_TOKEN=${WORKER_CALLBACK_TOKEN}
-      # notify_upload_progress 용 (backend_callback.py). 미설정 시 BACKEND_CALLBACK_URL 재사용.
-      - BACKEND_INTERNAL_URL=${BACKEND_INTERNAL_URL:-${BACKEND_CALLBACK_URL}}
-      - INTERNAL_API_TOKEN=${INTERNAL_API_TOKEN:-}
-      # SOG 변환은 CPU 기본 (GPU 불필요).
-      - SOG_DEVICE=cpu
-      - SOG_ITERATIONS=${SOG_ITERATIONS:-10}
-      # gsplat 경로/스텝 (기본값은 DGX(imlabdgx1) 기준; 필요시 .env 로 오버라이드).
-      - GSPLAT_PYTHON=${GSPLAT_PYTHON:-/home/imlabdgx1/miniforge3/envs/gsplat/bin/python}
-      - GSPLAT_TRAINER=${GSPLAT_TRAINER:-/home/imlabdgx1/Development/gsplat/examples/simple_trainer.py}
-      - GSPLAT_MAX_STEPS=${GSPLAT_MAX_STEPS:-7000}
-    volumes:
-      - ./core:/app/core:ro
-      - ./utilities:/app/utilities:ro
-      # gsplat 학습은 gsplat_module.py 가 호스트 conda 환경/레포를 subprocess 로
-      # 호출한다. 컨테이너에서 그 경로가 보이도록 마운트한다 (DGX 사용자=imlabdgx1).
-      # 경로가 다르면 .env 의 GSPLAT_PYTHON / GSPLAT_TRAINER 로 오버라이드.
-      - /home/imlabdgx1/miniforge3:/home/imlabdgx1/miniforge3:ro
-      - /home/imlabdgx1/Development/gsplat:/home/imlabdgx1/Development/gsplat:ro
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+    environment: *worker-environment
+    volumes: *worker-volumes
+    deploy: *gpu-deploy
+    restart: unless-stopped
+
+  # SOG 변환 전용 워커 — 'sog' 큐만 소비. 긴 SOG 변환이 training/alignment 를 막지 않도록 분리.
+  sog-worker:
+    build: ./worker
+    image: modutwin-worker          # worker 와 동일 이미지 (command 만 다름)
+    container_name: 3dgs-sog-worker
+    command: ["celery", "-A", "celery_app", "worker", "-Q", "sog", "-c", "1", "--loglevel=info"]
+    environment: *worker-environment
+    volumes: *worker-volumes
+    deploy: *gpu-deploy
     restart: unless-stopped
 
   # SAM3 문검출 HTTP 서버. PC 백엔드가 POST /detect 로 호출한다(celery 미사용).

@@ -7,6 +7,9 @@ ENV PYTHONPATH=/app \
     PYTHONUNBUFFERED=1
 
 # ffmpeg + OpenCV/GL 런타임 라이브러리 + Node.js 설치 도구
+# libvulkan1: Vulkan 로더(splat-transform WebGPU/Dawn 이 GB10 을 Vulkan 으로 사용).
+#   NVIDIA Vulkan ICD/드라이버 라이브러리는 NVIDIA Container Toolkit 이 런타임에 마운트한다
+#   (compose 의 NVIDIA_DRIVER_CAPABILITIES=all 필요). vulkan-tools: vulkaninfo 검증용.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libglib2.0-0 \
@@ -14,6 +17,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxext6 \
     libxrender1 \
     libgl1 \
+    libvulkan1 \
+    vulkan-tools \
     curl \
     ca-certificates \
     gnupg \
@@ -36,7 +41,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# SOG 변환기 빌드 (CPU 전용; webgpu 는 optional 이라 미설치여도 무방).
+# SOG 변환기 빌드. webgpu(Dawn) 는 optionalDependency + rollup external 이라 런타임에
+# `import 'webgpu'` 로 로드된다. `npm prune --omit=dev` 는 optional 을 유지하므로 GPU(Vulkan)
+# 경로가 살아있다. (★ `--omit=optional` 로 빌드하면 webgpu 가 빠져 GPU 시도가 죽고 CPU 폴백만
+# 남으니 금지.) Vulkan 미가용 시엔 CPU(-g cpu)로 동작한다(tasks/sog.py 가 자동 폴백).
 # 빌드에 필요한 devDependencies 설치 → 번들 → dev 의존성 정리로 이미지 축소.
 RUN cd /app/splat-transform \
     && npm ci --no-audit --no-fund \

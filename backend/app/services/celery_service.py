@@ -87,7 +87,7 @@ def dispatch_sog_conversion_task(scene_id: str, ply_key: str) -> str:
     result = celery_app.send_task(
         "tasks.sog.convert_scene_to_sog",
         args=[scene_id, ply_key],
-        queue="training",
+        queue="sog",  # 전용 sog-worker 가 소비 (training 큐 블로킹 방지)
     )
     return result.id
 

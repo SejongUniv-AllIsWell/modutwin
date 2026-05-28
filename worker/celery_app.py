@@ -19,7 +19,8 @@ app.config_from_object({
     'task_routes': {
         'tasks.training.*': {'queue': 'training'},
         'tasks.alignment.*': {'queue': 'alignment'},
-        'tasks.sog.*': {'queue': 'training'},
+        # SOG 는 전용 'sog' 큐 → 별도 sog-worker 가 소비. 긴 변환이 training/alignment 를 막지 않게.
+        'tasks.sog.*': {'queue': 'sog'},
     },
     'task_default_queue': 'training',
     'imports': (

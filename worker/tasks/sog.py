@@ -30,7 +30,21 @@ def convert_scene_to_sog(self, scene_id: str, ply_key: str):
         download_file(ply_key, local_ply)
 
         local_sog = os.path.join(work_dir, "output.sog")
-        convert_to_sog(local_ply, output_path=local_sog)
+
+        # SOG_DEVICE=auto 면 WebGPU(Vulkan)로 GB10 사용을 시도하고, Vulkan ICD 미가용 등으로
+        # 실패하면 CPU 로 자동 폴백한다. (auto 를 그대로 두면 Vulkan 없는 환경에서 SOG 가
+        # 전부 죽으므로, 여기서 폴백을 보장해 auto 를 안전하게 만든다.)
+        device = os.environ.get("SOG_DEVICE", "cpu")
+        try:
+            convert_to_sog(local_ply, output_path=local_sog, device=device)
+        except Exception as gpu_err:
+            if device != "cpu":
+                logger.warning(
+                    f"[Task {task_id}] GPU({device}) SOG 실패 → CPU 폴백: {gpu_err}"
+                )
+                convert_to_sog(local_ply, output_path=local_sog, device="cpu")
+            else:
+                raise
 
         sog_key = os.path.splitext(ply_key)[0] + ".sog"
         upload_file(local_sog, sog_key)
@@ -40,8 +54,10 @@ def convert_scene_to_sog(self, scene_id: str, ply_key: str):
         return {"status": "completed", "scene_id": scene_id, "sog_key": sog_key}
 
     except Exception as e:
+        # PipelineError 등 일부 예외는 Celery result backend(Redis) pickle 이 불가해
+        # UnpickleableExceptionWrapper 를 유발한다 → 평문 RuntimeError 로 변환해 raise.
         logger.error(f"[Task {task_id}] SOG 변환 실패 (scene={scene_id}): {e}")
-        raise
+        raise RuntimeError(f"SOG 변환 실패 (scene={scene_id}): {e}") from None
 
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
