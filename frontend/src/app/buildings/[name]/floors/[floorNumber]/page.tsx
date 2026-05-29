@@ -222,10 +222,12 @@ function FloorCompositeViewer({
   // 층 overview 는 보기 전용이므로 CPU ImageData 복사 없이 로드해 대형 텍스처 메모리 사용을 줄인다.
   // onLoaded: primary 자산이 베이스맵일 때 visual ceiling entity + Y 를 잡아둠. primary 가 모듈이면
   //   별도의 useRefinedMeshLoader 호출 (아래) 이 채움.
+  // 3.A 단일 source: primary 가 모듈이면(module 모드) basemap refined(wall mesh + 도어 splat) 을 로드하지 않는다.
+  // enabled 가 false 로 바뀌면 useRefinedMeshLoader 의 effect cleanup 이 이미 로드된 엔티티/도어 splat 을 자동 destroy 한다.
   useRefinedMeshLoader(
     coreRef,
     basemapSourceUploadId ?? undefined,
-    !!basemapSourceUploadId,
+    !primaryIsModule && !!basemapSourceUploadId,
     additional,
     null,
     false,
@@ -654,10 +656,10 @@ export default function FloorDetailPage() {
     () => moduleRows.filter((module) => module.url && module.is_visible !== false),
     [moduleRows],
   );
-  const moduleOverlays = useMemo(() => {
-    if (!primaryUrl || !hasBasemap) return [];
-    return renderableModules.filter((module) => module.url !== primaryUrl && module.alignment_transform);
-  }, [hasBasemap, primaryUrl, renderableModules]);
+  // 3.A 단일 source 렌더: 한 번에 하나의 자산(primary)만 그린다. 같은 방을 basemap+module 이
+  // 동시에 그려 카메라 이동 시 깊이/정렬 충돌(깜빡임)이 나던 중복 렌더를 제거. 다른 모듈은 사이드바에서
+  // 클릭해 primaryUrl 을 그 모듈로 전환해 보고, [전체 층 보기] 로 basemap 으로 복귀한다.
+  const moduleOverlays = useMemo<FloorDetailModuleEntry[]>(() => [], []);
 
   // primary 자산의 source_upload_id — 베이스맵이 primary 면 베이스맵의, 모듈이 primary 면 그 모듈의 것.
   // 천장제거가 mesh.json 의 ceiling corners 를 읽어야 하므로 둘 다 cover.
@@ -827,8 +829,9 @@ export default function FloorDetailPage() {
                             disabled={disabled}
                             onClick={() => {
                               if (!module.url) return;
+                              // 3.A 단일 source: basemap 유무와 무관하게 클릭한 모듈로 primary 전환(module 모드).
                               setSelectedModuleId(module.id);
-                              if (!hasBasemap) setPrimaryUrl(module.url);
+                              setPrimaryUrl(module.url);
                             }}
                             className={`flex-1 min-w-0 px-4 py-2.5 text-left ${
                               disabled ? 'cursor-not-allowed' : 'hover:bg-sky-400/10'
@@ -1036,6 +1039,25 @@ export default function FloorDetailPage() {
               ceilingRemoved={ceilingRemoved}
               onCoreReady={(core) => { viewerCoreRef.current = core; }}
             />
+            {hasBasemap && primaryIsModule && (
+              <button
+                type="button"
+                onClick={() => {
+                  const url = manifest?.basemap?.url;
+                  if (!url) return;
+                  setPrimaryUrl(url);
+                  setSelectedModuleId(null);
+                }}
+                className="absolute top-4 left-4 z-10 px-3 py-2 rounded text-xs font-semibold border transition"
+                style={{
+                  background: 'var(--paper)',
+                  color: 'var(--ink)',
+                  borderColor: 'var(--rule)',
+                }}
+              >
+                ← 전체 층 보기
+              </button>
+            )}
             {primarySourceUploadId && (
               <div className="absolute top-4 right-4 z-10 flex flex-col gap-2 items-end">
                 <button
