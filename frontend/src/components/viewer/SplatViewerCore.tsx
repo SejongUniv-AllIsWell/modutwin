@@ -57,6 +57,28 @@ export interface SplatViewerCoreRef {
   getAlignmentGroup: () => any | null;
   /** 메인 splat 을 새 URL (blob URL 가능) 로 재로드. 카메라 보존 옵션 지원. asset.ready 까지 await. */
   reloadSplatFromUrl: (url: string, opts?: { preserveCamera?: boolean }) => Promise<void>;
+  /**
+   * 현재 씬을 일시적으로 ortho top-down 카메라로 렌더해 PNG Blob 으로 캡처.
+   * 캡처 후 카메라 원상 복구. 천장제거 토글이 ON 인 상태에서 호출하면 위에서 본 실내 평면도 형태.
+   *
+   * @param opts.padding bbox 둘레 여유 (m, 기본 0.5)
+   * @returns blob + 카메라/bbox 메타 (overview_meta_path 에 함께 저장하면 나중에 재현 가능). 실패 시 null.
+   */
+  snapshotTopdown: (opts?: { padding?: number }) => Promise<{ blob: Blob; meta: SnapshotMeta } | null>;
+}
+
+export interface SnapshotMeta {
+  width: number;
+  height: number;
+  bbox: { min: [number, number, number]; max: [number, number, number] };
+  camera: {
+    position: [number, number, number];
+    lookAt: [number, number, number];
+    up: [number, number, number];
+    orthographic: true;
+    orthoHeight: number;
+  };
+  timestamp: string;
 }
 
 interface SplatViewerCoreProps {
@@ -194,6 +216,114 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
         const fn = loadSplatRef.current;
         if (!fn) return Promise.reject(new Error('splat loader not ready'));
         return fn(url, opts);
+      },
+      snapshotTopdown: async (opts?: { padding?: number }) => {
+        const app = appRef.current;
+        const pc = pcRef.current;
+        const cam = cameraEntityRef.current;
+        const canvas = canvasRef.current;
+        if (!app || !pc || !cam || !canvas) return null;
+
+        // 1. 씬 전체 AABB — 활성화된 gsplat instance + render meshInstance 모두 합산.
+        const aabb = new pc.BoundingBox();
+        let first = true;
+        const accumulate = (node: any) => {
+          if (!node || node.enabled === false) return;
+          const render = node.render;
+          if (render?.meshInstances) {
+            for (const mi of render.meshInstances) {
+              if (!mi?.aabb) continue;
+              if (first) { aabb.copy(mi.aabb); first = false; }
+              else aabb.add(mi.aabb);
+            }
+          }
+          const gsplat = node.gsplat;
+          const gsAabb = gsplat?.instance?.meshInstance?.aabb ?? gsplat?.aabb;
+          if (gsAabb) {
+            if (first) { aabb.copy(gsAabb); first = false; }
+            else aabb.add(gsAabb);
+          }
+          for (const c of (node.children ?? [])) accumulate(c);
+        };
+        accumulate(app.root);
+        if (first) return null;
+
+        // 2. 카메라 현재 상태 저장.
+        const camComp = cam.camera;
+        const savedPos = cam.getPosition().clone();
+        const savedRot = cam.getRotation().clone();
+        const saved = {
+          orthographic: camComp.orthographic,
+          orthoHeight: camComp.orthoHeight,
+          fov: camComp.fov,
+          farClip: camComp.farClip,
+          nearClip: camComp.nearClip,
+        };
+
+        // 3. Ortho top-down 셋업.
+        //   PlayCanvas +Y up. 카메라를 world Y 큰 쪽에 두고 -Y 방향 lookAt. up = -Z (claude.md:90 컨벤션).
+        //   천장제거 토글이 ON 이면 시각적 천장 (surface 'floor', world +Y 큰 쪽) 이 이미 가려져 있어 실내가 보임.
+        const padding = opts?.padding ?? 0.5;
+        const center = aabb.center;
+        const halfX = aabb.halfExtents.x + padding;
+        const halfZ = aabb.halfExtents.z + padding;
+        const topY = center.y + aabb.halfExtents.y + 5;
+        const bottomY = center.y - aabb.halfExtents.y;
+        const aspect = canvas.width / Math.max(1, canvas.height);
+        // ortho height 는 viewport 의 절반 높이. 가로 fit 도 같이 고려해 max 값.
+        const orthoHeight = Math.max(halfZ, halfX / aspect);
+
+        camComp.orthographic = true;
+        camComp.orthoHeight = orthoHeight;
+        camComp.nearClip = 0.01;
+        camComp.farClip = Math.max(saved.farClip, (topY - bottomY) + 20);
+        cam.setPosition(center.x, topY, center.z);
+        cam.lookAt(center.x, bottomY, center.z, 0, 0, -1);
+
+        // 4. 다음 프레임에서 PlayCanvas 가 새 카메라로 렌더하도록 2 frame wait — 1 frame 으로는
+        //    canvas 백버퍼가 아직 이전 카메라 결과일 수 있다. requestAnimationFrame 이중 호출이
+        //    preserveDrawingBuffer 여부와 무관하게 안전 (PC 가 own RAF tick 으로 렌더하므로).
+        await new Promise<void>((resolve) => {
+          requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+        });
+
+        // 5. canvas 캡처.
+        const blob = await new Promise<Blob | null>((resolve) => {
+          canvas.toBlob((b) => resolve(b), 'image/png');
+        });
+
+        // 6. 카메라 원상 복구.
+        camComp.orthographic = saved.orthographic;
+        camComp.orthoHeight = saved.orthoHeight;
+        camComp.fov = saved.fov;
+        camComp.farClip = saved.farClip;
+        camComp.nearClip = saved.nearClip;
+        cam.setPosition(savedPos.x, savedPos.y, savedPos.z);
+        cam.setRotation(savedRot.x, savedRot.y, savedRot.z, savedRot.w);
+
+        if (!blob) return null;
+
+        const min = aabb.getMin();
+        const max = aabb.getMax();
+        return {
+          blob,
+          meta: {
+            width: canvas.width,
+            height: canvas.height,
+            bbox: {
+              min: [min.x, min.y, min.z],
+              max: [max.x, max.y, max.z],
+            },
+            camera: {
+              position: [center.x, topY, center.z],
+              lookAt: [center.x, bottomY, center.z],
+              up: [0, 0, -1],
+              orthographic: true,
+              orthoHeight,
+            },
+            timestamp: new Date().toISOString(),
+          },
+        };
       },
     }));
 

@@ -227,6 +227,8 @@ export function createWallMeshEntity(
   const ent = new pc.Entity(name);
   ent.addComponent('render', { meshInstances: [meshInstance] });
   (ent as any).__averageColor = opts.solidWhite ? [1, 1, 1] : averageOpaqueColor(bake.rgba);
+  // 천장제거 등 후속 기능에서 surface 별 식별이 필요. name 컨벤션 `wallMesh_<surfaceId>` 에서 추출.
+  (ent as any).__surfaceId = name.startsWith('wallMesh_') ? name.slice('wallMesh_'.length) : null;
   // Z-180만 직접 부여.
   ent.setLocalEulerAngles(0, 0, 180);
   app.root.addChild(ent);
@@ -345,6 +347,9 @@ export function createWallMeshFromPersisted(
   const ent = new pc.Entity(name);
   ent.addComponent('render', { meshInstances: [meshInstance] });
   (ent as any).__averageColor = averageColor;
+  // 천장제거 등 후속 기능에서 surface 별 식별. createWallMeshFromPersisted 는 호출자가 data.surfaceId 를
+  // 명시 (예: 'ceiling', 'module_<uuid>_ceiling') 하므로 그대로 부착.
+  (ent as any).__surfaceId = data.surfaceId;
   // Z-180 (저장된 corners 는 raw PLY 프레임 기준)
   ent.setLocalEulerAngles(0, 0, 180);
   app.root.addChild(ent);
