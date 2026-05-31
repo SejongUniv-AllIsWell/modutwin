@@ -23,12 +23,21 @@ export interface FloorplanResult {
   ppm: number; // pixels per meter
 }
 
+export interface SceneBounds {
+  mnX: number; mxX: number;
+  mnY: number; mxY: number;
+  mnZ: number; mxZ: number;
+}
+
 export interface BakeFloorplanOptions {
   pixelsPerMeter?: number;     // default 50
   cutoffOffsetMeters?: number; // default 0.05 (천장에서 5cm 아래까지 자름)
   alphaThreshold?: number;     // default 0.05 (bbox 산출용)
   paddingMeters?: number;      // default 0.5
   maxDimension?: number;       // default 1500
+  // 씬 전체(basemap + 모듈 오버레이) world bbox. 주어지면 단일 splat bbox 대신 사용 →
+  // 모듈이 프레임 밖으로 잘리지 않는다.
+  bounds?: SceneBounds;
 }
 
 interface SplatLike {
@@ -59,28 +68,33 @@ export async function bakeFloorplan(
   const device = app.graphicsDevice;
   if (!device) return null;
 
-  // 1) world bbox (CPU 1-pass) — alpha 작은 splat 무시.
-  //    splatEntity.getWorldTransform() 으로 world 변환.
-  const m = splatEntity.getWorldTransform().data;
-  const n = splat.numSplats;
+  // 1) world bbox. bounds 가 주어지면 씬 전체(basemap + 모듈) 범위를 그대로 쓰고,
+  //    아니면 단일 splat 을 CPU 1-pass 로 산출 (alpha 작은 splat 무시).
   let mnX = Infinity, mxX = -Infinity, mnY = Infinity, mxY = -Infinity, mnZ = Infinity, mxZ = -Infinity;
-  for (let i = 0; i < n; i++) {
-    const a = half2Float(orig[i * 4 + 3]);
-    if (a < alphaT) continue;
-    const px = splat.posX[i], py = splat.posY[i], pz = splat.posZ[i];
-    const wx = m[0]*px + m[4]*py + m[8]*pz + m[12];
-    const wy = m[1]*px + m[5]*py + m[9]*pz + m[13];
-    const wz = m[2]*px + m[6]*py + m[10]*pz + m[14];
-    if (wx < mnX) mnX = wx; if (wx > mxX) mxX = wx;
-    if (wy < mnY) mnY = wy; if (wy > mxY) mxY = wy;
-    if (wz < mnZ) mnZ = wz; if (wz > mxZ) mxZ = wz;
+  if (opts.bounds) {
+    ({ mnX, mxX, mnY, mxY, mnZ, mxZ } = opts.bounds);
+  } else {
+    const m = splatEntity.getWorldTransform().data;
+    const n = splat.numSplats;
+    for (let i = 0; i < n; i++) {
+      const a = half2Float(orig[i * 4 + 3]);
+      if (a < alphaT) continue;
+      const px = splat.posX[i], py = splat.posY[i], pz = splat.posZ[i];
+      const wx = m[0]*px + m[4]*py + m[8]*pz + m[12];
+      const wy = m[1]*px + m[5]*py + m[9]*pz + m[13];
+      const wz = m[2]*px + m[6]*py + m[10]*pz + m[14];
+      if (wx < mnX) mnX = wx; if (wx > mxX) mxX = wx;
+      if (wy < mnY) mnY = wy; if (wy > mxY) mxY = wy;
+      if (wz < mnZ) mnZ = wz; if (wz > mxZ) mxZ = wz;
+    }
   }
   if (!Number.isFinite(mnX) || !Number.isFinite(mxY)) return null;
 
-  // splat entity 에 Z-180 회전이 적용돼있어 world frame 에서 visual ceiling = mnY (small Y),
-  // visual floor = mxY (large Y). PC 의 +Y up 컨벤션 기준으로는 방이 거꾸로 매달려있음.
-  // 사용자가 원하는 "천장 컷" = 시각적 천장에서 cutoff 만큼 안쪽 (방 내부 방향) → world frame 에선 mnY + cutoff.
-  const cutoffY = mnY + cutoff;
+  // Z-180 컨벤션: PLY +Y → World -Y 이므로 화면상 천장(머리 위) = World +Y = mxY,
+  // 화면상 바닥(발밑) = World -Y = mnY.
+  // "천장 컷" = 천장에서 cutoff 만큼 안쪽(방 내부, 아래 방향) → world frame 에선 mxY - cutoff.
+  // 이 평면보다 아래(작은 Y)만 남기고 위(천장 쪽)는 카메라 frustum 밖으로 컷.
+  const cutoffY = mxY - cutoff;
   // padding 적용 (xz 만)
   const minX = mnX - pad, maxX = mxX + pad;
   const minZ = mnZ - pad, maxZ = mxZ + pad;
@@ -117,18 +131,19 @@ export async function bakeFloorplan(
   });
 
   // 3) 직교 top-down 카메라.
-  //    카메라 위치 y = cutoffY. -Y 로 lookdown. near 작게 → 카메라 바로 아래 (= cutoffY 미만) splat 만 frustum 내.
+  //    카메라 위치 y = cutoffY (천장 컷 평면). -Y 로 lookdown. near 작게 →
+  //    cutoffY 미만 (방 내부, 바닥 쪽) splat 만 frustum 내, 천장 쪽은 카메라 뒤라 컷.
   //    orthoHeight = worldZ / 2 (PC 의 orthoHeight 는 frustum 절반 높이).
   //
-  //    좌표 정합 핵심 (Z-180 으로 인해 visual UP = world -Y direction):
-  //    카메라는 mnY 부근 (visual ceiling 바깥) 에 두고 +Y 방향 (visual DOWN) 으로 lookAt.
+  //    좌표 정합 핵심: 위에서 -Y 방향으로 내려다봄.
   //    PlayCanvas lookAt(target, up): localY = up, localZ = -(target-pos), localX = cross(localY, localZ).
-  //    target-pos = (0,+1,0) → localZ = (0,-1,0).
-  //    up = (0,0,+1) 로 잡으면:
-  //      localY = (0,0,+1)
-  //      localX = cross((0,0,1), (0,-1,0)) = (1,0,0)  → 카메라 right = +X world (정상)
-  //      screen +Y (framebuffer up) = +Z world → framebuffer top = world maxZ
-  //    Y-flip 후 canvas (0,0) = world (minX, _, minZ) → 미니맵의 (pos.x-minX, pos.z-minZ)*ppm 매핑과 일치.
+  //    target-pos = (0,-1,0) → localZ = (0,+1,0).
+  //    up = (0,0,-1) (top-down 컨벤션) 로 잡으면:
+  //      localY = (0,0,-1)
+  //      localX = cross((0,0,-1), (0,1,0)) = (1,0,0)  → 카메라 right = +X world (정상)
+  //      framebuffer up = localY = -Z world → framebuffer top = world minZ
+  //    Y-flip 후 canvas (0,0) = world (minX, _, minZ), canvas py 증가 = +Z 증가
+  //    → 미니맵의 (pos.x-minX, pos.z-minZ)*ppm 매핑과 일치.
   const cx = (minX + maxX) / 2;
   const cz = (minZ + maxZ) / 2;
   const camEnt = new pc.Entity('floorplan_cam');
@@ -144,8 +159,8 @@ export async function bakeFloorplan(
     priority: -10, // 메인보다 먼저 렌더
   });
   camEnt.setPosition(cx, cutoffY, cz);
-  // lookAt: target (cx, cutoffY+1, cz) — +Y 방향 (visual DOWN). up = +Z (좌표 정합).
-  camEnt.lookAt(new pc.Vec3(cx, cutoffY + 1, cz), new pc.Vec3(0, 0, 1));
+  // lookAt: target (cx, cutoffY-1, cz) — -Y 방향 (아래로 내려다봄). up = -Z (top-down 좌표 정합).
+  camEnt.lookAt(new pc.Vec3(cx, cutoffY - 1, cz), new pc.Vec3(0, 0, -1));
   app.root.addChild(camEnt);
 
   try {

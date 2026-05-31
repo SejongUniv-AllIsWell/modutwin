@@ -36,6 +36,8 @@ export interface SplatViewerCoreRef {
   getCamera: () => any | null;
   getCanvas: () => HTMLCanvasElement | null;
   getContainer: () => HTMLDivElement | null;
+  /** 뷰어 최상위 wrapper (전체화면 타겟). 오버레이·미니맵까지 포함. */
+  getRoot: () => HTMLDivElement | null;
   getSplatData: () => SplatData | null;
   getPC: () => any | null;
   float2Half: (v: number) => number;
@@ -71,11 +73,13 @@ type CameraMode = 'fly' | 'orbit';
 const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
   ({ sogUrl, onSplatLoaded, children }, ref) => {
     const containerRef = useRef<HTMLDivElement>(null);
+    const rootRef = useRef<HTMLDivElement>(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
     const [cameraMode, setCameraMode] = useState<CameraMode>('fly');
     const [moveSpeed, setMoveSpeed] = useState(0.5);
     const [shiftActive, setShiftActive] = useState(false);
+    const [isFullscreen, setIsFullscreen] = useState(false);
     /**
      * PlayCanvas 앱이 준비되어 splat 로드를 받을 수 있는 상태.
      * - 마운트 시 false → init useEffect의 async 초기화가 끝나면 true
@@ -110,6 +114,7 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
       getCamera: () => cameraEntityRef.current,
       getCanvas: () => canvasRef.current,
       getContainer: () => containerRef.current,
+      getRoot: () => rootRef.current,
       getSplatData: () => splatDataRef.current,
       getPC: () => pcRef.current,
       float2Half: (v: number) => float2HalfRef.current(v),
@@ -245,7 +250,9 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
           app = new pc.Application(canvas, {
             mouse: new pc.Mouse(canvas),
             touch: new pc.TouchDevice(canvas),
-            graphicsDeviceOptions: { antialias: false },
+            // TEMP_METRICS_EVAL: canvas PNG capture for PSNR/SSIM experiments needs the drawing buffer preserved.
+            // Remove preserveDrawingBuffer after the paper metric capture is done.
+            graphicsDeviceOptions: { antialias: false, preserveDrawingBuffer: true },
           });
           appRef.current = app;
           app.setCanvasFillMode(pc.FILLMODE_NONE);
@@ -391,34 +398,40 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
               syncCamera();
             }
 
-            // 기즈모는 화면 좌하단에 고정한다. 카메라 이동을 먼저 반영한 뒤 현재 카메라 기준으로
-            // screenToWorld 를 계산해야 WASD 이동 중 이전 프레임 위치로 끌려가며 떨리지 않는다.
+            // 기즈모: 화면 좌하단 고정 위치에서 카메라 방향만 따라 회전하는 2D 축 위젯.
+            // 각 월드 축 단위벡터를 카메라 right/up 에 정사영해 화면 좌표를 바로 구한다.
+            // (월드 좌표 왕복을 안 하므로 부동소수 누적 떨림이 없고, 정수 스냅으로 텍스트도 안 떨린다.)
             {
               const cam = cameraEntity.camera!;
-              const gizmoScreenX = 60;
-              const gizmoScreenY = canvas.clientHeight - 60;
-              const gizmoCenter = new pc.Vec3();
-              cam.screenToWorld(gizmoScreenX, gizmoScreenY, 2, gizmoCenter);
+              const cx = 60;
+              const cy = canvas.clientHeight - 60;
+              const lenPx = 30;       // 화면상 축 길이
+              const depth = 1;        // drawLine 용 역투영 평면 (center/tip 동일 depth → 일관)
+              const right = cameraEntity.right;
+              const up = cameraEntity.up;
 
-              const refPoint = new pc.Vec3();
-              cam.screenToWorld(gizmoScreenX + 30, gizmoScreenY, 2, refPoint);
-              const axisLen = gizmoCenter.distance(refPoint);
+              // 월드 축 → 화면 좌표 (정수 스냅).
+              const proj = (ax: number, ay: number, az: number): [number, number] => {
+                const dr = ax * right.x + ay * right.y + az * right.z;
+                const du = ax * up.x + ay * up.y + az * up.z;
+                return [Math.round(cx + dr * lenPx), Math.round(cy - du * lenPx)];
+              };
+              const sX = proj(1, 0, 0);
+              const sY = proj(0, 1, 0);
+              const sZ = proj(0, 0, 1);
 
-              const tipX = new pc.Vec3(gizmoCenter.x + axisLen, gizmoCenter.y, gizmoCenter.z);
-              const tipY = new pc.Vec3(gizmoCenter.x, gizmoCenter.y + axisLen, gizmoCenter.z);
-              const tipZ = new pc.Vec3(gizmoCenter.x, gizmoCenter.y, gizmoCenter.z + axisLen);
+              // drawLine 은 월드 좌표가 필요 — 같은 depth 평면에서 화면 좌표를 역투영.
+              const wCenter = new pc.Vec3(); cam.screenToWorld(cx, cy, depth, wCenter);
+              const wX = new pc.Vec3(); cam.screenToWorld(sX[0], sX[1], depth, wX);
+              const wY = new pc.Vec3(); cam.screenToWorld(sY[0], sY[1], depth, wY);
+              const wZ = new pc.Vec3(); cam.screenToWorld(sZ[0], sZ[1], depth, wZ);
+              app.drawLine(wCenter, wX, gizmoColorX, false);
+              app.drawLine(wCenter, wY, gizmoColorY, false);
+              app.drawLine(wCenter, wZ, gizmoColorZ, false);
 
-              app.drawLine(gizmoCenter, tipX, gizmoColorX, false);
-              app.drawLine(gizmoCenter, tipY, gizmoColorY, false);
-              app.drawLine(gizmoCenter, tipZ, gizmoColorZ, false);
-
-              const scrPos = new pc.Vec3();
-              cam.worldToScreen(tipX, scrPos);
-              labelX.style.left = `${scrPos.x + 4}px`; labelX.style.top = `${scrPos.y - 6}px`;
-              cam.worldToScreen(tipY, scrPos);
-              labelY.style.left = `${scrPos.x + 4}px`; labelY.style.top = `${scrPos.y - 6}px`;
-              cam.worldToScreen(tipZ, scrPos);
-              labelZ.style.left = `${scrPos.x + 4}px`; labelZ.style.top = `${scrPos.y - 6}px`;
+              labelX.style.left = `${sX[0] + 4}px`; labelX.style.top = `${sX[1] - 6}px`;
+              labelY.style.left = `${sY[0] + 4}px`; labelY.style.top = `${sY[1] - 6}px`;
+              labelZ.style.left = `${sZ[0] + 4}px`; labelZ.style.top = `${sZ[1] - 6}px`;
             }
 
             // 외부 등록 콜백
@@ -651,8 +664,20 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
       cameraModeRef.current = next;
     };
 
+    const toggleFullscreen = () => {
+      const root = rootRef.current;
+      if (!root) return;
+      if (document.fullscreenElement) void document.exitFullscreen();
+      else void root.requestFullscreen();
+    };
+    useEffect(() => {
+      const onFsChange = () => setIsFullscreen(!!document.fullscreenElement);
+      document.addEventListener('fullscreenchange', onFsChange);
+      return () => document.removeEventListener('fullscreenchange', onFsChange);
+    }, []);
+
     return (
-      <div className="relative w-full h-full min-h-[400px] bg-[#141414]">
+      <div ref={rootRef} className="relative w-full h-full min-h-[400px] bg-[#141414]">
         <div ref={containerRef} className="w-full h-full relative" />
 
         {loading && sogUrl && (
@@ -695,6 +720,23 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
                 ? '| 우클릭: 회전 | WASD: 이동 | QE: 상하 | 스크롤: 전후'
                 : '| 우클릭: 회전 | WASD: 이동 | QE: 상하 | 스크롤: 줌'}
             </span>
+            <button
+              onClick={toggleFullscreen}
+              title={isFullscreen ? '전체화면 해제 (Esc)' : '전체화면'}
+              className="ml-1 p-1 rounded text-gray-300 hover:text-white hover:bg-white/10 cursor-pointer"
+            >
+              {isFullscreen ? (
+                // 전체화면 해제 — 안쪽 화살표.
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M9 3v6H3M21 9h-6V3M3 15h6v6M15 21v-6h6" />
+                </svg>
+              ) : (
+                // 전체화면 — 네 모서리 확장.
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M8 3H3v5M21 8V3h-5M16 21h5v-5M3 16v5h5" />
+                </svg>
+              )}
+            </button>
           </div>
         )}
       </div>

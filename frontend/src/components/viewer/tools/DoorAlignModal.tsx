@@ -287,6 +287,8 @@ export default function DoorAlignModal({
     wallTextureSnapshotRect: { x: number; y: number; w: number; h: number } | null; // 벽 텍스처 복원용 bbox (cut.rgba 가 이 위치에서 잘림)
     doorExtractionDepth: number;                                      // 두께 메타 (commit 시 그대로 사용)
     boundarySplitEnabled: boolean;
+    hingeEdge: number | null;                                  // 회전축 변 (0..3). null = 미선택 → 층 뷰어 상호작용 제외.
+    swing: 1 | -1;                                             // 1 방 안쪽, -1 방 바깥쪽.
     unitName: string;                                           // 빈 문자열 = 미설정
     // 업로드 시 도어 splat PLY 를 final frame 으로 베이크할 때 사용. 베이스맵 메인 PLY 와 동일 프레임 보장.
     bakeRotation: { rotX: number; rotZ: number; wallAngleRad: number };
@@ -315,6 +317,8 @@ export default function DoorAlignModal({
       wallSurfaceId: string;
       doorExtractionDepth: number;
       boundarySplitEnabled: boolean;
+      hingeEdge: number | null;
+      swing: 1 | -1;
       doorMesh?: { corners: number[][]; uvs: number[][]; normalInward: number[]; textureFilename: string; textureWidth: number; textureHeight: number };
       doorSplat?: { filename: string };
     }> = [];
@@ -326,6 +330,8 @@ export default function DoorAlignModal({
         wallSurfaceId: d.wallSurfaceId,
         doorExtractionDepth: d.doorExtractionDepth,
         boundarySplitEnabled: d.boundarySplitEnabled,
+        hingeEdge: d.hingeEdge,
+        swing: d.swing,
       };
       if (d.doorMeshInput.rgba.length > 0) {
         const canvas = document.createElement('canvas');
@@ -1887,6 +1893,9 @@ export default function DoorAlignModal({
               : null,
             doorExtractionDepth: doorExtractionDepth,
             boundarySplitEnabled,
+            // 추출 시점엔 회전축 미선택 — 이후 '문 열기'(applyDoorRotation)에서 현재 도어(=리스트 마지막)에 동기됨.
+            hingeEdge: hingeEdgeRef.current,
+            swing: doorSwing,
             unitName: '',  // 미설정 — 휠 피커로 부여.
             bakeRotation: basemapEditMode
               ? { rotX: 0, rotZ: 0, wallAngleRad: 0 }
@@ -2275,6 +2284,19 @@ export default function DoorAlignModal({
     setDoorRotated(true);
     setRotationApplied(true);
     setDoorRefineError(null);
+
+    // 베이스맵: 현재 작업 중인 도어(=리스트 마지막)에 확정된 회전축/방향을 기록.
+    // 추출 시점엔 hinge 미선택이라 null 로 들어갔으므로 여기서 동기 → doors.json 에 hingeEdge/swing 영속.
+    if (basemapMode) {
+      const he = hingeEdgeRef.current;
+      setInMemoryDoors(prev => {
+        if (prev.length === 0) return prev;
+        const next = prev.slice();
+        const last = next.length - 1;
+        next[last] = { ...next[last], hingeEdge: he, swing: doorSwing };
+        return next;
+      });
+    }
   }, [hingeIndices, doorAngleDeg, doorSwing, picked, planes, allPicked, getCurrentEditorRotation]);
 
   // 문을 즉시 닫힌 상태(angle=0)로 동기 적용. 애니메이션 없음.
@@ -2871,7 +2893,27 @@ export default function DoorAlignModal({
                 };
                 if (deferPersistenceToAlign && onSetupDoorAssetsFinalized) {
                   if (hingeEdge === null) throw new Error('회전축 정보 없음');
-                  const sourceDoor = inMemoryDoorsRef.current[inMemoryDoorsRef.current.length - 1] ?? null;
+                  // 모듈 모드는 추출 도어를 inMemoryDoors 에 쌓지 않는다 (그 리스트는 basemap 다중 도어 전용).
+                  // 추출 직후 살아있는 ref (mesh rgba / splat blob / bakeRotation) 로 저장 소스를 구성한다.
+                  type DoorAssetSource = Pick<InMemoryDoor, 'doorMeshInput' | 'doorSplatBlobUrl' | 'bakeRotation' | 'wallSurfaceId'>;
+                  let sourceDoor: DoorAssetSource | null =
+                    inMemoryDoorsRef.current[inMemoryDoorsRef.current.length - 1] ?? null;
+                  if (!sourceDoor) {
+                    const meshInput = lastDoorMeshInputRef.current;
+                    const hasMesh = !!meshInput && meshInput.rgba.length > 0;
+                    const hasSplat = !!doorSubBlobUrlRef.current;
+                    if (hasMesh || hasSplat) {
+                      sourceDoor = {
+                        doorMeshInput: meshInput ?? {
+                          rgba: new Uint8ClampedArray(0), width: 0, height: 0,
+                          corners: [], uvs: [], normalInward: [0, 0, 0],
+                        },
+                        doorSplatBlobUrl: doorSubBlobUrlRef.current,
+                        bakeRotation: getRemainingRotationToAY?.() ?? { rotX: 0, rotZ: 0, wallAngleRad: 0 },
+                        wallSurfaceId: doorOpts.wallSurfaceId ?? picked[0]!.surfaceId,
+                      };
+                    }
+                  }
                   let payload: ModuleDoorAssetPayload | null = null;
                   if (sourceDoor) {
                     let doorMesh: ModuleDoorAssetPayload['doorMesh'];
@@ -3063,8 +3105,7 @@ export default function DoorAlignModal({
                       await onCommitRefined(activeUploadId);
                     }
 
-                    // 3) 각 도어의 자산 (PNG + PLY) 업로드 + DoorMeta 작성
-                    const doorMetas: PickedCorner[][] = [];  // placeholder — 실제론 doors.json 페이로드 만듦
+                    // 3) 각 도어의 자산 (PNG + PLY) 업로드 + doors.json 엔트리 작성
                     const allDoors = inMemoryDoorsRef.current;
                     const doorEntries: Array<{
                       id: string;
@@ -3073,6 +3114,8 @@ export default function DoorAlignModal({
                       wallSurfaceId: string;
                       doorExtractionDepth: number;
                       boundarySplitEnabled: boolean;
+                      hingeEdge: number | null;
+                      swing: 1 | -1;
                       doorMesh?: { corners: number[][]; uvs: number[][]; normalInward: number[]; textureFilename: string; textureWidth: number; textureHeight: number };
                       doorSplat?: { filename: string };
                     }> = [];
@@ -3084,6 +3127,8 @@ export default function DoorAlignModal({
                         wallSurfaceId: d.wallSurfaceId,
                         doorExtractionDepth: d.doorExtractionDepth,
                         boundarySplitEnabled: d.boundarySplitEnabled,
+                        hingeEdge: d.hingeEdge,
+                        swing: d.swing,
                       };
                       // 도어 mesh 텍스처 PNG 업로드
                       if (d.doorMeshInput.rgba.length > 0) {
@@ -3149,7 +3194,6 @@ export default function DoorAlignModal({
 
                     // 6) 완료 모달 표시 — 사용자가 라우팅 선택 (onBasemapDone 콜백).
                     setCompletionModalOpen(true);
-                    void doorMetas;  // unused — 위 placeholder
                   } catch (e: any) {
                     setCommitError(`등록 실패: ${e?.message ?? e}`);
                   } finally {

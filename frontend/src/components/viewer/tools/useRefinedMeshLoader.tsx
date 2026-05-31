@@ -3,6 +3,7 @@
 import { RefObject, useEffect, useRef } from 'react';
 import type { SplatViewerCoreRef } from '../SplatViewerCore';
 import type { AdditionalGsplatsApi } from './useAdditionalGsplats';
+import type { DoorHandle } from '@/lib/gs/doorInteraction';
 
 /**
  * 정합/베이스 뷰어용: upload_id 의 정제 결과를 자동 로드해 door 자산과 wall mesh 를 씬에 추가한다.
@@ -49,8 +50,16 @@ export function useRefinedMeshLoader(
     uvs: number[][];
     normalInward: [number, number, number];
   }) => void,
+  /**
+   * 옵션: 도어 wrapper 생성 시 호출 — 층 뷰어의 문 hover/열기·닫기 상호작용 등록용.
+   * 힌지/normalInward 메타가 있는 도어만 핸들이 전달된다.
+   */
+  onDoorRegister?: (handle: DoorHandle) => void,
+  /** 옵션: 도어 wrapper 정리 시 호출 — 상호작용 등록 해제용. */
+  onDoorUnregister?: (wrapper: any) => void,
 ): void {
   const entitiesRef = useRef<any[]>([]);
+  const doorWrappersRef = useRef<any[]>([]);
   const doorSplatIdsRef = useRef<string[]>([]);
   const labelOverlayRef = useRef<HTMLDivElement | null>(null);
   const labelRafRef = useRef<number>(0);
@@ -63,6 +72,10 @@ export function useRefinedMeshLoader(
 
     let cancelled = false;
     const cleanup = () => {
+      for (const w of doorWrappersRef.current) {
+        try { onDoorUnregister?.(w); } catch { /* ignore */ }
+      }
+      doorWrappersRef.current = [];
       for (const e of entitiesRef.current) {
         try { e.destroy(); } catch { /* ignore */ }
       }
@@ -98,6 +111,8 @@ export function useRefinedMeshLoader(
             corners: number[][];
             unitName?: string | null;
             wallSurfaceId?: string | null;
+            hingeEdge?: number | null;
+            swing?: number | null;
             door_mesh?: {
               corners: number[][];
               uvs: number[][];
@@ -142,6 +157,25 @@ export function useRefinedMeshLoader(
           try { basemapDoorWrapper.tags?.add?.('basemap'); } catch {}
           app.root.addChild(basemapDoorWrapper);
           entitiesRef.current.push(basemapDoorWrapper); // cleanup 시 wrapper destroy → 자식 cascade
+          doorWrappersRef.current.push(basemapDoorWrapper);
+
+          // 층 뷰어 문 상호작용 등록 — 힌지 + normalInward 메타가 있는 도어만.
+          const ni = door.door_mesh?.normalInward;
+          if (
+            onDoorRegister &&
+            typeof door.hingeEdge === 'number' &&
+            Array.isArray(door.corners) && door.corners.length === 4 &&
+            Array.isArray(ni) && ni.length === 3
+          ) {
+            onDoorRegister({
+              id: `basemap_${door.id}`,
+              wrapper: basemapDoorWrapper,
+              corners: door.corners.map((c) => [c[0], c[1], c[2]] as [number, number, number]),
+              hingeEdge: door.hingeEdge,
+              swing: typeof door.swing === 'number' ? door.swing : 1,
+              normalInward: [ni[0], ni[1], ni[2]],
+            });
+          }
 
           // 1) 도어 mesh quad → wrapper 자식으로
           if (door.door_mesh) {
@@ -369,5 +403,7 @@ export function useRefinedMeshLoader(
     onlyDoorUnitName,
     mutableTextures,
     onWallTextureData,
+    onDoorRegister,
+    onDoorUnregister,
   ]);
 }

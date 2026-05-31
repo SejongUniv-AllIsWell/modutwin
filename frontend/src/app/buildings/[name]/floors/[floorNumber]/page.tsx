@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import { api } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
@@ -10,6 +10,15 @@ import { useAdditionalGsplats } from '@/components/viewer/tools/useAdditionalGsp
 import { useRefinedMeshLoader } from '@/components/viewer/tools/useRefinedMeshLoader';
 import { useToast } from '@/components/ui/Toast';
 import RoomWheelPicker, { roomNumberLabel } from '@/components/ui/RoomWheelPicker';
+import type { FloorplanResult } from '@/lib/gs/floorplan';
+import { createDoorInteraction, type DoorInteractionController, type DoorHandle } from '@/lib/gs/doorInteraction';
+
+const Minimap = lazy(() => import('@/components/viewer/tools/Minimap'));
+const CeilingCutPanel = lazy(() => import('@/components/viewer/tools/CeilingCutPanel'));
+
+// 미니맵 이미지 베이크는 천장에서 고정 11cm 컷으로 항상 층 전체를 굽는다.
+// (라이브 3D 천장 컷 슬라이더와 분리 — 슬라이더는 화면상 3D 씬 컷만 조절.)
+const MINIMAP_CEILING_CUT_M = 0.11;
 
 type Vec3 = [number, number, number];
 type Quat = [number, number, number, number];
@@ -27,6 +36,14 @@ type ModuleOverlayRecord = {
   splatLayerIds: string[];
   meshEntities: any[];
   cancelled: boolean;
+};
+type CeilingCutAlphaRecord = {
+  texture: any;
+  entries: Array<[number, number]>;
+};
+type CeilingCutState = {
+  alphaRecords: CeilingCutAlphaRecord[];
+  meshRecords: Array<{ ent: any; enabled: boolean }>;
 };
 
 const moduleNameCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
@@ -175,6 +192,150 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function traverseEntities(root: any, visit: (ent: any) => void) {
+  if (!root) return;
+  visit(root);
+  for (const child of root.children ?? []) traverseEntities(child, visit);
+}
+
+function visualCeilingMeshEntities(app: any): any[] {
+  const results: any[] = [];
+  traverseEntities(app?.root, (ent) => {
+    const name = String(ent?.name ?? '');
+    if (!name.startsWith('wallMesh_')) return;
+    // Z-180 뷰어 컨벤션상 저장 surfaceId "floor" 가 화면상 천장이다.
+    // basemap: wallMesh_floor, module: wallMesh_module_<id>_floor.
+    if (name === 'wallMesh_floor' || name.endsWith('_floor')) results.push(ent);
+  });
+  return results;
+}
+
+function collectGsplatRuntimes(app: any): Array<{
+  ent: any;
+  gsplatData: any;
+  colorTexture: any;
+  posX: Float32Array;
+  posY: Float32Array;
+  posZ: Float32Array;
+  numSplats: number;
+}> {
+  const results: Array<{
+    ent: any;
+    gsplatData: any;
+    colorTexture: any;
+    posX: Float32Array;
+    posY: Float32Array;
+    posZ: Float32Array;
+    numSplats: number;
+  }> = [];
+  traverseEntities(app?.root, (ent) => {
+    if (!ent?.enabled || !ent.gsplat) return;
+    const comp = ent.gsplat;
+    const resource = comp.asset?.resource ?? comp.instance?.resource ?? comp.instance?.splatData;
+    const gsplatData = resource?.gsplatData ?? resource;
+    const colorTexture = resource?.streams?.textures?.get?.('splatColor')
+      ?? comp.material?.colorMap
+      ?? comp.instance?.material?.colorMap;
+    const posX = gsplatData?.getProp?.('x') as Float32Array | undefined;
+    const posY = gsplatData?.getProp?.('y') as Float32Array | undefined;
+    const posZ = gsplatData?.getProp?.('z') as Float32Array | undefined;
+    const numSplats = Number(gsplatData?.numSplats ?? posX?.length ?? 0);
+    if (!colorTexture || !posX || !posY || !posZ || !numSplats) return;
+    results.push({ ent, gsplatData, colorTexture, posX, posY, posZ, numSplats });
+  });
+  return results;
+}
+
+// 씬 전체(basemap primary + 모듈 오버레이) 가우시안의 world bbox.
+// 평면도 프레임을 모든 방에 맞춰 잡아 모듈이 잘리지 않도록 한다.
+function sceneWorldBounds(app: any): { mnX: number; mxX: number; mnY: number; mxY: number; mnZ: number; mxZ: number } | null {
+  const runtimes = collectGsplatRuntimes(app);
+  if (runtimes.length === 0) return null;
+  let mnX = Infinity, mxX = -Infinity, mnY = Infinity, mxY = -Infinity, mnZ = Infinity, mxZ = -Infinity;
+  for (const rt of runtimes) {
+    const m = rt.ent.getWorldTransform().data;
+    for (let i = 0; i < rt.numSplats; i++) {
+      const [wx, wy, wz] = worldPositionFromLocal(m, rt.posX[i], rt.posY[i], rt.posZ[i]);
+      if (wx < mnX) mnX = wx; if (wx > mxX) mxX = wx;
+      if (wy < mnY) mnY = wy; if (wy > mxY) mxY = wy;
+      if (wz < mnZ) mnZ = wz; if (wz > mxZ) mxZ = wz;
+    }
+  }
+  if (!Number.isFinite(mnX)) return null;
+  return { mnX, mxX, mnY, mxY, mnZ, mxZ };
+}
+
+function worldPositionFromLocal(m: Float32Array | number[], x: number, y: number, z: number): [number, number, number] {
+  return [
+    m[0] * x + m[4] * y + m[8] * z + m[12],
+    m[1] * x + m[5] * y + m[9] * z + m[13],
+    m[2] * x + m[6] * y + m[10] * z + m[14],
+  ];
+}
+
+// 천장 컷: 화면상 천장에서 cutoffMeters 이내 가우시안 alpha=0 + 천장 메시 숨김. 렌더 전용으로
+// 저장 PLY/mesh 는 안 건드리고, restoreCeilingCutForPaper 가 GPU alpha/메시 가시성을 되돌린다.
+function applyCeilingCutForPaper(app: any, core: SplatViewerCoreRef, cutoffMeters: number): CeilingCutState | null {
+  const runtimes = collectGsplatRuntimes(app);
+  if (runtimes.length === 0) return null;
+  // Z-180 컨벤션: 화면상 천장(머리 위) = World +Y 최댓값.
+  let ceilingY = -Infinity;
+  for (const rt of runtimes) {
+    const m = rt.ent.getWorldTransform().data;
+    for (let i = 0; i < rt.numSplats; i++) {
+      const [, wy] = worldPositionFromLocal(m, rt.posX[i], rt.posY[i], rt.posZ[i]);
+      if (wy > ceilingY) ceilingY = wy;
+    }
+  }
+  if (!Number.isFinite(ceilingY)) return null;
+  // 천장에서 cutoffMeters 만큼 아래 평면. 이 위(천장 슬랩)를 가린다.
+  const cutoffY = ceilingY - cutoffMeters;
+  const zeroHalf = core.float2Half(0);
+  const alphaRecords: CeilingCutAlphaRecord[] = [];
+  for (const rt of runtimes) {
+    const tex = rt.colorTexture;
+    const data = tex.lock?.() as Uint16Array | null;
+    if (!data) continue;
+    const m = rt.ent.getWorldTransform().data;
+    const entries: Array<[number, number]> = [];
+    for (let i = 0; i < rt.numSplats; i++) {
+      const [, wy] = worldPositionFromLocal(m, rt.posX[i], rt.posY[i], rt.posZ[i]);
+      if (wy < cutoffY) continue;
+      const ai = i * 4 + 3;
+      const prev = data[ai];
+      if (prev === zeroHalf) continue;
+      entries.push([ai, prev]);
+      data[ai] = zeroHalf;
+    }
+    tex.unlock?.();
+    if (entries.length > 0) alphaRecords.push({ texture: tex, entries });
+  }
+
+  const meshRecords = visualCeilingMeshEntities(app).map((ent) => {
+    const enabled = ent.enabled;
+    ent.enabled = false;
+    return { ent, enabled };
+  });
+  return { alphaRecords, meshRecords };
+}
+
+function restoreCeilingCutForPaper(state: CeilingCutState | null) {
+  if (!state) return;
+  for (const record of state.alphaRecords) {
+    try {
+      const data = record.texture.lock?.() as Uint16Array | null;
+      if (!data) continue;
+      for (const [idx, value] of record.entries) data[idx] = value;
+      record.texture.unlock?.();
+    } catch {
+      try { record.texture.unlock?.(); } catch {}
+    }
+  }
+  for (const { ent, enabled } of state.meshRecords) {
+    try { ent.enabled = enabled; } catch {}
+  }
+}
+
 function FloorCompositeViewer({
   primaryUrl,
   basemapSourceUploadId,
@@ -188,11 +349,131 @@ function FloorCompositeViewer({
   const additional = useAdditionalGsplats(coreRef);
   const { add, getEntity, remove } = additional;
   const overlayRecordsRef = useRef<Map<string, ModuleOverlayRecord>>(new Map());
+  const doorInteractionRef = useRef<DoorInteractionController | null>(null);
+  // 컨트롤러 생성 (splatReady) 보다 도어 로드가 먼저 끝날 수 있어 등록을 큐잉했다가 생성 시 drain.
+  const pendingDoorsRef = useRef<DoorHandle[]>([]);
+  const registerDoor = useCallback((handle: DoorHandle) => {
+    const ctl = doorInteractionRef.current;
+    if (ctl) ctl.add(handle);
+    else pendingDoorsRef.current.push(handle);
+  }, []);
+  const unregisterDoorByWrapper = useCallback((wrapper: any) => {
+    const ctl = doorInteractionRef.current;
+    if (ctl) { try { ctl.removeByWrapper(wrapper); } catch {} }
+    pendingDoorsRef.current = pendingDoorsRef.current.filter(h => h.wrapper !== wrapper);
+  }, []);
+  const ceilingCutStateRef = useRef<CeilingCutState | null>(null);
+  const floorplanBakeSeqRef = useRef(0);
+  const [splatReady, setSplatReady] = useState(false);
+  const [paperCeilingCut, setPaperCeilingCut] = useState(false);
+  const [floorplan, setFloorplan] = useState<FloorplanResult | null>(null);
+  const [floorplanCutoff, setFloorplanCutoff] = useState(0.11);
 
   // 베이스맵의 wall mesh + 텍스처(천장/바닥/벽) + 도어 splat 까지 같이 로드.
   // 4번째 인자 (additional) 가 있어야 도어 splat 도 씬에 add 됨.
   // 층 overview 는 보기 전용이므로 CPU ImageData 복사 없이 로드해 대형 텍스처 메모리 사용을 줄인다.
-  useRefinedMeshLoader(coreRef, basemapSourceUploadId ?? undefined, !!basemapSourceUploadId, additional, null, false);
+  useRefinedMeshLoader(coreRef, basemapSourceUploadId ?? undefined, !!basemapSourceUploadId, additional, null, false, undefined, registerDoor, unregisterDoorByWrapper);
+
+  const restorePaperCut = useCallback(() => {
+    restoreCeilingCutForPaper(ceilingCutStateRef.current);
+    ceilingCutStateRef.current = null;
+  }, []);
+
+  const applyPaperCut = useCallback(() => {
+    const core = coreRef.current;
+    const app = core?.getApp();
+    if (!core || !app) return;
+    restorePaperCut();
+    ceilingCutStateRef.current = applyCeilingCutForPaper(app, core, floorplanCutoff);
+  }, [floorplanCutoff, restorePaperCut]);
+
+  useEffect(() => {
+    if (paperCeilingCut) applyPaperCut();
+    else restorePaperCut();
+    return () => restorePaperCut();
+  }, [paperCeilingCut, applyPaperCut, restorePaperCut]);
+
+  const bakePaperFloorplan = useCallback(async () => {
+    const seq = ++floorplanBakeSeqRef.current;
+    const core = coreRef.current;
+    const app = core?.getApp();
+    const pc = core?.getPC();
+    const sd = core?.getSplatData();
+    if (!core || !app || !pc || !sd) return;
+
+    const ceilingMeshes = visualCeilingMeshEntities(app);
+    const prevEnabled = ceilingMeshes.map((ent) => ent.enabled);
+    for (const ent of ceilingMeshes) ent.enabled = false;
+    try {
+      const { bakeFloorplan } = await import('@/lib/gs/floorplan');
+      // 씬 전체(basemap + 모듈) 범위로 프레임을 잡아 모듈이 잘리지 않도록 한다.
+      const bounds = sceneWorldBounds(app) ?? undefined;
+      const fp = await bakeFloorplan(
+        pc,
+        app,
+        {
+          posX: sd.posX,
+          posY: sd.posY,
+          posZ: sd.posZ,
+          numSplats: sd.numSplats,
+          origColorData: sd.origColorData ?? null,
+          splatEntity: sd.splatEntity,
+        },
+        core.half2Float,
+        {
+          cutoffOffsetMeters: MINIMAP_CEILING_CUT_M,
+          paddingMeters: 0.5,
+          pixelsPerMeter: 60,
+          bounds,
+        },
+      );
+      if (seq === floorplanBakeSeqRef.current && fp) setFloorplan(fp);
+    } finally {
+      for (let i = 0; i < ceilingMeshes.length; i++) ceilingMeshes[i].enabled = prevEnabled[i];
+      if (paperCeilingCut) applyPaperCut();
+    }
+  }, [applyPaperCut, paperCeilingCut]);
+
+  useEffect(() => {
+    setSplatReady(false);
+    setFloorplan(null);
+    restorePaperCut();
+    setPaperCeilingCut(false);
+  }, [primaryUrl, restorePaperCut]);
+
+  useEffect(() => {
+    if (!splatReady) return;
+    const t = setTimeout(() => {
+      if (paperCeilingCut) applyPaperCut();
+      void bakePaperFloorplan();
+    }, 1600);
+    return () => clearTimeout(t);
+  }, [splatReady, applyPaperCut, bakePaperFloorplan, moduleOverlays.length, paperCeilingCut]);
+
+  // 문 상호작용 컨트롤러 — splat 준비 후 1회 생성. 모듈 도어 로드 시 add() 로 등록.
+  useEffect(() => {
+    if (!splatReady) return;
+    const core = coreRef.current;
+    const pc = core?.getPC();
+    const app = core?.getApp();
+    const canvas = core?.getCanvas();
+    if (!pc || !app || !canvas) return;
+    const controller = createDoorInteraction({
+      pc, app, canvas,
+      getCamera: () => coreRef.current?.getCamera() ?? null,
+      onUpdate: (cb) => core!.onUpdate(cb),
+    });
+    doorInteractionRef.current = controller;
+    // 컨트롤러 생성 전 큐잉된 도어 등록 drain.
+    if (pendingDoorsRef.current.length) {
+      for (const h of pendingDoorsRef.current) controller.add(h);
+      pendingDoorsRef.current = [];
+    }
+    return () => {
+      controller.dispose();
+      doorInteractionRef.current = null;
+    };
+  }, [splatReady]);
 
   useEffect(() => {
     const cleanupRecord = (record: ModuleOverlayRecord) => {
@@ -202,6 +483,7 @@ function FloorCompositeViewer({
       }
       record.splatLayerIds = [];
       for (const ent of record.meshEntities) {
+        try { unregisterDoorByWrapper(ent); } catch {}
         try { ent.destroy(); } catch {}
       }
       record.meshEntities = [];
@@ -292,6 +574,9 @@ function FloorCompositeViewer({
               id: string;
               unitName?: string | null;
               wallSurfaceId?: string | null;
+              corners?: number[][];
+              hingeEdge?: number | null;
+              swing?: number | null;
               door_mesh?: {
                 corners: number[][];
                 uvs: number[][];
@@ -363,6 +648,24 @@ function FloorCompositeViewer({
             const wrapper = new pc.Entity(`moduleDoor_${module.id}_${door.id}`);
             record.group.addChild(wrapper);
             record.meshEntities.push(wrapper);
+
+            // 문 상호작용 등록 — 힌지/코너/normalInward 가 모두 있어야 열기/닫기 가능.
+            // (구버전 모듈은 doorMesh/hinge 메타가 없어 hover/클릭 대상에서 제외됨.)
+            const doorNormalInward = door.door_mesh?.normalInward;
+            if (
+              typeof door.hingeEdge === 'number'
+              && Array.isArray(door.corners) && door.corners.length === 4
+              && Array.isArray(doorNormalInward) && doorNormalInward.length === 3
+            ) {
+              registerDoor({
+                id: `${module.id}_${door.id}`,
+                wrapper,
+                corners: door.corners.map(c => [c[0], c[1], c[2]] as [number, number, number]),
+                hingeEdge: door.hingeEdge,
+                swing: typeof door.swing === 'number' ? door.swing : 1,
+                normalInward: [doorNormalInward[0], doorNormalInward[1], doorNormalInward[2]],
+              });
+            }
 
             let doorMeshImage: HTMLImageElement | null = null;
             let doorMeshAverageColor: [number, number, number] | null = null;
@@ -441,7 +744,35 @@ function FloorCompositeViewer({
     };
   }, [remove]);
 
-  return <SplatViewerCore ref={coreRef} sogUrl={primaryUrl} />;
+  return (
+    <SplatViewerCore
+      ref={coreRef}
+      sogUrl={primaryUrl}
+      onSplatLoaded={() => setSplatReady(true)}
+    >
+      {/* 우측 컬럼 — 미니맵(자동 베이크) 위, 천장 컷 패널 아래. 각자 독립 슬라이드 숨김. */}
+      <div className="absolute top-3 right-3 z-30 flex flex-col items-end gap-2">
+        {floorplan && (
+          <Suspense fallback={null}>
+            <Minimap
+              floorplan={floorplan}
+              cameraGetter={() => coreRef.current?.getCamera() ?? null}
+            />
+          </Suspense>
+        )}
+        {splatReady && (
+          <Suspense fallback={null}>
+            <CeilingCutPanel
+              enabled={paperCeilingCut}
+              onToggle={() => setPaperCeilingCut((v) => !v)}
+              cutoff={floorplanCutoff}
+              onCutoffChange={setFloorplanCutoff}
+            />
+          </Suspense>
+        )}
+      </div>
+    </SplatViewerCore>
+  );
 }
 
 function formatRegisteredAt(iso: string | null | undefined): string | null {

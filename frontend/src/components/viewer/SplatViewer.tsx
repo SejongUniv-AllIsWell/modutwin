@@ -31,8 +31,8 @@ export default function SplatViewer({ sogUrl, mode, uploadId, onSelectionDone }:
   // ── 평면도 (정합 단계 미니맵 테스트) ──
   const [floorplan, setFloorplan] = useState<FloorplanResult | null>(null);
   const [splatReady, setSplatReady] = useState(false);
-  // 천장 컷오프 — 미니맵 슬라이더로 실시간 조정. 변경 시 디바운스 후 재베이크.
-  const [floorplanCutoff, setFloorplanCutoff] = useState(0.05);
+  // 천장 컷오프 — 미니맵 베이크 시 천장에서 제거할 깊이 (m).
+  const floorplanCutoff = 0.05;
   // selector 객체는 매 렌더 새로 생성되므로 ref 로 잡아 콜백 stable 유지.
   // (onSplatLoaded prop 이 매 렌더 변경되면 SplatViewerCore 가 splat 재로드 → 카메라 리셋 루프.)
   const selectorRef = useRef(selector);
@@ -140,8 +140,6 @@ export default function SplatViewer({ sogUrl, mode, uploadId, onSelectionDone }:
           <Minimap
             floorplan={floorplan}
             cameraGetter={() => coreRef.current?.getCamera() ?? null}
-            cutoff={floorplanCutoff}
-            onCutoffChange={setFloorplanCutoff}
           />
         </Suspense>
       )}
