@@ -283,11 +283,16 @@ function FloorCompositeViewer({
   const additional = useAdditionalGsplats(coreRef);
   const { add, getEntity, remove, applyCeilingMask } = additional;
   const overlayRecordsRef = useRef<Map<string, ModuleOverlayRecord>>(new Map());
+  const [assetRevision, setAssetRevision] = useState(0);
+  const bumpAssetRevision = useCallback(() => {
+    setAssetRevision((v) => v + 1);
+  }, []);
   const {
     applyModuleCeilingState,
     clearPrimaryCeiling,
     handlePrimarySplatLoaded,
     registerPrimaryFromSurfaces,
+    withTemporaryCeilingCut,
   } = useCeilingRemoval<ModuleOverlayRecord>({
     coreRef,
     ceilingRemoved,
@@ -314,6 +319,10 @@ function FloorCompositeViewer({
   const floorplanBakeSeqRef = useRef(0);
   const [splatReady, setSplatReady] = useState(false);
   const [floorplan, setFloorplan] = useState<FloorplanResult | null>(null);
+  const moduleOverlayKey = useMemo(
+    () => moduleOverlays.map((module) => module.id).join('|'),
+    [moduleOverlays],
+  );
 
   useEffect(() => {
     clearPrimaryCeiling();
@@ -324,7 +333,7 @@ function FloorCompositeViewer({
   // 층 overview 는 보기 전용이므로 CPU ImageData 복사 없이 로드해 대형 텍스처 메모리 사용을 줄인다.
   // onLoaded: primary 자산이 베이스맵일 때 visual ceiling entity + Y 를 잡아둠. primary 가 모듈이면
   //   별도의 useRefinedMeshLoader 호출 (아래) 이 채움.
-  // 3.A 단일 source: primary 가 모듈이면(module 모드) basemap refined(wall mesh + 도어 splat) 을 로드하지 않는다.
+  // 베이스맵 없이 모듈이 primary 인 층에서는 basemap refined 를 로드하지 않는다 (enabled 게이트).
   // enabled 가 false 로 바뀌면 useRefinedMeshLoader 의 effect cleanup 이 이미 로드된 엔티티/도어 splat 을 자동 destroy 한다.
   useRefinedMeshLoader(
     coreRef,
@@ -337,6 +346,7 @@ function FloorCompositeViewer({
     !primaryIsModule
       ? ({ surfaces }) => {
           registerPrimaryFromSurfaces(surfaces);
+          bumpAssetRevision();
         }
       : undefined,
     registerDoor,
@@ -356,6 +366,7 @@ function FloorCompositeViewer({
     primaryIsModule
       ? ({ surfaces }) => {
           registerPrimaryFromSurfaces(surfaces);
+          bumpAssetRevision();
         }
       : undefined,
   );
@@ -373,45 +384,55 @@ function FloorCompositeViewer({
     const prevEnabled = ceilingMeshes.map((ent) => ent.enabled);
     for (const ent of ceilingMeshes) ent.enabled = false;
     try {
-      const { bakeFloorplan } = await import('@/lib/gs/floorplan');
-      const bounds = sceneWorldBounds(app) ?? undefined;
-      const fp = await bakeFloorplan(
-        pc,
-        app,
-        {
-          posX: sd.posX,
-          posY: sd.posY,
-          posZ: sd.posZ,
-          numSplats: sd.numSplats,
-          origColorData: sd.origColorData ?? null,
-          splatEntity: sd.splatEntity,
-        },
-        core.half2Float,
-        {
-          cutoffOffsetMeters: MINIMAP_CEILING_CUT_M,
-          paddingMeters: 0.5,
-          pixelsPerMeter: 60,
-          bounds,
-        },
-      );
+      const fp = await withTemporaryCeilingCut(MINIMAP_CEILING_CUT_M, async () => {
+        const { bakeFloorplan } = await import('@/lib/gs/floorplan');
+        const bounds = sceneWorldBounds(app) ?? undefined;
+        return bakeFloorplan(
+          pc,
+          app,
+          {
+            posX: sd.posX,
+            posY: sd.posY,
+            posZ: sd.posZ,
+            numSplats: sd.numSplats,
+            origColorData: sd.origColorData ?? null,
+            splatEntity: sd.splatEntity,
+          },
+          core.half2Float,
+          {
+            cutoffOffsetMeters: MINIMAP_CEILING_CUT_M,
+            paddingMeters: 0.5,
+            pixelsPerMeter: 60,
+            bounds,
+            disableCameraCut: true,
+          },
+        );
+      });
       if (seq === floorplanBakeSeqRef.current && fp) setFloorplan(fp);
     } finally {
       for (let i = 0; i < ceilingMeshes.length; i++) ceilingMeshes[i].enabled = prevEnabled[i];
     }
-  }, []);
+  }, [withTemporaryCeilingCut]);
 
-  // primary 교체 시 미니맵 상태 초기화.
+  // primary 교체 시 splat load 를 다시 기다린다.
   useEffect(() => {
+    floorplanBakeSeqRef.current += 1;
     setSplatReady(false);
     setFloorplan(null);
   }, [primaryUrl]);
+
+  // overlay 구성이 바뀌면 미니맵만 무효화한다. primary splat 은 그대로 살아있다.
+  useEffect(() => {
+    floorplanBakeSeqRef.current += 1;
+    setFloorplan(null);
+  }, [moduleOverlayKey]);
 
   // splat + 모듈 자산이 안정된 뒤 평면도를 한 번 굽는다.
   useEffect(() => {
     if (!splatReady) return;
     const t = setTimeout(() => { void bakeMinimap(); }, 1600);
     return () => clearTimeout(t);
-  }, [splatReady, bakeMinimap, moduleOverlays.length]);
+  }, [splatReady, bakeMinimap, moduleOverlayKey, assetRevision]);
 
   // 문 상호작용 컨트롤러 — splat 준비 후 1회 생성. 큐잉된 도어 등록을 drain.
   useEffect(() => {
@@ -537,6 +558,7 @@ function FloorCompositeViewer({
             resetPlyLocalFrame(ent);
             // 천장제거 토글이 ON 상태라면 이 모듈에 즉시 마스킹 (race-safe).
             applyModuleCeilingState(record);
+            bumpAssetRevision();
           })
           .catch(() => {});
 
@@ -622,6 +644,7 @@ function FloorCompositeViewer({
                   applyModuleCeilingState(record);
                 }
               }
+              bumpAssetRevision();
             }
           }
 
@@ -699,16 +722,18 @@ function FloorCompositeViewer({
                   if (!ent) return;
                   wrapper.addChild(ent);
                   resetPlyLocalFrame(ent);
+                  bumpAssetRevision();
                 })
                 .catch(() => {});
             }
           }
+          bumpAssetRevision();
         } catch (e) {
           console.warn(`[FloorCompositeViewer] module refined assets load failed: ${module.name}`, e);
         }
       })();
     });
-  }, [add, getEntity, moduleOverlays, remove, applyModuleCeilingState]);
+  }, [add, getEntity, moduleOverlays, remove, applyModuleCeilingState, bumpAssetRevision]);
 
   useEffect(() => {
     return () => {
@@ -887,10 +912,14 @@ export default function FloorDetailPage() {
     () => moduleRows.filter((module) => module.url && module.is_visible !== false),
     [moduleRows],
   );
-  // 3.A 단일 source 렌더: 한 번에 하나의 자산(primary)만 그린다. 같은 방을 basemap+module 이
-  // 동시에 그려 카메라 이동 시 깊이/정렬 충돌(깜빡임)이 나던 중복 렌더를 제거. 다른 모듈은 사이드바에서
-  // 클릭해 primaryUrl 을 그 모듈로 전환해 보고, [전체 층 보기] 로 basemap 으로 복귀한다.
-  const moduleOverlays = useMemo<FloorDetailModuleEntry[]>(() => [], []);
+  // 베이스맵이 있으면 베이스맵을 기준 primary 로 유지하고, 정합 완료된 모듈만 overlay 로 올린다.
+  // 모듈 선택은 primary 교체가 아니라 overlay 필터링으로 처리해야 alignment_transform 이 유지된다.
+  const moduleOverlays = useMemo<FloorDetailModuleEntry[]>(() => {
+    if (!hasBasemap) return [];
+    const aligned = renderableModules.filter((module) => !!module.alignment_transform);
+    if (selectedModuleId) return aligned.filter((module) => module.id === selectedModuleId);
+    return aligned;
+  }, [hasBasemap, renderableModules, selectedModuleId]);
 
   // primary 자산의 source_upload_id — 베이스맵이 primary 면 베이스맵의, 모듈이 primary 면 그 모듈의 것.
   // 천장제거가 mesh.json 의 ceiling corners 를 읽어야 하므로 둘 다 cover.
@@ -1062,9 +1091,13 @@ export default function FloorDetailPage() {
                             disabled={disabled}
                             onClick={() => {
                               if (!module.url) return;
-                              // 3.A 단일 source: basemap 유무와 무관하게 클릭한 모듈로 primary 전환(module 모드).
                               setSelectedModuleId(module.id);
-                              setPrimaryUrl(module.url);
+                              if (hasBasemap) {
+                                const url = manifest?.basemap?.url;
+                                if (url) setPrimaryUrl(url);
+                              } else {
+                                setPrimaryUrl(module.url);
+                              }
                             }}
                             className={`flex-1 min-w-0 px-4 py-2.5 text-left ${
                               disabled ? 'cursor-not-allowed' : 'hover:bg-sky-400/10'
@@ -1277,7 +1310,7 @@ export default function FloorDetailPage() {
             />
             {/* 좌측 상단 버튼 묶음 — 전체 층 보기 + (관리자) 대표 이미지 캡처. 우측은 미니맵/천장 패널이 차지. */}
             <div className="absolute top-4 left-4 z-10 flex flex-col gap-2 items-start">
-              {hasBasemap && primaryIsModule && (
+              {hasBasemap && (primaryIsModule || selectedModuleId) && (
                 <button
                   type="button"
                   onClick={() => {

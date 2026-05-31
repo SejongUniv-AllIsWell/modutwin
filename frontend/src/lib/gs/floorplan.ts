@@ -35,6 +35,9 @@ export interface BakeFloorplanOptions {
   alphaThreshold?: number;     // default 0.05 (bbox 산출용)
   paddingMeters?: number;      // default 0.5
   maxDimension?: number;       // default 1500
+  // true 면 카메라 near plane 으로 천장 컷을 하지 않는다. 호출자가 splat alpha/mesh
+  // visibility 를 기준면별로 이미 마스킹한 경우 사용한다.
+  disableCameraCut?: boolean;
   // 씬 전체(basemap + 모듈 오버레이) world bbox. 주어지면 단일 splat bbox 대신 사용 →
   // 모듈이 프레임 밖으로 잘리지 않는다.
   bounds?: SceneBounds;
@@ -94,7 +97,9 @@ export async function bakeFloorplan(
   // 화면상 바닥(발밑) = World -Y = mnY.
   // "천장 컷" = 천장에서 cutoff 만큼 안쪽(방 내부, 아래 방향) → world frame 에선 mxY - cutoff.
   // 이 평면보다 아래(작은 Y)만 남기고 위(천장 쪽)는 카메라 frustum 밖으로 컷.
-  const cutoffY = mxY - cutoff;
+  // disableCameraCut=true 면 호출자가 per-room/per-module 기준으로 이미 alpha 마스크를 적용한 상태이므로
+  // 카메라를 전체 bbox 위에 두고 frustum 으로 추가 컷하지 않는다.
+  const cameraY = opts.disableCameraCut ? mxY + 1 : mxY - cutoff;
   // padding 적용 (xz 만)
   const minX = mnX - pad, maxX = mxX + pad;
   const minZ = mnZ - pad, maxZ = mxZ + pad;
@@ -131,8 +136,8 @@ export async function bakeFloorplan(
   });
 
   // 3) 직교 top-down 카메라.
-  //    카메라 위치 y = cutoffY (천장 컷 평면). -Y 로 lookdown. near 작게 →
-  //    cutoffY 미만 (방 내부, 바닥 쪽) splat 만 frustum 내, 천장 쪽은 카메라 뒤라 컷.
+  //    카메라 위치 y = cameraY. 기본값은 천장 컷 평면(mxY-cutoff)이고, -Y 로 lookdown.
+  //    near 작게 → cameraY 미만 splat 만 frustum 내, 천장 쪽은 카메라 뒤라 컷.
   //    orthoHeight = worldZ / 2 (PC 의 orthoHeight 는 frustum 절반 높이).
   //
   //    좌표 정합 핵심: 위에서 -Y 방향으로 내려다봄.
@@ -151,16 +156,16 @@ export async function bakeFloorplan(
     projection: pc.PROJECTION_ORTHOGRAPHIC,
     orthoHeight: worldZ / 2,
     nearClip: 0.001,
-    farClip: Math.max(1, (mxY - mnY) + 2),
+    farClip: Math.max(1, (cameraY - mnY) + 2),
     clearColor: new pc.Color(0, 0, 0, 0),
     clearColorBuffer: true,
     clearDepthBuffer: true,
     renderTarget: rt,
     priority: -10, // 메인보다 먼저 렌더
   });
-  camEnt.setPosition(cx, cutoffY, cz);
-  // lookAt: target (cx, cutoffY-1, cz) — -Y 방향 (아래로 내려다봄). up = -Z (top-down 좌표 정합).
-  camEnt.lookAt(new pc.Vec3(cx, cutoffY - 1, cz), new pc.Vec3(0, 0, -1));
+  camEnt.setPosition(cx, cameraY, cz);
+  // lookAt: target (cx, cameraY-1, cz) — -Y 방향 (아래로 내려다봄). up = -Z (top-down 좌표 정합).
+  camEnt.lookAt(new pc.Vec3(cx, cameraY - 1, cz), new pc.Vec3(0, 0, -1));
   app.root.addChild(camEnt);
 
   try {

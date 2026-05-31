@@ -23,7 +23,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.core.security import get_current_user
 from app.core.storage_keys import is_key_under_prefix, normalize_minio_key
-from app.models import User, Upload, Task, SceneOutput, TaskType, TaskStatus, Module, Floor
+from app.models import (
+    User, UserRole, Upload, Task, SceneOutput, TaskType, TaskStatus,
+    Module, Floor, Building, Basemap,
+)
 from app.services.minio_service import get_minio_service, PART_SIZE
 from app.services.storage_paths import (
     build_refined_object_key,
@@ -333,16 +336,53 @@ async def get_refined_bundle(
 
     align/base 뷰어에서 정제된 모듈을 로드할 때 사용.
     """
-    # 가장 최근 SceneOutput 조회 (해당 upload + 사용자 소유)
+    # 가장 최근 SceneOutput 조회. 편집 흐름은 소유자만, 층 뷰어는 공개/활성 basemap
+    # 자산을 읽을 수 있어야 하므로 권한 판정은 scene 조회 뒤 명시적으로 수행한다.
     result = await db.execute(
-        select(SceneOutput)
+        select(SceneOutput, Module, Floor, Building)
         .join(Task, SceneOutput.task_id == Task.id)
-        .where(Task.upload_id == upload_id, SceneOutput.user_id == user.id)
+        .join(Module, SceneOutput.module_id == Module.id)
+        .join(Floor, Module.floor_id == Floor.id)
+        .join(Building, Floor.building_id == Building.id)
+        .where(Task.upload_id == upload_id)
         .order_by(SceneOutput.created_at.desc())
         .limit(1)
     )
-    scene = result.scalar_one_or_none()
-    if not scene:
+    row = result.one_or_none()
+    if not row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="정제 결과가 없습니다.")
+    scene, module, floor, building = row
+
+    can_read = (
+        user.role == UserRole.admin
+        or scene.user_id == user.id
+        or module.user_id == user.id
+    )
+    if not can_read:
+        active_basemap_result = await db.execute(
+            select(Basemap.id)
+            .where(
+                Basemap.source_upload_id == upload_id,
+                Basemap.floor_id == floor.id,
+                Basemap.is_active == True,
+            )
+            .limit(1)
+        )
+        can_read = (
+            active_basemap_result.scalar_one_or_none() is not None
+            and floor.is_visible is True
+            and building.is_visible is True
+        )
+
+    if not can_read:
+        can_read = (
+            scene.is_aligned is True
+            and module.is_visible is True
+            and floor.is_visible is True
+            and building.is_visible is True
+        )
+
+    if not can_read:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="정제 결과가 없습니다.")
 
     minio = get_minio_service()

@@ -56,7 +56,7 @@ export function useCeilingRemoval<T extends CeilingMaskRecord>({
     ceilingRemovedRef.current = ceilingRemoved;
   }, [ceilingRemoved]);
 
-  const applyPrimarySplatMask = useCallback((visualCeilingY: number, hide: boolean) => {
+  const applyPrimarySplatMask = useCallback((visualCeilingY: number, hide: boolean, cutoffMeters = cutoff) => {
     const core = coreRef.current;
     if (!core) return;
     const sd = core.getSplatData();
@@ -64,7 +64,7 @@ export function useCeilingRemoval<T extends CeilingMaskRecord>({
     const data = sd.colorTexture.lock();
     if (!data) return;
 
-    const threshold = visualCeilingY + cutoff;
+    const threshold = visualCeilingY + cutoffMeters;
     const zeroH = core.float2Half(0);
     const orig = sd.origColorData;
     const posY = sd.posY;
@@ -141,10 +141,45 @@ export function useCeilingRemoval<T extends CeilingMaskRecord>({
     applyCeilingState({ kind: 'primary' });
   }, [applyCeilingState]);
 
+  const withTemporaryCeilingCut = useCallback(async <R,>(
+    cutoffMeters: number,
+    run: () => Promise<R>,
+  ): Promise<R> => {
+    const primary = primaryCeilingRef.current;
+    if (primary.entity) primary.entity.enabled = false;
+    if (primary.visualCeilingY != null) {
+      applyPrimarySplatMask(primary.visualCeilingY, true, cutoffMeters);
+    }
+
+    for (const record of Array.from(overlayRecordsRef.current?.values() ?? [])) {
+      if (record.visualCeilingEntity) record.visualCeilingEntity.enabled = false;
+      if (record.mainSplatLayerId && record.visualCeilingY != null) {
+        applyAdditionalCeilingMask(
+          record.mainSplatLayerId,
+          record.visualCeilingY,
+          cutoffMeters,
+          'remove',
+        );
+      }
+    }
+
+    try {
+      return await run();
+    } finally {
+      applyCeilingState({ kind: 'all' });
+    }
+  }, [
+    applyAdditionalCeilingMask,
+    applyCeilingState,
+    applyPrimarySplatMask,
+    overlayRecordsRef,
+  ]);
+
   return {
     clearPrimaryCeiling,
     registerPrimaryFromSurfaces,
     applyModuleCeilingState,
     handlePrimarySplatLoaded,
+    withTemporaryCeilingCut,
   };
 }
