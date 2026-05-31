@@ -267,6 +267,18 @@ export default function BuildingOverviewPage() {
     }
   };
 
+  const handleDeleteOverviewImage = async (floor: FloorOverviewManifestEntry) => {
+    if (!floor.topdown_url) return;
+    const ok = window.confirm(`${floorLabel(floor.floor_number)} 의 대표 이미지를 삭제하시겠습니까?`);
+    if (!ok) return;
+    try {
+      await api.delete(`/admin/floors/${floor.floor_id}/overview-image`);
+      await loadOverview();
+    } catch (err: any) {
+      showToast(`대표 이미지 삭제 실패: ${err?.message ?? err}`, 'error');
+    }
+  };
+
   const handleDeleteFloor = async (floor: FloorOverviewManifestEntry) => {
     setOpenFloorMenuId(null);
     if (floor.floor_id.startsWith('pending-')) {
@@ -530,6 +542,7 @@ export default function BuildingOverviewPage() {
                 dimmed={dimmed}
                 inactive={hasBasemapWarning}
                 interactive={!isPendingFloor}
+                isAdmin={user?.role === 'admin'}
                 onHover={() => setHoveredFloorId(floor.floor_id)}
                 onLeave={() => setHoveredFloorId(null)}
                 onImageError={() => setBrokenImageByFloorId((prev) => ({ ...prev, [floor.floor_id]: true }))}
@@ -537,6 +550,7 @@ export default function BuildingOverviewPage() {
                   if (isPendingFloor) return;
                   router.push(`/buildings/${buildingId}/floors/${floor.floor_number}`);
                 }}
+                onDeleteOverviewImage={() => handleDeleteOverviewImage(floor)}
               />
             );
           })}
@@ -699,10 +713,12 @@ function FloorSlab({
   dimmed,
   inactive,
   interactive,
+  isAdmin,
   onHover,
   onLeave,
   onImageError,
   onClick,
+  onDeleteOverviewImage,
 }: {
   floor: FloorOverviewManifestEntry;
   imageUrl: string | null;
@@ -710,21 +726,35 @@ function FloorSlab({
   dimmed: boolean;
   inactive: boolean;
   interactive: boolean;
+  isAdmin: boolean;
   onHover: () => void;
   onLeave: () => void;
   onImageError: () => void;
   onClick: () => void;
+  onDeleteOverviewImage: () => void;
 }) {
+  // 카드 마크업 — 삭제 X 가 real <button> 이라야 valid HTML. 외곽은 div role=button 으로
+  // (button 안에 button 금지). interactive=false 면 tabIndex=-1 + onClick 미연결로 비활성.
+  const handleCardKeyDown = interactive
+    ? (e: React.KeyboardEvent<HTMLDivElement>) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          onClick();
+        }
+      }
+    : undefined;
   return (
-    <button
-      type="button"
+    <div
+      role="button"
+      tabIndex={interactive ? 0 : -1}
+      aria-disabled={!interactive}
       onMouseEnter={onHover}
       onMouseLeave={onLeave}
-      onClick={onClick}
-      disabled={!interactive}
+      onClick={interactive ? onClick : undefined}
+      onKeyDown={handleCardKeyDown}
       className={`group relative w-full h-28 lg:h-32 overflow-hidden text-left transition duration-200 ${
         imageUrl ? 'rounded-sm' : 'rounded-md border'
-      } ${dimmed ? 'opacity-40' : inactive ? 'opacity-55 grayscale' : 'opacity-100'} ${!interactive ? 'cursor-default' : ''}`}
+      } ${dimmed ? 'opacity-40' : inactive ? 'opacity-55 grayscale' : 'opacity-100'} ${interactive ? 'cursor-pointer' : 'cursor-default'}`}
       style={{
         borderColor: hovered && interactive ? 'var(--accent)' : imageUrl ? undefined : 'var(--rule)',
         boxShadow: hovered && interactive ? '0 12px 26px -14px rgba(56,189,248,0.42)' : undefined,
@@ -759,6 +789,20 @@ function FloorSlab({
         <div className="pointer-events-none absolute inset-0 bg-black/10" />
       )}
       {imageUrl && <div className="pointer-events-none absolute inset-x-0 bottom-0 h-12 bg-gradient-to-t from-black/45 to-transparent" />}
-    </button>
+      {imageUrl && isAdmin && (
+        <button
+          type="button"
+          aria-label="대표 이미지 삭제"
+          title="대표 이미지 삭제"
+          onClick={(e) => { e.stopPropagation(); onDeleteOverviewImage(); }}
+          className="absolute top-1.5 right-1.5 z-20 w-6 h-6 rounded-full flex items-center justify-center text-white opacity-0 group-hover:opacity-100 transition cursor-pointer"
+          style={{ background: 'rgba(0,0,0,0.55)' }}
+        >
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+            <path d="M2 2 L10 10 M10 2 L2 10" />
+          </svg>
+        </button>
+      )}
+    </div>
   );
 }

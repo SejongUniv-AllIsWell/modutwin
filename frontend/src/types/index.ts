@@ -34,6 +34,8 @@ export interface Floor {
   floor_number: number;
   is_visible: boolean;
   is_confirmed?: boolean;
+  // 대표 이미지 MinIO 키. null/undefined 면 미등록. 대시보드 "대표 이미지 삭제" 버튼 노출 조건.
+  overview_image_path?: string | null;
   created_at: string;
 }
 
