@@ -1,13 +1,13 @@
-"""Phase 7 — Douglas-Peucker 단일 경로 quadrilateral extraction.
+"""Phase 7 — robust quadrilateral extraction.
 
-plan v2 §Phase 7 (D11: fallback 금지):
-  1. cv2.findContours → 가장 큰 외곽선
-  2. cv2.approxPolyDP epsilon sweep ε ∈ [0.005, 0.05] × perimeter, 4-vertex 첫 ε 채택
-  3. validation:
-     - convex (cv2.isContourConvex)
-     - self-intersection 없음
-     - 면적이 mask area의 [0.7, 1.3]
-  4. 셋 중 하나라도 실패 → return None (= view drop)
+기존 구현은 largest contour에 대해 Douglas-Peucker 1경로만 시도했다.
+문 mask가 jagged/fragmented 하거나 문틀 일부가 빠지면 4점이 안 나와 바로 실패했다.
+
+개선점:
+- morphology + largest component로 mask를 먼저 안정화
+- contour와 convex hull 양쪽에서 approxPolyDP sweep
+- 최후 fallback으로 minAreaRect 후보 생성
+- 면적 비율만 보지 않고 polygon-mask IoU와 coverage까지 점수화
 """
 
 from __future__ import annotations
@@ -44,57 +44,164 @@ def _quad_self_intersects(quad: np.ndarray) -> bool:
     return False
 
 
+def _odd_kernel(size: int) -> int:
+    size = max(3, int(size))
+    return size if size % 2 == 1 else size + 1
+
+
+def _largest_component(mask_u8: np.ndarray) -> np.ndarray:
+    import cv2
+
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
+    if n_labels <= 1:
+        return mask_u8
+    largest_idx = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    return (labels == largest_idx).astype(np.uint8)
+
+
+def _preprocess_mask(mask: np.ndarray) -> np.ndarray:
+    import cv2
+
+    mask_u8 = (mask > 0).astype(np.uint8)
+    if mask_u8.sum() == 0:
+        return mask_u8
+
+    base = min(mask_u8.shape)
+    k_close = _odd_kernel(min(13, max(3, round(base * 0.012))))
+    k_open = _odd_kernel(min(7, max(3, round(base * 0.005))))
+
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_close, k_close))
+    open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_open, k_open))
+
+    cleaned = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, close_kernel)
+    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, open_kernel)
+    cleaned = _largest_component(cleaned)
+    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, close_kernel)
+    return _largest_component(cleaned)
+
+
+def _normalize_quad(quad: np.ndarray) -> np.ndarray:
+    return quad.reshape(4, 2).astype(np.float64)
+
+
+def _quad_score(
+    mask_u8: np.ndarray,
+    quad: np.ndarray,
+    area_min_ratio: float,
+    area_max_ratio: float,
+) -> Optional[float]:
+    import cv2
+
+    quad = _normalize_quad(quad)
+    if not cv2.isContourConvex(quad.astype(np.float32).reshape(4, 1, 2)):
+        return None
+    if _quad_self_intersects(quad):
+        return None
+
+    mask_area = float(mask_u8.sum())
+    if mask_area <= 0.0:
+        return None
+
+    quad_area = float(cv2.contourArea(quad.astype(np.float32)))
+    if quad_area <= 1e-6:
+        return None
+    area_ratio = quad_area / mask_area
+    if area_ratio < area_min_ratio or area_ratio > area_max_ratio:
+        return None
+
+    poly_mask = np.zeros_like(mask_u8, dtype=np.uint8)
+    quad_i32 = np.round(quad).astype(np.int32)
+    cv2.fillConvexPoly(poly_mask, quad_i32, 1)
+
+    inter = float(np.logical_and(poly_mask > 0, mask_u8 > 0).sum())
+    union = float(np.logical_or(poly_mask > 0, mask_u8 > 0).sum())
+    if union <= 0.0:
+        return None
+
+    iou = inter / union
+    coverage = inter / mask_area
+    fill_ratio = mask_area / max(float(poly_mask.sum()), 1.0)
+
+    if iou < 0.45 or coverage < 0.72 or fill_ratio < 0.55:
+        return None
+
+    return 0.55 * iou + 0.30 * coverage + 0.15 * min(fill_ratio, 1.0)
+
+
+def _candidate_quads(
+    contour,
+    eps_min_ratio: float,
+    eps_max_ratio: float,
+    eps_steps: int,
+) -> list[np.ndarray]:
+    import cv2
+
+    candidates: list[np.ndarray] = []
+    perimeter = float(cv2.arcLength(contour, closed=True))
+    if perimeter > 0.0:
+        for er in np.linspace(eps_min_ratio, eps_max_ratio, eps_steps):
+            approx = cv2.approxPolyDP(contour, float(er) * perimeter, closed=True)
+            if approx.shape[0] == 4:
+                candidates.append(_normalize_quad(approx))
+
+    rect = cv2.minAreaRect(contour)
+    box = cv2.boxPoints(rect)
+    if box.shape == (4, 2):
+        candidates.append(_normalize_quad(box))
+    return candidates
+
+
 def extract_quadrilateral(
     mask: np.ndarray,
-    eps_min_ratio: float = 0.005,
-    eps_max_ratio: float = 0.05,
-    eps_steps: int = 18,
-    area_min_ratio: float = 0.7,
-    area_max_ratio: float = 1.3,
+    eps_min_ratio: float = 0.003,
+    eps_max_ratio: float = 0.08,
+    eps_steps: int = 28,
+    area_min_ratio: float = 0.55,
+    area_max_ratio: float = 1.6,
 ) -> Optional[np.ndarray]:
-    """binary mask → (4, 2) quadrilateral 픽셀 좌표 (cv2 contour 순서). 실패 시 None.
+    """binary mask -> (4, 2) quadrilateral 픽셀 좌표. 실패 시 None.
 
     좌표 컨벤션: (x, y). x = column, y = row (OpenCV).
     """
     import cv2
 
-    mask_b = mask > 0 if mask.dtype != bool else mask
-    mask_u8 = mask_b.astype(np.uint8)
+    mask_u8 = _preprocess_mask(mask)
     if mask_u8.sum() == 0:
         return None
 
     contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return None
+
     largest = max(contours, key=cv2.contourArea)
-    perimeter = float(cv2.arcLength(largest, closed=True))
-    if perimeter <= 0:
-        return None
-    mask_area = float(mask_b.sum())
-    if mask_area <= 0:
+    hull = cv2.convexHull(largest)
+
+    candidates: list[np.ndarray] = []
+    candidates.extend(_candidate_quads(largest, eps_min_ratio, eps_max_ratio, eps_steps))
+    candidates.extend(_candidate_quads(hull, eps_min_ratio, eps_max_ratio, eps_steps))
+
+    if not candidates:
         return None
 
-    quad: Optional[np.ndarray] = None
-    eps_ratios = np.linspace(eps_min_ratio, eps_max_ratio, eps_steps)
-    for er in eps_ratios:
-        approx = cv2.approxPolyDP(largest, float(er) * perimeter, closed=True)
-        if approx.shape[0] == 4:
-            quad = approx.reshape(4, 2).astype(np.float64)
-            break
+    best_quad: Optional[np.ndarray] = None
+    best_score = -1.0
+    seen: set[tuple[int, ...]] = set()
+    for quad in candidates:
+        key = tuple(int(v) for v in np.round(quad).reshape(-1))
+        if key in seen:
+            continue
+        seen.add(key)
 
-    if quad is None:
-        return None
+        score = _quad_score(
+            mask_u8=mask_u8,
+            quad=quad,
+            area_min_ratio=area_min_ratio,
+            area_max_ratio=area_max_ratio,
+        )
+        if score is None:
+            continue
+        if score > best_score:
+            best_score = score
+            best_quad = quad
 
-    if not cv2.isContourConvex(quad.astype(np.float32).reshape(4, 1, 2)):
-        return None
-    if _quad_self_intersects(quad):
-        return None
-
-    quad_area = float(cv2.contourArea(quad.astype(np.float32)))
-    if quad_area <= 0:
-        return None
-    ratio = quad_area / mask_area
-    if ratio < area_min_ratio or ratio > area_max_ratio:
-        return None
-
-    return quad
+    return best_quad
