@@ -263,13 +263,34 @@ export function usePivotEditor(
 
       // 회전 링 영역 (링 반경 ± 허용 오차)
       const camera = core.getCamera();
-      if (camera) {
+      const pc = core.getPC();
+      if (camera && pc) {
         const camPos = camera.getLocalPosition();
         const dist3d = Math.sqrt(
           (mid[0] - camPos.x) ** 2 + (mid[1] - camPos.y) ** 2 + (mid[2] - camPos.z) ** 2,
         );
-        // 링의 스크린 반경 추정
-        const ringScreenRadius = (dist3d * 0.02) / dist3d * 500; // 대략적 추정
+        const radius = dist3d * 0.02;
+        const lineDir = new pc.Vec3(
+          p.pointB[0] - p.pointA[0],
+          p.pointB[1] - p.pointA[1],
+          p.pointB[2] - p.pointA[2],
+        ).normalize();
+        const viewDir = new pc.Vec3(mid[0] - camPos.x, mid[1] - camPos.y, mid[2] - camPos.z).normalize();
+        const right = new pc.Vec3().cross(lineDir, viewDir);
+        if (right.lengthSq() < 1e-10) {
+          right.set(1, 0, 0);
+          if (Math.abs(lineDir.dot(right)) > 0.95) right.set(0, 1, 0);
+          right.cross(lineDir, right);
+        }
+        right.normalize();
+        const ringPoint: [number, number, number] = [
+          mid[0] + right.x * radius,
+          mid[1] + right.y * radius,
+          mid[2] + right.z * radius,
+        ];
+        const screenRing = worldToScreen(ringPoint);
+        if (!screenRing) return null;
+        const ringScreenRadius = Math.hypot(screenRing[0] - screenMid[0], screenRing[1] - screenMid[1]);
         const ringTolerance = 8;
         if (Math.abs(distMid - ringScreenRadius) < ringTolerance) return 'rotate';
       }

@@ -16,7 +16,7 @@ from typing import List, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from sqlalchemy import select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -314,13 +314,16 @@ class RefinedBundleDoorEntry(BaseModel):
     door_splat: Optional[dict] = None
     # 정합 단계에서 만든 문 옆면/두께 frame mesh. 이미 floor world 좌표계.
     door_frame: Optional[dict] = None
+    # 문 leaf 두께 side mesh. module/basemap 양쪽 door face 와 함께 회전한다.
+    door_leaf_side: Optional[dict] = None
+    paired_basemap_door_id: Optional[str] = None
+    align_door_thickness: Optional[float] = None
 
 
 class RefinedBundleResponse(BaseModel):
     ply_url: str
     mesh_meta_url: Optional[str]
     textures: dict[str, str]  # surfaceId → presigned URL
-    texture_variants: dict[str, dict[str, str]] = Field(default_factory=dict)  # surfaceId → variantId → presigned URL
     # basemap 다중 도어 자산 (mesh + splat). doors.json 이 없거나 도어가 없으면 빈 배열.
     doors: list[RefinedBundleDoorEntry] = []
     scene_id: UUID
@@ -396,7 +399,6 @@ async def get_refined_bundle(
     mesh_meta_object_key = mesh_meta_key(session_dir)
     mesh_meta_url: Optional[str] = None
     textures: dict[str, str] = {}
-    texture_variants: dict[str, dict[str, str]] = {}
     if minio.object_exists(mesh_meta_object_key):
         mesh_meta_url = minio.get_presigned_download_url(mesh_meta_object_key)
         try:
@@ -409,24 +411,15 @@ async def get_refined_bundle(
                     tex_key = session_file_key(session_dir, tex_filename)
                     if minio.object_exists(tex_key):
                         textures[surface_id] = minio.get_presigned_download_url(tex_key)
-                for variant in surface.get("textureVariants", []) or []:
-                    if not isinstance(variant, dict):
-                        continue
-                    variant_id = variant.get("id")
-                    variant_filename = variant.get("textureFilename")
-                    if not surface_id or not variant_id or not variant_filename:
-                        continue
-                    variant_key = session_file_key(session_dir, variant_filename)
-                    if minio.object_exists(variant_key):
-                        texture_variants.setdefault(surface_id, {})[variant_id] = minio.get_presigned_download_url(variant_key)
         except Exception as e:
             # mesh.json 파싱 실패해도 PLY 는 반환
             logger.exception(f"[refined-bundle] mesh.json parse failed: {e}")
 
-    # doors.json 동반 로드 — basemap 다중 도어 자산 포함. scene.ply_path 는 `{refined}/{session}/final.ply`
-    # 형식이라 doors.json 은 그 부모 (`{refined}/doors.json`) 에 위치.
+    # doors.json 동반 로드 — 새 commit 은 scene session 폴더에 저장하고, 기존 자산은 parent 위치를 fallback 으로 읽는다.
     doors_out: list[RefinedBundleDoorEntry] = []
-    doors_key = f"{os.path.dirname(session_dir)}/doors.json"
+    doors_key = f"{session_dir}/doors.json"
+    if not minio.object_exists(doors_key):
+        doors_key = f"{os.path.dirname(session_dir)}/doors.json"
     if minio.object_exists(doors_key):
         try:
             doors_raw = minio.get_object_bytes(doors_key)
@@ -470,6 +463,15 @@ async def get_refined_bundle(
                 df = d.get("doorFrame")
                 if isinstance(df, dict):
                     entry.door_frame = df
+                dls = d.get("doorLeafSide")
+                if isinstance(dls, dict):
+                    entry.door_leaf_side = dls
+                paired = d.get("pairedBasemapDoorId")
+                if isinstance(paired, str):
+                    entry.paired_basemap_door_id = paired
+                thickness = d.get("alignDoorThickness")
+                if isinstance(thickness, (int, float)):
+                    entry.align_door_thickness = float(thickness)
                 doors_out.append(entry)
         except Exception as e:
             logger.exception(f"[refined-bundle] doors.json parse failed: {e}")
@@ -478,7 +480,6 @@ async def get_refined_bundle(
         ply_url=ply_url,
         mesh_meta_url=mesh_meta_url,
         textures=textures,
-        texture_variants=texture_variants,
         doors=doors_out,
         scene_id=scene.id,
     )

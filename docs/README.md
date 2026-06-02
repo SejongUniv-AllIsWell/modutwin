@@ -15,7 +15,7 @@ plans were removed or merged.
 | `validation_and_qa.md` | Repeatable checks, smoke tests, manual QA matrix, and rollback notes. |
 | `frontend_pages.md` | Current frontend App Router pages and shared shell components. |
 | `ROADMAP.md` | Current product, cleanup, and refactoring work that has not been completed. |
-| `sam3_worker_callback_plan.md` | Current automatic door detection architecture and the legacy async SAM3 path. |
+| `sam3_worker_callback_plan.md` | Current automatic door detection architecture and optional async SAM3 path. |
 
 ## Removed or Merged
 
@@ -31,7 +31,7 @@ plans were removed or merged.
 | `sam3_alignment_pipeline.md` | Merged into `sam3_worker_callback_plan.md`. |
 | `codex_refactoring_prompt.md` | One-off agent prompt, not a project document. |
 | `다듬기.md` | Refine save/SAM3 service notes merged into `sam3_worker_callback_plan.md`. |
-| `claude_refactored.md` | Legacy snapshot superseded by root `claude.md`. |
+| `claude_refactored.md` | Archived snapshot superseded by root `claude.md`. |
 | `codex_refactoring_plan.md` | Historical refactoring plan; current work lives in `ROADMAP.md`. |
 | `refactoring_batches_roadmap.md` | Historical batch plan; current work lives in `ROADMAP.md`. |
 | `floor_overview_pipeline_plan.md` | Historical feature plan; implemented behavior is documented in `CODEBASE_REFERENCE.md`. |

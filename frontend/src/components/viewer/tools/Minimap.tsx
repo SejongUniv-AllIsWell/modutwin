@@ -3,16 +3,14 @@
 import { useEffect, useRef, useState } from 'react';
 import type { FloorplanResult } from '@/lib/gs/floorplan';
 
-const MIN_ZOOM = 0.25;
+const MIN_ZOOM = 0.02;
 const MAX_ZOOM = 6;
 
 /**
- * FPS / GTA 스타일 헤딩-업 미니맵.
+ * 전체 층 평면도.
  *
- * - 평면도 이미지 (월드 XZ → 픽셀) 를 사용자(=카메라) 위치 중심으로 평행이동 + 헤딩만큼 회전.
- * - 사용자는 항상 화면 위쪽을 향함 (heading-up): 카메라 forward 가 위로 가도록 맵을 돌림.
- * - 사각 뷰포트 (캔버스 경계로 클립).
- * - 가운데 빨강 삼각형: 사용자, 항상 위를 가리킴.
+ * - 기본 상태는 현재 카메라를 중앙에 두고, 카메라가 바라보는 방향이 위로 오도록 그린다.
+ * - 빨강 삼각형은 항상 중앙에 고정된 현재 위치를 표시한다.
  *
  * 카메라는 매번 변하므로 prop 으로 직접 받지 않고 getter 로 주입 (ref-like).
  */
@@ -59,41 +57,36 @@ export default function Minimap({ floorplan, cameraGetter, size = 220 }: Minimap
       const playerPx = (pos.x - floorplan.minX) * floorplan.ppm;
       const playerPy = (pos.z - floorplan.minZ) * floorplan.ppm;
 
-      const z = zoomRef.current;
-      const cx = size / 2, cy = size / 2;
-
-      // 헤딩-업 회전각: 평면도 이미지 공간(+X 우, +Z 하)에서 forward 방향(fwd.x, fwd.z)이
-      // 화면 위(-Y)를 향하도록 맵 전체를 회전. rot = -π/2 - atan2(fwd.z, fwd.x).
       const fLen = Math.hypot(fwd.x, fwd.z);
       const heading = fLen > 1e-6 ? Math.atan2(fwd.z, fwd.x) : -Math.PI / 2;
-      const rot = -Math.PI / 2 - heading;
+      const headingToUp = -(heading + Math.PI / 2);
 
-      // player 중심 회전 후 평면도 그리기 (사각 뷰포트, 캔버스 경계로 자동 클립)
-      ctx.save();
-      ctx.translate(cx, cy);
-      ctx.rotate(rot);
+      const z = zoomRef.current;
       ctx.imageSmoothingEnabled = false;
-      ctx.drawImage(
-        floorplan.canvas,
-        -playerPx * z,
-        -playerPy * z,
-        floorplan.width * z,
-        floorplan.height * z,
-      );
+
+      // 사용자 중심 미니맵: playerPx/playerPy 가 항상 패널 중앙에 오도록 translate 하고,
+      // 카메라 forward 가 화면 위쪽을 향하도록 지도 자체를 반대로 회전한다.
+      ctx.save();
+      ctx.translate(size / 2, size / 2);
+      ctx.rotate(headingToUp);
+      ctx.drawImage(floorplan.canvas, -playerPx * z, -playerPy * z, floorplan.width * z, floorplan.height * z);
       ctx.restore();
 
-      // 사용자 마커 — 항상 위(-Y)를 가리키는 삼각형, 중앙 고정
+      // 사용자 마커 — 지도는 회전하므로 마커는 중앙에서 위쪽을 향한 고정 삼각형.
+      ctx.save();
+      ctx.translate(size / 2, size / 2);
       ctx.fillStyle = '#ef4444';
       ctx.strokeStyle = '#fef2f2';
       ctx.lineWidth = 1.5;
       ctx.beginPath();
-      ctx.moveTo(cx, cy - 11);       // tip (up)
-      ctx.lineTo(cx - 7, cy + 7);    // base left
-      ctx.lineTo(cx, cy + 3);        // notch
-      ctx.lineTo(cx + 7, cy + 7);    // base right
+      ctx.moveTo(0, -11);
+      ctx.lineTo(-7, 7);
+      ctx.lineTo(0, 3);
+      ctx.lineTo(7, 7);
       ctx.closePath();
       ctx.fill();
       ctx.stroke();
+      ctx.restore();
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
@@ -114,22 +107,21 @@ export default function Minimap({ floorplan, cameraGetter, size = 220 }: Minimap
   }, []);
 
   return (
-    // 위치는 부모(우측 컬럼)가 결정. 바깥 컨테이너는 클립하지 않음 — 핸들이 뷰포트 밖에 놓여 잘리지 않도록.
     <div className="relative" style={{ width: size }}>
-      {/* 슬라이드 래퍼 — 숨김 시 오른쪽으로 밀어 화면 밖으로 (핸들만 남김). */}
+      <button
+        type="button"
+        onClick={() => setHidden(h => !h)}
+        className="absolute top-2 right-2 z-10 w-6 h-6 flex items-center justify-center rounded bg-black/70 text-white text-xs border border-white/20 hover:bg-black/85 shadow-lg"
+        title={hidden ? '평면도 펼치기' : '평면도 숨기기'}
+      >
+        {hidden ? '◀' : '▶'}
+      </button>
+
+      {/* 슬라이드 래퍼 — 숨김 시 오른쪽으로 밀어 화면 밖으로. */}
       <div
         className="relative transition-transform duration-300 ease-out"
         style={{ transform: hidden ? 'translateX(calc(100% + 12px))' : 'translateX(0)' }}
       >
-        {/* 접기/펼치기 핸들 — 패널 왼쪽에 붙어 함께 이동, 숨김 시 화면 오른쪽 가장자리에 남음. */}
-        <button
-          type="button"
-          onClick={() => setHidden(h => !h)}
-          className="absolute top-2 -left-7 w-7 h-9 flex items-center justify-center rounded-l-md bg-black/70 text-white text-sm border border-r-0 border-white/20 hover:bg-black/85 shadow-lg"
-          title={hidden ? '미니맵 펼치기' : '미니맵 숨기기'}
-        >
-          {hidden ? '◀' : '▶'}
-        </button>
       {/* 사각 평면도 뷰포트 */}
       <div
         className="relative rounded-lg overflow-hidden border-2 border-[var(--rule)] shadow-xl bg-[var(--paper)]"
@@ -140,7 +132,7 @@ export default function Minimap({ floorplan, cameraGetter, size = 220 }: Minimap
           평면도
         </div>
         <div className="absolute bottom-2 left-1/2 -translate-x-1/2 text-[9px] text-[var(--muted)] bg-black/50 px-1 py-0.5 rounded">
-          휠: 줌
+          휠: 줌 · 내 방향 기준
         </div>
       </div>
       </div>

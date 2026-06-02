@@ -128,11 +128,11 @@ export default function UnifiedSplatEditor({
   // SAM3 자동 추출 완료 시 doors.json 에서 가져온 4 corner. DoorAlignModal 에 prefill 로 전달.
   const [autoExtractedCorners, setAutoExtractedCorners] = useState<Array<[number, number, number]> | null>(null);
   // /sam3/start 응답을 받아 backend 가 sam3_status='running' 으로 commit 한 시점 이후에만 폴링을
-  // 시작하기 위한 가드. 이전 dispatch 의 stale 'done' 을 새 시도의 결과로 오인하는 race 차단.
+  // 시작하기 위한 가드. 완료된 dispatch 결과가 새 시도에 섞이는 race 차단.
   const [sam3DispatchSent, setSam3DispatchSent] = useState(false);
 
   // ── 단방향 진행 잠금 ──
-  // 완료 버튼으로 다음 단계로 넘어간 이전 단계는 되돌릴 수 없음 (변경 시 후속 단계 의존성이 깨지므로).
+  // 완료 버튼으로 확정한 단계는 되돌릴 수 없음 (변경 시 후속 단계 의존성이 깨지므로).
   // 다듬기 완료 → 'upload' + 'refine' 잠금. 문 설정 완료 → 'door' 추가 잠금.
   const [lockedStages, setLockedStages] = useState<Set<'upload' | 'refine' | 'door'>>(() => new Set());
 
@@ -153,6 +153,8 @@ export default function UnifiedSplatEditor({
   const [basemapSourceUploadId, setBasemapSourceUploadId] = useState<string | null>(null);
   // 모듈측 (현재 작업 중인 모듈) 의 1차 도어 (door_1) 4 코너 (raw 프레임).
   const [moduleDoorCorners, setModuleDoorCorners] = useState<Array<[number, number, number]> | null>(null);
+  // 모듈측 도어의 선택된 힌지 변. 정합 단계 doorPivotGroup 회전축 계산에 사용.
+  const [moduleDoorHingeEdge, setModuleDoorHingeEdge] = useState<number | null>(null);
 
   const reloadWithUrl = useCallback((newUrl: string) => {
     setCurrentUrl(newUrl);
@@ -342,8 +344,7 @@ export default function UnifiedSplatEditor({
   // 다듬기 완료 직후 dispatch 한 SAM3 작업 상태(`/uploads/{id}/sam3`)를 2.5s 주기로 조회.
   // status='done' 이면 doors.json 가져와 4 corner 를 DoorAlignModal 에 prefill 후 autoExtracting=false.
   // status='failed' 면 autoExtracting=false (사용자가 수동 picking 으로 진행).
-  // sam3DispatchSent: /sam3/start 응답을 받은 이후에만 폴링. 이전 시도의 stale 'done' 을 새 시도의
-  // 결과로 오인해 로딩 표시가 즉시 사라지는 race 방지.
+  // sam3DispatchSent: /sam3/start 응답을 받은 이후에만 폴링해 완료 상태 race 를 방지.
   useEffect(() => {
     if (!autoExtracting || !uploadId || !sam3DispatchSent) return;
     let cancelled = false;
@@ -554,14 +555,14 @@ export default function UnifiedSplatEditor({
   );
   // basemap 의 wall mesh + 텍스처 + 도어 (다중) 자산 로드. source_upload_id 가 채워졌을 때만 동작.
   // additional 인스턴스 전달 → 도어 splat 들이 basemap 소속 추가 레이어로 등록됨.
-  // 정합 단계에서 매칭된 호수의 도어만 로드 — 다른 호수의 basemapDoor_* wrapper/splat/라벨이 안 생김.
-  // metadata.module_name 이 있을 때 (= 모듈 등록 흐름) 만 필터 적용. 베이스맵 자체 뷰어는 모든 도어 노출.
+  // 정합 대상은 AlignPanel 이 basemapTargetDoorId 로 하나만 묶지만, 표시 자산은 모든 도어를 로드한다.
+  // basemap PLY 는 모든 문 자리가 punch 되어 있으므로 비대상 도어도 mesh/splat 으로 채워야 구멍이 남지 않는다.
   useRefinedMeshLoader(
     coreRef,
     basemapSourceUploadId ?? undefined,
     !!basemapSourceUploadId,
     additional,
-    metadata?.module_name ?? null,
+    null,
   );
 
   const handleSplatLoaded = useCallback((data: SplatData) => {
@@ -582,7 +583,7 @@ export default function UnifiedSplatEditor({
     if (!currentUrl) {
       // 메인 없음 → 첫 파일을 메인으로
       const first = valid[0];
-      // 이전 메인 Object URL revoke (방어)
+      // 메인 Object URL 교체 전 정리
       if (localObjectUrlRef.current) {
         URL.revokeObjectURL(localObjectUrlRef.current);
         localObjectUrlRef.current = null;
@@ -680,10 +681,10 @@ export default function UnifiedSplatEditor({
     setMainVisible(detached.visible);
     setMode('refine');
 
-    // 메인이 추적하던 (이전) blob URL은 추가 레이어로 넘어가므로 더 이상 메인이 revoke 안 한다.
+    // 선택한 blob URL 의 소유권은 메인 상태가 관리한다.
     localObjectUrlRef.current = detached.url.startsWith('blob:') ? detached.url : null;
 
-    // 4) 기존 메인을 추가 레이어로 추가 (URL 소유권 이전)
+    // 4) 현재 메인을 추가 레이어로 이동
     if (prevMainUrl) {
       const prevAddSource: AdditionalGsplatSource = prevMainSource;
       additional.add(prevMainUrl, {
@@ -712,14 +713,20 @@ export default function UnifiedSplatEditor({
   //   basemap-main: wallMesh_* (basemap tag 있음), wallMesh_door_* 제외
   //   basemap-door: wallMesh_door_* (basemap tag 있음)
   type LayerKind = 'module-main' | 'module-door' | 'basemap-main' | 'basemap-door';
+  const collectSceneEntities = useCallback((root: any): any[] => {
+    const out: any[] = [];
+    const visit = (ent: any) => {
+      if (!ent) return;
+      out.push(ent);
+      for (const child of ent.children ?? []) visit(child);
+    };
+    visit(root);
+    return out;
+  }, []);
   const toggleAssociatedMeshes = useCallback((kind: LayerKind, visible: boolean) => {
     const app = coreRef.current?.getApp?.();
     if (!app) return;
-    const group = coreRef.current?.getAlignmentGroup?.();
-    const all: any[] = [
-      ...(app.root.children as any[]),
-      ...((group?.children as any[]) ?? []),
-    ];
+    const all = collectSceneEntities(app.root);
     for (const ent of all) {
       const name: string = ent.name ?? '';
       const isBasemap = !!ent.tags?.has?.('basemap');
@@ -727,14 +734,27 @@ export default function UnifiedSplatEditor({
       const isDoorByWallPrefix = name.startsWith('wallMesh_door_');
       const isWall = name.startsWith('wallMesh_') && !isDoorByWallPrefix;
       const isDoor = name.startsWith('doorMesh_') || isDoorByWallPrefix;
+      const isModuleDoorWrapper = name === 'moduleDoor';
       let match = false;
       if (kind === 'module-main' && isWall && !isBasemap) match = true;
-      else if (kind === 'module-door' && isDoor && !isBasemap) match = true;
+      else if (kind === 'module-door' && ((isDoor && !isBasemap) || isModuleDoorWrapper)) match = true;
       else if (kind === 'basemap-main' && isWall && isBasemap) match = true;
       else if (kind === 'basemap-door' && isDoor && isBasemap) match = true;
       if (match) ent.enabled = visible;
     }
-  }, []);
+  }, [collectSceneEntities]);
+
+  const syncModuleDoorWrapperVisibility = useCallback((moduleVisible: boolean) => {
+    const app = coreRef.current?.getApp?.();
+    if (!app) return;
+    const doorLayerVisible = additional.items.some((item) => {
+      const ent = additional.getEntity(item.id);
+      return item.visible && ent?.parent?.name === 'moduleDoor';
+    });
+    for (const ent of collectSceneEntities(app.root)) {
+      if (ent.name === 'moduleDoor') ent.enabled = moduleVisible && doorLayerVisible;
+    }
+  }, [additional, collectSceneEntities]);
 
   // ── 메인 splat 가시성 토글 (코어 + 모듈 wall mesh 동기화) ──
   const handleToggleMainVisible = useCallback(() => {
@@ -742,7 +762,8 @@ export default function UnifiedSplatEditor({
     setMainVisible(next);
     coreRef.current?.setMainVisible(next);
     toggleAssociatedMeshes('module-main', next);
-  }, [mainVisible, toggleAssociatedMeshes]);
+    syncModuleDoorWrapperVisibility(next);
+  }, [mainVisible, toggleAssociatedMeshes, syncModuleDoorWrapperVisibility]);
 
   // ── 레이어 패널용 메인 정보 ──
   const mainLayerInfo = useMemo(() => {
@@ -756,6 +777,7 @@ export default function UnifiedSplatEditor({
 
   // 좌측 패널(사이드바 + 레이어 + 툴) 숨김 토글 — 캔버스 가득 보고 싶을 때.
   const [panelHidden, setPanelHidden] = useState(false);
+  const [doorCleanupOverlayOpen, setDoorCleanupOverlayOpen] = useState(false);
   const handleCollapsePanel = useCallback(() => setPanelHidden(true), []);
   const handleExpandPanel = useCallback(() => setPanelHidden(false), []);
 
@@ -793,7 +815,7 @@ export default function UnifiedSplatEditor({
   return (
     <SplatViewerCore ref={coreRef} sogUrl={currentUrl} onSplatLoaded={handleSplatLoaded}>
       {/* 패널 숨김 시: 좌측 가장자리에 펼치기 핸들 노출 */}
-      {panelHidden && (
+      {panelHidden && !doorCleanupOverlayOpen && (
         <button
           onClick={handleExpandPanel}
           title="패널 보이기"
@@ -805,51 +827,57 @@ export default function UnifiedSplatEditor({
         </button>
       )}
 
-      {/* 좌측 컬럼: 사이드바 → 레이어 패널 → 도구 패널. panelHidden 일 때 화면 밖으로 슬라이드. */}
+      {/* 좌측 컬럼: 사이드바 → 레이어 패널 → 도구 패널. 문 추출 중에는 추출 UI 만 표시한다. */}
       <div
         className={`absolute top-3 left-3 z-50 flex flex-col gap-2 items-start transition-transform duration-200 ${
-          panelHidden ? '-translate-x-[120%] pointer-events-none' : 'translate-x-0'
+          panelHidden || doorCleanupOverlayOpen ? '-translate-x-[120%] pointer-events-none' : 'translate-x-0'
         }`}
       >
-        <ViewerSidebar
-          mode={mode}
-          hasMain={!!currentUrl}
-          hasMetadata={!!metadata}
-          lockedStages={lockedStages}
-          onPickFiles={handlePickFiles}
-          onToggleMode={handleToggleMode}
-          hideAlign={isBasemapPurpose}
-          onCollapse={handleCollapsePanel}
-        />
+        {!doorCleanupOverlayOpen && (
+          <>
+            <ViewerSidebar
+              mode={mode}
+              hasMain={!!currentUrl}
+              hasMetadata={!!metadata}
+              lockedStages={lockedStages}
+              onPickFiles={handlePickFiles}
+              onToggleMode={handleToggleMode}
+              hideAlign={isBasemapPurpose}
+              onCollapse={handleCollapsePanel}
+            />
 
-        <LayerPanel
-          main={mainLayerInfo}
-          onMainToggleVisible={handleToggleMainVisible}
-          onMainRemove={handleRemoveMain}
-          additional={additional.items}
-          onAdditionalToggleVisible={(id) => {
-            const item = additional.items.find(it => it.id === id);
-            if (!item) return;
-            const next = !item.visible;
-            additional.setVisible(id, next);
-            // 도어 splat 의 부모가 wrapper entity (basemapDoor_* / moduleDoor) 면 wrapper.enabled 토글 → mesh 도 cascade.
-            const ent = additional.getEntity(id);
-            const parent = ent?.parent;
-            const parentName = parent?.name ?? '';
-            if (parentName.startsWith('basemapDoor_') || parentName === 'moduleDoor') {
-              parent.enabled = next;
-            } else {
-              // wrapper 없는 케이스 (예: basemap main PLY) — 기존 name 기반 mesh 검색 로직 사용.
-              const isBasemapMain = item.source === 'basemap' && item.name.startsWith('basemap ');
-              if (isBasemapMain) toggleAssociatedMeshes('basemap-main', next);
-            }
-          }}
-          onAdditionalRemove={additional.remove}
-          onAdditionalSelect={handleSelectAdditional}
-        />
+            <LayerPanel
+              main={mainLayerInfo}
+              onMainToggleVisible={handleToggleMainVisible}
+              onMainRemove={handleRemoveMain}
+              additional={additional.items}
+              onAdditionalToggleVisible={(id) => {
+                const item = additional.items.find(it => it.id === id);
+                if (!item) return;
+                const next = !item.visible;
+                additional.setVisible(id, next);
+                // 도어 splat 의 부모가 wrapper entity (basemapDoor_* / moduleDoor) 면 wrapper.enabled 토글 → mesh 도 cascade.
+                const ent = additional.getEntity(id);
+                const parent = ent?.parent;
+                const parentName = parent?.name ?? '';
+                if (parentName === 'moduleDoor') {
+                  parent.enabled = mainVisible && next;
+                } else if (parentName.startsWith('basemapDoor_')) {
+                  parent.enabled = next;
+                } else {
+                  // wrapper 없는 케이스 (예: basemap main PLY) 는 name 기반 mesh 검색으로 동기화한다.
+                  const isBasemapMain = item.source === 'basemap' && item.name.startsWith('basemap ');
+                  if (isBasemapMain) toggleAssociatedMeshes('basemap-main', next);
+                }
+              }}
+              onAdditionalRemove={additional.remove}
+              onAdditionalSelect={handleSelectAdditional}
+            />
 
-        {mode === 'refine' && currentUrl && refine.panel}
-        {alignPanel}
+            {mode === 'refine' && currentUrl && refine.panel}
+            {alignPanel}
+          </>
+        )}
         {/* 문 설정 단계 — DoorAlignModal 의 setup view 항상 표시. uploadId 없어도 렌더 (문 설정 완료 시점에 register-local). */}
         {mode === 'door' && currentUrl && (
           <Suspense fallback={null}>
@@ -883,8 +911,15 @@ export default function UnifiedSplatEditor({
               }}
               onSetupDoorAssetsFinalized={(payload) => {
                 setupDoorAssetsRef.current = payload;
+                setModuleDoorHingeEdge(typeof payload?.hingeEdge === 'number' ? payload.hingeEdge : null);
               }}
-              onManualPickStart={() => { setAutoExtracting(false); setSam3DispatchSent(false); setAutoExtractedCorners(null); }}
+              onCleanupOpenChange={setDoorCleanupOverlayOpen}
+              onManualPickStart={() => {
+                setAutoExtracting(false);
+                setSam3DispatchSent(false);
+                setAutoExtractedCorners(null);
+                setModuleDoorHingeEdge(null);
+              }}
               ensureUploadId={async () => {
                 // 모듈 등록 흐름: register-local 안 함. placeholder ID 반환.
                 // 정합 완료 시 commit-final 이 module/upload row 를 한 번에 생성.
@@ -1088,7 +1123,7 @@ export default function UnifiedSplatEditor({
         {/* 정합 단계 — 새 AlignPanel (basemap 자동 매칭 + 슝 애니메이션 + 수동 핸들 + 4×4 저장). */}
         {mode === 'align' && !isBasemapPurpose && (
           <>
-            {/* 진단용: 어느 조건이 막고 있는지 표시. 모듈 등록은 uploadId 미확보가 정상이라 제외. */}
+            {/* 정합 패널 표시 조건. 모듈 등록은 uploadId 없이 정합 단계에 진입할 수 있다. */}
             {(!currentUrl || (!uploadId && !isModulePurpose) || !metadata) && (
               <div className="bg-amber-900/80 border border-amber-600 rounded p-3 text-amber-100 text-xs space-y-1">
                 <div className="font-bold">정합 패널 미표시 — 누락 조건:</div>
@@ -1108,7 +1143,18 @@ export default function UnifiedSplatEditor({
                   basemapTargetDoorNormalInward={basemapTargetDoorNormalInward}
                   basemapMatchError={basemapMatchError}
                   moduleDoorCorners={moduleDoorCorners}
-                  onCommitFinal={isModulePurpose ? async ({ matrix4x4, position, rotation, scale, rmsd, doorFrame }) => {
+                  moduleDoorHingeEdge={moduleDoorHingeEdge}
+                  onCommitFinal={isModulePurpose ? async ({
+                    matrix4x4,
+                    position,
+                    rotation,
+                    scale,
+                    rmsd,
+                    doorFrame,
+                    doorLeafSide,
+                    pairedBasemapDoorId,
+                    alignDoorThickness,
+                  }) => {
                     // 다듬기 결과 자산 + 정합 행렬을 commit-final 로 일괄 영속화.
                     if (!initialRegistrationContext?.building_id
                       || !initialRegistrationContext?.floor_id
@@ -1195,6 +1241,9 @@ export default function UnifiedSplatEditor({
                           },
                         } : {}),
                         ...(doorFrame ? { doorFrame } : {}),
+                        ...(doorLeafSide ? { doorLeafSide } : {}),
+                        ...(pairedBasemapDoorId ? { pairedBasemapDoorId } : {}),
+                        alignDoorThickness,
                       }],
                     });
 
@@ -1234,9 +1283,6 @@ export default function UnifiedSplatEditor({
                       const tex = assets.textures.get(sid);
                       if (!tex) throw new Error(`텍스처 누락: ${sid} (다듬기 단계에서 모든 면 베이크 필요)`);
                       form.append(`tex_${sid}`, tex, `tex_${sid}.png`);
-                    }
-                    for (const [key, tex] of Array.from(assets.textureVariants.entries())) {
-                      form.append(`texview_${key}`, tex, `tex_${key}.png`);
                     }
                     if (sam3PrepareSessionIdRef.current) {
                       form.append('sam3_session_id', sam3PrepareSessionIdRef.current);

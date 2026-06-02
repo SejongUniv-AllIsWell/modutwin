@@ -31,6 +31,24 @@ export interface SplatData {
   gsplatData: any;
 }
 
+export type CameraMode = 'fly' | 'orbit';
+
+export interface CameraPose {
+  mode: CameraMode;
+  position: [number, number, number];
+  azim: number;
+  elev: number;
+  orbitRadius: number;
+  orbitTarget: [number, number, number];
+  camera: {
+    orthographic: boolean;
+    orthoHeight: number;
+    fov: number;
+    nearClip: number;
+    farClip: number;
+  };
+}
+
 export interface SplatViewerCoreRef {
   getApp: () => any | null;
   getCamera: () => any | null;
@@ -46,6 +64,10 @@ export interface SplatViewerCoreRef {
   onUpdate: (cb: (dt: number) => void) => () => void;
   /** PlayCanvas app.drawLine 래퍼 */
   drawLine: (a: [number, number, number], b: [number, number, number], color: [number, number, number, number], depthTest?: boolean) => void;
+  /** 현재 카메라 조작 상태를 외부 뷰어로 복제하기 위한 snapshot. */
+  getCameraPose: () => CameraPose | null;
+  /** getCameraPose 로 얻은 snapshot 을 현재 뷰어에 적용. */
+  setCameraPose: (pose: CameraPose) => void;
   /** 메인 splat 엔티티 visibility 토글 */
   setMainVisible: (visible: boolean) => void;
   /** 정합 모드: 모듈 entity 들 (splat + wall mesh + door mesh + module 추가 splat) 을
@@ -90,8 +112,6 @@ interface SplatViewerCoreProps {
   children?: React.ReactNode;
 }
 
-type CameraMode = 'fly' | 'orbit';
-
 const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
   ({ sogUrl, onSplatLoaded, children }, ref) => {
     const containerRef = useRef<HTMLDivElement>(null);
@@ -119,6 +139,9 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
     // 정합 모드용 공통 부모 entity. enterAlignmentMode 가 생성, exitAlignmentMode 가 정리.
     const alignmentGroupRef = useRef<any>(null);
     const syncOrbitFromFlyRef = useRef<() => void>(() => {});
+    const resetCameraRef = useRef<() => void>(() => {});
+    const getCameraPoseRef = useRef<() => CameraPose | null>(() => null);
+    const setCameraPoseRef = useRef<(pose: CameraPose) => void>(() => {});
     const float2HalfRef = useRef<(v: number) => number>((v) => v);
     const updateCallbacksRef = useRef<Set<(dt: number) => void>>(new Set());
     const pcRef = useRef<any>(null);
@@ -156,6 +179,8 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
           depthTest,
         );
       },
+      getCameraPose: () => getCameraPoseRef.current(),
+      setCameraPose: (pose: CameraPose) => setCameraPoseRef.current(pose),
       setMainVisible: (visible: boolean) => {
         const ent = splatEntityRef.current;
         if (ent) ent.enabled = visible;
@@ -166,7 +191,7 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
         if (!app || !pc) return null;
         let group = alignmentGroupRef.current;
         if (!group) {
-          group = new pc.Entity('alignmentGroup');
+          group = new pc.Entity('alignmentGroup', app);
           app.root.addChild(group);
           alignmentGroupRef.current = group;
         }
@@ -177,7 +202,7 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
         //   name.startsWith('doorMesh_')           → 도어 메시
         //   name.startsWith('add_splat_') && tag 'basemap' 미부여 → 도어 sub-splat 등 module-side
         // basemap (tag 'basemap') 은 제외.
-        // 정리 단계: 이전 호출에서 잘못 들어간 basemap-tag entity 가 group 안에 있으면 root 로 복귀.
+        // basemap-tag entity 는 정합 그룹 밖에서 유지한다.
         const groupChildren: any[] = group.children?.slice() ?? [];
         for (const c of groupChildren) {
           if (c?.tags?.has?.('basemap')) {
@@ -286,7 +311,7 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
         cam.lookAt(center.x, bottomY, center.z, 0, 0, -1);
 
         // 4. 다음 프레임에서 PlayCanvas 가 새 카메라로 렌더하도록 2 frame wait — 1 frame 으로는
-        //    canvas 백버퍼가 아직 이전 카메라 결과일 수 있다. requestAnimationFrame 이중 호출이
+        //    canvas 백버퍼가 카메라 전환 직전 프레임을 들고 있을 수 있다. requestAnimationFrame 이중 호출이
         //    preserveDrawingBuffer 여부와 무관하게 안전 (PC 가 own RAF tick 으로 렌더하므로).
         await new Promise<void>((resolve) => {
           requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
@@ -359,7 +384,7 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
       let app: any = null;
       let destroyed = false;
       const cleanups: (() => void)[] = [];
-      // 현재 진행 중인 splat 로드의 cancel 토큰. loadSplat 호출 시 이전 진행을 취소.
+      // 현재 진행 중인 splat 로드의 cancel 토큰. 새 loadSplat 호출 시 활성 로드를 취소.
       let activeCancel: (() => void) | null = null;
 
       (async () => {
@@ -380,8 +405,7 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
           app = new pc.Application(canvas, {
             mouse: new pc.Mouse(canvas),
             touch: new pc.TouchDevice(canvas),
-            // TEMP_METRICS_EVAL: canvas PNG capture for PSNR/SSIM experiments needs the drawing buffer preserved.
-            // Remove preserveDrawingBuffer after the paper metric capture is done.
+            // snapshotTopdown/canvas capture paths read the current frame from the drawing buffer.
             graphicsDeviceOptions: { antialias: false, preserveDrawingBuffer: true },
           });
           appRef.current = app;
@@ -389,7 +413,7 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
           app.setCanvasResolution(pc.RESOLUTION_AUTO);
 
           // ── 카메라 ──
-          const cameraEntity = new pc.Entity('camera');
+          const cameraEntity = new pc.Entity('camera', app);
           cameraEntity.addComponent('camera', {
             clearColor: new pc.Color(0.08, 0.08, 0.08),
             farClip: 10000,
@@ -426,6 +450,63 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
                 camPos.y + lookDir.y * orbitRadius,
                 camPos.z + lookDir.z * orbitRadius,
             );
+          };
+
+          resetCameraRef.current = () => {
+            const ent = splatEntityRef.current;
+            const mi = (ent as any)?.gsplat?.meshInstance;
+            if (!mi?.aabb) return;
+            const aabb = mi.aabb;
+            const size = aabb.halfExtents.length();
+            if (cameraModeRef.current === 'fly') {
+              camPos.set(aabb.center.x, aabb.center.y, aabb.center.z + size * 2.5);
+            } else {
+              orbitRadius = size * 2.5;
+              orbitTarget.copy(aabb.center);
+            }
+            azim = 0;
+            elev = 0;
+            syncCamera();
+          };
+
+          getCameraPoseRef.current = () => {
+            const camComp = cameraEntity.camera;
+            if (!camComp) return null;
+            const camAny = camComp as any;
+            return {
+              mode: cameraModeRef.current,
+              position: [camPos.x, camPos.y, camPos.z],
+              azim,
+              elev,
+              orbitRadius,
+              orbitTarget: [orbitTarget.x, orbitTarget.y, orbitTarget.z],
+              camera: {
+                orthographic: !!camAny.orthographic,
+                orthoHeight: camComp.orthoHeight,
+                fov: camComp.fov,
+                nearClip: camComp.nearClip,
+                farClip: camComp.farClip,
+              },
+            };
+          };
+
+          setCameraPoseRef.current = (pose: CameraPose) => {
+            const camComp = cameraEntity.camera;
+            cameraModeRef.current = pose.mode;
+            setCameraMode(pose.mode);
+            camPos.set(pose.position[0], pose.position[1], pose.position[2]);
+            azim = pose.azim;
+            elev = pose.elev;
+            orbitRadius = pose.orbitRadius;
+            orbitTarget.set(pose.orbitTarget[0], pose.orbitTarget[1], pose.orbitTarget[2]);
+            if (camComp && pose.camera) {
+              (camComp as any).orthographic = pose.camera.orthographic;
+              camComp.orthoHeight = pose.camera.orthoHeight;
+              camComp.fov = pose.camera.fov;
+              camComp.nearClip = pose.camera.nearClip;
+              camComp.farClip = pose.camera.farClip;
+            }
+            syncCamera();
           };
 
           // ── 기즈모 (drawLine + DOM 라벨) ──
@@ -606,9 +687,9 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
           }, { passive: false });
 
           // ── splat 로드/교체 인터페이스 ──
-          // 옛 entity는 새 asset이 ready된 시점에 destroy → 화면이 비는 순간이 없다.
+          // 새 asset 준비가 끝난 뒤 splat entity 를 교체해 화면 공백을 줄인다.
           const loadSplat = (url: string, opts?: { preserveCamera?: boolean }): Promise<void> => {
-            // 이전 진행 중 로드 취소 (asset.ready 콜백이 더 이상 entity를 만들지 않게 함)
+            // 진행 중인 로드를 취소해 asset.ready 콜백이 entity를 만들지 않게 한다.
             activeCancel?.();
 
             let cancelled = false;
@@ -629,94 +710,95 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
             app.assets.add(asset);
 
             return new Promise<void>((resolve, reject) => {
-            asset.on('error', (_msg: string, err: Error) => {
-              if (cancelled || destroyed) return;
-              console.error('[loadSplat] asset error:', err);
-              setError(`파일 로드 실패: ${err?.message ?? '알 수 없는 오류'}`);
-              setLoading(false);
-              reject(err ?? new Error('splat load failed'));
-            });
+              asset.on('error', (_msg: string, err: Error) => {
+                if (cancelled || destroyed) return;
+                console.error('[loadSplat] asset error:', err);
+                setError(`파일 로드 실패: ${err?.message ?? '알 수 없는 오류'}`);
+                setLoading(false);
+                reject(err ?? new Error('splat load failed'));
+              });
 
-            asset.ready(() => {
-              if (cancelled || destroyed) { resolve(); return; }
+              asset.ready(() => {
+                if (cancelled || destroyed) { resolve(); return; }
 
-              // 이전 splat 제거 (이 시점에 이미 새 asset이 GPU에 올라왔으므로 화면이 비지 않음)
-              if (splatEntityRef.current) {
-                try { splatEntityRef.current.destroy(); } catch {}
-                splatEntityRef.current = null;
-              }
-              splatDataRef.current = null;
-
-              const splatEntity = new pc.Entity('splat');
-              // SuperSplat과 동일한 PLY 로드 기본 회전 (SPZ는 (0,0,0), PLY/기타는 Z축 180°)
-              const ext = url.split('?')[0].split('.').pop()?.toLowerCase();
-              if (ext !== 'spz') {
-                splatEntity.setLocalEulerAngles(0, 0, 180);
-              }
-              splatEntity.addComponent('gsplat', { asset });
-              app.root.addChild(splatEntity);
-              splatEntityRef.current = splatEntity;
-
-              // preserveCamera 면 카메라 fit 건너뛰고 현재 위치 유지.
-              if (!preserveCamera) {
-                const mi = (splatEntity as any).gsplat?.meshInstance;
-                if (mi?.aabb) {
-                  const aabb = mi.aabb;
-                  const size = aabb.halfExtents.length();
-                  if (cameraModeRef.current === 'fly') {
-                    camPos.set(aabb.center.x, aabb.center.y, aabb.center.z + size * 2.5);
-                  } else {
-                    orbitRadius = size * 2.5;
-                    orbitTarget.copy(aabb.center);
-                  }
-                  azim = 0;
-                  elev = 0;
-                  syncCamera();
+                // 현재 splat 제거 (새 asset 이 GPU에 올라온 뒤 교체).
+                if (splatEntityRef.current) {
+                  try { splatEntityRef.current.destroy(); } catch {}
+                  splatEntityRef.current = null;
                 }
-              }
+                splatDataRef.current = null;
 
-              // PlayCanvas 2.x: gsplatData
-              const resource = asset.resource as any;
-              const gsplatData = resource?.gsplatData;
-              if (gsplatData) {
-                const n = gsplatData.numSplats;
-                const posX = gsplatData.getProp('x') as Float32Array;
-                const posY = gsplatData.getProp('y') as Float32Array;
-                const posZ = gsplatData.getProp('z') as Float32Array;
-                const colorTex = resource?.streams?.textures?.get('splatColor') ?? null;
-                let origColorData: Uint16Array | null = null;
-                if (colorTex) {
-                  const td = colorTex.lock();
-                  if (td) {
-                    origColorData = new Uint16Array(td.length);
-                    origColorData.set(td);
-                    colorTex.unlock();
+                const splatEntity = new pc.Entity('splat', app);
+                // SuperSplat과 동일한 PLY 로드 기본 회전 (SPZ는 (0,0,0), PLY/기타는 Z축 180°)
+                const ext = url.split('?')[0].split('.').pop()?.toLowerCase();
+                if (ext !== 'spz') {
+                  splatEntity.setLocalEulerAngles(0, 0, 180);
+                }
+                splatEntity.addComponent('gsplat', { asset });
+                app.root.addChild(splatEntity);
+                splatEntityRef.current = splatEntity;
+
+                // 초기 파일 로드 카메라 배치는 PlayCanvas 기본 AABB 를 우선 사용한다.
+                // robust bounds 는 수동 "카메라 리셋"에서만 사용한다.
+                if (!preserveCamera) {
+                  const mi = (splatEntity as any).gsplat?.meshInstance;
+                  if (mi?.aabb) {
+                    const aabb = mi.aabb;
+                    const size = aabb.halfExtents.length();
+                    if (cameraModeRef.current === 'fly') {
+                      camPos.set(aabb.center.x, aabb.center.y, aabb.center.z + size * 2.5);
+                    } else {
+                      orbitRadius = size * 2.5;
+                      orbitTarget.copy(aabb.center);
+                    }
+                    azim = 0;
+                    elev = 0;
+                    syncCamera();
                   }
                 }
 
-                const transformATex = resource?.streams?.textures?.get('transformA') ?? null;
-                const transformBTex = resource?.streams?.textures?.get('transformB') ?? null;
+                // PlayCanvas 2.x: gsplatData
+                const resource = asset.resource as any;
+                const gsplatData = resource?.gsplatData;
+                if (gsplatData) {
+                  const n = gsplatData.numSplats;
+                  const posX = gsplatData.getProp('x') as Float32Array;
+                  const posY = gsplatData.getProp('y') as Float32Array;
+                  const posZ = gsplatData.getProp('z') as Float32Array;
+                  const colorTex = resource?.streams?.textures?.get('splatColor') ?? null;
+                  let origColorData: Uint16Array | null = null;
+                  if (colorTex) {
+                    const td = colorTex.lock();
+                    if (td) {
+                      origColorData = new Uint16Array(td.length);
+                      origColorData.set(td);
+                      colorTex.unlock();
+                    }
+                  }
 
-                const data: SplatData = {
-                  numSplats: n,
-                  posX, posY, posZ,
-                  colorTexture: colorTex,
-                  origColorData,
-                  splatEntity,
-                  transformATexture: transformATex,
-                  transformBTexture: transformBTex,
-                  resource,
-                  gsplatData,
-                };
-                splatDataRef.current = data;
-                onSplatLoadedRef.current?.(data);
-              }
+                  const transformATex = resource?.streams?.textures?.get('transformA') ?? null;
+                  const transformBTex = resource?.streams?.textures?.get('transformB') ?? null;
 
-              setLoading(false);
-              resolve();
-            });
+                  const data: SplatData = {
+                    numSplats: n,
+                    posX, posY, posZ,
+                    colorTexture: colorTex,
+                    origColorData,
+                    splatEntity,
+                    transformATexture: transformATex,
+                    transformBTexture: transformBTex,
+                    resource,
+                    gsplatData,
+                  };
+                  splatDataRef.current = data;
+                  onSplatLoadedRef.current?.(data);
+                }
 
-            app.assets.load(asset);
+                setLoading(false);
+                resolve();
+              });
+
+              app.assets.load(asset);
             });
           };
 
@@ -766,6 +848,8 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
         appRef.current = null;
         loadSplatRef.current = null;
         clearSplatRef.current = null;
+        getCameraPoseRef.current = () => null;
+        setCameraPoseRef.current = () => {};
         updateCallbacksRef.current.clear();
         if (app) { try { app.destroy(); } catch { } }
         if (containerRef.current) {
@@ -776,7 +860,7 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
     }, []);
 
     // ── splat 로드/교체 (sogUrl 변경 시) ──
-    // 앱은 그대로 유지하면서 entity만 교체. 옛 entity는 새 asset.ready 시점에 destroy.
+    // 앱은 그대로 유지하면서 splat entity 만 교체한다.
     useEffect(() => {
       if (!appReady) return;
       if (sogUrl) {
@@ -834,6 +918,13 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
         {/* 하단 카메라 컨트롤 */}
         {!loading && !error && (
           <div className="absolute bottom-3 right-3 flex items-center gap-2 bg-black/60 text-gray-400 text-xs px-3 py-2 rounded select-none">
+            <button
+              onClick={() => resetCameraRef.current()}
+              className="px-2 py-0.5 bg-gray-700 hover:bg-gray-600 text-white rounded cursor-pointer"
+              title="모듈 중심을 바라보도록 카메라를 리셋"
+            >
+              카메라 리셋
+            </button>
             <button onClick={toggleMode} className="px-2 py-0.5 bg-gray-700 hover:bg-gray-600 text-white rounded cursor-pointer">
               {cameraMode === 'fly' ? 'Fly' : 'Orbit'}
             </button>

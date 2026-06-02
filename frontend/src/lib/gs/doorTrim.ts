@@ -89,13 +89,14 @@ export interface DecomposeOptions {
   /**
    * "boundary 에서 얼마나 떨어져야 fully inside/outside 로 판정하는지" 에 사용하는 σ 배수.
    * 미지정 시 PlayCanvas visible radius 를 opacity 별로 계산한다.
-   * 지정하면 디버그/보수 판정용 고정 σ 배수로 강제한다.
+   * 지정하면 보수 판정용 고정 σ 배수로 강제한다.
    */
   sigmaMultiplier?: number;
   /**
-   * 문 두께 (m). 벽 평면에서 **방 안쪽으로** 들어가는 단방향 깊이.
-   * 도어로 분류되려면 splat center 가 벽 평면 ~0 부터 -doorExtractionDepth 사이여야 함
-   * (방 바깥은 다듬기 단계에서 이미 alpha=0 처리되었으므로 슬랩이 비대칭).
+   * 문 추출 깊이 (m). 벽 평면에서 **방 안쪽으로** 들어가는 단방향 깊이.
+   * 문 내부 원본 splat 으로 분류되려면 splat center 가 벽 평면 ~0 부터
+   * -doorExtractionDepth 사이여야 함. 경계 분할은 splat visible extent 가 이 깊이 구간과
+   * 겹치는지도 함께 본다.
    * 손잡이/잠금처럼 벽에서 방 안쪽으로 돌출된 splat 도 doorExtractionDepth 이내면 도어로 잡힘.
    * 미지정 또는 0 이하 시 깊이 필터 없음.
    */
@@ -130,6 +131,26 @@ export function isInDoorSlab(
               + (cy - planeOrigin[1]) * wallOutward[1]
               + (cz - planeOrigin[2]) * wallOutward[2];
   return sdOut <= 0 && sdOut >= -doorExtractionDepth;
+}
+
+/**
+ * splat 의 visible extent 가 문 추출 깊이 구간과 조금이라도 겹치는지.
+ * 이 판정은 문 직육면체의 4개 옆면을 관통하는 splat 을 분할 후보로 잡는 데 사용한다.
+ * 문 추출 깊이 끝면 자체로는 분할하지 않는다.
+ */
+function overlapsDoorSlab(
+  cx: number, cy: number, cz: number,
+  planeOrigin: Vec3,
+  wallOutward: Vec3,
+  doorExtractionDepth: number,
+  extentAlongWallOutward: number,
+): boolean {
+  if (!(doorExtractionDepth > 0)) return true;
+  const sdOut = (cx - planeOrigin[0]) * wallOutward[0]
+              + (cy - planeOrigin[1]) * wallOutward[1]
+              + (cz - planeOrigin[2]) * wallOutward[2];
+  return (sdOut + extentAlongWallOutward) >= -doorExtractionDepth
+      && (sdOut - extentAlongWallOutward) <= 0;
 }
 
 export interface BoundarySubUpdate {
@@ -224,6 +245,14 @@ export function decomposeBoundaryGaussians(
     const kSigma = forcedKSigma ?? gsplatVisibleSigmaRadius(op ? sigmoidOpacity(op[i]) : 1);
     if (kSigma <= 0) continue;
 
+    const wallA0n = R00*wallOut[0] + R10*wallOut[1] + R20*wallOut[2];
+    const wallA1n = R01*wallOut[0] + R11*wallOut[1] + R21*wallOut[2];
+    const wallA2n = R02*wallOut[0] + R12*wallOut[1] + R22*wallOut[2];
+    const wallVariance = wallA0n*wallA0n*s0*s0 + wallA1n*wallA1n*s1*s1 + wallA2n*wallA2n*s2*s2;
+    const wallExt = kSigma * Math.sqrt(wallVariance);
+    const centerInDoorDepth = isInDoorSlab(cx, cy, cz, pO, wallOut, doorExtractionDepth);
+    const overlapsDoorDepth = overlapsDoorSlab(cx, cy, cz, pO, wallOut, doorExtractionDepth, wallExt);
+
     // 4 edge 검사: fully outside (한 edge 라도 visible extent 전체가 edge 바깥) 인지,
     // 아니면 edge 를 가로지르는지. center 가 edge 바깥(sd < 0)에 있어도 extent 가 문 안쪽으로
     // 넘어오면 boundary 로 split 해야 문 가장자리 번짐이 남지 않는다.
@@ -263,17 +292,16 @@ export function decomposeBoundaryGaussians(
       continue;
     }
 
-    // 벽 평면 깊이 필터 — 비대칭 슬랩 (방 안쪽 단방향). 슬랩 밖이면 도어 영역 X.
-    // (이 필터 없이 boundary 로 분류되면 door-side sub 가 깊은 위치에서 도어와 함께 회전 → 시각 이상)
-    if (!isInDoorSlab(cx, cy, cz, pO, wallOut, doorExtractionDepth)) {
-      continue;
-    }
-
     if (mostBoundaryEdge < 0) {
-      // 4 edge 모두 fully inside (sd >= ext) AND ±halfThickness 안 → 진짜 도어 영역.
+      if (!centerInDoorDepth) continue;
+      // 4 edge 모두 fully inside (sd >= ext) AND 문 추출 깊이 안 → 진짜 문 영역.
       doorOriginalIndices.push(i);
       continue;
     }
+
+    // 경계 splat 은 중심이 깊이 밖에 있어도 visible extent 가 문 추출 깊이 구간과 겹치면
+    // 문 직육면체의 옆면을 관통한 것으로 보고 분할한다. 깊이 끝면 자체는 분할 기준으로 쓰지 않는다.
+    if (!overlapsDoorDepth) continue;
 
     // 분할: door-side / wall-side sub 두 개 생성.
     const sd = bestSd, ext = bestExt, n = bestN;

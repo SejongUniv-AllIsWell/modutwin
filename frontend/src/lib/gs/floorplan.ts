@@ -151,7 +151,7 @@ export async function bakeFloorplan(
   //    → 미니맵의 (pos.x-minX, pos.z-minZ)*ppm 매핑과 일치.
   const cx = (minX + maxX) / 2;
   const cz = (minZ + maxZ) / 2;
-  const camEnt = new pc.Entity('floorplan_cam');
+  const camEnt = new pc.Entity('floorplan_cam', app);
   camEnt.addComponent('camera', {
     projection: pc.PROJECTION_ORTHOGRAPHIC,
     orthoHeight: worldZ / 2,

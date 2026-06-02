@@ -7,11 +7,9 @@
  *  - 좌클릭 → hover 중인 문을 열기/닫기 토글. 힌지 축 기준 90° 회전 애니메이션.
  *
  * 좌표 정합: 문 wrapper (moduleDoor_*) 의 자식 mesh/splat 은 local Z-180 (resetPlyLocalFrame) 을 이미 갖는다.
- *   즉 자식 지오메트리는 World 프레임 (= Z-180 · A'+Y). 따라서 wrapper 회전을 World 프레임 힌지 축으로
- *   직접 걸면 된다 (에디터처럼 baseRot 합성 불필요).
+ *   실제 층 월드 좌표는 wrapper 부모의 정합 transform 까지 포함해야 한다.
  *     worldCorner = wrapper.getWorldTransform() · (Z-180 · cornerAY)
- *     wrapperLocalRot = quat(axisWorld, angle)
- *     wrapperLocalPos = originWorld − quat·originWorld   (힌지점 고정)
+ *   따라서 힌지 축/원점도 같은 식으로 월드화한 뒤 회전 행렬을 걸어야 한다.
  */
 
 type Vec3 = [number, number, number];
@@ -23,10 +21,12 @@ export interface DoorHandle {
   hingeEdge: number;            // 0..3 — 힌지 변 시작 코너 인덱스
   swing: number;                // ±1 (저장된 doorSwing)
   normalInward: Vec3;           // 방 안쪽 normal (A'+Y 프레임)
+  linkedWrappers?: any[];        // 같은 문으로 함께 움직일 wrapper 들
 }
 
 export interface DoorInteractionController {
   add(handle: DoorHandle): void;
+  addLinkedWrapper(ownerWrapper: any, linkedWrapper: any): void;
   /** wrapper 로 등록 해제 (오버레이 record 정리 시). */
   removeByWrapper(wrapper: any): void;
   clear(): void;
@@ -36,13 +36,33 @@ export interface DoorInteractionController {
 interface DoorState {
   id: string;
   wrapper: any;
+  corners: Vec3[];
+  hingeEdge: number;
   z180Corners: Vec3[];     // Z-180 적용된 4 코너 (World 프레임, wrapper local)
-  axisWorld: Vec3;         // 힌지 단위축 (World)
-  originWorld: Vec3;       // 힌지 시작점 (World)
+  linkedWrappers: any[];
   openAngleRad: number;    // 열린 상태 목표각 (부호 포함)
   isOpen: boolean;
-  anim: { start: number; duration: number; from: number; to: number } | null;
+  anim: {
+    start: number;
+    duration: number;
+    fromAngle: number;
+    toAngle: number;
+    fromDelta: number;
+    toDelta: number;
+    motion: DoorMotion;
+  } | null;
   curAngle: number;
+}
+
+interface DoorMember {
+  ent: any;
+  initialWorld: any;
+}
+
+interface DoorMotion {
+  axisWorld: Vec3;
+  originWorld: Vec3;
+  members: DoorMember[];
 }
 
 const OPEN_ANGLE = Math.PI / 2; // 90°
@@ -57,8 +77,8 @@ function z180(v: Vec3): Vec3 {
   return [-v[0], -v[1], v[2]];
 }
 
-/** 힌지 축/원점/열림 부호 산출 (A'+Y 프레임 계산 → World 변환). */
-function computeHinge(h: DoorHandle): { axisWorld: Vec3; originWorld: Vec3; openAngleRad: number } {
+/** 열림 부호 산출 (A'+Y 저장 프레임 기준). */
+function computeOpenAngle(h: DoorHandle): number {
   const c = h.corners;
   const h1 = h.hingeEdge % 4;
   const h2 = (h.hingeEdge + 1) % 4;
@@ -81,13 +101,7 @@ function computeHinge(h: DoorHandle): { axisWorld: Vec3; originWorld: Vec3; open
   const dotCN = crossX * wnOut[0] + crossY * wnOut[1] + crossZ * wnOut[2];
   const insideSign = dotCN > 0 ? -1 : 1;
   const swing = h.swing === 0 || Number.isNaN(h.swing) ? 1 : h.swing;
-  const openAngleRad = swing * insideSign * OPEN_ANGLE;
-
-  return {
-    axisWorld: z180(axisA),
-    originWorld: z180(start),
-    openAngleRad,
-  };
+  return swing * insideSign * OPEN_ANGLE;
 }
 
 /** Möller–Trumbore. ray (o,d) 와 삼각형 (a,b,c) 교차 시 t (>0) 반환, 없으면 null. */
@@ -125,6 +139,73 @@ export function createDoorInteraction(opts: {
 
   const tmpWorld = new pc.Vec3();
   const tmpFar = new pc.Vec3();
+  const tmpPos = new pc.Vec3();
+  const tmpRot = new pc.Quat();
+  const tmpScale = new pc.Vec3();
+  const tmpHingeStart = new pc.Vec3();
+  const tmpHingeEnd = new pc.Vec3();
+
+  function computeWorldHinge(h: { wrapper: any; corners: Vec3[]; hingeEdge: number }): { axisWorld: Vec3; originWorld: Vec3 } {
+    const c = h.corners;
+    const h1 = h.hingeEdge % 4;
+    const h2 = (h.hingeEdge + 1) % 4;
+    const start = z180(c[h1]);
+    const end = z180(c[h2]);
+    const wrapperWorld = h.wrapper.getWorldTransform();
+
+    tmpHingeStart.set(start[0], start[1], start[2]);
+    tmpHingeEnd.set(end[0], end[1], end[2]);
+    wrapperWorld.transformPoint(tmpHingeStart, tmpHingeStart);
+    wrapperWorld.transformPoint(tmpHingeEnd, tmpHingeEnd);
+
+    const ax = tmpHingeEnd.x - tmpHingeStart.x;
+    const ay = tmpHingeEnd.y - tmpHingeStart.y;
+    const az = tmpHingeEnd.z - tmpHingeStart.z;
+    const len = Math.hypot(ax, ay, az) || 1;
+    return {
+      axisWorld: [ax / len, ay / len, az / len],
+      originWorld: [tmpHingeStart.x, tmpHingeStart.y, tmpHingeStart.z],
+    };
+  }
+
+  function captureMember(ent: any): DoorMember {
+    return { ent, initialWorld: ent.getWorldTransform().clone() };
+  }
+
+  function captureMotion(s: DoorState, wrappers = [s.wrapper, ...s.linkedWrappers]): DoorMotion {
+    const seen = new Set<any>();
+    const members = wrappers
+      .filter((ent) => {
+        if (!ent || ent._destroyed || seen.has(ent)) return false;
+        seen.add(ent);
+        return true;
+      })
+      .map(captureMember);
+    return { ...computeWorldHinge(s), members };
+  }
+
+  function setWorldTransform(ent: any, world: any) {
+    const parent = ent.parent;
+    const local = parent
+      ? new pc.Mat4().mul2(parent.getWorldTransform().clone().invert(), world)
+      : world;
+    local.getTranslation(tmpPos);
+    local.getScale(tmpScale);
+    const pureRot = new pc.Mat4();
+    const src = local.data;
+    const dst = pureRot.data;
+    const sx = tmpScale.x || 1;
+    const sy = tmpScale.y || 1;
+    const sz = tmpScale.z || 1;
+    dst[0] = src[0] / sx; dst[1] = src[1] / sx; dst[2] = src[2] / sx; dst[3] = 0;
+    dst[4] = src[4] / sy; dst[5] = src[5] / sy; dst[6] = src[6] / sy; dst[7] = 0;
+    dst[8] = src[8] / sz; dst[9] = src[9] / sz; dst[10] = src[10] / sz; dst[11] = 0;
+    dst[12] = 0; dst[13] = 0; dst[14] = 0; dst[15] = 1;
+    tmpRot.setFromMat4(pureRot);
+    ent.setLocalPosition(tmpPos.x, tmpPos.y, tmpPos.z);
+    ent.setLocalRotation(tmpRot.x, tmpRot.y, tmpRot.z, tmpRot.w);
+    ent.setLocalScale(tmpScale.x, tmpScale.y, tmpScale.z);
+  }
 
   // wrapper world transform 으로 z180 코너 → floor world 코너.
   function liveCorners(s: DoorState): Vec3[] {
@@ -184,9 +265,7 @@ export function createDoorInteraction(opts: {
     if (Math.hypot(e.clientX - downX, e.clientY - downY) > CLICK_SLOP) return; // 드래그 → 무시
     const hit = pickAt(e.clientX, e.clientY);
     if (!hit) return;
-    const target = hit.isOpen ? 0 : hit.openAngleRad;
-    hit.anim = { start: performance.now(), duration: ANIM_MS, from: hit.curAngle, to: target };
-    hit.isOpen = !hit.isOpen;
+    startMotion(hit, hit.isOpen ? 0 : hit.openAngleRad);
   };
 
   canvas.addEventListener('pointermove', onMove);
@@ -201,9 +280,13 @@ export function createDoorInteraction(opts: {
       if (s.anim) {
         const tNorm = Math.min(1, (now - s.anim.start) / s.anim.duration);
         const u = easeInOutCubic(tNorm);
-        s.curAngle = s.anim.from + (s.anim.to - s.anim.from) * u;
-        applyAngle(s);
-        if (tNorm >= 1) s.anim = null;
+        const delta = s.anim.fromDelta + (s.anim.toDelta - s.anim.fromDelta) * u;
+        s.curAngle = s.anim.fromAngle + delta;
+        applyMotion(s.anim.motion, delta);
+        if (tNorm >= 1) {
+          s.curAngle = s.anim.toAngle;
+          s.anim = null;
+        }
       }
     }
     if (hoveredId) {
@@ -219,41 +302,72 @@ export function createDoorInteraction(opts: {
     }
   });
 
-  function applyAngle(s: DoorState) {
-    const half = s.curAngle / 2;
+  function startMotion(s: DoorState, targetAngle: number) {
+    s.anim = {
+      start: performance.now(),
+      duration: ANIM_MS,
+      fromAngle: s.curAngle,
+      toAngle: targetAngle,
+      fromDelta: 0,
+      toDelta: targetAngle - s.curAngle,
+      motion: captureMotion(s),
+    };
+    s.isOpen = targetAngle !== 0;
+  }
+
+  function applyMotion(motion: DoorMotion, deltaAngle: number) {
+    const half = deltaAngle / 2;
     const sH = Math.sin(half), cH = Math.cos(half);
-    const qx = s.axisWorld[0] * sH, qy = s.axisWorld[1] * sH, qz = s.axisWorld[2] * sH, qw = cH;
-    // rotated origin = q · origin · q⁻¹
-    const o = s.originWorld;
+    const qx = motion.axisWorld[0] * sH, qy = motion.axisWorld[1] * sH, qz = motion.axisWorld[2] * sH, qw = cH;
     const rot = new pc.Quat(qx, qy, qz, qw);
-    const ov = new pc.Vec3(o[0], o[1], o[2]);
-    const rotated = new pc.Vec3();
-    rot.transformVector(ov, rotated);
-    s.wrapper.setLocalRotation(qx, qy, qz, qw);
-    s.wrapper.setLocalPosition(o[0] - rotated.x, o[1] - rotated.y, o[2] - rotated.z);
+    const o = new pc.Vec3(motion.originWorld[0], motion.originWorld[1], motion.originWorld[2]);
+    const rotatedOrigin = new pc.Vec3();
+    rot.transformVector(o, rotatedOrigin);
+    const hingeMat = new pc.Mat4().setTRS(
+      new pc.Vec3(o.x - rotatedOrigin.x, o.y - rotatedOrigin.y, o.z - rotatedOrigin.z),
+      rot,
+      new pc.Vec3(1, 1, 1),
+    );
+    for (const member of motion.members) {
+      if (!member.ent || member.ent._destroyed) continue;
+      const nextWorld = new pc.Mat4().mul2(hingeMat, member.initialWorld);
+      setWorldTransform(member.ent, nextWorld);
+    }
   }
 
   return {
     add(h: DoorHandle) {
       if (doors.some(d => d.id === h.id)) return;
-      const hinge = computeHinge(h);
       doors.push({
         id: h.id,
         wrapper: h.wrapper,
+        corners: h.corners,
+        hingeEdge: h.hingeEdge,
         z180Corners: h.corners.map(z180),
-        axisWorld: hinge.axisWorld,
-        originWorld: hinge.originWorld,
-        openAngleRad: hinge.openAngleRad,
+        linkedWrappers: [...(h.linkedWrappers ?? [])],
+        openAngleRad: computeOpenAngle(h),
         isOpen: false,
         anim: null,
         curAngle: 0,
       });
+    },
+    addLinkedWrapper(ownerWrapper: any, linkedWrapper: any) {
+      if (!ownerWrapper || !linkedWrapper || linkedWrapper._destroyed) return;
+      const state = doors.find(d => d.wrapper === ownerWrapper);
+      if (!state) return;
+      if (state.linkedWrappers.includes(linkedWrapper)) return;
+      state.linkedWrappers.push(linkedWrapper);
+      if (state.curAngle !== 0) {
+        applyMotion(captureMotion(state, [linkedWrapper]), state.curAngle);
+      }
     },
     removeByWrapper(wrapper: any) {
       for (let i = doors.length - 1; i >= 0; i--) {
         if (doors[i].wrapper === wrapper) {
           if (hoveredId === doors[i].id) hoveredId = null;
           doors.splice(i, 1);
+        } else {
+          doors[i].linkedWrappers = doors[i].linkedWrappers.filter(ent => ent !== wrapper);
         }
       }
     },

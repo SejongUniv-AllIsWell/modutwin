@@ -56,17 +56,17 @@ export interface AdditionalGsplatsApi {
   getEntity: (id: string) => any | null;
   /** 부분 업데이트 (이름/visible/meta 등) */
   update: (id: string, patch: Partial<Pick<AdditionalGsplat, 'name' | 'source' | 'visible' | 'meta'>>) => void;
-  /** 항목을 목록에서 제거하면서 URL 소유권을 호출자에게 이전 (blob revoke 안 함). PlayCanvas entity/asset은 제거. */
+  /** 항목을 목록에서 제거하면서 URL 소유권을 호출자에게 넘긴다 (blob revoke 안 함). PlayCanvas entity/asset은 제거. */
   detach: (id: string) => DetachedLayer | null;
   /**
    * 모든 entity/asset을 현재 PlayCanvas app에 다시 만든다.
    * SplatViewerCore가 reload되어 app 인스턴스가 바뀐 뒤 호출.
-   * 기존 entity/asset 참조는 (이미 destroy된 app에 속해 있어) 그냥 버린다.
+   * app 교체 전 entity/asset 참조는 파기된 PlayCanvas app 소속이므로 폐기한다.
    */
   refreshAll: () => void;
   /**
    * 천장제거 마스크 — baked frame `posY < visualCeilingY + cutoff` 인 splat 의 alpha 를 0 으로 만든다.
-   * 'restore' 시 원본 alpha 복원. asset.ready 이전 호출은 조용히 skip — 호출자가 `.ready` 콜백에서 재호출.
+   * 'restore' 시 원본 alpha 복원. asset.ready 전 호출은 조용히 skip — 호출자가 `.ready` 콜백에서 재호출.
    *
    * 좌표 규약 (claude.md:78-80):
    *  - 코드 surfaceId 'ceiling' (PLY +Y) = 화면상 방 **바닥**
@@ -156,7 +156,7 @@ export function useAdditionalGsplats(
           if (r) { r.reject(new Error('cancelled')); readyMapRef.current.delete(id); }
           return;
         }
-        const ent = new pc.Entity(`add_splat_${id}`);
+        const ent = new pc.Entity(`add_splat_${id}`, app);
         if (ext !== 'spz') {
           // PLY 컨벤션: Z축 180° 회전 (SuperSplat과 동일)
           ent.setLocalEulerAngles(0, 0, 180);
@@ -228,7 +228,7 @@ export function useAdditionalGsplats(
     id: string, visualCeilingY: number, cutoff: number, mode: 'remove' | 'restore',
   ) => {
     const snap = colorSnapshotMapRef.current.get(id);
-    if (!snap) return;  // asset.ready 이전 — 호출자가 ready 직후 재호출하는 패턴 가정.
+    if (!snap) return;  // asset.ready 전에는 호출자가 ready 직후 다시 적용한다.
     const core = coreRef.current;
     if (!core) return;
     const f2h = core.float2Half;
@@ -337,15 +337,15 @@ export function useAdditionalGsplats(
   }, [coreRef]);
 
   const refreshAll = useCallback(() => {
-    // 1) 진행 중 로드 모두 취소 (asset.ready 콜백이 새 app과 무관하게 발화하지 않도록)
+    // 1) 진행 중 로드 모두 취소
     cancelMapRef.current.forEach(c => { try { c(); } catch {} });
     cancelMapRef.current.clear();
-    // 2) 옛 app에 속한 entity/asset 참조는 그냥 버린다 (app.destroy가 정리함)
+    // 2) 현재 app 에 묶인 entity/asset 참조 초기화
     entityMapRef.current.clear();
     assetMapRef.current.clear();
-    // 옛 colorTexture 도 옛 app 소속 — snapshot 참조 폐기.
+    // colorTexture snapshot 도 현재 app 리소스 기준으로 다시 만든다.
     colorSnapshotMapRef.current.clear();
-    // 3) 모든 항목을 unloaded로 표시 후 새 app에 재로드
+    // 3) 모든 항목을 unloaded 로 표시 후 현재 app 에 재로드
     const list = itemsRef.current;
     setItems(prev => prev.map(it => ({ ...it, loaded: false, error: null })));
     list.forEach(item => loadEntity(item.id, item.url, item.source, item.visible));

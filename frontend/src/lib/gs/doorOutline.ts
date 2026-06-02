@@ -33,8 +33,8 @@ export function createDoorOutlineEntity(
     rotation?: [number, number, number, number]; // local quaternion. 미지정 시 Z-180.
   },
 ): DoorOutlineHandle {
-  const root = new pc.Entity('doorOutlineRoot');
-  const outlineEnt = new pc.Entity('doorOutline');
+  const root = new pc.Entity('doorOutlineRoot', app);
+  const outlineEnt = new pc.Entity('doorOutline', app);
   root.addChild(outlineEnt);
 
   let cornersRef: Vec3[] = opts.corners.slice() as Vec3[];

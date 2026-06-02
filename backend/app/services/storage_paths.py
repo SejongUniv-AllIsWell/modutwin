@@ -7,8 +7,13 @@ from app.core.storage_keys import is_key_under_prefix, normalize_minio_key
 _SAFE_PATH_PART_PATTERN = re.compile(r"[^A-Za-z0-9._-]")
 
 
+def safe_path_part(value: str, fallback: str = "item") -> str:
+    safe = _SAFE_PATH_PART_PATTERN.sub("_", value).strip("._")
+    return safe or fallback
+
+
 def module_folder(module_id: str, module_name: str) -> str:
-    return f"{module_id}_{module_name}"
+    return f"{safe_path_part(module_id, 'module')}_{safe_path_part(module_name, 'module')}"
 
 
 def module_base_path(building_id: str, floor_id: str, module_id: str, module_name: str) -> str:

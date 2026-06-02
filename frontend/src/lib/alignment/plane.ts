@@ -124,7 +124,7 @@ export function ransacPlaneFit(
 
 /**
  * 평면에 점들을 투영한 뒤, PCA로 2축을 찾아 축정렬된 bbox의 4 꼭짓점을 3D로 돌려준다.
- * (Python의 rotating calipers min-area OBB 대신 PCA 근사 — ConvexHull 없이 MVP용)
+ * ConvexHull 없이 동작하도록 PCA 근사 OBB 를 사용한다.
  *
  * @param points 3D 점 (Float64Array Nx3)
  * @param normal 평면 법선

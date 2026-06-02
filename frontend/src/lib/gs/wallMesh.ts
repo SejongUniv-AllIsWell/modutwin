@@ -1,30 +1,5 @@
 import type { TextureBakeResult, Vec3 } from './textureBake';
 
-/**
- * Bake 결과로 PlayCanvas quad mesh 엔티티를 생성한다.
- *
- * - app.root에 추가하고 Z-180만 직접 부여
- *   bake 좌표는 이미 (raw + pendingRotation) 프레임이므로 Z-180만 한 번 적용해야 splat과 정렬됨.
- *   splatEntity의 child로 붙이면 splatEntity transform(Z-180 ∘ pendingRotation)이 상속돼
- *   pendingRotation이 이중 적용되는 버그 발생.
- * - 머티리얼: emissiveMap (unlit), 양면 렌더 (CULLFACE_NONE) — 면별 winding 차이로 인한 누락 방지
- *
- * 반환: 생성된 entity. 호출자가 .destroy() 책임.
- */
-export interface WallMeshOptions {
-  /** true면 텍스처 무시하고 단색 흰색 불투명 메시. 지오메트리 검증용 디버그 모드. */
-  solidWhite?: boolean;
-}
-
-export interface ViewTextureVariant {
-  id: string;
-  viewpoint: [number, number, number];
-  textureImage?: HTMLImageElement;
-  rgba?: Uint8ClampedArray;
-  width?: number;
-  height?: number;
-}
-
 function averageOpaqueColor(rgba: Uint8ClampedArray | Uint8Array): [number, number, number] | null {
   let r = 0, g = 0, b = 0, n = 0;
   for (let i = 0; i < rgba.length; i += 4) {
@@ -102,68 +77,12 @@ function createTextureFromImage(pc: any, device: any, name: string, image: HTMLI
   return tex;
 }
 
-function findActiveCamera(app: any): any | null {
-  const cams = app?.root?.findComponents?.('camera') ?? [];
-  for (const c of cams) {
-    const ent = c?.entity;
-    if (ent?.enabled !== false && c?.enabled !== false) return ent;
-  }
-  return null;
-}
-
-function installViewTextureSwitcher(
-  pc: any,
-  app: any,
-  ent: any,
-  mat: any,
-  variants: Array<{ id: string; viewpoint: [number, number, number]; texture: any }>,
-): void {
-  if (variants.length <= 1 || typeof app?.on !== 'function' || typeof app?.off !== 'function') return;
-  const localPoint = new pc.Vec3();
-  const worldPoint = new pc.Vec3();
-  let activeIdx = -1;
-  const choose = () => {
-    const cam = findActiveCamera(app);
-    if (!cam) return;
-    const cp = cam.getPosition ? cam.getPosition() : cam.getLocalPosition();
-    const wt = ent.getWorldTransform?.();
-    let bestIdx = 0;
-    let bestD2 = Infinity;
-    for (let i = 0; i < variants.length; i++) {
-      const p = variants[i].viewpoint;
-      localPoint.set(p[0], p[1], p[2]);
-      if (wt?.transformPoint) wt.transformPoint(localPoint, worldPoint);
-      else worldPoint.copy(localPoint);
-      const dx = cp.x - worldPoint.x;
-      const dy = cp.y - worldPoint.y;
-      const dz = cp.z - worldPoint.z;
-      const d2 = dx * dx + dy * dy + dz * dz;
-      if (d2 < bestD2) { bestD2 = d2; bestIdx = i; }
-    }
-    if (bestIdx === activeIdx) return;
-    activeIdx = bestIdx;
-    const tex = variants[bestIdx].texture;
-    mat.emissiveMap = tex;
-    mat.opacityMap = tex;
-    mat.update();
-  };
-  app.on('update', choose);
-  choose();
-
-  const prevDestroy = ent.destroy?.bind(ent);
-  ent.destroy = (...args: any[]) => {
-    try { app.off('update', choose); } catch {}
-    return prevDestroy?.(...args);
-  };
-}
-
 export function createWallMeshEntity(
   pc: any,
   app: any,
   _splatEntity: any,
   bake: TextureBakeResult,
   name = 'wallMesh',
-  opts: WallMeshOptions = {},
 ): any {
   const device = app.graphicsDevice;
 
@@ -173,17 +92,10 @@ export function createWallMeshEntity(
   mat.diffuse.set(0, 0, 0);
   mat.cull = pc.CULLFACE_NONE;
 
-  if (opts.solidWhite) {
-    // 디버그: 단색 흰색 불투명. 메시 위치/방향만 검증.
-    mat.emissive.set(1, 1, 1);
-  } else {
-    // ── 텍스처 ──
-    const tex = createTextureFromRgba(pc, device, name, bake.width, bake.height, bake.rgba);
-
-    mat.emissive.set(1, 1, 1);
-    mat.emissiveMap = tex;
-    applyBakedTextureCutout(pc, mat, tex);
-  }
+  const tex = createTextureFromRgba(pc, device, name, bake.width, bake.height, bake.rgba);
+  mat.emissive.set(1, 1, 1);
+  mat.emissiveMap = tex;
+  applyBakedTextureCutout(pc, mat, tex);
   mat.update();
 
   // ── Quad 메시 ──
@@ -224,24 +136,14 @@ export function createWallMeshEntity(
 
   const meshInstance = new pc.MeshInstance(mesh, mat);
 
-  const ent = new pc.Entity(name);
+  const ent = new pc.Entity(name, app);
   ent.addComponent('render', { meshInstances: [meshInstance] });
-  (ent as any).__averageColor = opts.solidWhite ? [1, 1, 1] : averageOpaqueColor(bake.rgba);
+  (ent as any).__averageColor = averageOpaqueColor(bake.rgba);
   // 천장제거 등 후속 기능에서 surface 별 식별이 필요. name 컨벤션 `wallMesh_<surfaceId>` 에서 추출.
   (ent as any).__surfaceId = name.startsWith('wallMesh_') ? name.slice('wallMesh_'.length) : null;
   // Z-180만 직접 부여.
   ent.setLocalEulerAngles(0, 0, 180);
   app.root.addChild(ent);
-
-  if (!opts.solidWhite && bake.viewVariants?.length) {
-    const variants = bake.viewVariants.map((variant) => ({
-      id: variant.id,
-      viewpoint: variant.viewpoint,
-      texture: createTextureFromRgba(pc, device, `${name}_${variant.id}`, bake.width, bake.height, variant.rgba),
-    }));
-    (ent as any).__viewTextureVariants = variants;
-    installViewTextureSwitcher(pc, app, ent, mat, variants);
-  }
 
   return ent;
 }
@@ -259,7 +161,6 @@ export interface PersistedMeshData {
   uvs: number[][];          // 4 × 2 (TL, TR, BR, BL)
   normalInward: [number, number, number];
   textureImage: HTMLImageElement;
-  viewTextures?: ViewTextureVariant[];
 }
 
 export function createWallMeshFromPersisted(
@@ -344,7 +245,7 @@ export function createWallMeshFromPersisted(
 
   const meshInstance = new pc.MeshInstance(mesh, mat);
 
-  const ent = new pc.Entity(name);
+  const ent = new pc.Entity(name, app);
   ent.addComponent('render', { meshInstances: [meshInstance] });
   (ent as any).__averageColor = averageColor;
   // 천장제거 등 후속 기능에서 surface 별 식별. createWallMeshFromPersisted 는 호출자가 data.surfaceId 를
@@ -353,28 +254,6 @@ export function createWallMeshFromPersisted(
   // Z-180 (저장된 corners 는 raw PLY 프레임 기준)
   ent.setLocalEulerAngles(0, 0, 180);
   app.root.addChild(ent);
-
-  if (data.viewTextures?.length) {
-    const variants = data.viewTextures.flatMap((variant) => {
-      if (variant.textureImage) {
-        return [{
-          id: variant.id,
-          viewpoint: variant.viewpoint,
-          texture: createTextureFromImage(pc, device, `${name}_${variant.id}`, variant.textureImage),
-        }];
-      }
-      if (variant.rgba && variant.width && variant.height) {
-        return [{
-          id: variant.id,
-          viewpoint: variant.viewpoint,
-          texture: createTextureFromRgba(pc, device, `${name}_${variant.id}`, variant.width, variant.height, variant.rgba),
-        }];
-      }
-      return [];
-    });
-    (ent as any).__viewTextureVariants = variants;
-    installViewTextureSwitcher(pc, app, ent, mat, variants);
-  }
 
   return ent;
 }

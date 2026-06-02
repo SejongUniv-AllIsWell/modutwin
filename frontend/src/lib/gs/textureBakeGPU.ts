@@ -225,7 +225,8 @@ export async function compositeTextureGPU(
     return null;
   }
   const stripRowsMax = Math.min(height, Math.floor(maxRowsPerStripRaw / TILE_SIZE) * TILE_SIZE);
-  const stripBufSizeMax = stripRowsMax * width * 16;
+  const stripDispatchRowsMax = Math.ceil(stripRowsMax / TILE_SIZE) * TILE_SIZE;
+  const stripBufSizeMax = stripDispatchRowsMax * width * 16;
   void tilesPerCol;  // strip 분할 시 strip 별 workgroupsY 로 대체.
 
   device.pushErrorScope('validation');

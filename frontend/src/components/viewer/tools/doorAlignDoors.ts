@@ -147,6 +147,8 @@ export async function persistDoorsToServer(
       if (door.wallSurfaceId === undefined && prev.wallSurfaceId !== undefined) door.wallSurfaceId = prev.wallSurfaceId;
       if (door.doorExtractionDepth === undefined && prev.doorExtractionDepth !== undefined) door.doorExtractionDepth = prev.doorExtractionDepth;
       if (door.boundarySplitEnabled === undefined && prev.boundarySplitEnabled !== undefined) door.boundarySplitEnabled = prev.boundarySplitEnabled;
+      if (door.doorMesh === undefined && prev.doorMesh !== undefined) door.doorMesh = prev.doorMesh;
+      if (door.doorSplat === undefined && prev.doorSplat !== undefined) door.doorSplat = prev.doorSplat;
     }
     const others = opts.replaceExistingId === false
       ? (existing.doors ?? [])

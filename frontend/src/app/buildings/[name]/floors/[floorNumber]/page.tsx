@@ -17,7 +17,7 @@ import { createDoorInteraction, type DoorInteractionController, type DoorHandle 
 const Minimap = lazy(() => import('@/components/viewer/tools/Minimap'));
 const CeilingCutPanel = lazy(() => import('@/components/viewer/tools/CeilingCutPanel'));
 
-// 미니맵 평면도는 천장에서 고정 11cm 컷으로 항상 층 전체를 굽는다. (라이브 천장 컷 깊이와 분리.)
+// 천장 컷 OFF 상태에서도 미니맵은 기본 컷으로 위에서 내려다볼 수 있게 굽는다.
 const MINIMAP_CEILING_CUT_M = 0.11;
 
 type Vec3 = [number, number, number];
@@ -174,10 +174,35 @@ function createColoredMeshEntity(
   mat.cull = pc.CULLFACE_NONE;
   mat.update();
 
-  const ent = new pc.Entity(name);
+  const ent = new pc.Entity(name, app);
   ent.addComponent('render', { meshInstances: [new pc.MeshInstance(mesh, mat)] });
   app.root.addChild(ent);
   return ent;
+}
+
+function findEntityByName(root: any, name: string): any | null {
+  let found: any | null = null;
+  traverseEntities(root, (ent) => {
+    if (!found && ent?.name === name) found = ent;
+  });
+  return found;
+}
+
+function findBasemapDoorWrapper(root: any, doorId: string | null | undefined, unitName: string | null | undefined): any | null {
+  if (doorId) {
+    const byId = findEntityByName(root, `basemapDoor_${doorId}`);
+    if (byId) return byId;
+  }
+  const normalizedUnit = unitName?.trim();
+  if (!normalizedUnit) return null;
+  let found: any | null = null;
+  traverseEntities(root, (ent) => {
+    if (found) return;
+    const name = String(ent?.name ?? '');
+    if (!name.startsWith('basemapDoor_')) return;
+    if ((ent as any).__doorUnitName === normalizedUnit) found = ent;
+  });
+  return found;
 }
 
 function delay(ms: number): Promise<void> {
@@ -304,6 +329,7 @@ function FloorCompositeViewer({
   // 문 상호작용 컨트롤러. splatReady 보다 도어 로드가 먼저 끝날 수 있어 등록을 큐잉했다가 생성 시 drain.
   const doorInteractionRef = useRef<DoorInteractionController | null>(null);
   const pendingDoorsRef = useRef<DoorHandle[]>([]);
+  const pendingDoorLinksRef = useRef<Array<{ ownerWrapper: any; linkedWrapper: any }>>([]);
   const registerDoor = useCallback((handle: DoorHandle) => {
     const ctl = doorInteractionRef.current;
     if (ctl) ctl.add(handle);
@@ -313,6 +339,14 @@ function FloorCompositeViewer({
     const ctl = doorInteractionRef.current;
     if (ctl) { try { ctl.removeByWrapper(wrapper); } catch {} }
     pendingDoorsRef.current = pendingDoorsRef.current.filter((h) => h.wrapper !== wrapper);
+    pendingDoorLinksRef.current = pendingDoorLinksRef.current.filter((link) => (
+      link.ownerWrapper !== wrapper && link.linkedWrapper !== wrapper
+    ));
+  }, []);
+  const linkDoorWrappers = useCallback((ownerWrapper: any, linkedWrapper: any) => {
+    const ctl = doorInteractionRef.current;
+    if (ctl) ctl.addLinkedWrapper(ownerWrapper, linkedWrapper);
+    else pendingDoorLinksRef.current.push({ ownerWrapper, linkedWrapper });
   }, []);
 
   // 미니맵 평면도 — splat 준비 후 자동 베이크.
@@ -371,7 +405,7 @@ function FloorCompositeViewer({
       : undefined,
   );
 
-  // 미니맵 평면도 베이크 — 천장 메시를 잠시 숨기고 씬 전체를 top-down 정사영으로 굽는다.
+  // 미니맵 평면도 베이크 — 라이브 슬라이더와 분리된 고정 천장 컷으로 씬 전체를 top-down 정사영으로 굽는다.
   const bakeMinimap = useCallback(async () => {
     const seq = ++floorplanBakeSeqRef.current;
     const core = coreRef.current;
@@ -404,7 +438,6 @@ function FloorCompositeViewer({
             paddingMeters: 0.5,
             pixelsPerMeter: 60,
             bounds,
-            disableCameraCut: true,
           },
         );
       });
@@ -451,6 +484,12 @@ function FloorCompositeViewer({
     if (pendingDoorsRef.current.length) {
       for (const h of pendingDoorsRef.current) controller.add(h);
       pendingDoorsRef.current = [];
+    }
+    if (pendingDoorLinksRef.current.length) {
+      for (const link of pendingDoorLinksRef.current) {
+        controller.addLinkedWrapper(link.ownerWrapper, link.linkedWrapper);
+      }
+      pendingDoorLinksRef.current = [];
     }
     return () => {
       controller.dispose();
@@ -537,7 +576,7 @@ function FloorCompositeViewer({
         const pc = coreRef.current?.getPC();
         if (!app || !pc) return;
 
-        const group = new pc.Entity(`moduleOverlay_${module.id}`);
+        const group = new pc.Entity(`moduleOverlay_${module.id}`, app);
         applyGroupTransform(group, t);
         app.root.addChild(group);
         record.group = group;
@@ -567,7 +606,6 @@ function FloorCompositeViewer({
           const bundle = await api.get<{
             mesh_meta_url: string | null;
             textures: Record<string, string>;
-            texture_variants?: Record<string, Record<string, string>>;
             doors?: Array<{
               id: string;
               unitName?: string | null;
@@ -587,6 +625,13 @@ function FloorCompositeViewer({
                 indices?: number[];
                 color?: [number, number, number];
               } | null;
+              door_leaf_side?: {
+                positions?: number[];
+                indices?: number[];
+                color?: [number, number, number];
+              } | null;
+              paired_basemap_door_id?: string | null;
+              align_door_thickness?: number | null;
             }>;
           }>(`/refine/refined-bundle?upload_id=${module.source_upload_id}`);
           if (record.cancelled || !record.group) return;
@@ -604,17 +649,6 @@ function FloorCompositeViewer({
                   return url ? loadHtmlImage(url) : Promise.resolve(null);
                 }),
               );
-              const viewImageMatrix = await Promise.all(
-                surfaces.map((surface: any) => Promise.all(
-                  ((surface.textureVariants ?? []) as any[]).map(async (variant: any) => {
-                    const url = bundle.texture_variants?.[surface.surfaceId]?.[variant.id];
-                    const image = url ? await loadHtmlImage(url) : null;
-                    return image
-                      ? { id: String(variant.id), viewpoint: variant.viewpoint as [number, number, number], image }
-                      : null;
-                  }),
-                )),
-              );
               if (record.cancelled || !record.group) return;
               for (let i = 0; i < surfaces.length; i++) {
                 const surface = surfaces[i];
@@ -626,13 +660,6 @@ function FloorCompositeViewer({
                   uvs: surface.uvs,
                   normalInward: surface.normalInward,
                   textureImage: img,
-                  viewTextures: viewImageMatrix[i]
-                    .filter(Boolean)
-                    .map((variant: any) => ({
-                      id: variant.id,
-                      viewpoint: variant.viewpoint,
-                      textureImage: variant.image,
-                    })),
                 }, { mutableTexture: false });
                 record.group.addChild(ent);
                 resetPlyLocalFrame(ent);
@@ -650,7 +677,10 @@ function FloorCompositeViewer({
 
           for (const door of bundle.doors ?? []) {
             if (record.cancelled || !record.group) return;
-            const wrapper = new pc.Entity(`moduleDoor_${module.id}_${door.id}`);
+            const wrapper = new pc.Entity(`moduleDoor_${module.id}_${door.id}`, app);
+            (wrapper as any).__moduleId = module.id;
+            (wrapper as any).__doorId = door.id;
+            (wrapper as any).__pairedBasemapDoorId = door.paired_basemap_door_id ?? null;
             record.group.addChild(wrapper);
             record.meshEntities.push(wrapper);
 
@@ -687,11 +717,26 @@ function FloorCompositeViewer({
               const ent = createColoredMeshEntity(
                 pc,
                 app,
-                `moduleDoorFrame_${module.id}_${door.id}`,
+                `moduleDoorConnection_${module.id}_${door.id}`,
                 door.door_frame.positions,
                 door.door_frame.indices,
                 frameColor,
               );
+              record.meshEntities.push(ent);
+            }
+
+            if (door.door_leaf_side?.positions?.length && door.door_leaf_side?.indices?.length) {
+              const storedColor = door.door_leaf_side.color;
+              const frameColor = storedColor ?? doorMeshAverageColor ?? DEFAULT_DOOR_FRAME_COLOR;
+              const ent = createColoredMeshEntity(
+                pc,
+                app,
+                `moduleDoorLeafSide_${module.id}_${door.id}`,
+                door.door_leaf_side.positions,
+                door.door_leaf_side.indices,
+                frameColor,
+              );
+              linkDoorWrappers(wrapper, ent);
               record.meshEntities.push(ent);
             }
 
@@ -717,7 +762,7 @@ function FloorCompositeViewer({
               record.splatLayerIds.push(doorSplat.id);
               doorSplat.ready
                 .then(() => {
-                  if (record.cancelled) return;
+                  if (record.cancelled || !record.group || wrapper._destroyed || wrapper._destroying) return;
                   const ent = getEntity(doorSplat.id);
                   if (!ent) return;
                   wrapper.addChild(ent);
@@ -726,6 +771,28 @@ function FloorCompositeViewer({
                 })
                 .catch(() => {});
             }
+
+            const pairingUnitName = door.unitName ?? module.name ?? null;
+            if (door.paired_basemap_door_id || pairingUnitName) {
+              void (async () => {
+                for (let attempt = 0; attempt < 40; attempt++) {
+                  if (record.cancelled) return;
+                  const basemapWrapper = findBasemapDoorWrapper(app.root, door.paired_basemap_door_id, pairingUnitName);
+                  if (basemapWrapper) {
+                    unregisterDoorByWrapper(basemapWrapper);
+                    linkDoorWrappers(wrapper, basemapWrapper);
+                    return;
+                  }
+                  await delay(250);
+                }
+                console.warn('[FloorCompositeViewer] basemap door pair not found', {
+                  module: module.name,
+                  doorId: door.id,
+                  pairedBasemapDoorId: door.paired_basemap_door_id,
+                  unitName: pairingUnitName,
+                });
+              })();
+            }
           }
           bumpAssetRevision();
         } catch (e) {
@@ -733,7 +800,7 @@ function FloorCompositeViewer({
         }
       })();
     });
-  }, [add, getEntity, moduleOverlays, remove, applyModuleCeilingState, bumpAssetRevision]);
+  }, [add, getEntity, moduleOverlays, remove, applyModuleCeilingState, bumpAssetRevision, linkDoorWrappers, unregisterDoorByWrapper]);
 
   useEffect(() => {
     return () => {

@@ -36,11 +36,14 @@ function makeRng(seed?: number): () => number {
     s ^= s << 13; s >>>= 0;
     s ^= s >>> 17;
     s ^= s << 5;  s >>>= 0;
-    return (s & 0xffffffff) / 0x100000000;
+    return (s >>> 0) / 0x100000000;
   };
 }
 
 function sampleWithoutReplacement(rng: () => number, n: number, k: number): number[] {
+  if (k > n) {
+    throw new Error(`sample size ${k} exceeds population ${n}`);
+  }
   const out: number[] = [];
   const used = new Set<number>();
   while (out.length < k) {

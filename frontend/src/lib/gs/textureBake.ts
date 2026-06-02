@@ -23,12 +23,6 @@ export interface TextureBakeOptions {
   texelsPerMeter: number;
   /** 한 가우시안의 텍스처 footprint 픽셀 반경 한계. 너무 큰 가우시안(스카이/노이즈) 배제용 */
   maxFootprintPx: number;
-  /**
-   * 지정하면 단순 surface-normal depth(sd) 대신 대표 카메라 위치/방향 기준 depth 로 합성한다.
-   * viewpoint 만 있으면 거리순, viewDirection 도 있으면 dot(center-viewpoint, viewDirection) 순.
-   */
-  viewpoint?: Vec3;
-  viewDirection?: Vec3;
 }
 
 export const DEFAULT_TEXTURE_BAKE_OPTIONS: TextureBakeOptions = {
@@ -70,12 +64,6 @@ export interface TextureBakeResult {
   rgba: Uint8ClampedArray;
   width: number;
   height: number;
-  /** 같은 면을 여러 대표 시점에서 굽는 view-dependent texture variants. */
-  viewVariants?: Array<{
-    id: string;
-    viewpoint: Vec3;
-    rgba: Uint8ClampedArray;
-  }>;
   /** 4 코너 (월드 좌표) — TL, TR, BR, BL 순서. extend* 적용 후 위치. */
   corners: [Vec3, Vec3, Vec3, Vec3];
   /** 각 코너의 UV (TL, TR, BR, BL). extend가 있으면 [0,1] 밖으로 나갈 수 있음 (clamp-to-edge). */
@@ -116,8 +104,6 @@ interface SplatInfo {
   alpha: number;
   /** signed distance (origin 평면 기준). 정렬 key (ascending = 안쪽→바깥). */
   sd: number;
-  /** 대표 시점 기준 거리 정렬 key. 작을수록 먼저 합성. */
-  viewDepth: number;
 }
 
 /**
@@ -270,22 +256,11 @@ export async function bakeTextureForPlane(
     const g = Math.max(0, Math.min(1, 0.5 + GSPLAT_SH0 * f1[i]));
     const b = Math.max(0, Math.min(1, 0.5 + GSPLAT_SH0 * f2[i]));
 
-    let viewDepth = sd;
-    if (opts.viewpoint && opts.viewDirection) {
-      viewDepth =
-        (px[i] - opts.viewpoint[0]) * opts.viewDirection[0] +
-        (py[i] - opts.viewpoint[1]) * opts.viewDirection[1] +
-        (pz[i] - opts.viewpoint[2]) * opts.viewDirection[2];
-    } else if (opts.viewpoint) {
-      viewDepth = Math.hypot(px[i] - opts.viewpoint[0], py[i] - opts.viewpoint[1], pz[i] - opts.viewpoint[2]);
-    }
-
-    splats.push({ tu, tv, inv00, inv01, inv11, bbR, r, g, b, alpha, sd, viewDepth });
+    splats.push({ tu, tv, inv00, inv01, inv11, bbR, r, g, b, alpha, sd });
   }
 
   // ── 단계 2: front-to-back 정렬 ──
-  // 기본은 plane normal 기준(sd ascending), viewpoint 가 있으면 대표 시점에서 가까운 순.
-  splats.sort((a, b) => a.viewDepth - b.viewDepth);
+  splats.sort((a, b) => a.sd - b.sd);
 
   // ── 단계 2.5: 타일 인덱스 자료구조 빌드 ──
   // 각 splat 의 footprint(bbR) 가 닿는 16×16 픽셀 타일들에 등록.

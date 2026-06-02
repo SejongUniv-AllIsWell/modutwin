@@ -18,32 +18,31 @@ interface CeilingCutPanelProps {
  *
  * - ON/OFF: 천장에서 cutoff 깊이 이내 가우시안을 투명화 + 시각적 천장 메시 숨김.
  * - 슬라이더: 컷 깊이 조절. (미니맵 이미지 베이크는 별도 고정값을 쓰므로 영향 없음.)
- * - 핸들로 오른쪽 화면 밖으로 슬라이드 숨김/펼침 (미니맵과 동일 패턴).
+ * - 우상단 버튼으로 오른쪽 화면 밖으로 슬라이드 숨김/펼침 (미니맵과 동일 패턴).
  */
 export default function CeilingCutPanel({ enabled, onToggle, cutoff, onCutoffChange, width = 220 }: CeilingCutPanelProps) {
   const [hidden, setHidden] = useState(false);
 
   return (
     <div className="relative" style={{ width }}>
-      {/* 슬라이드 래퍼 — 숨김 시 오른쪽으로 밀어 화면 밖으로 (핸들만 남김). */}
+      <button
+        type="button"
+        onClick={() => setHidden(h => !h)}
+        className="absolute top-2 right-2 z-10 w-6 h-6 flex items-center justify-center rounded bg-[var(--paper)]/85 backdrop-blur-sm text-[var(--ink)] text-xs border border-[var(--rule)] hover:bg-[var(--paper)] shadow-lg"
+        title={hidden ? '천장 컷 펼치기' : '천장 컷 숨기기'}
+      >
+        {hidden ? '◀' : '▶'}
+      </button>
+
+      {/* 슬라이드 래퍼 — 숨김 시 오른쪽으로 밀어 화면 밖으로. */}
       <div
         className="relative transition-transform duration-300 ease-out"
         style={{ transform: hidden ? 'translateX(calc(100% + 12px))' : 'translateX(0)' }}
       >
-        {/* 접기/펼치기 핸들 — 패널 왼쪽에 붙어 함께 이동. */}
-        <button
-          type="button"
-          onClick={() => setHidden(h => !h)}
-          className="absolute top-2 -left-7 w-7 h-9 flex items-center justify-center rounded-l-md bg-[var(--paper)]/80 backdrop-blur-sm text-[var(--ink)] text-sm border border-r-0 border-[var(--rule)] hover:bg-[var(--paper)] shadow-lg"
-          title={hidden ? '천장 컷 펼치기' : '천장 컷 숨기기'}
-        >
-          {hidden ? '◀' : '▶'}
-        </button>
-
         {/* 패널 카드 — 반투명 배경 + blur. */}
-        <div className="rounded-lg border-2 border-[var(--rule)] bg-[var(--paper)]/80 backdrop-blur-sm shadow-xl px-3 py-2.5 space-y-2.5">
+        <div className="rounded-lg border-2 border-[var(--rule)] bg-[var(--paper)]/80 backdrop-blur-sm shadow-xl px-3 py-2.5 pr-10 space-y-2.5">
           {/* ON/OFF */}
-          <div className="flex items-center justify-between gap-2">
+          <div className="flex items-center justify-start gap-2">
             <span className="text-[11px] font-bold text-[var(--ink)]">천장 컷</span>
             <button
               type="button"

@@ -103,7 +103,7 @@ localZ = -(target - pos),  localY = up,  localX = cross(localY, localZ)
   - `final.ply` — 정제 PLY (회전 + boundaryCull/brush 마스크 적용).
   - `mesh.json` — wall mesh 메타 (corners, uvs, normalInward, textureFilename).
   - `tex_{surfaceId}.png` — 면별 베이크 텍스처 (ceiling/floor + `w0..w(N-1)`).
-- `refined/doors.json` — 도어 corners + 메타 + doorFrame 직렬화 데이터 + (basemap 한정) doorMesh/doorSplat 자산 참조.
+- `refined/doors.json` — 도어 corners + 메타 + 정합 연결 mesh(`doorFrame`, `doorLeafSide`) 직렬화 데이터 + (basemap 한정) doorMesh/doorSplat 자산 참조.
 - `refined/tex_<doorId>.png`, `<doorId>.ply` — basemap 도어별 mesh 텍스처 + 가우시안 PLY.
 
 업로드 정책:
@@ -124,7 +124,7 @@ localZ = -(target - pos),  localY = up,  localX = cross(localY, localZ)
 - **rectFit** (`lib/alignment/rectFit.ts`) — 사용자 픽이 `normalizeDoorRect` 로 완벽한 직사각형이 보장됨. R, s, t 를 직교 basis 비교로 한 번에 산출. SVD Kabsch 안 씀.
   - `dstForcedN`: dst basis n 을 외부 지정 → cornerpick winding 무관 deterministic. basemap door 의 `normalInward` 메타가 ground truth.
   - `withScale`: uniform 스케일 산출 — module 도어 크기를 basemap 도어 크기에 맞춤.
-- **gap 의미**: basemap 도어와 module 도어는 **각자 자기 facade 위에 그대로**. 정합 후 두 facade 가 사용자 슬라이더 "정합 문 두께" (`alignDoorThickness`, default 5cm) 만큼 평행 이격. 그 사이 공간을 `createDoorFrameMesh` (`AlignPanel.tsx`) 의 4면 quad mesh 가 채움. frame 은 `doorPivotGroup` 의 자식 — 도어 열기 슬라이더 회전 시 양 도어 + frame 한 묶음.
+- **gap 의미**: basemap 도어와 module 도어는 **각자 자기 facade 위에 그대로**. 정합 후 두 facade 가 사용자 슬라이더 "정합 문 두께" (`alignDoorThickness`, default 1cm) 만큼 평행 이격. 그 사이 공간은 `createDoorFrameMesh` (`AlignPanel.tsx`) 로 만든 두 mesh 가 나눠서 채운다. `doorFixedFrame` 은 벽/문틀처럼 고정되고, `doorLeafSide` 는 양쪽 도어 face 를 연결하는 문 옆면으로 `doorPivotGroup` 에 들어가 도어와 함께 회전한다.
 - **DOOR_CORNER_MIRROR_MAP `[1, 0, 3, 2]`** — 양측이 각자 자기 방 안에서 CW [TL,TR,BR,BL] 픽 가정. 두 방 사이 도어는 양쪽에서 좌우 반전되어 보이므로 mirror.
 - **picked.pos / moduleDoorCorners 프레임 = A'** (saveRefined 후 splatData = A' 이고 raycast 결과는 splatData 프레임). AlignPanel 의 `srcWorld = splatEntity.getWorldTransform() · A' = Z-180 · A'`.
 - **도어 corner 픽 제약**: 하단 corner (BR=2, BL=3) 는 시각 바닥 (코드 `ceiling` 평면, A' Y = ceilingY) 보다 아래로 안 내려가도록 강제 클램프.
@@ -153,9 +153,11 @@ app.root
 └── doorPivotGroup (도어 열기 슬라이더 회전 보유)
     ├── moduleDoor (wrapper 가 alignmentGroup → doorPivotGroup 으로 다시 reparent)
     ├── basemapDoor_<doorId> (정합 대상 한 개)
-    └── doorFrame (4면 quad mesh, frame)
+    └── doorLeafSide (회전하는 문 옆면 mesh)
+app.root
+└── doorFixedFrame (두 facade 사이 opening frame, 고정 mesh)
 ```
-정합 후 두 facade 가 `alignDoorThickness` (default 5cm) 만큼 평행 이격. 그 사이 `createDoorFrameMesh` 가 채움.
+정합 후 두 facade 가 `alignDoorThickness` (default 1cm) 만큼 평행 이격. 고정 opening frame 과 회전 door leaf side 를 각각 직렬화해 `doors.json` 에 저장한다.
 
 wrapper.enabled 토글로 자식 mesh+splat 동시 hide/show.
 
@@ -169,7 +171,7 @@ wrapper.enabled 토글로 자식 mesh+splat 동시 hide/show.
 
 `UnifiedSplatEditor` 의 `EditorMode = 'refine' | 'door' | 'align' | null`. 사이드바 4탭: 업로드 / 다듬기 / 문 설정 / 정합.
 
-단방향 lock (`lockedStages`) — 이전 단계를 되돌리면 후속 의존성 깨짐 (경계면 변경 시 베이크된 텍스처/mesh/문 corners 모두 무효):
+단방향 lock (`lockedStages`) — 완료된 단계를 다시 열면 후속 의존성 깨짐 (경계면 변경 시 베이크된 텍스처/mesh/문 corners 모두 무효):
 - 다듬기 완료 → `upload` + `refine` 잠금 (회색 opacity-40 + disabled).
 - 문 설정 완료 → `door` 추가 잠금.
 
@@ -192,7 +194,7 @@ wrapper.enabled 토글로 자식 mesh+splat 동시 hide/show.
 5. **다듬기 완료** → `bakeSplatRotation` 으로 `splatData` 메모리에 pendingRotation in-place 적용 (raw → A') 후 삭제 마스크까지 반영한 canonical PLY scene 을 만든다. 이후 문 설정/정합은 이 scene 을 기준으로 동작.
 6. **문 설정** (`DoorAlignModal`) — SAM3 또는 수동 4점 → 문 추출 (boundary split + wall mesh α punch + wall 텍스처 crop 으로 도어 mesh) → 회전축/각도/방향.
 7. **문 설정 완료** — 문 열린 상태였으면 자동 닫기 + `angleDeg=0` 강제. 모듈은 메모리 유지, 베이스맵은 백그라운드 일괄 업로드. 둘 다 정합 단계로 transition.
-8. **정합** (`AlignPanel`) — 4점 자동/수동 → `rectFit(withScale)` → similarity transform. 모듈은 wallAngle bake 보정이 반영된 transform 과 refined bundle 을 `commit-final` 로 일괄 저장한다. `doorFrame` 은 별도 multipart field 가 아니라 `doors.json` 내부에 직렬화되어 함께 저장된다. 베이스맵은 해당 단계 없음.
+8. **정합** (`AlignPanel`) — 4점 자동/수동 → `rectFit(withScale)` → similarity transform. 모듈은 wallAngle bake 보정이 반영된 transform 과 refined bundle 을 `commit-final` 로 일괄 저장한다. 정합 연결 mesh(`doorFrame`, `doorLeafSide`) 는 별도 multipart field 가 아니라 `doors.json` 내부에 직렬화되어 함께 저장된다. 베이스맵은 해당 단계 없음.
 
 ### WallModal 폴리곤 모드
 N-각형 폴리곤 입력. 단일 cycle 완성 시 확인 활성. **평행화 모드**: 첫 선택 = 기준선 (시안 "기준" 라벨) → 이후 선택 = 평행화 대상 (주황 번호). 출력 `(angleDeg, polygon: PolygonPoint[])` — angleDeg 는 polygon PCA 주축 기반 베이크용 Y 회전.
