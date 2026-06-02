@@ -39,9 +39,13 @@ Flow: 사용자가 외부에서 학습한 `.ply` 업로드 → 브라우저에�
 ├── minio           :9000
 └── flower          :5555 (옵션: --profile monitoring)
 
-[DGX Spark] docker compose -f docker-compose.gpu-remote.yml   # 유일 GPU 워커
-├── worker          (Celery training/alignment: COLMAP 전처리·gsplat 학습·문 정합·SOG 변환)
-└── door-ml         (SAM3 문검출 HTTP :8000)
+[GPU 서버 옵션]
+├── DGX Spark: docker compose --env-file .env.dgx-worker -f docker-compose.gpu-dgx.yml
+│   ├── worker / sog-worker (Celery training/alignment/sog)
+│   └── door-ml             (SAM3 문검출 HTTP :8100)
+└── RTX: docker compose --env-file .env.rtx-worker -f docker-compose.gpu-rtx.yml
+    ├── worker / sog-worker (Celery training/alignment/sog, 컨테이너 내부 gsplat)
+    └── door-ml             (SAM3 문검출 HTTP :8100, 컨테이너 내부 SAM3)
 ```
 
 ## Coordinate Conventions ⚠ 매번 헷갈리는 곳

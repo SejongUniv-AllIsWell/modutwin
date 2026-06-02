@@ -7,21 +7,23 @@
 #   - door-ml    : SAM3 문검출 HTTP 서버. PC 백엔드가 DGX:8100 으로 호출
 # (base docker-compose.yml 과 합치지 말고 이 파일 "단독"으로 실행할 것.)
 #
-# 사용법 (GPU 머신에서):
-#   docker compose -f docker-compose.gpu-remote.yml up -d --build
+# 사용법 (DGX 머신에서):
+#   cp .env.dgx-worker.example .env.dgx-worker
+#   docker compose --env-file .env.dgx-worker -f docker-compose.gpu-dgx.yml up -d --build
 #
 # 사전 조건:
-#   1) .env 에 PC_HOST_IP + 비밀값이 PC 와 "동일"하게, HF_TOKEN(SAM3 게이트 모델) 설정
+#   1) .env.dgx-worker 에 PC_HOST_IP + 비밀값이 PC 와 "동일"하게, HF_TOKEN(SAM3 게이트 모델) 설정
 #      (docs/DEVELOPMENT.md: "keep secrets identical on both machines")
 #   2) PC 의 RabbitMQ(5673)/Redis(6379)/MinIO(9000) 가 PC_HOST_IP 로 접근 가능
 #        nc -zv $PC_HOST_IP 5673 && nc -zv $PC_HOST_IP 6379 && nc -zv $PC_HOST_IP 9000
 #   3) NVIDIA Container Toolkit 설치
 #
 # ★ SOG GPU(Vulkan) 가속: splat-transform 은 WebGPU(Dawn)=Vulkan 백엔드를 쓴다(CUDA 아님).
-#   GB10 을 쓰려면 (a) Dockerfile 에 libvulkan1 설치(되어있음), (b) 아래 환경의
-#   NVIDIA_DRIVER_CAPABILITIES=all 로 드라이버의 graphics/vulkan 부분을 컨테이너에 마운트.
-#   배포 후 `docker exec 3dgs-sog-worker vulkaninfo | head` 로 GB10 이 잡히는지 확인.
-#   잡히면 SOG_DEVICE=auto 가 GPU 사용, 실패하면 tasks/sog.py 가 자동으로 CPU 폴백한다.
+#   RTX 30/40/50, RTX A/Ada/Blackwell 등 NVIDIA GPU는 컨테이너에 Vulkan graphics
+#   드라이버가 보여야 한다. 호스트에는 Vulkan ICD(OpenGL/Vulkan lib package: 예 libnvidia-gl-580)
+#   가 설치돼 있어야 하고, Dockerfile 의 libvulkan1 + 아래 NVIDIA_* 환경이 컨테이너 전제다.
+#   배포 후 `docker exec 3dgs-dgx-sog-worker vulkaninfo | head` 로 NVIDIA 어댑터가 잡히는지 확인.
+#   잡히면 SOG_DEVICE=auto 가 NVIDIA/Vulkan 어댑터를 우선 사용하고, 실패하면 CPU 로 폴백한다.
 #
 # ★ 배포 순서(중요): SOG 발행 큐가 'sog' 로 바뀌었다(backend celery_service + worker celery_app).
 #   소비는 worker 의 -Q 플래그로만 결정되므로, 'sog' 를 소비하는 건 여기 sog-worker 뿐이다.
@@ -53,12 +55,15 @@ x-worker-environment: &worker-environment
   # notify_upload_progress 용 (backend_callback.py). 미설정 시 BACKEND_CALLBACK_URL 재사용.
   - BACKEND_INTERNAL_URL=${BACKEND_INTERNAL_URL:-${BACKEND_CALLBACK_URL}}
   - INTERNAL_API_TOKEN=${INTERNAL_API_TOKEN:-}
-  # SOG 변환 디바이스: auto = WebGPU(Vulkan)로 GB10 사용 시도, 실패 시 tasks/sog.py 가 CPU 폴백.
+  # SOG 변환 디바이스: auto = WebGPU(Dawn)에서 NVIDIA/Vulkan 어댑터 우선, 실패 시 CPU 폴백.
   - SOG_DEVICE=${SOG_DEVICE:-auto}
   - SOG_ITERATIONS=${SOG_ITERATIONS:-10}
   - SOG_TIMEOUT=${SOG_TIMEOUT:-3600}
-  # NVIDIA 드라이버의 graphics/vulkan 부분까지 컨테이너에 마운트(Dawn→Vulkan→GB10).
-  - NVIDIA_DRIVER_CAPABILITIES=all
+  - SOG_DAWN_BACKEND=${SOG_DAWN_BACKEND:-vulkan}
+  - SOG_PREFER_NVIDIA=${SOG_PREFER_NVIDIA:-1}
+  # NVIDIA 드라이버의 compute + utility + graphics/Vulkan 부분까지 컨테이너에 마운트.
+  - NVIDIA_VISIBLE_DEVICES=all
+  - NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
   # gsplat 경로/스텝 (기본값은 DGX(imlabdgx1) 기준; 필요시 .env 로 오버라이드).
   - GSPLAT_PYTHON=${GSPLAT_PYTHON:-/home/imlabdgx1/miniforge3/envs/gsplat/bin/python}
   - GSPLAT_TRAINER=${GSPLAT_TRAINER:-/home/imlabdgx1/Development/gsplat/examples/simple_trainer.py}
@@ -83,9 +88,9 @@ x-gpu-deploy: &gpu-deploy
 services:
   # training + alignment 전용 워커 (Dockerfile CMD: -Q training,alignment -c 1).
   worker:
-    build: ./worker
-    image: modutwin-worker          # sog-worker 와 동일 이미지 공유 (중복 빌드 방지)
-    container_name: 3dgs-worker
+    build: ./worker_dgx
+    image: modutwin-worker-dgx      # sog-worker 와 동일 이미지 공유 (중복 빌드 방지)
+    container_name: 3dgs-dgx-worker
     environment: *worker-environment
     volumes: *worker-volumes
     deploy: *gpu-deploy
@@ -93,9 +98,9 @@ services:
 
   # SOG 변환 전용 워커 — 'sog' 큐만 소비. 긴 SOG 변환이 training/alignment 를 막지 않도록 분리.
   sog-worker:
-    build: ./worker
-    image: modutwin-worker          # worker 와 동일 이미지 (command 만 다름)
-    container_name: 3dgs-sog-worker
+    build: ./worker_dgx
+    image: modutwin-worker-dgx      # worker 와 동일 이미지 (command 만 다름)
+    container_name: 3dgs-dgx-sog-worker
     command: ["celery", "-A", "celery_app", "worker", "-Q", "sog", "-c", "1", "--loglevel=info"]
     environment: *worker-environment
     volumes: *worker-volumes
@@ -115,7 +120,9 @@ services:
       - ./utilities:/app/utilities:ro
       - hf_cache:/root/.cache/huggingface   # SAM3 체크포인트 캐시(재다운로드 방지)
     environment:
-      - TORCH_CUDA_ARCH_LIST=12.1+PTX        # DGX Spark GB10 = sm_121
+      # Ampere=8.6, Ada=8.9, GB10/Blackwell=12.x.
+      # 필요하면 .env 에서 좁혀 빌드 시간을 줄일 수 있다.
+      - TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST:-8.6 8.9 12.0 12.1+PTX}
       - HF_TOKEN=${HF_TOKEN}                 # facebook/sam3 gated 모델 접근 토큰
       - HF_HUB_DISABLE_PROGRESS_BARS=1
     deploy:

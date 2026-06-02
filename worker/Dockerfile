@@ -7,9 +7,9 @@ ENV PYTHONPATH=/app \
     PYTHONUNBUFFERED=1
 
 # ffmpeg + OpenCV/GL 런타임 라이브러리 + Node.js 설치 도구
-# libvulkan1: Vulkan 로더(splat-transform WebGPU/Dawn 이 GB10 을 Vulkan 으로 사용).
-#   NVIDIA Vulkan ICD/드라이버 라이브러리는 NVIDIA Container Toolkit 이 런타임에 마운트한다
-#   (compose 의 NVIDIA_DRIVER_CAPABILITIES=all 필요). vulkan-tools: vulkaninfo 검증용.
+# libvulkan1: Vulkan loader for splat-transform WebGPU/Dawn on NVIDIA GPUs.
+#   NVIDIA Vulkan ICD/driver libraries are mounted by NVIDIA Container Toolkit at runtime
+#   (compose must expose the graphics driver capability). vulkan-tools is for vulkaninfo checks.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libglib2.0-0 \

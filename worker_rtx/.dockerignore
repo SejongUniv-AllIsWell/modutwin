@@ -1,0 +1,12 @@
+# 파이썬 캐시
+**/__pycache__/
+*.pyc
+
+# SOG 변환기: 호스트에서 만든 산출물은 제외하고 이미지 안에서 새로 빌드
+# (package-lock.json 은 포함시켜 `npm ci` 로 재현 가능한 빌드를 한다)
+splat-transform/node_modules/
+splat-transform/dist/
+
+# 기타
+.git/
+*.log

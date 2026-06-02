@@ -31,9 +31,9 @@ def convert_scene_to_sog(self, scene_id: str, ply_key: str):
 
         local_sog = os.path.join(work_dir, "output.sog")
 
-        # SOG_DEVICE=auto 면 WebGPU(Vulkan)로 GB10 사용을 시도하고, Vulkan ICD 미가용 등으로
-        # 실패하면 CPU 로 자동 폴백한다. (auto 를 그대로 두면 Vulkan 없는 환경에서 SOG 가
-        # 전부 죽으므로, 여기서 폴백을 보장해 auto 를 안전하게 만든다.)
+        # SOG_DEVICE=auto uses WebGPU(Dawn) and prefers NVIDIA/Vulkan adapters
+        # when available. If Vulkan ICD/driver exposure fails, fall back to CPU so
+        # the viewer derivative never blocks canonical PLY availability.
         device = os.environ.get("SOG_DEVICE", "cpu")
         try:
             convert_to_sog(local_ply, output_path=local_sog, device=device)

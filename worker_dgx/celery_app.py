@@ -1,0 +1,36 @@
+import os
+import sys
+from celery import Celery
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+if APP_DIR not in sys.path:
+    sys.path.insert(0, APP_DIR)
+
+app = Celery('worker')
+app.config_from_object({
+    'broker_url': os.environ.get('RABBITMQ_URL', 'amqp://guest:guest@localhost:5672//'),
+    'result_backend': os.environ.get('REDIS_URL', 'redis://localhost:6379/0'),
+    'task_serializer': 'json',
+    'result_serializer': 'json',
+    'accept_content': ['json'],
+    'task_track_started': True,
+    'task_acks_late': True,
+    'worker_prefetch_multiplier': 1,
+    'task_routes': {
+        'tasks.training.*': {'queue': 'training'},
+        'tasks.alignment.*': {'queue': 'alignment'},
+        # SOG 는 전용 'sog' 큐 → 별도 sog-worker 가 소비. 긴 변환이 training/alignment 를 막지 않게.
+        'tasks.sog.*': {'queue': 'sog'},
+    },
+    'task_default_queue': 'training',
+    'imports': (
+        'tasks.training',
+        'tasks.alignment',
+        'tasks.sog',
+    ),
+})
+
+import tasks.colmap   # noqa: F401
+import tasks.training  # noqa: F401
+import tasks.alignment # noqa: F401
+import tasks.sog       # noqa: F401

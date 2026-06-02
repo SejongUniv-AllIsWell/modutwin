@@ -52,7 +52,7 @@ OPTIONS
   -i, --iterations <n>         SH compression iterations (more = better). Default: 10
   -g, --gpu <n|cpu|auto>       Device for SH clustering. Default: cpu
                                  cpu   - CPU k-means (no GPU needed)
-                                 auto  - let WebGPU pick an adapter
+                                 auto  - prefer an NVIDIA/Vulkan adapter when available
                                  <n>   - GPU adapter index
   -q, --quiet                  Suppress non-error output
       --verbose                Show debug-level diagnostics
@@ -111,7 +111,11 @@ const main = async () => {
     const reportDone = (failed = false) => {
         const elapsedMs = performance.now() - startTime;
         const line = `${failed ? 'failed in' : 'done in'} ${fmtTime(elapsedMs)}  [peak ${fmtBytes(peakMemoryBytes())}]`;
-        failed ? logger.error(line) : logger.info(line);
+        if (failed) {
+            logger.error(line);
+        } else {
+            logger.info(line);
+        }
     };
 
     const failExit = (err: unknown): never => {
@@ -222,20 +226,20 @@ const main = async () => {
         let cached: GraphicsDevice | undefined;
         deviceCreator = async () => {
             if (cached) return cached;
-            const { createDevice, enumerateAdapters } = await import('./node-device');
-            let adapterName: string | undefined;
+            const { createDevice, enumerateAdapters, selectAutoAdapter } = await import('./node-device');
+            let adapter = gpu === 'auto' ? await selectAutoAdapter() : undefined;
             if (gpu !== 'auto') {
                 const idx = Number.parseInt(gpu, 10);
                 if (!Number.isInteger(idx) || idx < 0) {
                     throw new Error(`Invalid --gpu value: ${values.gpu}. Use cpu, auto, or a non-negative index.`);
                 }
                 const adapters = await enumerateAdapters();
-                adapterName = adapters[idx]?.name;
-                if (!adapterName) {
+                adapter = adapters[idx];
+                if (!adapter) {
                     logger.warn(`GPU adapter index ${idx} not found, using default`);
                 }
             }
-            cached = await createDevice(adapterName);
+            cached = await createDevice(adapter);
             return cached;
         };
     }

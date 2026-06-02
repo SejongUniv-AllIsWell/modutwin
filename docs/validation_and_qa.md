@@ -83,7 +83,8 @@ Expected fresh-state results:
 | Local HTTP | `docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build` | Uses `nginx.local.conf`; run migrations after startup. |
 | Production-like | `docker compose up -d --build` | Uses base compose and `.env` values such as `PUBLIC_BASE_URL`. |
 | Backend isolated test | `docker run --rm --env-file .env ... python -m pytest -q` | Useful when host Python lacks pytest. |
-| GPU worker | `docker compose -f docker-compose.gpu.yml config` | Optional; used for GPU/door-ml related services. |
+| DGX GPU worker | `docker compose --env-file .env.dgx-worker.example -f docker-compose.gpu-dgx.yml config` | Optional remote worker stack for DGX Spark. |
+| RTX GPU worker | `docker compose --env-file .env.rtx-worker.example -f docker-compose.gpu-rtx.yml config` | Optional remote worker stack for RTX GPUs. |
 
 Required environment checks:
 

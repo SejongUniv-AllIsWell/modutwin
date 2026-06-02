@@ -62,7 +62,7 @@ class Settings(BaseSettings):
     # 워커 → 백엔드 콜백 인증 (공유 시크릿). 빈 값이면 콜백 endpoint 가 항상 401.
     INTERNAL_API_TOKEN: str = ""
 
-    # door-ml SAM3 inference 서비스 (docker-compose.gpu.yml 의 door-ml 컨테이너).
+    # door-ml SAM3 inference 서비스 (GPU 머신의 door-ml HTTP 컨테이너).
     DOOR_ML_URL: str = "http://door-ml:8000"
 
     @model_validator(mode="after")
