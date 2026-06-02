@@ -21,11 +21,22 @@ function isZipFile(file: File): boolean {
   return fileExt(file.name) === '.zip';
 }
 
+const VIDEO_EXTENSIONS = ['.mp4', '.mov', '.avi', '.mkv', '.webm'];
+
+function isVideoFile(file: File): boolean {
+  return VIDEO_EXTENSIONS.includes(fileExt(file.name));
+}
+
 const EXT_TO_MIME: Record<string, string> = {
   ply: 'application/octet-stream',
   splat: 'application/octet-stream',
   sog: 'application/octet-stream',
   zip: 'application/zip',
+  mp4: 'video/mp4',
+  mov: 'video/quicktime',
+  avi: 'video/x-msvideo',
+  mkv: 'video/x-matroska',
+  webm: 'video/webm',
 };
 
 function resolveContentType(file: File): string {
@@ -35,7 +46,7 @@ function resolveContentType(file: File): string {
 }
 
 function isAcceptedFile(file: File): boolean {
-  return isScene3DFile(file.name) || isZipFile(file);
+  return isScene3DFile(file.name) || isZipFile(file) || isVideoFile(file);
 }
 
 export interface UploaderFixedContext {
@@ -170,8 +181,8 @@ export default function MultipartUploader({
         return;
       }
 
-      // 분기 2: .zip → COLMAP 파이프라인. 업로드 시작과 동시에 /dashboard 로 이동.
-      if (isZipFile(file)) {
+      // 분기 2: .zip / 영상 → COLMAP 파이프라인. 업로드 시작과 동시에 /dashboard 로 이동.
+      if (isZipFile(file) || isVideoFile(file)) {
         if (fixedContext.purpose === 'basemap') {
           setMessage('Basemap 등록은 .ply / .splat / .sog 파일만 지원합니다.');
           setMessageKind('error');
@@ -237,8 +248,8 @@ export default function MultipartUploader({
           {file ? (
             <div className="text-center px-4">
               <p className="text-sm text-blue-400 font-medium truncate max-w-full">{file.name}</p>
-              {isZipFile(file) && (
-                <p className="text-xs text-emerald-400 mt-1">COLMAP 사진 묶음 — 백그라운드 학습 후 마이페이지에서 결과 확인</p>
+              {(isZipFile(file) || isVideoFile(file)) && (
+                <p className="text-xs text-emerald-400 mt-1">COLMAP 입력 — 백그라운드 학습 후 마이페이지에서 결과 확인</p>
               )}
               {isScene3DFile(file.name) && (
                 <p className="text-xs text-blue-300 mt-1">불러온 PLY 로 곧바로 다듬기 단계가 시작됩니다</p>
@@ -248,14 +259,14 @@ export default function MultipartUploader({
             <>
               <p className="text-sm text-[var(--ink-2)]">파일을 끌어다 놓거나 클릭하여 선택</p>
               <p className="text-xs text-[var(--muted)] mt-1">.ply / .splat / .sog</p>
-              <p className="text-xs text-emerald-600 mt-0.5">또는 사진 묶음 .zip (COLMAP)</p>
+              <p className="text-xs text-emerald-600 mt-0.5">또는 영상 .mp4 / .mov, 사진 묶음 .zip (COLMAP)</p>
             </>
           )}
         </div>
         <input
           ref={fileRef}
           type="file"
-          accept=".ply,.splat,.sog,.zip"
+          accept=".ply,.splat,.sog,.zip,.mp4,.mov,.avi,.mkv,.webm"
           onChange={handleFileChange}
           className="hidden"
           disabled={submitting}

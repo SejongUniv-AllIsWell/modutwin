@@ -17,7 +17,7 @@ interface Props {
   onCollapse: () => void;
 }
 
-const ACCEPT = '.ply,.splat,.sog';
+const ACCEPT = '.ply,.splat,.sog,.zip,.mp4,.mov,.avi,.mkv,.webm';
 
 export default function ViewerSidebar({
   mode, hasMain, hasMetadata, lockedStages, onPickFiles, onToggleMode, hideAlign = false, onCollapse,
@@ -53,7 +53,7 @@ export default function ViewerSidebar({
       <button
         onClick={() => { if (!uploadLocked) fileInputRef.current?.click(); }}
         disabled={uploadLocked}
-        title={uploadLocked ? lockTitle : '로컬 파일 선택 (.ply / .splat / .sog)'}
+        title={uploadLocked ? lockTitle : '로컬 파일 선택 (.ply / .splat / .sog / .mp4 / .zip)'}
         className={`flex flex-col items-center justify-center gap-0.5 w-14 h-9 rounded transition ${
           uploadLocked
             ? lockedClass

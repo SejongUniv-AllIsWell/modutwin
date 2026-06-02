@@ -571,8 +571,65 @@ export default function UnifiedSplatEditor({
   // ── 파일 선택 (로컬, 다중) ──
   // - 메인이 아직 없으면: 첫 파일을 메인으로, 나머지는 추가 레이어
   // - 메인이 이미 있으면: 모두 추가 레이어 (덮어쓰지 않음)
-  const handlePickFiles = useCallback((files: File[]) => {
-    const { valid, rejected } = splitSceneFilesByExtension(files);
+  // - 영상(.mp4/.mov 등) / .zip → COLMAP 파이프라인으로 업로드 후 dashboard 이동
+  const handlePickFiles = useCallback(async (files: File[]) => {
+    const COLMAP_EXTS = new Set(['.zip', '.mp4', '.mov', '.avi', '.mkv', '.webm']);
+    const fileExt = (f: File) => `.${f.name.split('.').pop()?.toLowerCase() ?? ''}`;
+
+    const colmapFiles = files.filter(f => COLMAP_EXTS.has(fileExt(f)));
+    const sceneFiles  = files.filter(f => !COLMAP_EXTS.has(fileExt(f)));
+
+    if (colmapFiles.length > 0) {
+      const file = colmapFiles[0];
+      try {
+        const result = await autoFinalizeFromContext();
+        if (!result) {
+          alert('건물/층/모듈 정보를 확정하지 못했습니다.');
+          return;
+        }
+        const { building_id: buildingId, floor_id: floorId, module_id: moduleId } = result;
+
+        const ext = fileExt(file).replace('.', '');
+        const mimeMap: Record<string, string> = {
+          zip: 'application/zip', mp4: 'video/mp4', mov: 'video/quicktime',
+          avi: 'video/x-msvideo', mkv: 'video/x-matroska', webm: 'video/webm',
+        };
+
+        const initRes = await api.post<{ upload_id: string; minio_upload_id: string; presigned_urls: string[]; part_size: number }>(
+          '/uploads/init',
+          {
+            filename: file.name,
+            file_size: file.size,
+            content_type: file.type || mimeMap[ext] || 'application/octet-stream',
+            building_id: buildingId,
+            floor_id: floorId,
+            module_id: moduleId,
+            ply_target: 'colmap',
+          }
+        );
+
+        // 백그라운드 업로드 후 dashboard 이동
+        (async () => {
+          const { upload_id, minio_upload_id, presigned_urls, part_size } = initRes;
+          const parts: { part_number: number; etag: string }[] = [];
+          for (let i = 0; i < presigned_urls.length; i++) {
+            const start = i * part_size;
+            const chunk = file.slice(start, start + part_size);
+            const res = await fetch(presigned_urls[i], { method: 'PUT', body: chunk });
+            parts.push({ part_number: i + 1, etag: res.headers.get('ETag') ?? '' });
+          }
+          await api.post('/uploads/complete', { upload_id, minio_upload_id, parts });
+        })().catch(() => {});
+
+        router.push('/dashboard');
+        return;
+      } catch (e) {
+        alert(`COLMAP 업로드 실패: ${e instanceof Error ? e.message : String(e)}`);
+        return;
+      }
+    }
+
+    const { valid, rejected } = splitSceneFilesByExtension(sceneFiles);
     if (rejected.length > 0) {
       alert(`지원하지 않는 파일은 무시됨 (.ply / .splat / .sog 만 지원):\n${rejected.join('\n')}`);
     }
