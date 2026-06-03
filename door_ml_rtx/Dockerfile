@@ -37,7 +37,7 @@ WORKDIR /app
 ARG PYTORCH_INDEX_URL=https://download.pytorch.org/whl/cu128
 
 # PyTorch + torchvision (CUDA 12.8 빌드). torchvision 도 같은 인덱스에서 받아야 torch 와 ABI 호환.
-RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel \
+RUN python3 -m pip install --no-cache-dir --ignore-installed "setuptools<81" wheel \
     && python3 -m pip install --no-cache-dir torch torchvision --index-url "${PYTORCH_INDEX_URL}"
 
 COPY requirements.txt .

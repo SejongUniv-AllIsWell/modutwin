@@ -1085,6 +1085,8 @@ export default function UnifiedSplatEditor({
                     const sid = sam3PrepareSessionIdRef.current;
                     if (!sid) {
                       console.warn('[Sam3] 임시 PLY 세션 미확보 — 자동 검출 불가, 수동 지정으로 진행');
+                      setAutoExtracting(false);
+                      setSam3DispatchSent(false);
                       return;
                     }
                     const bake = refine.getRemainingRotationToAY?.() ?? { rotX: 0, rotZ: 0, wallAngleRad: 0 };

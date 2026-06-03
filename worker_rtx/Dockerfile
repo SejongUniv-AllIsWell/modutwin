@@ -55,13 +55,14 @@ ARG GSPLAT_REF=main
 # PyTorch CUDA wheel first, then app deps. gsplat examples/simple_trainer.py is
 # installed from source because the worker calls that script directly.
 COPY requirements.txt .
-RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel \
+RUN python3 -m pip install --no-cache-dir --ignore-installed "setuptools<81" wheel \
     && python3 -m pip install --no-cache-dir torch torchvision --index-url "${PYTORCH_INDEX_URL}" \
     && python3 -m pip install --no-cache-dir -r requirements.txt \
     && git clone https://github.com/nerfstudio-project/gsplat.git "${GSPLAT_REPO}" \
     && cd "${GSPLAT_REPO}" \
     && git fetch --depth=1 origin "${GSPLAT_REF}" \
     && git checkout FETCH_HEAD \
+    && git submodule update --init --recursive \
     && python3 -m pip install --no-cache-dir ninja numpy jaxtyping rich \
     && python3 -m pip install --no-cache-dir --no-build-isolation -e "${GSPLAT_REPO}" \
     && python3 -m pip install --no-cache-dir --no-build-isolation -r "${GSPLAT_REPO}/examples/requirements.txt"
