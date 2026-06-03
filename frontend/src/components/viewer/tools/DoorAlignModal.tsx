@@ -103,6 +103,10 @@ interface Props {
   autoExtractedCorners?: Array<[number, number, number]> | null;
   /** 비정합 문 corners (raw 프레임). 문 설정 완료 시 door mesh texture 를 bake 해 onSetupDoorAssetsFinalized 에 포함. */
   nonAlignmentDoorCorners?: Array<Array<[number, number, number]>> | null;
+  /** door-ml 이 감지한 정합 문의 hinge 변 인덱스 (0..3). null 이면 감지 실패 → 수동 선택 필요. */
+  suggestedHingeEdge?: number | null;
+  /** 비정합 문별 suggested_hinge_edge. nonAlignmentDoorCorners 와 1:1 대응. */
+  nonAlignmentDoorHinges?: Array<number | null> | null;
   /** 사용자가 "문 수동 지정" 을 누르면 호출 — 부모가 autoExtracting 을 false 로 내릴 수 있게. */
   onManualPickStart?: () => void;
   /** "문 설정 완료" 가 성공한 후 호출 — 부모가 정합 단계로 진입할 수 있게.
@@ -308,7 +312,7 @@ function derivePlanesFromMeshSurfaces(surfaces: any[]): SurfacePlane[] {
  * 정합 단계는 별도 `AlignPanel` 이 담당.
  */
 export default function DoorAlignModal({
-  coreRef, uploadId, currentUrl, onDone, onClose, autoExtracting = false, autoExtractedCorners = null, nonAlignmentDoorCorners = null, onManualPickStart, onSetupSaveDone, ensureUploadId, onCommitRefined, getCurrentKeepMask, getBakeRgba, getRemainingRotationToAY, markNextSplatLoadSkipRebake, onMainSplatReplaced, basemapMode = false, basemapEditMode = false, basemapId, basemapUnitName, basemapFloorId, basemapFloorNumber, onBasemapDone, deferPersistenceToAlign = false, onSetupCornersFinalized, onSetupDoorAssetsFinalized, onCleanupOpenChange, sharedAdditional,
+  coreRef, uploadId, currentUrl, onDone, onClose, autoExtracting = false, autoExtractedCorners = null, suggestedHingeEdge = null, nonAlignmentDoorCorners = null, nonAlignmentDoorHinges = null, onManualPickStart, onSetupSaveDone, ensureUploadId, onCommitRefined, getCurrentKeepMask, getBakeRgba, getRemainingRotationToAY, markNextSplatLoadSkipRebake, onMainSplatReplaced, basemapMode = false, basemapEditMode = false, basemapId, basemapUnitName, basemapFloorId, basemapFloorNumber, onBasemapDone, deferPersistenceToAlign = false, onSetupCornersFinalized, onSetupDoorAssetsFinalized, onCleanupOpenChange, sharedAdditional,
 }: Props) {
   const [picked, setPicked] = useState<Array<PickedCorner | null>>(() => emptyPicked());
   // 모듈 등록 흐름: 문 설정 완료 시 메모리 보관 → 정합 완료 시 commit-final 페이로드에 포함.
@@ -862,6 +866,16 @@ export default function DoorAlignModal({
   const [hingeEdge, setHingeEdge] = useState<number | null>(null);
   const hingeEdgeRef = useRef<number | null>(null);
   useEffect(() => { hingeEdgeRef.current = hingeEdge; }, [hingeEdge]);
+
+  // SAM3 자동 감지 hinge 자동 적용 — picked 가 꽉 차고 hingeEdge 가 아직 null 일 때 suggestedHingeEdge 를 자동 세팅.
+  // 사용자가 이미 수동으로 선택한 경우(hingeEdge != null)엔 덮어쓰지 않음.
+  useEffect(() => {
+    if (suggestedHingeEdge === null || suggestedHingeEdge === undefined) return;
+    if (!picked.every(p => p !== null)) return;
+    if (hingeEdge !== null) return;
+    setHingeEdge(suggestedHingeEdge);
+  }, [suggestedHingeEdge, picked, hingeEdge]);
+
   const [edgePickArmed, setEdgePickArmed] = useState(false);
   const edgePickArmedRef = useRef(false);
   useEffect(() => { edgePickArmedRef.current = edgePickArmed; }, [edgePickArmed]);
@@ -2253,7 +2267,9 @@ export default function DoorAlignModal({
       const meshInput = lastDoorMeshInputRef.current;
       const splatBlobUrl = doorSubBlobUrlRef.current;
       const cornersAY = dc.map(c => Array.from(rawToAY(c as Vec3, bakeRot as FrameRotation)));
-      const entry: NonAlignmentDoorEntry = { id: `door_${i + 2}`, cornersAY, wallSurfaceId: bestId, hingeEdge: 3, swing: 1 };
+      // suggested_hinge_edge 우선 사용 → 없으면 현재 정합 문 힌지 → 최후 fallback 3(왼쪽 변)
+      const doorHinge = nonAlignmentDoorHinges?.[i] ?? hingeEdgeRef.current ?? 3;
+      const entry: NonAlignmentDoorEntry = { id: `door_${i + 2}`, cornersAY, wallSurfaceId: bestId, hingeEdge: doorHinge, swing: 1 };
 
       if (meshInput && meshInput.rgba.length > 0) {
         try {
@@ -2280,7 +2296,7 @@ export default function DoorAlignModal({
       results.push(entry);
     }
     return results;
-  }, [nonAlignmentDoorCorners, planes, getCurrentEditorRotation, getRemainingRotationToAY, applyDoorRefine]);
+  }, [nonAlignmentDoorCorners, nonAlignmentDoorHinges, planes, getCurrentEditorRotation, getRemainingRotationToAY, applyDoorRefine]);
 
   // 서버에서 corners 복원 후 1회 자동 문 추출 — 다시 들어와도 회전이 바로 활성.
   // 수동 픽 (사용자가 4점 직접 클릭) 일 때는 발동 안 함 (serverHydratedRef 게이트).
@@ -2903,6 +2919,16 @@ export default function DoorAlignModal({
           </div>
 
           {/* 회전축 변 선택 — 단일 버튼. */}
+          {/* 자동 감지 힌트 배지 */}
+          {allPicked && doorRefineActive && suggestedHingeEdge !== null && (
+            <div className="flex items-center gap-1 text-[10px] text-green-400">
+              <span>✓ 회전축 자동 감지됨</span>
+              <span className="text-[var(--muted)]">(수동 변경 가능)</span>
+            </div>
+          )}
+          {allPicked && doorRefineActive && suggestedHingeEdge === null && hingeEdge === null && (
+            <div className="text-[10px] text-amber-400">! 회전축 수동 선택 필요</div>
+          )}
           <button
             onClick={() => {
               if (edgePickArmed) {

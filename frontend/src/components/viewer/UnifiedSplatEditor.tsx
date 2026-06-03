@@ -129,6 +129,8 @@ export default function UnifiedSplatEditor({
   const [autoExtractedCorners, setAutoExtractedCorners] = useState<Array<[number, number, number]> | null>(null);
   // N-door: 자동 추출된 모든 문 corners (raw 프레임). 3D 윤곽선으로 표시, 클릭으로 정합 문 지정.
   const [allExtractedDoors, setAllExtractedDoors] = useState<Array<Array<[number, number, number]>> | null>(null);
+  // N-door: 각 문의 suggested_hinge_edge (door-ml 에서 감지한 손잡이 반대 변 인덱스, null=미감지).
+  const [allExtractedDoorHinges, setAllExtractedDoorHinges] = useState<Array<number | null> | null>(null);
   const [alignmentDoorIdx, setAlignmentDoorIdx] = useState<number>(0); // 정합 문 index (기본 0)
   const [nDoorHoverIdx, setNDoorHoverIdx] = useState<number | null>(null);
   const nDoorOutlinesRef = useRef<any[]>([]); // PlayCanvas DoorOutlineHandle[]
@@ -774,6 +776,7 @@ export default function UnifiedSplatEditor({
       nDoorOutlinesRef.current.forEach(h => { try { h.destroy(); } catch {} });
       nDoorOutlinesRef.current = [];
       setAllExtractedDoors(null);
+      setAllExtractedDoorHinges(null);
     }
   }, [mode]);
 
@@ -1020,9 +1023,19 @@ export default function UnifiedSplatEditor({
               onClose={() => { if (!isBasemapPurpose) { void handleToggleMode('align'); } }}
               autoExtracting={autoExtracting}
               autoExtractedCorners={autoExtractedCorners}
+              suggestedHingeEdge={
+                allExtractedDoorHinges && allExtractedDoorHinges.length > alignmentDoorIdx
+                  ? allExtractedDoorHinges[alignmentDoorIdx]
+                  : null
+              }
               nonAlignmentDoorCorners={
                 allExtractedDoors && allExtractedDoors.length > 1
                   ? allExtractedDoors.filter((_, i) => i !== alignmentDoorIdx)
+                  : null
+              }
+              nonAlignmentDoorHinges={
+                allExtractedDoorHinges && allExtractedDoors && allExtractedDoors.length > 1
+                  ? allExtractedDoorHinges.filter((_, i) => i !== alignmentDoorIdx)
                   : null
               }
               basemapMode={isBasemapPurpose}
@@ -1230,7 +1243,7 @@ export default function UnifiedSplatEditor({
                     const roomFrame = refine.getRefinedRoomFrame?.() ?? null;
                     const resp = await api.post<{
                       corners: { left_top: { x: number; y: number; z: number }; right_top: { x: number; y: number; z: number }; right_bottom: { x: number; y: number; z: number }; left_bottom: { x: number; y: number; z: number } };
-                      all_doors?: Array<{ left_top: { x: number; y: number; z: number }; right_top: { x: number; y: number; z: number }; right_bottom: { x: number; y: number; z: number }; left_bottom: { x: number; y: number; z: number } }>;
+                      all_doors?: Array<{ left_top: { x: number; y: number; z: number }; right_top: { x: number; y: number; z: number }; right_bottom: { x: number; y: number; z: number }; left_bottom: { x: number; y: number; z: number }; suggested_hinge_edge?: number | null }>;
                     }>(
                       '/uploads/sam3/detect-temp',
                       {
@@ -1265,6 +1278,9 @@ export default function UnifiedSplatEditor({
                     // N-door: all_doors 파싱
                     const rawAllDoors = (resp.all_doors ?? [resp.corners]).map(cornersAYtoRaw);
                     setAllExtractedDoors(rawAllDoors);
+                    // N-door: suggested_hinge_edge 파싱 (없으면 null)
+                    const hinges = (resp.all_doors ?? []).map(d => d.suggested_hinge_edge ?? null);
+                    setAllExtractedDoorHinges(hinges.length > 0 ? hinges : null);
                     setAlignmentDoorIdx(0); // score 최고(첫 번째)를 기본 정합 문으로
                     // 정합 문(idx=0) corners 를 autoExtractedCorners 에 세팅
                     setAutoExtractedCorners(primaryOrder);
