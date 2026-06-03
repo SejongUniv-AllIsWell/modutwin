@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 
 # NVIDIA GB10 (Grace Blackwell, compute capability 12.1) 호환성:
 # 현재 PyTorch 2.12.0.dev는 sm_80/90/100/120까지만 컴파일됨. JIT(nvrtc)이 12.1 기반
@@ -49,7 +50,8 @@ from .room.wall_planes import build_wall_planes, ray_wall_hit, pick_door_wall
 
 
 from .segmentation.sam3_runner import list_input_pngs, run_sam3
-from .view_selection.iterative_approach import run_iterative_approach
+from .view_selection.iterative_approach import run_iterative_approach, analyze_mask_quad, IterativeView
+from .view_selection.filter import SelectedView, ViewSelection
 from .corner_extraction.ordering import order_all_selected
 from .triangulation.ray import (
     Ray,
@@ -250,6 +252,33 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     cache_dir = _resolve_cache_dir(args)
+
+    # Phase 타이머
+    _t_pipeline_start = time.perf_counter()
+    _t_phase: dict[str, float] = {}
+
+    def _tick(phase: str) -> None:
+        """Phase 시작 시 호출 — 직전 Phase 경과 시간 출력 후 새 Phase 시작."""
+        now = time.perf_counter()
+        if _t_phase:
+            prev_phase, prev_t = next(reversed(_t_phase.items())), list(_t_phase.values())[-1]
+            prev_name = list(_t_phase.keys())[-1]
+            elapsed = now - prev_t
+            print(f"[Timer] {prev_name} → {elapsed:.1f}s", file=sys.stderr)
+        _t_phase[phase] = now
+
+    def _tock() -> None:
+        """파이프라인 종료 시 마지막 Phase + 전체 시간 출력."""
+        now = time.perf_counter()
+        if _t_phase:
+            elapsed = now - list(_t_phase.values())[-1]
+            print(f"[Timer] {list(_t_phase.keys())[-1]} → {elapsed:.1f}s", file=sys.stderr)
+        total = now - _t_pipeline_start
+        summary = "  ".join(f"{k} {v:.1f}s" for k, v in
+                            zip(list(_t_phase.keys()), [list(_t_phase.values())[i+1] - t
+                                if i+1 < len(_t_phase) else now - t
+                                for i, t in enumerate(_t_phase.values())]))
+        print(f"[Timer] total {total:.1f}s | {summary}", file=sys.stderr)
     os.makedirs(cache_dir, exist_ok=True)
 
     config = PipelineConfig(
@@ -294,6 +323,7 @@ def main(argv: list[str] | None = None) -> int:
     real_ceiling_y = min(float(args.floor_y), float(args.ceiling_y)) if known_room else None
 
     # ------------------------------------------------------------------
+    _tick("Phase1")
     # Phase 1 — Room interior estimation (or known-room from refine)
     # ------------------------------------------------------------------
     if known_room:
@@ -340,6 +370,7 @@ def main(argv: list[str] | None = None) -> int:
     # ------------------------------------------------------------------
     # Phase 2 — Coarse view generation (sphere inside room) + RGB render
     # ------------------------------------------------------------------
+    _tick("Phase2-render")
     print("[Phase 2] sampling coarse cameras + rendering ...", file=sys.stderr)
     coarse_dir = os.path.join(cache_dir, "coarse")
     coarse_renders_dir = os.path.join(coarse_dir, "renders")
@@ -488,6 +519,7 @@ def main(argv: list[str] | None = None) -> int:
     # ------------------------------------------------------------------
     # Phase 3 — SAM3 first pass (confidence ≥ 0.8, D2)
     # ------------------------------------------------------------------
+    _tick("Phase3-SAM3")
     print(f"[Phase 3] running SAM3 on {len(saved_pngs)} coarse views ...", file=sys.stderr)
     coarse_image_paths = list_input_pngs(coarse_renders_dir)
     sam3_summary = run_sam3(
@@ -511,43 +543,88 @@ def main(argv: list[str] | None = None) -> int:
 
     # ------------------------------------------------------------------
     # Phase 4-6 — Iterative door approach
-    #   - top-3 coarse candidates → 최대 5회 접근 반복
-    #   - 사다리꼴 분석으로 카메라 position + rotation 보정
-    #   - score 개선 시 계속, 감소 시 다음 후보
-    #   - 조기 종료: h_ratio/v_ratio ≥ 0.85 && all_corners_visible
+    #   - coarse 뷰에서 이미 4코너 보이면 iterative 전체 skip (SAM3 재로딩 불필요)
+    #   - 없으면 top-3 후보 접근 반복
     # ------------------------------------------------------------------
+    _tick("Phase4-6-iterative")
     print("[Phase 4-6] iterative door approach ...", file=sys.stderr)
-    iterative_dir = os.path.join(cache_dir, "iterative")
 
-    splats = load_ply(args.ply)  # 다시 로드 (Phase 2 렌더 후 del 했음)
-    _means_air_for_iter = means_air if args.camera_mode == "walk" else None
-    all_iterative_views, selection, iterative_cam_by_key = run_iterative_approach(
-        coarse_summary=sam3_summary,
-        coarse_cameras=coarse_cameras,
-        splats=splats,
-        room_center=np.asarray(room_info.room_center, dtype=np.float64),
-        horizontal_half_extent=horizontal_half if args.camera_mode == "walk" else r_coarse,
-        iterative_dir=iterative_dir,
-        prompt=args.prompt,
-        confidence_threshold=args.sam3_prob,
-        device=args.device,
-        checkpoint_path=args.sam3_checkpoint,
-        means_for_air_check=_means_air_for_iter,
-        air_radius=args.air_radius,
-        air_max_count=args.air_max_count,
-        cam_rot=cam_rot,
-        require_all_corners=wall_poly is None,
-    )
-    del splats
-    print(
-        f"[Phase 4-6] iterative: {len(all_iterative_views)} good views, "
-        f"selected {selection.n_selected} after diversity filter",
-        file=sys.stderr,
-    )
+    # ── coarse fast-path: 4코너 다 보이는 뷰가 이미 있으면 iterative skip ──
+    from PIL import Image as _PILImage
+    _coarse_cam_map = {c.view_idx: c for c in coarse_cameras}
+    _fast_views: list[IterativeView] = []
+    for _v in sorted(sam3_summary["views"], key=lambda x: -(x.get("max_score") or 0)):
+        if not _v.get("mask_path"):
+            continue
+        _cam = _coarse_cam_map.get(_v["view_idx"])
+        if _cam is None:
+            continue
+        _mask = np.asarray(_PILImage.open(_v["mask_path"]).convert("L")) > 127
+        _m = analyze_mask_quad(_mask, img_size=_cam.w)
+        if _m is None or not _m.all_corners_visible:
+            continue
+        _fast_views.append(IterativeView(
+            camera=_cam,
+            render_path="",
+            mask_path=_v["mask_path"],
+            score=float(_v["max_score"]),
+            coverage=float(_m.coverage),
+            h_ratio=float(_m.h_ratio),
+            v_ratio=float(_m.v_ratio),
+            all_corners_visible=True,
+            iteration=0,
+            candidate_rank=0,
+        ))
+
+    if _fast_views:
+        # 4코너 보이는 coarse 뷰로 바로 확정 — iterative 전체 skip
+        all_iterative_views = _fast_views
+        _sel_views = [
+            SelectedView(source="coarse", view_idx=iv.camera.view_idx,
+                         score=iv.score, mask_path=iv.mask_path,
+                         mask_area_ratio=iv.coverage)
+            for iv in _fast_views
+        ]
+        selection = ViewSelection(selected=_sel_views, rejected=[],
+                                  n_selected=len(_sel_views), n_rejected=0)
+        iterative_cam_by_key: dict = {}
+        print(
+            f"[Phase 4-6] SKIP iterative — {len(_fast_views)} coarse view(s) already "
+            f"show all 4 corners (best score={_fast_views[0].score:.3f})",
+            file=sys.stderr,
+        )
+    else:
+        iterative_dir = os.path.join(cache_dir, "iterative")
+        splats = load_ply(args.ply)
+        _means_air_for_iter = means_air if args.camera_mode == "walk" else None
+        all_iterative_views, selection, iterative_cam_by_key = run_iterative_approach(
+            coarse_summary=sam3_summary,
+            coarse_cameras=coarse_cameras,
+            splats=splats,
+            room_center=np.asarray(room_info.room_center, dtype=np.float64),
+            horizontal_half_extent=horizontal_half if args.camera_mode == "walk" else r_coarse,
+            iterative_dir=iterative_dir,
+            prompt=args.prompt,
+            confidence_threshold=args.sam3_prob,
+            device=args.device,
+            checkpoint_path=args.sam3_checkpoint,
+            means_for_air_check=_means_air_for_iter,
+            air_radius=args.air_radius,
+            air_max_count=args.air_max_count,
+            cam_rot=cam_rot,
+            require_all_corners=wall_poly is None,
+        )
+        del splats
+        print(
+            f"[Phase 4-6] iterative: {len(all_iterative_views)} good views, "
+            f"selected {selection.n_selected} after diversity filter",
+            file=sys.stderr,
+        )
 
     # ------------------------------------------------------------------
     # Phase 7+8 — Quadrilateral extraction + LT/RT/LB/RB ordering (chained)
     # ------------------------------------------------------------------
+    _tick("Phase7+8-quad")
     print("[Phase 7+8] extracting quadrilaterals + ordering corners ...", file=sys.stderr)
     cam_by_key: dict = {("coarse", c.view_idx): c for c in coarse_cameras}
     cam_by_key.update(iterative_cam_by_key)
@@ -566,6 +643,7 @@ def main(argv: list[str] | None = None) -> int:
     # ------------------------------------------------------------------
     # Phase 9 — World-space ray generation (4 corners × N views)
     # ------------------------------------------------------------------
+    _tick("Phase9-11-rays+corners")
     print("[Phase 9] generating world-space rays ...", file=sys.stderr)
     all_rays: list[Ray] = []
     CORNER_KEYS_TUPLE = ("left_top", "right_top", "left_bottom", "right_bottom")
@@ -609,29 +687,61 @@ def main(argv: list[str] | None = None) -> int:
             )
         door_wall = walls[wall_idx]
 
-        def _corner_on_wall(ck: str):
-            pts = []
-            for (o, dr) in _rays_of(ck):
-                p = ray_wall_hit(o, dr, door_wall)
-                if p is not None:
-                    pts.append(p)
-            if not pts:
-                return None
-            return np.mean(np.stack(pts, axis=0), axis=0)
+        # 4코너 보이는 best view 탐색:
+        # ordered_cache.views 는 all_corners_visible DESC 로 정렬된 good view 들 중
+        # quad+ordering 통과한 것. 같은 정렬 순서를 유지하므로 앞 쪽이 best.
+        # all_iterative_views 에서 (source, view_idx) → all_corners_visible 매핑 구성.
+        _all_vis_map: dict[tuple, bool] = {
+            ("coarse" if v.iteration == 0 else "iterative", v.camera.view_idx): v.all_corners_visible
+            for v in all_iterative_views
+        }
+        best_4corner_ov = next(
+            (ov for ov in ordered_cache.views if _all_vis_map.get((ov.source, ov.view_idx), False)),
+            None,
+        )
+        has_4corner_view = best_4corner_ov is not None
 
-        tl = _corner_on_wall("left_top")
-        tr = _corner_on_wall("right_top")
-        if tl is None or tr is None:
-            raise RuntimeError("Phase 10: 상단 코너 ray∩벽평면 교점 실패. (D10)")
+        def _single_view_hit(ov, ck: str):
+            """단일 뷰 픽셀 → ray → 벽 교점. 교점 없으면 None."""
+            cam = cam_by_key[(ov.source, ov.view_idx)]
+            u_s, v_s = getattr(ov, ck)
+            u_o, v_o = pixel_rotate_cw_to_orig(u_s, v_s, cam.w)
+            r = pixel_to_world_ray(u_o, v_o, np.asarray(cam.K, dtype=np.float64),
+                                   np.asarray(cam.c2w, dtype=np.float64))
+            return ray_wall_hit(r.origin, r.direction, door_wall)
+
+        def _corner_on_wall_avg(ck: str):
+            """다중 뷰 ray → 벽 교점 평균 (상단 2코너 전용)."""
+            pts = [p for (o, dr) in _rays_of(ck)
+                   if (p := ray_wall_hit(o, dr, door_wall)) is not None]
+            return np.mean(np.stack(pts, axis=0), axis=0) if pts else None
 
         floor_y = float(real_floor_y)
-        bl = _corner_on_wall("left_bottom")
-        br = _corner_on_wall("right_bottom")
-        bottom_source = "ray∩wall"
-        if bl is None or br is None:
+
+        if has_4corner_view:
+            # ── 4코너 보이는 best single view: 각 코너 ray 1개로 즉시 확정 ──
+            tl = _single_view_hit(best_4corner_ov, "left_top")
+            tr = _single_view_hit(best_4corner_ov, "right_top")
+            bl = _single_view_hit(best_4corner_ov, "left_bottom")
+            br = _single_view_hit(best_4corner_ov, "right_bottom")
+            if tl is None or tr is None:
+                raise RuntimeError("Phase 10: 4코너 best view 상단 교점 실패. (D10)")
+            # 하단도 교점 실패 시에만 floorY fallback (정상이면 실제 교점 사용)
+            bottom_source = f"single-view (v{best_4corner_ov.view_idx})"
+            if bl is None or br is None:
+                bl = np.array([tl[0], floor_y, tl[2]], dtype=np.float64)
+                br = np.array([tr[0], floor_y, tr[2]], dtype=np.float64)
+                bottom_source += f" + floorY={floor_y:.3f} fallback"
+        else:
+            # ── 상단 2코너만 보임: 다중 뷰 평균으로 상단 확정,
+            #    하단은 ray 없이 바로 상단 XZ → floorY 수직 하강 ──
+            tl = _corner_on_wall_avg("left_top")
+            tr = _corner_on_wall_avg("right_top")
+            if tl is None or tr is None:
+                raise RuntimeError("Phase 10: 상단 코너 ray∩벽평면 교점 실패. (D10)")
             bl = np.array([tl[0], floor_y, tl[2]], dtype=np.float64)
             br = np.array([tr[0], floor_y, tr[2]], dtype=np.float64)
-            bottom_source = f"floorY={floor_y:.3f} fallback"
+            bottom_source = f"top-2-only → floorY={floor_y:.3f}"
 
         corners_3d_dict = {
             "left_top": tuple(float(x) for x in tl),
@@ -645,7 +755,7 @@ def main(argv: list[str] | None = None) -> int:
                 mean_perp_dist=0.0, max_perp_dist=0.0, condition_number=1.0,
             )
         print(
-            f"[Phase 10] wall #{wall_idx} | "
+            f"[Phase 10] wall #{wall_idx} | {'4-corner' if has_4corner_view else 'top-2'} mode | "
             f"TL={tuple(round(x,3) for x in tl)} TR={tuple(round(x,3) for x in tr)} | "
             f"BL={tuple(round(x,3) for x in bl)} ({bottom_source})",
             file=sys.stderr,
@@ -701,6 +811,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     write_result(result, args.output_json)
+    _tock()
     print(f"[done] result written to {args.output_json}", file=sys.stderr)
     return 0
 
