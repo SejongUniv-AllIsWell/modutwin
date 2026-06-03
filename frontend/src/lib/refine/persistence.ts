@@ -32,7 +32,7 @@ export interface PersistedRefineState {
 
   wallConfirmed: boolean;
   // 벽 베이크용 Y회전 (도). 폴리곤의 PCA 또는 첫 변 방향 등에서 derive. 폴리곤 변경 시에도
-  // 일관된 베이크 회전을 위해 한 번 freeze 한다 (Phase 4 에서 정책 확정).
+  // 일관된 베이크 회전을 위해 확정 시점의 값을 저장한다.
   wallAngle: number | null;
   // 사용자가 정의한 벽 폴리곤. 4점이면 직사각, N점이면 N각형. surfacePlanesFromPolygon 입력.
   wallPolygon: WallPolygonPoint[] | null;

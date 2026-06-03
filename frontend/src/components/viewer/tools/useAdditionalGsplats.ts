@@ -56,14 +56,31 @@ export interface AdditionalGsplatsApi {
   getEntity: (id: string) => any | null;
   /** 부분 업데이트 (이름/visible/meta 등) */
   update: (id: string, patch: Partial<Pick<AdditionalGsplat, 'name' | 'source' | 'visible' | 'meta'>>) => void;
-  /** 항목을 목록에서 제거하면서 URL 소유권을 호출자에게 이전 (blob revoke 안 함). PlayCanvas entity/asset은 제거. */
+  /** 항목을 목록에서 제거하면서 URL 소유권을 호출자에게 넘긴다 (blob revoke 안 함). PlayCanvas entity/asset은 제거. */
   detach: (id: string) => DetachedLayer | null;
   /**
    * 모든 entity/asset을 현재 PlayCanvas app에 다시 만든다.
    * SplatViewerCore가 reload되어 app 인스턴스가 바뀐 뒤 호출.
-   * 기존 entity/asset 참조는 (이미 destroy된 app에 속해 있어) 그냥 버린다.
+   * app 교체 전 entity/asset 참조는 파기된 PlayCanvas app 소속이므로 폐기한다.
    */
   refreshAll: () => void;
+  /**
+   * 천장제거 마스크 — baked frame `posY < visualCeilingY + cutoff` 인 splat 의 alpha 를 0 으로 만든다.
+   * 'restore' 시 원본 alpha 복원. asset.ready 전 호출은 조용히 skip — 호출자가 `.ready` 콜백에서 재호출.
+   *
+   * 좌표 규약 (claude.md:78-80):
+   *  - 코드 surfaceId 'ceiling' (PLY +Y) = 화면상 방 **바닥**
+   *  - 코드 surfaceId 'floor'   (PLY -Y) = 화면상 방 **천장**  ← 이 surface 의 baked Y 가 visualCeilingY
+   *  - "위에서 내려다볼 때" 시야를 막는 면 = visual ceiling = 'floor' surface
+   *  - baked frame 에서 방 내부 = visualCeilingY < posY < (코드 'ceiling'). cutoff 는 안쪽(+baked Y) 방향.
+   *  - 따라서 hide 영역 = `posY < visualCeilingY + cutoff` (visual ceiling 자체 + 안쪽 cutoff 너머).
+   *
+   * @param id 대상 gsplat id
+   * @param visualCeilingY mesh.json 의 surfaceId='floor' surface corners[0][1] (baked frame Y)
+   * @param cutoff visual ceiling 에서 방 내부로 안쪽 오프셋 (m, 보통 5cm)
+   * @param mode 'remove' 면 visual ceiling 위 alpha=0, 'restore' 면 원본 alpha 복원
+   */
+  applyCeilingMask: (id: string, visualCeilingY: number, cutoff: number, mode: 'remove' | 'restore') => void;
 }
 
 /**
@@ -88,6 +105,16 @@ export function useAdditionalGsplats(
   const urlMapRef = useRef<Map<string, string>>(new Map());
   // id → ready Promise resolver/rejector (asset.ready / asset.error 시 호출).
   const readyMapRef = useRef<Map<string, { resolve: () => void; reject: (e: Error) => void }>>(new Map());
+
+  // 천장제거 마스킹용 snapshot — asset.ready 직후 1회 캡처. 외부에서 applyCeilingMask 로 alpha 변경 시
+  // origColor 의 alpha 채널을 복원 기준으로 사용. posY 는 baked frame 좌표 (PLY 원본).
+  type ColorSnapshot = {
+    origColor: Uint16Array;     // RGBA half-float (rgb + alpha 모두 원본 보존)
+    posY: Float32Array;         // baked frame Y
+    colorTexture: any;          // PlayCanvas texture (lock/unlock 대상)
+    numSplats: number;
+  };
+  const colorSnapshotMapRef = useRef<Map<string, ColorSnapshot>>(new Map());
 
   const revokeIfBlob = (url: string) => {
     if (url.startsWith('blob:')) {
@@ -129,7 +156,7 @@ export function useAdditionalGsplats(
           if (r) { r.reject(new Error('cancelled')); readyMapRef.current.delete(id); }
           return;
         }
-        const ent = new pc.Entity(`add_splat_${id}`);
+        const ent = new pc.Entity(`add_splat_${id}`, app);
         if (ext !== 'spz') {
           // PLY 컨벤션: Z축 180° 회전 (SuperSplat과 동일)
           ent.setLocalEulerAngles(0, 0, 180);
@@ -145,6 +172,29 @@ export function useAdditionalGsplats(
         const parent = (alignGroup && source !== 'basemap') ? alignGroup : app.root;
         parent.addChild(ent);
         entityMapRef.current.set(id, ent);
+
+        // 천장제거 마스킹용 snapshot — posY (baked) + colorTexture + 원본 alpha (half-float) 캡처.
+        // 실패해도 (예: streams 구조 변경) 다른 기능에는 영향 없음. 마스킹만 no-op.
+        try {
+          const resource = (asset as any).resource;
+          const gsplatData = resource?.gsplatData;
+          const colorTex = resource?.streams?.textures?.get('splatColor') ?? null;
+          if (gsplatData && colorTex) {
+            const posY = gsplatData.getProp('y') as Float32Array;
+            const td = colorTex.lock();
+            if (td) {
+              const origColor = new Uint16Array(td.length);
+              origColor.set(td);
+              colorTex.unlock();
+              colorSnapshotMapRef.current.set(id, {
+                origColor, posY, colorTexture: colorTex, numSplats: gsplatData.numSplats,
+              });
+            }
+          }
+        } catch (e) {
+          console.warn('[useAdditionalGsplats] color snapshot failed for', id, e);
+        }
+
         setItems(prev => prev.map(it => it.id === id ? { ...it, loaded: true, error: null } : it));
         const r = readyMapRef.current.get(id);
         if (r) { r.resolve(); readyMapRef.current.delete(id); }
@@ -169,7 +219,37 @@ export function useAdditionalGsplats(
     // 미해결 ready Promise 가 있으면 reject (await 가 hang 되지 않도록).
     const r = readyMapRef.current.get(id);
     if (r) { r.reject(new Error('removed before ready')); readyMapRef.current.delete(id); }
+    // 천장제거 snapshot 도 함께 정리 (colorTexture 는 asset 소유라 자동 GC).
+    colorSnapshotMapRef.current.delete(id);
     setItems(prev => prev.filter(it => it.id !== id));
+  }, [coreRef]);
+
+  const applyCeilingMask = useCallback((
+    id: string, visualCeilingY: number, cutoff: number, mode: 'remove' | 'restore',
+  ) => {
+    const snap = colorSnapshotMapRef.current.get(id);
+    if (!snap) return;  // asset.ready 전에는 호출자가 ready 직후 다시 적용한다.
+    const core = coreRef.current;
+    if (!core) return;
+    const f2h = core.float2Half;
+    const data = snap.colorTexture.lock?.();
+    if (!data) return;
+    // visual ceiling 의 baked Y + 방 내부 방향(+baked Y) 안쪽 cutoff 까지 hide.
+    const threshold = visualCeilingY + cutoff;
+    const zeroH = f2h(0);
+    const orig = snap.origColor;
+    const posY = snap.posY;
+    const N = snap.numSplats;
+    if (mode === 'remove') {
+      for (let i = 0; i < N; i++) {
+        const aboveVisualCeiling = posY[i] < threshold;
+        data[i*4+3] = aboveVisualCeiling ? zeroH : orig[i*4+3];
+      }
+    } else {
+      // restore: alpha 만 원본으로 복원 (RGB 는 다른 기능이 건드릴 수 있어 건드리지 않음).
+      for (let i = 0; i < N; i++) data[i*4+3] = orig[i*4+3];
+    }
+    snap.colorTexture.unlock();
   }, [coreRef]);
 
   const add = useCallback((url: string, opts?: AddOptions): AddResult => {
@@ -243,6 +323,7 @@ export function useAdditionalGsplats(
     assetMapRef.current.delete(id);
     // URL은 revoke하지 않는다 — 호출자가 이어받음
     urlMapRef.current.delete(id);
+    colorSnapshotMapRef.current.delete(id);
 
     setItems(prev => prev.filter(it => it.id !== id));
 
@@ -256,13 +337,15 @@ export function useAdditionalGsplats(
   }, [coreRef]);
 
   const refreshAll = useCallback(() => {
-    // 1) 진행 중 로드 모두 취소 (asset.ready 콜백이 새 app과 무관하게 발화하지 않도록)
+    // 1) 진행 중 로드 모두 취소
     cancelMapRef.current.forEach(c => { try { c(); } catch {} });
     cancelMapRef.current.clear();
-    // 2) 옛 app에 속한 entity/asset 참조는 그냥 버린다 (app.destroy가 정리함)
+    // 2) 현재 app 에 묶인 entity/asset 참조 초기화
     entityMapRef.current.clear();
     assetMapRef.current.clear();
-    // 3) 모든 항목을 unloaded로 표시 후 새 app에 재로드
+    // colorTexture snapshot 도 현재 app 리소스 기준으로 다시 만든다.
+    colorSnapshotMapRef.current.clear();
+    // 3) 모든 항목을 unloaded 로 표시 후 현재 app 에 재로드
     const list = itemsRef.current;
     setItems(prev => prev.map(it => ({ ...it, loaded: false, error: null })));
     list.forEach(item => loadEntity(item.id, item.url, item.source, item.visible));
@@ -282,8 +365,9 @@ export function useAdditionalGsplats(
       assetMapRef.current.clear();
       urlMapRef.current.forEach(url => revokeIfBlob(url));
       urlMapRef.current.clear();
+      colorSnapshotMapRef.current.clear();
     };
   }, [coreRef]);
 
-  return { items, add, remove, setTransform, setVisible, getEntity, update, detach, refreshAll };
+  return { items, add, remove, setTransform, setVisible, getEntity, update, detach, refreshAll, applyCeilingMask };
 }

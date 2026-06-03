@@ -2,6 +2,7 @@
 
 import { useRef, useState, useCallback, useEffect, RefObject } from 'react';
 import { SplatData, SplatViewerCoreRef } from '../SplatViewerCore';
+import { gsplatVisibleSigmaRadius, sigmoidOpacity } from '@/lib/gs/playcanvasGsplat';
 
 type SelectTool = 'none' | 'paint' | 'bbox';
 type PaintMode = 'union' | 'diff';
@@ -221,11 +222,64 @@ export function useGaussianSelector(
     if (!canvas || !cameraEntity) return;
 
     let painting = false;
+    let lastBrushPoint: { x: number; y: number } | null = null;
     let bboxDragAxis = -1;
     let bboxDragIsMax = false;
     let bboxDragStartVal = 0;
     let bboxDragStartMouseY = 0;
     let bboxDragScale = 1;
+
+    const projectSplatPoint = (m: Float32Array | number[], x: number, y: number, z: number, w: number, h: number): { x: number; y: number } | null => {
+      const clipW = m[3] * x + m[7] * y + m[11] * z + m[15];
+      if (clipW <= 0.01) return null;
+      const invW = 1 / clipW;
+      return {
+        x: ((m[0] * x + m[4] * y + m[8] * z + m[12]) * invW + 1) * 0.5 * w,
+        y: (1 - (m[1] * x + m[5] * y + m[9] * z + m[13]) * invW) * 0.5 * h,
+      };
+    };
+
+    const projectedSplatScreenRadius = (
+      splatData: SplatData,
+      m: Float32Array | number[],
+      i: number,
+      center: { x: number; y: number },
+      w: number,
+      h: number,
+    ): number => {
+      const sc0 = splatData.gsplatData?.getProp?.('scale_0') as Float32Array | undefined;
+      const sc1 = splatData.gsplatData?.getProp?.('scale_1') as Float32Array | undefined;
+      const sc2 = splatData.gsplatData?.getProp?.('scale_2') as Float32Array | undefined;
+      const r0 = splatData.gsplatData?.getProp?.('rot_0') as Float32Array | undefined;
+      const r1 = splatData.gsplatData?.getProp?.('rot_1') as Float32Array | undefined;
+      const r2 = splatData.gsplatData?.getProp?.('rot_2') as Float32Array | undefined;
+      const r3 = splatData.gsplatData?.getProp?.('rot_3') as Float32Array | undefined;
+      const opacity = splatData.gsplatData?.getProp?.('opacity') as Float32Array | undefined;
+      if (!sc0 || !sc1 || !sc2 || !r0 || !r1 || !r2 || !r3) return 0;
+      const k = gsplatVisibleSigmaRadius(opacity ? sigmoidOpacity(opacity[i]) : 1);
+      if (!(k > 0)) return 0;
+      const qw0 = r0[i], qx0 = r1[i], qy0 = r2[i], qz0 = r3[i];
+      const qLen = Math.hypot(qw0, qx0, qy0, qz0) || 1;
+      const qw = qw0 / qLen, qx = qx0 / qLen, qy = qy0 / qLen, qz = qz0 / qLen;
+      const xx = qx * qx, yy = qy * qy, zz = qz * qz;
+      const xy = qx * qy, xz = qx * qz, yz = qy * qz;
+      const wx = qw * qx, wy = qw * qy, wz = qw * qz;
+      const s0 = Math.exp(sc0[i]) * k;
+      const s1 = Math.exp(sc1[i]) * k;
+      const s2 = Math.exp(sc2[i]) * k;
+      const axes = [
+        [(1 - 2 * (yy + zz)) * s0, (2 * (xy + wz)) * s0, (2 * (xz - wy)) * s0],
+        [(2 * (xy - wz)) * s1, (1 - 2 * (xx + zz)) * s1, (2 * (yz + wx)) * s1],
+        [(2 * (xz + wy)) * s2, (2 * (yz - wx)) * s2, (1 - 2 * (xx + yy)) * s2],
+      ] as const;
+      let radius = 0;
+      for (const axis of axes) {
+        const p = projectSplatPoint(m, splatData.posX[i] + axis[0], splatData.posY[i] + axis[1], splatData.posZ[i] + axis[2], w, h);
+        if (!p) continue;
+        radius = Math.max(radius, Math.hypot(p.x - center.x, p.y - center.y));
+      }
+      return radius;
+    };
 
     const applyBrush = (mouseX: number, mouseY: number) => {
       const splatData = coreRef.current?.getSplatData();
@@ -242,22 +296,39 @@ export function useGaussianSelector(
       mvpMat.mul2(vpMat, splatData.splatEntity.getWorldTransform());
       const m = mvpMat.data;
       const w = canvas.clientWidth, h = canvas.clientHeight;
-      const r2 = brushSizeRef.current * brushSizeRef.current;
+      const brushRadius = brushSizeRef.current;
       const isUnion = paintModeRef.current === 'union';
 
       for (let i = 0; i < splatData.numSplats; i++) {
-        const px = splatData.posX[i], py = splatData.posY[i], pz = splatData.posZ[i];
-        const clipW = m[3] * px + m[7] * py + m[11] * pz + m[15];
-        if (clipW <= 0.01) continue;
-        const invW = 1 / clipW;
-        const sx = ((m[0] * px + m[4] * py + m[8] * pz + m[12]) * invW + 1) * 0.5 * w;
-        const sy = (1 - (m[1] * px + m[5] * py + m[9] * pz + m[13]) * invW) * 0.5 * h;
-        const dx = sx - mouseX, dy = sy - mouseY;
-        if (dx * dx + dy * dy < r2) {
+        const center = projectSplatPoint(m, splatData.posX[i], splatData.posY[i], splatData.posZ[i], w, h);
+        if (!center) continue;
+        const splatRadius = projectedSplatScreenRadius(splatData, m, i, center, w, h);
+        const hitRadius = brushRadius + splatRadius;
+        const dx = center.x - mouseX, dy = center.y - mouseY;
+        if (dx * dx + dy * dy <= hitRadius * hitRadius) {
           sel.selected[i] = isUnion ? 1 : 0;
         }
       }
       refreshHighlight();
+    };
+
+    const applyBrushStroke = (mouseX: number, mouseY: number) => {
+      const prev = lastBrushPoint;
+      if (!prev) {
+        applyBrush(mouseX, mouseY);
+        lastBrushPoint = { x: mouseX, y: mouseY };
+        return;
+      }
+      const dx = mouseX - prev.x;
+      const dy = mouseY - prev.y;
+      const dist = Math.hypot(dx, dy);
+      const step = Math.max(1, brushSizeRef.current * 0.5);
+      const steps = Math.max(1, Math.ceil(dist / step));
+      for (let i = 1; i <= steps; i++) {
+        const t = i / steps;
+        applyBrush(prev.x + dx * t, prev.y + dy * t);
+      }
+      lastBrushPoint = { x: mouseX, y: mouseY };
     };
 
     const pickBboxFace = (mouseX: number, mouseY: number): { axis: number; isMax: boolean } | null => {
@@ -306,9 +377,10 @@ export function useGaussianSelector(
 
       if (e.button === 0 && tool === 'paint') {
         painting = true;
+        lastBrushPoint = null;
         pushHistory();
         const rect = canvas.getBoundingClientRect();
-        applyBrush(e.clientX - rect.left, e.clientY - rect.top);
+        applyBrushStroke(e.clientX - rect.left, e.clientY - rect.top);
         return;
       }
 
@@ -340,6 +412,7 @@ export function useGaussianSelector(
     const onMouseUp = (e: MouseEvent) => {
       if (e.button === 0) {
         painting = false;
+        lastBrushPoint = null;
         bboxDragAxis = -1;
       }
     };
@@ -352,6 +425,7 @@ export function useGaussianSelector(
     };
     const onMouseLeave = () => {
       if (brushCursorRef.current) brushCursorRef.current.style.display = 'none';
+      lastBrushPoint = null;
     };
     canvas.addEventListener('mouseenter', onMouseEnter);
     canvas.addEventListener('mouseleave', onMouseLeave);
@@ -397,7 +471,7 @@ export function useGaussianSelector(
 
       if (painting) {
         const rect = canvas.getBoundingClientRect();
-        applyBrush(e.clientX - rect.left, e.clientY - rect.top);
+        applyBrushStroke(e.clientX - rect.left, e.clientY - rect.top);
       }
     };
     canvas.addEventListener('mousemove', onMouseMove);

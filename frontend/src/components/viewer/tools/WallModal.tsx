@@ -11,13 +11,10 @@ interface Props {
   numSplats: number;
   ceilingY: number;
   floorY: number;
+  initialPolygon?: PathPoint[] | null;
   /**
    * 확인 클릭 시 호출. polygon 은 cycle 순서의 N개 점 (마지막→첫 점 자동 연결).
    * angleDeg 는 폴리곤 PCA eigenvector 기반 베이크용 Y 회전 (도).
-   *
-   * Phase 1 임시: cycle 강제 미적용 — edge 에 쓰인 점들을 path 순서대로 polygon 으로 반환.
-   * 4점 직사각 polygon 이면 기존 4벽 시절과 동등 동작.
-   * Phase 2 에서 cycle 감지 + 확인 활성 조건 추가 예정.
    */
   onConfirm: (angleDeg: number, polygon: PathPoint[]) => void;
   onClose: () => void;
@@ -34,9 +31,19 @@ type PathAction =
   | { type: 'point'; pointIdx: number; edge: PathEdge | null; prevSelected: number }
   | { type: 'edge'; edge: PathEdge; prevSelected: number }
   | { type: 'move'; pointIdx: number; prev: PathPoint }
+  | { type: 'segmentMove'; from: number; to: number; prevFrom: PathPoint; prevTo: PathPoint }
   | { type: 'parallel'; prevPoints: PathPoint[] };
 
 type CanvasMode = 'draw' | 'parallel';
+
+function clonePathPoints(points: PathPoint[] | null | undefined): PathPoint[] {
+  return (points ?? []).map(p => ({ x: p.x, z: p.z }));
+}
+
+function closedEdgesForPoints(points: PathPoint[]): PathEdge[] {
+  if (points.length < 2) return [];
+  return points.map((_, i) => ({ from: i, to: (i + 1) % points.length }));
+}
 
 function normalizeAngle90(deg: number): number {
   let d = ((deg % 180) + 180) % 180;
@@ -49,7 +56,7 @@ function normalizeAngle90(deg: number): number {
  *
  * 사용처: PLY 저장 시 wallAngle Y 회전을 베이크해 재진입 시에도 사용자가 보기 좋은 정렬 상태 유지.
  *
- * 정책 (Phase 4 확정): **PCA 자동 갱신**.
+ * 정책: **PCA 자동 갱신**.
  *   - polygon 모양이 변할 때마다 (점 추가/이동/평행화 적용) 즉시 재계산.
  *   - normalizeAngle90 으로 0~90° 매핑 — 회전 모호성(±90°/180°) 제거.
  *   - 비-직사각 polygon 에서는 PCA 주축이 모양에 따라 약간 변동될 수 있으나, 사용자가
@@ -90,7 +97,9 @@ function angleFromPolygon(points: PathPoint[]): number {
  *  - 좌클릭 빈 공간 → 새 점 추가. 직전 선택점이 있으면 자동으로 edge 연결.
  *  - 좌클릭 기존 점 → 그 점 선택 (다음 빈 공간 클릭 시 그 점으로부터 edge).
  *  - 기존 점 드래그 → 점 이동.
- *  - 우클릭 → 마지막 조작 1단계 undo (점/edge 추가, 점 이동, 평행화 적용).
+ *  - 기존 선분 길게 누른 뒤 드래그 → 선분 길이를 유지한 채 평행이동.
+ *  - 우클릭 드래그 → point cloud 보기 평행이동.
+ *  - 되돌리기 버튼 → 마지막 조작 1단계 undo (점/edge 추가, 점 이동, 평행화 적용).
  *
  * 평행화 모드 (cycle 형성 후 진입 가능):
  *  - 좌클릭 선분 → 선택 토글. 첫 선택이 기준, 나머지가 그 각도에 평행해지도록 회전 (적용 시).
@@ -99,9 +108,12 @@ function angleFromPolygon(points: PathPoint[]): number {
 export default function WallModal({
   posX, posY, posZ, numSplats,
   ceilingY, floorY,
+  initialPolygon = null,
   onConfirm, onClose,
 }: Props) {
   const xzRef = useRef<HTMLCanvasElement>(null);
+  const initialPathPoints = useMemo(() => clonePathPoints(initialPolygon), [initialPolygon]);
+  const initialPathEdges = useMemo(() => closedEdgesForPoints(initialPathPoints), [initialPathPoints]);
 
   // 천장/바닥 사이 가우시안만 필터 + 샘플링 (60k 상한).
   // pts: 전체 점 (zoomout 시 outlier 도 보이게).
@@ -145,6 +157,12 @@ export default function WallModal({
   // 전체 점 기준이면 멀리 떨어진 노이즈 1~2개로 화면이 휑해지므로 trim 사용. 줌아웃하면 전체 점 보임.
   const dataBounds = useMemo(() => {
     let mnX = bboxTrimmed.xLo, mxX = bboxTrimmed.xHi, mnZ = bboxTrimmed.zLo, mxZ = bboxTrimmed.zHi;
+    for (const p of initialPathPoints) {
+      mnX = Math.min(mnX, p.x);
+      mxX = Math.max(mxX, p.x);
+      mnZ = Math.min(mnZ, p.z);
+      mxZ = Math.max(mxZ, p.z);
+    }
     const mx = (mxX - mnX) * 0.05, mz = (mxZ - mnZ) * 0.05;
     mnX -= mx; mxX += mx; mnZ -= mz; mxZ += mz;
     const rangeMax = Math.max(mxX - mnX, mxZ - mnZ);
@@ -159,7 +177,7 @@ export default function WallModal({
       mnR: cX - half, mxR: cX + half,
       mnT: cZ - half, mxT: cZ + half,
     };
-  }, [bboxTrimmed]);
+  }, [bboxTrimmed, initialPathPoints]);
 
   // 휠 줌/팬용 viewport — 초기엔 dataBounds, 사용자 휠로 변경 가능.
   const [viewport, setViewport] = useState<typeof dataBounds | null>(null);
@@ -218,14 +236,20 @@ export default function WallModal({
     document.addEventListener('mouseup', onUp);
   }, []);
 
-  const [pathPoints, setPathPoints] = useState<PathPoint[]>([]);
-  const [pathEdges, setPathEdges] = useState<PathEdge[]>([]);
+  const [pathPoints, setPathPoints] = useState<PathPoint[]>(initialPathPoints);
+  const [pathEdges, setPathEdges] = useState<PathEdge[]>(initialPathEdges);
   const [hoverPointIdx, setHoverPointIdx] = useState<number>(-1);
-  const [selectedPointIdx, setSelectedPointIdx] = useState<number>(-1);
-  const pathPointsRef = useRef<PathPoint[]>([]);
-  const pathEdgesRef = useRef<PathEdge[]>([]);
+  const [selectedPointIdx, setSelectedPointIdx] = useState<number>(initialPathPoints.length > 0 ? 0 : -1);
+  const pathPointsRef = useRef<PathPoint[]>(initialPathPoints);
+  const pathEdgesRef = useRef<PathEdge[]>(initialPathEdges);
   const pathActionsRef = useRef<PathAction[]>([]);
-  const selectedPointIdxRef = useRef<number>(-1);
+  const selectedPointIdxRef = useRef<number>(initialPathPoints.length > 0 ? 0 : -1);
+  const [undoDepth, setUndoDepth] = useState(0);
+
+  const pushPathAction = useCallback((action: PathAction) => {
+    pathActionsRef.current.push(action);
+    setUndoDepth(pathActionsRef.current.length);
+  }, []);
 
   // 평행화 모드 — cycle 형성 시에만 진입 가능.
   // mode='parallel' 동안에는 점 추가/이동/edge 그리기 비활성. 캔버스 클릭 = segment 선택.
@@ -236,6 +260,26 @@ export default function WallModal({
   const [parallelSelected, setParallelSelected] = useState<number[]>([]);
   const parallelSelectedRef = useRef<number[]>([]);
   const [hoverEdgeIdx, setHoverEdgeIdx] = useState<number>(-1);
+
+  useEffect(() => {
+    const points = clonePathPoints(initialPolygon);
+    const edges = closedEdgesForPoints(points);
+    pathPointsRef.current = points;
+    pathEdgesRef.current = edges;
+    pathActionsRef.current = [];
+    const selected = points.length > 0 ? 0 : -1;
+    selectedPointIdxRef.current = selected;
+    setPathPoints(points);
+    setPathEdges(edges);
+    setSelectedPointIdx(selected);
+    setHoverPointIdx(-1);
+    setHoverEdgeIdx(-1);
+    setUndoDepth(0);
+    modeRef.current = 'draw';
+    setMode('draw');
+    parallelSelectedRef.current = [];
+    setParallelSelected([]);
+  }, [initialPolygon]);
 
   // TDZ 우회 — draw/handleMouseDown/handleMouseMove (이 위에 선언) 가 아래 정의된
   // derivedPolygon / findEdgeHit 을 참조해야 함. ref 로 한 단계 indirect 해서 hoisting 회피.
@@ -274,6 +318,24 @@ export default function WallModal({
     for (let i = 0; i < points.length; i++) {
       const d = Math.hypot(points[i].x - rx, points[i].z - rz);
       if (d < best) { best = d; hit = i; }
+    }
+    return hit;
+  }, [pathHitThreshold]);
+
+  const findPathEdgeHit = useCallback((rx: number, rz: number): PathEdge | null => {
+    const points = pathPointsRef.current;
+    const edges = pathEdgesRef.current;
+    let best = pathHitThreshold;
+    let hit: PathEdge | null = null;
+    for (const edge of edges) {
+      const a = points[edge.from];
+      const b = points[edge.to];
+      if (!a || !b) continue;
+      const d = segmentDistance({ x: rx, z: rz }, a, b);
+      if (d < best) {
+        best = d;
+        hit = edge;
+      }
     }
     return hit;
   }, [pathHitThreshold]);
@@ -466,14 +528,13 @@ export default function WallModal({
   // 점 드래그는 document mousemove/mouseup 으로 추적 — 캔버스 밖으로 나가도 끊기지 않음.
   const handleMouseDown = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     // 패닝 — 중간버튼(휠클릭) 드래그, 또는 스페이스바 누른 상태 좌드래그.
-    // 우클릭은 기존 동작(parallel 선분이동 / draw undo)으로 점유되어 충돌 회피 위해 좌/중간버튼만 사용.
-    if (e.button === 1 || (e.button === 0 && spaceHeldRef.current)) {
+    // draw 모드의 우클릭도 pan 으로 사용한다. parallel 모드 우클릭은 선분 수직 이동에 예약.
+    if (e.button === 1 || (e.button === 0 && spaceHeldRef.current) || (e.button === 2 && modeRef.current !== 'parallel')) {
       e.preventDefault();
       startPan(e);
       return;
     }
     // 우클릭 — 평행화 모드에서 선분 수직(normal) 평행이동 드래그.
-    // (draw 모드 우클릭은 onContextMenu 의 undo 가 처리하므로 여기선 무시.)
     if (e.button === 2) {
       if (modeRef.current !== 'parallel') return;
       const dp = derivedPolygonRef.current;
@@ -488,7 +549,6 @@ export default function WallModal({
       const b = polygon[(segHit + 1) % N];
       const ex = b.x - a.x, ez = b.z - a.z;
       const elen = Math.hypot(ex, ez) || 1;
-      // 선분 기울기의 수직 (XZ) 단위벡터. 부호는 무관 — 마우스 이동 투영이 양/음 결정.
       const nx = ez / elen, nz = -ex / elen;
       const aIdx = cycleOrder[segHit];
       const bIdx = cycleOrder[(segHit + 1) % N];
@@ -501,7 +561,6 @@ export default function WallModal({
       const onMove = (ev: MouseEvent) => {
         const r = nativeToWorld(ev);
         if (!r) return;
-        // 마우스 이동량을 선분 normal 에 투영 → 그만큼만 수직 평행이동.
         const proj = (r.rx - startWx) * nx + (r.rz - startWz) * nz;
         if (!moved && Math.abs(proj) < 1e-4) return;
         moved = true;
@@ -516,8 +575,9 @@ export default function WallModal({
       const onUp = () => {
         document.removeEventListener('mousemove', onMove);
         document.removeEventListener('mouseup', onUp);
-        // 실제 이동했을 때만 undo 스냅샷 기록 (parallel 액션과 동일 형식).
-        if (moved) pathActionsRef.current.push({ type: 'parallel', prevPoints: startSnapshot });
+        if (moved) {
+          pushPathAction({ type: 'parallel', prevPoints: startSnapshot });
+        }
       };
       document.addEventListener('mousemove', onMove);
       document.addEventListener('mouseup', onUp);
@@ -568,17 +628,74 @@ export default function WallModal({
         document.removeEventListener('mousemove', onMove);
         document.removeEventListener('mouseup', onUp);
         if (moved) {
-          pathActionsRef.current.push({ type: 'move', pointIdx: hit, prev: startPoint });
+          pushPathAction({ type: 'move', pointIdx: hit, prev: startPoint });
           selectPathPoint(hit);
         } else {
           const curSelected = selectedPointIdxRef.current;
           if (curSelected >= 0 && curSelected < pathPointsRef.current.length && curSelected !== hit) {
             const edge = addPathEdge(curSelected, hit);
-            if (edge) pathActionsRef.current.push({ type: 'edge', edge, prevSelected: curSelected });
+            if (edge) pushPathAction({ type: 'edge', edge, prevSelected: curSelected });
           }
           selectPathPoint(hit);
         }
       };
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', onUp);
+      return;
+    }
+
+    const edgeHit = findPathEdgeHit(rx, rz);
+    if (edgeHit) {
+      // 기존 선분을 길게 누른 뒤 드래그하면 선분 양 끝점을 같은 delta 로 이동한다.
+      // 선분 길이는 유지되고, 공유 endpoint 때문에 인접 선분은 자연스럽게 따라 변형된다.
+      const fromIdx = edgeHit.from;
+      const toIdx = edgeHit.to;
+      const startPoints = pathPointsRef.current;
+      const startFrom = startPoints[fromIdx];
+      const startTo = startPoints[toIdx];
+      if (!startFrom || !startTo) return;
+
+      const prevFrom = { ...startFrom };
+      const prevTo = { ...startTo };
+      const startWorld = { x: rx, z: rz };
+      let active = false;
+      let moved = false;
+      let longPressTimer: number | null = window.setTimeout(() => {
+        active = true;
+      }, 250);
+
+      const clearLongPress = () => {
+        if (longPressTimer !== null) {
+          window.clearTimeout(longPressTimer);
+          longPressTimer = null;
+        }
+      };
+
+      const onMove = (ev: MouseEvent) => {
+        if (!active) return;
+        const r = nativeToWorld(ev);
+        if (!r) return;
+        const dx = r.rx - startWorld.x;
+        const dz = r.rz - startWorld.z;
+        if (Math.hypot(dx, dz) > 1e-9) moved = true;
+        const next = pathPointsRef.current.map((p, i) => {
+          if (i === fromIdx) return { x: prevFrom.x + dx, z: prevFrom.z + dz };
+          if (i === toIdx) return { x: prevTo.x + dx, z: prevTo.z + dz };
+          return p;
+        });
+        pathPointsRef.current = next;
+        setPathPoints(next);
+      };
+
+      const onUp = () => {
+        clearLongPress();
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+        if (active && moved) {
+          pushPathAction({ type: 'segmentMove', from: fromIdx, to: toIdx, prevFrom, prevTo });
+        }
+      };
+
       document.addEventListener('mousemove', onMove);
       document.addEventListener('mouseup', onUp);
       return;
@@ -591,9 +708,9 @@ export default function WallModal({
     pathPointsRef.current = next;
     setPathPoints(next);
     const edge = fromIdx >= 0 ? addPathEdge(fromIdx, nextIdx) : null;
-    pathActionsRef.current.push({ type: 'point', pointIdx: nextIdx, edge, prevSelected: selected });
+    pushPathAction({ type: 'point', pointIdx: nextIdx, edge, prevSelected: selected });
     selectPathPoint(nextIdx);
-  }, [addPathEdge, findPathPointHit, mouseToWorld, nativeToWorld, selectPathPoint, startPan]);
+  }, [addPathEdge, findPathEdgeHit, findPathPointHit, mouseToWorld, nativeToWorld, pushPathAction, selectPathPoint, startPan]);
 
   // hover 표시만 — 드래그는 document listener 가 담당.
   const handleMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -646,12 +763,9 @@ export default function WallModal({
     };
   }, [viewport, dataBounds]);
 
-  // 우클릭 — draw 모드: 마지막 조작 1단계 undo. parallel 모드: 선분 수직 이동(handleMouseDown 처리)
-  // 이므로 컨텍스트 메뉴만 차단하고 undo 는 하지 않음 (이동 undo 는 draw 모드 복귀 후 우클릭).
-  const handleContextMenu = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
-    e.preventDefault();
-    if (modeRef.current === 'parallel') return;
+  const undoLastAction = useCallback(() => {
     const action = pathActionsRef.current.pop();
+    setUndoDepth(pathActionsRef.current.length);
     if (!action) return;
 
     if (action.type === 'parallel') {
@@ -665,6 +779,17 @@ export default function WallModal({
 
     if (action.type === 'move') {
       const next = pathPointsRef.current.map((p, i) => i === action.pointIdx ? action.prev : p);
+      pathPointsRef.current = next;
+      setPathPoints(next);
+      return;
+    }
+
+    if (action.type === 'segmentMove') {
+      const next = pathPointsRef.current.map((p, i) => {
+        if (i === action.from) return action.prevFrom;
+        if (i === action.to) return action.prevTo;
+        return p;
+      });
       pathPointsRef.current = next;
       setPathPoints(next);
       return;
@@ -694,6 +819,28 @@ export default function WallModal({
     setPathEdges(nextEdges);
     selectPathPoint(action.prevSelected);
   }, [selectPathPoint]);
+
+  const resetPath = useCallback(() => {
+    pathPointsRef.current = [];
+    pathEdgesRef.current = [];
+    pathActionsRef.current = [];
+    selectedPointIdxRef.current = -1;
+    parallelSelectedRef.current = [];
+    modeRef.current = 'draw';
+    setPathPoints([]);
+    setPathEdges([]);
+    setSelectedPointIdx(-1);
+    setHoverPointIdx(-1);
+    setHoverEdgeIdx(-1);
+    setUndoDepth(0);
+    setMode('draw');
+    setParallelSelected([]);
+  }, []);
+
+  // 우클릭은 viewport pan 전용. 브라우저 컨텍스트 메뉴만 차단한다.
+  const handleContextMenu = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    e.preventDefault();
+  }, []);
 
   // edge 그래프에서 **단일 cycle** 추출. cycle 미형성 시 null.
   //
@@ -872,7 +1019,7 @@ export default function WallModal({
     }
 
     // undo 기록 — 전체 좌표 스냅샷.
-    pathActionsRef.current.push({
+    pushPathAction({
       type: 'parallel',
       prevPoints: pathPointsRef.current.map(p => ({ ...p })),
     });
@@ -882,7 +1029,7 @@ export default function WallModal({
     // 적용 후 선택 초기화 (모드는 유지 — 사용자가 추가 선택 가능).
     parallelSelectedRef.current = [];
     setParallelSelected([]);
-  }, [derivedPolygon]);
+  }, [derivedPolygon, pushPathAction]);
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70" onClick={onClose}>
@@ -893,13 +1040,13 @@ export default function WallModal({
             <>
               ① 좌클릭으로 <span style={{color:'#22d3ee', fontWeight:'bold'}}>기준 선분</span> 선택 → ② <span style={{color:'#f59e0b', fontWeight:'bold'}}>대상 선분</span>들을 순서대로 클릭으로 평행화.
               <br />
-              우클릭 드래그로 선분 수직 평행이동 (되돌리기는 모드 해제 후 우클릭). 휠클릭(또는 스페이스+좌)드래그로 화면 이동.
+              우클릭 드래그로 선분을 수직 평행이동하고, 휠클릭 또는 스페이스+좌클릭 드래그로 화면을 이동합니다.
             </>
           ) : (
             <>
-              좌클릭으로 점과 선을 추가, 기존 점은 드래그로 이동. 점을 클릭하면 직전에 선택한 점과 연결되고, 우클릭은 마지막 조작을 되돌립니다.
+              좌클릭으로 점과 선을 추가, 기존 점은 드래그로 이동. 점을 클릭하면 직전에 선택한 점과 연결됩니다.
               <br />
-              모든 점이 닫힌 cycle 로 연결되어야 확인이 활성화됩니다. 마우스 휠로 줌, 휠클릭(또는 스페이스+좌)드래그로 화면 이동, 더블클릭으로 초기화.
+              모든 점이 닫힌 cycle 로 연결되어야 확인이 활성화됩니다. 우클릭/휠클릭 또는 스페이스+좌클릭 드래그로 화면 이동, 마우스 휠로 줌, 더블클릭으로 초기화.
             </>
           )}
         </div>
@@ -928,6 +1075,18 @@ export default function WallModal({
             )}
           </div>
           <div className="flex gap-2 shrink-0">
+            <button
+              onClick={() => undoLastAction()}
+              disabled={undoDepth === 0}
+              className="px-3 py-2 bg-[var(--bg-soft)] hover:bg-[var(--rule)] disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] disabled:cursor-not-allowed text-[var(--ink-2)] rounded text-xs cursor-pointer">
+              되돌리기
+            </button>
+            <button
+              onClick={() => resetPath()}
+              disabled={pathPoints.length === 0 && pathEdges.length === 0}
+              className="px-3 py-2 bg-[var(--bg-soft)] hover:bg-[var(--rule)] disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] disabled:cursor-not-allowed text-[var(--ink-2)] rounded text-xs cursor-pointer">
+              초기화
+            </button>
             {mode === 'parallel' ? (
               <>
                 <button

@@ -17,8 +17,10 @@ interface Props {
    *  미지정이면 rectFit 의 cross-product n 으로 fallback (정합 회전은 정확, gap 방향만 winding 영향). */
   basemapTargetDoorNormalInward: [number, number, number] | null;
   basemapMatchError: string | null;
-  /** 모듈측 (현재 작업 중인) 도어의 4 코너 (A'+Y 프레임). null 이면 정합 불가. */
+  /** 모듈측 (현재 작업 중인) 도어의 4 코너 (현재 PLY local/A' 프레임). null 이면 정합 불가. */
   moduleDoorCorners: Array<[number, number, number]> | null;
+  /** 모듈측 도어의 힌지 변. null 이면 도어 회전 UI 는 기본 왼쪽 변을 사용한다. */
+  moduleDoorHingeEdge?: number | null;
   /**
    * 모듈 등록 흐름: 정합 완료 시 호출. 다듬기 결과 자산 + 정합 행렬을 일괄 영속화.
    * 제공되면 module alignment-transform fallback 대신 이 콜백 사용.
@@ -35,10 +37,22 @@ interface Props {
       indices: number[];
       color: [number, number, number];
     } | null;
+    doorLeafSide: {
+      positions: number[];
+      indices: number[];
+      color: [number, number, number];
+    } | null;
+    pairedBasemapDoorId: string | null;
+    alignDoorThickness: number;
   }) => Promise<void>;
 }
 
 type ManualMode = 'translate' | 'rotate' | 'scale';
+type LocalTransformSnapshot = {
+  position: [number, number, number];
+  rotation: [number, number, number, number];
+  scale: [number, number, number];
+};
 
 const ANIM_MAX_MS = 2500;
 const ANIM_BASE_MS = 400;
@@ -49,7 +63,7 @@ const ANIM_BASE_MS = 400;
 const DOOR_CORNER_MIRROR_MAP = [1, 0, 3, 2] as const;
 
 // 정합 문 두께 — basemap facade ↔ module facade 평행 간격. 두 facade 사이를 4면 frame mesh 가 채움.
-const DEFAULT_ALIGN_DOOR_THICKNESS = 0.05;  // 5cm
+const DEFAULT_ALIGN_DOOR_THICKNESS = 0.01;  // 1cm
 const ALIGN_DOOR_THICKNESS_MIN = 0.001;     // 1mm — 0 이면 z-fight, 1mm 가 최소 분리.
 const ALIGN_DOOR_THICKNESS_MAX = 0.5;       // 50cm — 한국 차음벽 두께 200mm 의 두 배 까지.
 
@@ -90,6 +104,25 @@ function reparentPreserveWorld(pc: any, ent: any, newParent: any): void {
   ent.setLocalScale(s.x, s.y, s.z);
 }
 
+function captureLocalTransform(ent: any): LocalTransformSnapshot {
+  const p = ent.getLocalPosition();
+  const r = ent.getLocalRotation();
+  const s = ent.getLocalScale();
+  return {
+    position: [p.x, p.y, p.z],
+    rotation: [r.x, r.y, r.z, r.w],
+    scale: [s.x, s.y, s.z],
+  };
+}
+
+function restoreParentAndLocal(ent: any, oldParent: any, local: LocalTransformSnapshot): void {
+  if (!ent || !oldParent) return;
+  oldParent.addChild(ent);
+  ent.setLocalPosition(local.position[0], local.position[1], local.position[2]);
+  ent.setLocalRotation(local.rotation[0], local.rotation[1], local.rotation[2], local.rotation[3]);
+  ent.setLocalScale(local.scale[0], local.scale[1], local.scale[2]);
+}
+
 function anisotropicRectToMat4(pc: any, R: number[], scale: [number, number, number], t: number[]): any {
   const m = new pc.Mat4();
   m.data[0]  = scale[0]*R[0]; m.data[1]  = scale[0]*R[3]; m.data[2]  = scale[0]*R[6]; m.data[3]  = 0;
@@ -97,51 +130,6 @@ function anisotropicRectToMat4(pc: any, R: number[], scale: [number, number, num
   m.data[8]  = scale[2]*R[2]; m.data[9]  = scale[2]*R[5]; m.data[10] = scale[2]*R[8]; m.data[11] = 0;
   m.data[12] = t[0]; m.data[13] = t[1]; m.data[14] = t[2]; m.data[15] = 1;
   return m;
-}
-
-function rectCentroid(p: Float64Array): [number, number, number] {
-  return [
-    (p[0] + p[3] + p[6] + p[9]) * 0.25,
-    (p[1] + p[4] + p[7] + p[10]) * 0.25,
-    (p[2] + p[5] + p[8] + p[11]) * 0.25,
-  ];
-}
-
-function rectEdgeLength(p: Float64Array, a: number, b: number): number {
-  const ai = a * 3;
-  const bi = b * 3;
-  return Math.hypot(p[bi] - p[ai], p[bi + 1] - p[ai + 1], p[bi + 2] - p[ai + 2]);
-}
-
-function transformPointByRS(
-  R: number[],
-  scale: [number, number, number],
-  p: [number, number, number],
-): [number, number, number] {
-  return [
-    R[0] * scale[0] * p[0] + R[1] * scale[1] * p[1] + R[2] * scale[2] * p[2],
-    R[3] * scale[0] * p[0] + R[4] * scale[1] * p[1] + R[5] * scale[2] * p[2],
-    R[6] * scale[0] * p[0] + R[7] * scale[1] * p[1] + R[8] * scale[2] * p[2],
-  ];
-}
-
-function rmsdForRectTransform(
-  src: Float64Array,
-  dst: Float64Array,
-  R: number[],
-  scale: [number, number, number],
-  t: number[],
-): number {
-  let sumSq = 0;
-  for (let i = 0; i < 4; i++) {
-    const p: [number, number, number] = [src[i*3], src[i*3+1], src[i*3+2]];
-    const rp = transformPointByRS(R, scale, p);
-    const dx = rp[0] + t[0] - dst[i*3];
-    const dy = rp[1] + t[1] - dst[i*3+1];
-    const dz = rp[2] + t[2] - dst[i*3+2];
-    sumSq += dx*dx + dy*dy + dz*dz;
-  }
-  return Math.sqrt(sumSq / 4);
 }
 
 /**
@@ -152,6 +140,7 @@ function rmsdForRectTransform(
 function createDoorFrameMesh(
   pc: any,
   app: any,
+  name: string,
   moduleWorld: Array<[number, number, number]>,
   basemapWorld: Array<[number, number, number]>,
   color: [number, number, number],
@@ -184,22 +173,22 @@ function createDoorFrameMesh(
   mat.cull = pc.CULLFACE_NONE;
   mat.update();
 
-  const ent = new pc.Entity('doorFrame');
+  const ent = new pc.Entity(name, app);
   ent.addComponent('render', { meshInstances: [new pc.MeshInstance(mesh, mat)] });
-  (ent as any).__doorFramePositions = positions;
-  (ent as any).__doorFrameIndices = indices;
-  (ent as any).__doorFrameColor = color;
+  (ent as any).__doorMeshPositions = positions;
+  (ent as any).__doorMeshIndices = indices;
+  (ent as any).__doorMeshColor = color;
   app.root.addChild(ent);
   return ent;
 }
 
-function extractDoorFrameWorld(pc: any, ent: any): {
+function extractDoorMeshWorld(pc: any, ent: any): {
   positions: number[];
   indices: number[];
   color: [number, number, number];
 } | null {
-  if (!ent?.__doorFramePositions || !ent?.__doorFrameIndices) return null;
-  const local: number[] = ent.__doorFramePositions;
+  if (!ent?.__doorMeshPositions || !ent?.__doorMeshIndices) return null;
+  const local: number[] = ent.__doorMeshPositions;
   const world: number[] = [];
   const mat = ent.getWorldTransform();
   const src = new pc.Vec3();
@@ -211,9 +200,27 @@ function extractDoorFrameWorld(pc: any, ent: any): {
   }
   return {
     positions: world,
-    indices: Array.from(ent.__doorFrameIndices),
-    color: (ent as any).__doorFrameColor ?? DEFAULT_FRAME_COLOR,
+    indices: Array.from(ent.__doorMeshIndices),
+    color: (ent as any).__doorMeshColor ?? DEFAULT_FRAME_COLOR,
   };
+}
+
+function applyDoorPivotAngle(
+  pc: any,
+  pivot: any,
+  hinge: { origin: [number, number, number]; axis: [number, number, number] },
+  angleDeg: number,
+): void {
+  const angle = (angleDeg * Math.PI) / 180;
+  const half = angle / 2;
+  const sH = Math.sin(half);
+  const cH = Math.cos(half);
+  const q = new pc.Quat(hinge.axis[0] * sH, hinge.axis[1] * sH, hinge.axis[2] * sH, cH);
+  const o = new pc.Vec3(hinge.origin[0], hinge.origin[1], hinge.origin[2]);
+  const rotated = new pc.Vec3();
+  q.transformVector(o, rotated);
+  pivot.setLocalRotation(q.x, q.y, q.z, q.w);
+  pivot.setLocalPosition(o.x - rotated.x, o.y - rotated.y, o.z - rotated.z);
 }
 
 function findAverageDoorMeshColor(root: any): [number, number, number] | null {
@@ -237,7 +244,7 @@ function findAverageDoorMeshColor(root: any): [number, number, number] | null {
 
 export default function AlignPanel({
   coreRef, uploadId, metadata, basemapDoorCorners, basemapTargetDoorId, basemapTargetDoorNormalInward,
-  basemapMatchError, moduleDoorCorners, onCommitFinal,
+  basemapMatchError, moduleDoorCorners, moduleDoorHingeEdge = null, onCommitFinal,
 }: Props) {
   const [aligned, setAligned] = useState(false);   // 자동 정합 한 번이라도 성공
   const [running, setRunning] = useState(false);
@@ -251,20 +258,21 @@ export default function AlignPanel({
   const alignDoorThicknessRef = useRef(DEFAULT_ALIGN_DOOR_THICKNESS);
   useEffect(() => { alignDoorThicknessRef.current = alignDoorThickness; }, [alignDoorThickness]);
 
-  // 도어 frame mesh — 정합 후 모듈 도어 ↔ 베이스맵 도어 사이 공간을 4면 quad 로 둘러쌈.
-  // 정합 다시 돌리면 destroy 후 재생성. 초기화 시 destroy.
-  const frameEntityRef = useRef<any>(null);
+  // 고정 opening frame: 두 공간의 벽 두께/문틀을 메우는 mesh. 문과 함께 회전하지 않는다.
+  const fixedFrameEntityRef = useRef<any>(null);
+  // 회전 leaf side: 모듈/베이스맵 양쪽 door face 를 연결하는 문 두께 mesh. 문과 함께 회전한다.
+  const leafSideEntityRef = useRef<any>(null);
 
-  // 도어 통합 그룹 (Phase 3) — 정합 후 양측 도어 (모듈 + basemap) + frame mesh 를 한 부모로 묶어
+  // 도어 통합 그룹 — 정합 후 양측 도어 (모듈 + basemap) + frame mesh 를 한 부모로 묶어
   // 슬라이더로 hinge 축 기준 회전. 정합 초기화 시 destroy + 원래 부모로 복원.
   const doorPivotGroupRef = useRef<any>(null);
   // doorPivot 준비 상태 — UI 슬라이더 노출 조건. ref 만으론 re-render 트리거 안 되므로 별도 state.
   const [doorPivotReady, setDoorPivotReady] = useState(false);
   // doorPivotGroup 에 reparent 된 entity 들의 원래 부모 정보 (revert 용).
-  const doorPivotMembersRef = useRef<Array<{ ent: any; oldParent: any }>>([]);
-  // hinge 회전 상태 (Phase 4).
+  const doorPivotMembersRef = useRef<Array<{ ent: any; oldParent: any; oldLocal: LocalTransformSnapshot }>>([]);
+  // hinge 회전 상태.
   const [doorAngleDeg, setDoorAngleDeg] = useState(0);
-  // hinge 축 (world frame) — basemap door corner [0]→[3] 변 기준 (왼쪽 변, 수직축).
+  // hinge 축 (world frame) — 모듈 도어에서 사용자가 선택한 hingeEdge 기준.
   const doorHingeRef = useRef<{ origin: [number, number, number]; axis: [number, number, number] } | null>(null);
 
   // 슝 애니메이션 상태 (rAF). DoorAlignModal 의 onUpdate 패턴 그대로 차용.
@@ -379,29 +387,14 @@ export default function AlignPanel({
         dst[i*3+1] += pushN[1] * gap;
         dst[i*3+2] += pushN[2] * gap;
       }
-      const fit = rectFit(src, dst, { ...(dstForcedN ? { dstForcedN } : {}), withScale: false });
-      const srcWidth = rectEdgeLength(src, 0, 1);
-      const srcHeight = rectEdgeLength(src, 1, 2);
-      const dstWidth = rectEdgeLength(dst, 0, 1);
-      const dstHeight = rectEdgeLength(dst, 1, 2);
-      const widthScale = srcWidth > 1e-9 ? dstWidth / srcWidth : 1;
-      const heightScale = srcHeight > 1e-9 ? dstHeight / srcHeight : 1;
-      // 도어는 정규화 단계에서 세로가 local Y, 가로가 수평 XZ 평면에 놓인다.
-      // 그래서 수평 축(X/Z)은 가로 비율, Y 축은 세로 비율을 적용해 문 bbox 가 정확히 일치하게 한다.
-      const rectScale: [number, number, number] = [widthScale, heightScale, widthScale];
-      const srcCenter = rectCentroid(src);
-      const dstCenter = rectCentroid(dst);
-      const rotatedScaledCenter = transformPointByRS(fit.R as unknown as number[], rectScale, srcCenter);
-      const rectT = [
-        dstCenter[0] - rotatedScaledCenter[0],
-        dstCenter[1] - rotatedScaledCenter[1],
-        dstCenter[2] - rotatedScaledCenter[2],
-      ];
-      const rectRmsd = rmsdForRectTransform(src, dst, fit.R as unknown as number[], rectScale, rectT);
-      setRmsd(rectRmsd);
-      // fit 은 src world → dst world 의 affine transform (R + axis별 scale + t).
+      const fit = rectFit(src, dst, { ...(dstForcedN ? { dstForcedN } : {}), withScale: true });
+      const uniformScale: [number, number, number] = [fit.s, fit.s, fit.s];
+      setRmsd(fit.rmsd);
+      // fit 은 src world → dst world 의 similarity transform (R + uniform scale + t).
+      // Gaussian splat 전체에 비균일 scale 을 걸면 parent/child 회전 조합에서 shear 성분이 생겨
+      // covariance 투영 품질이 카메라/회전에 따라 크게 깨질 수 있다.
       // alignmentGroup 의 새 world = fit · 현재 group world. group 부모가 app.root (identity) 이라 local = world.
-      const fitMat = anisotropicRectToMat4(pc, fit.R as unknown as number[], rectScale, rectT);
+      const fitMat = anisotropicRectToMat4(pc, fit.R as unknown as number[], uniformScale, fit.t);
       const newGroupWorld = new pc.Mat4().mul2(fitMat, group.getWorldTransform());
 
       // 분해: position + quaternion + scale.
@@ -435,16 +428,22 @@ export default function AlignPanel({
       const dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
       // 1m 당 약 200ms 추가, max 2.5s 캡.
       const duration = Math.min(ANIM_MAX_MS, ANIM_BASE_MS + dist * 200);
+      const basemapWorld: Array<[number, number, number]> = basemapDoorCorners.map(c => [-c[0], -c[1], c[2]]);
+      const moduleWorldAfterAlign: Array<[number, number, number]> = [];
+      for (let i = 0; i < 4; i++) {
+        moduleWorldAfterAlign.push([dst[i*3], dst[i*3+1], dst[i*3+2]]);
+      }
 
-      // Phase 3 reparent 는 애니메이션 완료 후 실행 (group 의 최종 transform 이 정확해야 world 보존 reparent 가 옳음).
+      // reparent 는 애니메이션 완료 후 실행한다. group 의 최종 transform 이 확정된 뒤에야
+      // world 보존 reparent 결과가 정확하다.
       //   onComplete 콜백으로 등록 — 애니메이션 onUpdate 가 종료 시점에 호출.
       const doDoorPivotSetup = () => {
         try {
-          // 기존 그룹 정리.
+          // 이전 pivot 그룹 정리.
           if (doorPivotGroupRef.current) {
             for (const m of doorPivotMembersRef.current) {
               if (m.ent && m.oldParent) {
-                try { reparentPreserveWorld(pc, m.ent, m.oldParent); } catch {}
+                try { restoreParentAndLocal(m.ent, m.oldParent, m.oldLocal); } catch {}
               }
             }
             doorPivotMembersRef.current = [];
@@ -452,35 +451,49 @@ export default function AlignPanel({
             doorPivotGroupRef.current = null;
           }
           const app = core.getApp();
-          const doorPivot = new pc.Entity('doorPivotGroup');
+          const doorPivot = new pc.Entity('doorPivotGroup', app);
           app.root.addChild(doorPivot);
           doorPivotGroupRef.current = doorPivot;
 
-          const candidates: any[] = [
-            ...(app.root.children as any[]),
-            ...((group.children as any[]) ?? []),
-          ];
+          const candidates: any[] = [];
+          const seenCandidates = new Set<any>();
+          const collect = (node: any) => {
+            if (!node || seenCandidates.has(node)) return;
+            seenCandidates.add(node);
+            candidates.push(node);
+            for (const child of (node.children ?? [])) collect(child);
+          };
+          collect(app.root);
+          collect(group);
           for (const c of candidates) {
             if (c === doorPivot) continue;
             const name: string = c.name ?? '';
             const isModuleDoorWrapper = name === 'moduleDoor';
             // 정합 대상 basemap 도어 wrapper 만 매치 — 다른 호수의 basemapDoor_* 는 회전 대상 제외.
             const isBasemapDoorWrapper = basemapTargetDoorId
-              ? name === `basemapDoor_${basemapTargetDoorId}`
+              ? (
+                name === `basemapDoor_${basemapTargetDoorId}`
+                || (c as any).__doorId === basemapTargetDoorId
+                || (metadata.module_name && (c as any).__doorUnitName === metadata.module_name)
+              )
               : false;
-            const isFrame = name === 'doorFrame';
-            if (isModuleDoorWrapper || isBasemapDoorWrapper || isFrame) {
+            const isLeafSide = name === 'doorLeafSide';
+            if (isModuleDoorWrapper || isBasemapDoorWrapper || isLeafSide) {
               const oldParent = c.parent;
-              doorPivotMembersRef.current.push({ ent: c, oldParent });
+              const oldLocal = captureLocalTransform(c);
+              doorPivotMembersRef.current.push({ ent: c, oldParent, oldLocal });
               reparentPreserveWorld(pc, c, doorPivot);
             }
           }
 
-          // hinge 축 — basemap 도어 corner [0]→[3] (왼쪽 변, 수직).
-          const bc0 = basemapDoorCorners[0], bc3 = basemapDoorCorners[3];
-          const h0: [number, number, number] = [-bc0[0], -bc0[1], bc0[2]];
-          const h3: [number, number, number] = [-bc3[0], -bc3[1], bc3[2]];
-          const ax = h3[0] - h0[0], ay = h3[1] - h0[1], az = h3[2] - h0[2];
+          // hinge 축은 모듈 문에서 사용자가 선택한 변을 사용한다. 베이스맵 쪽은 반대편에서 본 같은 문이라
+          // 자체 hinge/swing 을 다시 계산하면 좌우/방향이 쉽게 뒤집힌다.
+          const hingeEdge = typeof moduleDoorHingeEdge === 'number'
+            ? ((moduleDoorHingeEdge % 4) + 4) % 4
+            : 3;
+          const h0 = moduleWorldAfterAlign[hingeEdge];
+          const h1 = moduleWorldAfterAlign[(hingeEdge + 1) % 4];
+          const ax = h1[0] - h0[0], ay = h1[1] - h0[1], az = h1[2] - h0[2];
           const aLen = Math.hypot(ax, ay, az) || 1;
           doorHingeRef.current = {
             origin: [h0[0], h0[1], h0[2]],
@@ -505,21 +518,21 @@ export default function AlignPanel({
       // group scale 도 적용 (애니메이션 안 함 — scale 은 보통 1).
       group.setLocalScale(newScale.x, newScale.y, newScale.z);
 
-      // 도어 frame mesh — 모듈 ↔ 베이스맵 도어 사이 4면 측벽 (시각화).
+      // 고정 opening frame + 회전 door leaf side mesh.
       try {
-        if (frameEntityRef.current) {
-          try { frameEntityRef.current.destroy(); } catch {}
-          frameEntityRef.current = null;
+        if (fixedFrameEntityRef.current) {
+          try { fixedFrameEntityRef.current.destroy(); } catch {}
+          fixedFrameEntityRef.current = null;
         }
-        const basemapWorld: Array<[number, number, number]> = basemapDoorCorners.map(c => [-c[0], -c[1], c[2]]);
-        const moduleWorld: Array<[number, number, number]> = [];
-        for (let i = 0; i < 4; i++) {
-          moduleWorld.push([dst[i*3], dst[i*3+1], dst[i*3+2]]);
+        if (leafSideEntityRef.current) {
+          try { leafSideEntityRef.current.destroy(); } catch {}
+          leafSideEntityRef.current = null;
         }
         const frameColor = findAverageDoorMeshColor(core.getApp().root) ?? DEFAULT_FRAME_COLOR;
-        frameEntityRef.current = createDoorFrameMesh(pc, core.getApp(), moduleWorld, basemapWorld, frameColor);
+        fixedFrameEntityRef.current = createDoorFrameMesh(pc, core.getApp(), 'doorFixedFrame', moduleWorldAfterAlign, basemapWorld, frameColor);
+        leafSideEntityRef.current = createDoorFrameMesh(pc, core.getApp(), 'doorLeafSide', moduleWorldAfterAlign, basemapWorld, frameColor);
       } catch (e) {
-        console.warn('[Align] door frame 생성 실패', e);
+        console.warn('[Align] door frame/side 생성 실패', e);
       }
 
       setAligned(true);
@@ -528,7 +541,16 @@ export default function AlignPanel({
     } finally {
       setRunning(false);
     }
-  }, [coreRef, moduleDoorCorners, basemapDoorCorners, basemapMatchError]);
+  }, [
+    coreRef,
+    moduleDoorCorners,
+    moduleDoorHingeEdge,
+    basemapDoorCorners,
+    basemapTargetDoorId,
+    basemapTargetDoorNormalInward,
+    basemapMatchError,
+    metadata.module_name,
+  ]);
 
   // 수동 핸들 — 정합 그룹의 transform 을 +/- 단위로 조정. SuperSplat 처럼 gizmo 는
   // 추후 작업으로 미루고, 일단 명확한 numeric 컨트롤을 제공.
@@ -556,9 +578,8 @@ export default function AlignPanel({
       group.setLocalRotation(newQ.x, newQ.y, newQ.z, newQ.w);
     } else if (mode === 'scale') {
       const s = group.getLocalScale();
-      const ns = [s.x, s.y, s.z];
-      ns[axis] *= sign === 1 ? STEP_S : (1 / STEP_S);
-      group.setLocalScale(ns[0], ns[1], ns[2]);
+      const k = sign === 1 ? STEP_S : (1 / STEP_S);
+      group.setLocalScale(s.x * k, s.y * k, s.z * k);
     }
   }, [coreRef]);
 
@@ -572,18 +593,11 @@ export default function AlignPanel({
     group.setLocalPosition(0, 0, 0);
     group.setLocalEulerAngles(0, 0, 0);
     group.setLocalScale(1, 1, 1);
-    if (frameEntityRef.current) {
-      try { frameEntityRef.current.destroy(); } catch {}
-      frameEntityRef.current = null;
-    }
     // doorPivotGroup 정리 — 멤버들을 원래 부모로 복원하고 그룹 destroy.
     if (doorPivotGroupRef.current) {
-      const pc = coreRef.current?.getPC();
-      if (pc) {
-        for (const m of doorPivotMembersRef.current) {
-          if (m.ent && m.oldParent) {
-            try { reparentPreserveWorld(pc, m.ent, m.oldParent); } catch {}
-          }
+      for (const m of doorPivotMembersRef.current) {
+        if (m.ent && m.oldParent) {
+          try { restoreParentAndLocal(m.ent, m.oldParent, m.oldLocal); } catch {}
         }
       }
       doorPivotMembersRef.current = [];
@@ -593,6 +607,14 @@ export default function AlignPanel({
       setDoorAngleDeg(0);
       setDoorPivotReady(false);
     }
+    if (fixedFrameEntityRef.current) {
+      try { fixedFrameEntityRef.current.destroy(); } catch {}
+      fixedFrameEntityRef.current = null;
+    }
+    if (leafSideEntityRef.current) {
+      try { leafSideEntityRef.current.destroy(); } catch {}
+      leafSideEntityRef.current = null;
+    }
     setAligned(false);
     setRmsd(null);
     setError(null);
@@ -601,18 +623,28 @@ export default function AlignPanel({
   // 모달/패널 언마운트 시 frame + doorPivot 정리.
   useEffect(() => {
     return () => {
-      if (frameEntityRef.current) {
-        try { frameEntityRef.current.destroy(); } catch {}
-        frameEntityRef.current = null;
-      }
       if (doorPivotGroupRef.current) {
+        for (const m of doorPivotMembersRef.current) {
+          if (m.ent && m.oldParent) {
+            try { restoreParentAndLocal(m.ent, m.oldParent, m.oldLocal); } catch {}
+          }
+        }
+        doorPivotMembersRef.current = [];
         try { doorPivotGroupRef.current.destroy(); } catch {}
         doorPivotGroupRef.current = null;
+      }
+      if (fixedFrameEntityRef.current) {
+        try { fixedFrameEntityRef.current.destroy(); } catch {}
+        fixedFrameEntityRef.current = null;
+      }
+      if (leafSideEntityRef.current) {
+        try { leafSideEntityRef.current.destroy(); } catch {}
+        leafSideEntityRef.current = null;
       }
     };
   }, []);
 
-  // Phase 4: doorAngleDeg 변경 시 doorPivotGroup 을 hinge 축 기준으로 회전.
+  // doorAngleDeg 변경 시 doorPivotGroup 을 hinge 축 기준으로 회전.
   //   회전 origin = hinge.origin (왼쪽 변 시작점). hinge 축 = hinge.axis.
   //   localRotation = R_axis(angle), localPosition = origin - R_axis(angle) · origin (hinge 점 고정 유지).
   useEffect(() => {
@@ -621,18 +653,7 @@ export default function AlignPanel({
     const core = coreRef.current;
     const pc = core?.getPC();
     if (!pivot || !hinge || !pc) return;
-    const angle = (doorAngleDeg * Math.PI) / 180;
-    const half = angle / 2;
-    const sH = Math.sin(half), cH = Math.cos(half);
-    const q = new pc.Quat(hinge.axis[0] * sH, hinge.axis[1] * sH, hinge.axis[2] * sH, cH);
-    // hinge 점이 고정되도록 position 보정: P_new = origin + R(P - origin). entity 의 local 기준,
-    //   doorPivot 의 local = identity 부모 (app.root) 라 world = local.
-    //   회전 후 origin 이 R·origin 으로 이동했으므로 (origin - R·origin) 만큼 평행이동.
-    const o = new pc.Vec3(hinge.origin[0], hinge.origin[1], hinge.origin[2]);
-    const rotated = new pc.Vec3();
-    q.transformVector(o, rotated);
-    pivot.setLocalRotation(q.x, q.y, q.z, q.w);
-    pivot.setLocalPosition(o.x - rotated.x, o.y - rotated.y, o.z - rotated.z);
+    applyDoorPivotAngle(pc, pivot, hinge, doorAngleDeg);
   }, [doorAngleDeg, coreRef]);
 
   // 정합 결과 확정 — 4×4 행렬 저장. Upload + Module 양쪽.
@@ -647,9 +668,26 @@ export default function AlignPanel({
       const q = group.getLocalRotation();
       const s = group.getLocalScale();
       const pc = core?.getPC?.();
-      const doorFrame = pc && frameEntityRef.current
-        ? extractDoorFrameWorld(pc, frameEntityRef.current)
-        : null;
+      const pivot = doorPivotGroupRef.current;
+      const hinge = doorHingeRef.current;
+      const restoreDoorAngleDeg = doorAngleDeg;
+      let doorFrame: ReturnType<typeof extractDoorMeshWorld> = null;
+      let doorLeafSide: ReturnType<typeof extractDoorMeshWorld> = null;
+      try {
+        if (pc && pivot && hinge && restoreDoorAngleDeg !== 0) {
+          applyDoorPivotAngle(pc, pivot, hinge, 0);
+        }
+        doorFrame = pc && fixedFrameEntityRef.current
+          ? extractDoorMeshWorld(pc, fixedFrameEntityRef.current)
+          : null;
+        doorLeafSide = pc && leafSideEntityRef.current
+          ? extractDoorMeshWorld(pc, leafSideEntityRef.current)
+          : null;
+      } finally {
+        if (pc && pivot && hinge && restoreDoorAngleDeg !== 0) {
+          applyDoorPivotAngle(pc, pivot, hinge, restoreDoorAngleDeg);
+        }
+      }
 
       // onCommitFinal 제공 시 → 다듬기 결과 자산 + 정합 행렬 일괄 영속화.
       if (onCommitFinal) {
@@ -661,6 +699,9 @@ export default function AlignPanel({
             scale: [s.x, s.y, s.z],
             rmsd,
             doorFrame,
+            doorLeafSide,
+            pairedBasemapDoorId: basemapTargetDoorId,
+            alignDoorThickness: alignDoorThicknessRef.current,
           });
           setError('정합 완료 ✓');
         } catch (e: any) {
@@ -671,8 +712,7 @@ export default function AlignPanel({
         return;
       }
 
-      // Legacy fallback: older entry points can still persist the module transform
-      // directly, but upload-scoped alignment state is no longer stored.
+      // onCommitFinal 이 없는 진입점은 모듈 transform 만 저장한다.
       try {
         await api.put(`/modules/${metadata.module_id}/alignment-transform`, {
           transform: {
@@ -689,7 +729,7 @@ export default function AlignPanel({
     } finally {
       setSavingResult(false);
     }
-  }, [coreRef, uploadId, metadata.module_id, rmsd, onCommitFinal]);
+  }, [coreRef, uploadId, metadata.module_id, rmsd, onCommitFinal, doorAngleDeg, basemapTargetDoorId]);
 
   const matchReady = !!basemapDoorCorners && !!moduleDoorCorners;
   const runDisabled = !matchReady || running;

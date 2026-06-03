@@ -5,9 +5,47 @@ import SplatViewerCore, { SplatViewerCoreRef } from './SplatViewerCore';
 import { useGaussianSelector } from './tools/useGaussianSelector';
 import { useRefinedMeshLoader } from './tools/useRefinedMeshLoader';
 import type { FloorplanResult } from '@/lib/gs/floorplan';
+import { createDoorInteraction, type DoorHandle, type DoorInteractionController } from '@/lib/gs/doorInteraction';
 
 const DoorAlignModal = lazy(() => import('./tools/DoorAlignModal'));
 const Minimap = lazy(() => import('./tools/Minimap'));
+
+function traverseEntities(root: any, visit: (ent: any) => void) {
+  if (!root) return;
+  visit(root);
+  for (const child of root.children ?? []) traverseEntities(child, visit);
+}
+
+function worldPositionFromLocal(m: Float32Array | number[], x: number, y: number, z: number): [number, number, number] {
+  return [
+    m[0] * x + m[4] * y + m[8] * z + m[12],
+    m[1] * x + m[5] * y + m[9] * z + m[13],
+    m[2] * x + m[6] * y + m[10] * z + m[14],
+  ];
+}
+
+function sceneWorldBounds(app: any): { mnX: number; mxX: number; mnY: number; mxY: number; mnZ: number; mxZ: number } | null {
+  let mnX = Infinity, mxX = -Infinity, mnY = Infinity, mxY = -Infinity, mnZ = Infinity, mxZ = -Infinity;
+  traverseEntities(app?.root, (ent) => {
+    if (!ent?.enabled || !ent.gsplat) return;
+    const comp = ent.gsplat;
+    const resource = comp.asset?.resource ?? comp.instance?.resource ?? comp.instance?.splatData;
+    const gsplatData = resource?.gsplatData ?? resource;
+    const posX = gsplatData?.getProp?.('x') as Float32Array | undefined;
+    const posY = gsplatData?.getProp?.('y') as Float32Array | undefined;
+    const posZ = gsplatData?.getProp?.('z') as Float32Array | undefined;
+    const numSplats = Number(gsplatData?.numSplats ?? posX?.length ?? 0);
+    if (!posX || !posY || !posZ || !numSplats) return;
+    const m = ent.getWorldTransform().data;
+    for (let i = 0; i < numSplats; i++) {
+      const [wx, wy, wz] = worldPositionFromLocal(m, posX[i], posY[i], posZ[i]);
+      if (wx < mnX) mnX = wx; if (wx > mxX) mxX = wx;
+      if (wy < mnY) mnY = wy; if (wy > mxY) mxY = wy;
+      if (wz < mnZ) mnZ = wz; if (wz > mxZ) mxZ = wz;
+    }
+  });
+  return Number.isFinite(mnX) ? { mnX, mxX, mnY, mxY, mnZ, mxZ } : null;
+}
 
 interface SplatViewerProps {
   sogUrl: string;
@@ -31,8 +69,20 @@ export default function SplatViewer({ sogUrl, mode, uploadId, onSelectionDone }:
   // ── 평면도 (정합 단계 미니맵 테스트) ──
   const [floorplan, setFloorplan] = useState<FloorplanResult | null>(null);
   const [splatReady, setSplatReady] = useState(false);
-  // 천장 컷오프 — 미니맵 슬라이더로 실시간 조정. 변경 시 디바운스 후 재베이크.
-  const [floorplanCutoff, setFloorplanCutoff] = useState(0.05);
+  const doorInteractionRef = useRef<DoorInteractionController | null>(null);
+  const pendingDoorsRef = useRef<DoorHandle[]>([]);
+  const registerDoor = useCallback((handle: DoorHandle) => {
+    const ctl = doorInteractionRef.current;
+    if (ctl) ctl.add(handle);
+    else pendingDoorsRef.current.push(handle);
+  }, []);
+  const unregisterDoorByWrapper = useCallback((wrapper: any) => {
+    const ctl = doorInteractionRef.current;
+    if (ctl) { try { ctl.removeByWrapper(wrapper); } catch {} }
+    pendingDoorsRef.current = pendingDoorsRef.current.filter((h) => h.wrapper !== wrapper);
+  }, []);
+  // 천장 컷오프 — 미니맵 베이크 시 천장에서 제거할 깊이 (m).
+  const floorplanCutoff = 0.05;
   // selector 객체는 매 렌더 새로 생성되므로 ref 로 잡아 콜백 stable 유지.
   // (onSplatLoaded prop 이 매 렌더 변경되면 SplatViewerCore 가 splat 재로드 → 카메라 리셋 루프.)
   const selectorRef = useRef(selector);
@@ -40,6 +90,29 @@ export default function SplatViewer({ sogUrl, mode, uploadId, onSelectionDone }:
 
   // SplatViewerCore 가 reloadKey 변경으로 unmount/remount 되면 floorplan 도 리셋
   useEffect(() => { setFloorplan(null); setSplatReady(false); }, [reloadKey]);
+
+  useEffect(() => {
+    if (!splatReady) return;
+    const core = coreRef.current;
+    const pc = core?.getPC();
+    const app = core?.getApp();
+    const canvas = core?.getCanvas();
+    if (!core || !pc || !app || !canvas) return;
+    const controller = createDoorInteraction({
+      pc, app, canvas,
+      getCamera: () => coreRef.current?.getCamera() ?? null,
+      onUpdate: (cb) => core.onUpdate(cb),
+    });
+    doorInteractionRef.current = controller;
+    if (pendingDoorsRef.current.length) {
+      for (const h of pendingDoorsRef.current) controller.add(h);
+      pendingDoorsRef.current = [];
+    }
+    return () => {
+      controller.dispose();
+      doorInteractionRef.current = null;
+    };
+  }, [splatReady]);
 
   const onSplatLoadedCombined = useCallback((data: any) => {
     selectorRef.current.onSplatLoaded(data);
@@ -85,7 +158,11 @@ export default function SplatViewer({ sogUrl, mode, uploadId, onSelectionDone }:
             splatEntity: sd.splatEntity,
           },
           core.half2Float,
-          { cutoffOffsetMeters: floorplanCutoff },
+          {
+            cutoffOffsetMeters: floorplanCutoff,
+            paddingMeters: 1.0,
+            bounds: sceneWorldBounds(app) ?? undefined,
+          },
         );
       } finally {
         for (let i = 0; i < wallEnts.length; i++) wallEnts[i].enabled = prevEnabled[i];
@@ -102,7 +179,18 @@ export default function SplatViewer({ sogUrl, mode, uploadId, onSelectionDone }:
   }, [splatReady, mode, uploadId, floorplanCutoff]);
   // 정제된 wall mesh + 텍스처 자동 로드. uploadId 있으면 모든 모드 (align/readonly) 에서.
   // RefineViewer 는 SplatViewerCore 직접 쓰니 여기 안 영향.
-  useRefinedMeshLoader(coreRef, uploadId, Boolean(uploadId));
+  useRefinedMeshLoader(
+    coreRef,
+    uploadId,
+    Boolean(uploadId),
+    undefined,
+    null,
+    true,
+    undefined,
+    undefined,
+    registerDoor,
+    unregisterDoorByWrapper,
+  );
 
   return (
     <SplatViewerCore key={reloadKey} ref={coreRef} sogUrl={currentUrl} onSplatLoaded={onSplatLoadedCombined}>
@@ -140,8 +228,6 @@ export default function SplatViewer({ sogUrl, mode, uploadId, onSelectionDone }:
           <Minimap
             floorplan={floorplan}
             cameraGetter={() => coreRef.current?.getCamera() ?? null}
-            cutoff={floorplanCutoff}
-            onCutoffChange={setFloorplanCutoff}
           />
         </Suspense>
       )}

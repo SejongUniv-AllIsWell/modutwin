@@ -1,6 +1,6 @@
 'use client';
 
-import { useRef, useState, useCallback, useEffect, RefObject, lazy, Suspense } from 'react';
+import { useRef, useState, useCallback, useEffect, useMemo, RefObject, lazy, Suspense } from 'react';
 import { SplatData, SplatViewerCoreRef } from '../SplatViewerCore';
 import { useDepthNormal } from './useDepthNormal';
 import { surfacePlanesFromPolygon, signedDistance, type SurfacePlane, type PolygonPoint } from '@/lib/gs/planes';
@@ -93,55 +93,37 @@ function visibleExtentCrossesPlane(sd: number, sigmaN: number, visibleSigma: num
   return sd <= threshold && sd + visibleSigma * sigmaN > threshold;
 }
 
-function buildSurfaceBakeViewpoints(surfaceId: Surface, polygon: PolygonPoint[], ceilingY: number, floorY: number): Array<{ id: string; point: Vec3 }> {
-  const cx = polygon.reduce((sum, p) => sum + p.x, 0) / polygon.length;
-  const cz = polygon.reduce((sum, p) => sum + p.z, 0) / polygon.length;
-  const y = (ceilingY + floorY) / 2;
-  const center: Vec3 = [cx, y, cz];
-  if (!isWallSurface(surfaceId)) return [{ id: 'center', point: center }];
-
-  const i = Number(surfaceId.slice(1));
-  if (!Number.isInteger(i) || i < 0 || i >= polygon.length) return [{ id: 'center', point: center }];
-
-  const a = polygon[i];
-  const b = polygon[(i + 1) % polygon.length];
-  const dx = b.x - a.x;
-  const dz = b.z - a.z;
-  const len = Math.hypot(dx, dz);
-  if (len < 1e-6) return [{ id: 'center', point: center }];
-
-  const tx = dx / len;
-  const tz = dz / len;
-  const mx = (a.x + b.x) / 2;
-  const mz = (a.z + b.z) / 2;
-  const towardWallX = mx - cx;
-  const towardWallZ = mz - cz;
-  const nearX = cx + towardWallX * 0.65;
-  const nearZ = cz + towardWallZ * 0.65;
-  const lateral = Math.min(len * 0.28, Math.max(len * 0.12, 0.45));
-
-  const views: Array<{ id: string; point: Vec3 }> = [
-    { id: 'center', point: center },
-    { id: 'near', point: [nearX, y, nearZ] },
-  ];
-  if (len >= 1.2) {
-    views.push(
-      { id: 'left', point: [nearX - tx * lateral, y, nearZ - tz * lateral] },
-      { id: 'right', point: [nearX + tx * lateral, y, nearZ + tz * lateral] },
-    );
+function polygonSignedDistanceWithSurface(
+  polygon: PolygonPoint[],
+  x: number,
+  z: number,
+): { sd: number; surfaceId: string | null } {
+  let inside = false;
+  let minDist = Infinity;
+  let minSurfaceId: string | null = null;
+  for (let i = 0; i < polygon.length; i++) {
+    const a = polygon[i];
+    const b = polygon[(i + 1) % polygon.length];
+    if (((a.z > z) !== (b.z > z)) &&
+        (x < (b.x - a.x) * (z - a.z) / ((b.z - a.z) || 1e-12) + a.x)) {
+      inside = !inside;
+    }
+    const dx = b.x - a.x;
+    const dz = b.z - a.z;
+    const len2 = dx * dx + dz * dz;
+    let t = len2 > 0 ? ((x - a.x) * dx + (z - a.z) * dz) / len2 : 0;
+    t = Math.max(0, Math.min(1, t));
+    const qx = a.x + t * dx;
+    const qz = a.z + t * dz;
+    const dist = Math.hypot(x - qx, z - qz);
+    if (dist < minDist) {
+      minDist = dist;
+      minSurfaceId = `w${i}`;
+    }
   }
-  return views;
+  return { sd: inside ? -minDist : minDist, surfaceId: minSurfaceId };
 }
 
-function bakeTargetForPlane(input: import('@/lib/gs/textureBake').PlaneBakeInput): Vec3 {
-  const u = (input.uMin + input.uMax) / 2;
-  const v = (input.vMin + input.vMax) / 2;
-  return [
-    input.origin[0] + input.uAxis[0] * u + input.vAxis[0] * v,
-    input.origin[1] + input.uAxis[1] * u + input.vAxis[1] * v,
-    input.origin[2] + input.uAxis[2] * u + input.vAxis[2] * v,
-  ];
-}
 import {
   CF_SURFACES,
   SELECT_SUB_MODES,
@@ -165,6 +147,7 @@ import {
 
 const CeilingFloorModal = lazy(() => import('./CeilingFloorModal'));
 const WallModal = lazy(() => import('./WallModal'));
+
 
 // ── Hook ──
 
@@ -228,7 +211,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   const [boundaryCulling, setBoundaryCulling] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
-  // 다듬기 완료 → 문 설정 (SAM3 프롬프트 팝업) → 문 설정 완료에서 일괄 영속.
+  // 다듬기 완료 → 문 설정 (SAM3 프롬프트) → 문 설정 완료에서 일괄 영속.
   // 진행 중 전체 화면 오버레이 (업로드 단계 가시화).
   const [uploadProgressOpen, setUploadProgressOpen] = useState(false);
   const [uploadProgressMessage, setUploadProgressMessage] = useState('');
@@ -240,6 +223,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
 
   // 현재 폴리곤 변 수 (N) — wall surfaceId 목록 derive.
   const wallSurfaceIdList: string[] = wallPolygon ? wallSurfaceIds(wallPolygon.length) : [];
+  const validWallSurfaceSet = useMemo(() => new Set(wallSurfaceIdList), [wallSurfaceIdList]);
 
   const toggleSurface = (s: Surface) => {
     // Don't allow toggling disabled surfaces
@@ -284,6 +268,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
 
   // boundaryCull 마스크: 1=최종 PLY에서 제외할 경계 밖/경계 관통 splat. null=아직 적용 안 됨.
   const boundaryCullMaskRef = useRef<Uint8Array | null>(null);
+  const boundaryCullSurfaceIdsRef = useRef<string[] | null>(null);
   const [boundaryCullActive, setBoundaryCullActive] = useState(false);
   const boundaryCullActiveRef = useRef(false);
   const [boundaryCullVisible, setBoundaryCullVisible] = useState(true);
@@ -308,11 +293,9 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   // snapshot: clip 적용된 splat 들의 원본 log-scale (idx 별).
   const clippingSnapshotRef = useRef<Array<{ idx: number; s0: number; s1: number; s2: number }>>([]);
 
-  // ── Wall mesh test (texture-baked quad mesh, MVP)
+  // ── Wall mesh (texture-baked quad mesh)
   const [wallMeshActive, setWallMeshActive] = useState(false);
   const [wallMeshBaking, setWallMeshBaking] = useState(false);
-  const [wallMeshDebugWhite, setWallMeshDebugWhite] = useState(false);
-  const [textureBakeProjection, setTextureBakeProjection] = useState<'view-independent' | 'view-dependent'>('view-independent');
   const wallMeshEntitiesRef = useRef<any[]>([]);
   // 가장 최근 베이크 결과 (텍스처 다운로드 / 영속화용)
   const lastBakesRef = useRef<Map<string, {
@@ -322,11 +305,10 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     input: import('@/lib/gs/textureBake').PlaneBakeInput;
     corners: import('@/lib/gs/textureBake').TextureBakeResult['corners'];
     uvs: import('@/lib/gs/textureBake').TextureBakeResult['uvs'];
-    viewVariants?: import('@/lib/gs/textureBake').TextureBakeResult['viewVariants'];
   }>>(new Map());
 
 
-  // 디버그: 원본 splat 엔티티 숨기기 (메시 단독 확인용)
+  // 원본 splat 엔티티 숨김. 메시 위치와 텍스처를 별도로 확인할 때 사용한다.
   const [splatHidden, setSplatHidden] = useState(false);
 
   // 안전거리 실시간 미리보기 — 토글 ON 시 globalOffset / selectedSurfaces 변할 때마다
@@ -391,9 +373,11 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     if (!td) return;
     // preview: 빨강으로 표시 (alpha 유지). applied: alpha=0 (실제 삭제 시각화).
     // 둘 다 켜져있으면 preview가 우선.
-    const previewMask = boundaryCullPreviewActiveRef.current ? boundaryCullPreviewMaskRef.current : null;
-    const appliedMask = (boundaryCullActiveRef.current && boundaryCullVisibleRef.current) ? boundaryCullMaskRef.current : null;
-    const floaterMask = floaterActiveRef.current ? floaterMaskRef.current : null;
+    const maskForData = (mask: Uint8Array | null) =>
+      mask && mask.length === data.numSplats ? mask : null;
+    const previewMask = boundaryCullPreviewActiveRef.current ? maskForData(boundaryCullPreviewMaskRef.current) : null;
+    const appliedMask = (boundaryCullActiveRef.current && boundaryCullVisibleRef.current) ? maskForData(boundaryCullMaskRef.current) : null;
+    const floaterMask = floaterActiveRef.current ? maskForData(floaterMaskRef.current) : null;
     // 빨강 (R=1, G=0, B=0)
     const redR = f2h(1.0), redG = f2h(0.0), redB = f2h(0.0);
     for (let i = 0; i < data.numSplats; i++) {
@@ -448,7 +432,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   }, []);
 
 
-  // 원본 splat 엔티티 가리기 (디버그)
+  // 원본 splat 엔티티 가리기. wall mesh 만 따로 볼 때 사용한다.
   useEffect(() => {
     const data = coreRef.current?.getSplatData();
     if (!data?.splatEntity) return;
@@ -468,7 +452,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     const pc = core?.getPC();
     if (!app || !pc) return;
 
-    // 항상 이전 엔티티 정리 후 다시 생성
+    // 시각화 entity 를 정리한 뒤 현재 설정으로 다시 생성
     const cleanup = () => {
       if (safetyVizEntityRef.current) {
         try { safetyVizEntityRef.current.destroy(); } catch {}
@@ -490,7 +474,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         polygon: wallPolygon!,
         ceilingY, floorY,
       });
-      const ent = createOffsetArrows(pc, {
+      const ent = createOffsetArrows(pc, app, {
         planes,
         polygon: wallPolygon!,
         ceilingY, floorY,
@@ -644,6 +628,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       pushOp({
         type: 'boundaryCull',
         prevMask: boundaryCullMaskRef.current ? new Uint8Array(boundaryCullMaskRef.current) : null,
+        prevSurfaceIds: boundaryCullSurfaceIdsRef.current ? [...boundaryCullSurfaceIdsRef.current] : null,
         prevActive: true,
       });
       boundaryCullActiveRef.current = false; setBoundaryCullActive(false);
@@ -660,6 +645,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       paintBoundaryCullMask();
       // 마스크 자체는 보관해 둘 수도 있지만, 다음 클릭에서 어차피 재계산하므로 비움 → 의도 명확화
       boundaryCullMaskRef.current = null;
+      boundaryCullSurfaceIdsRef.current = null;
       // dirty/op 히스토리는 그대로. 토글 자체도 히스토리에 남음.
       setSaved(false);
       const stillDirty = opHistoryRef.current.length > 0
@@ -689,31 +675,6 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       const selectsFloor = selectedSurfaces.has('floor');
       const selectsAnyWall = Array.from(selectedSurfaces).some(s => isWallSurface(s));
       const polygonReady = !!polygon && polygon.length >= 3;
-
-      // polygon signed distance (음수 = 내부, 양수 = 외부). 비-볼록 polygon 도 정확.
-      const polygonSD = polygonReady
-        ? (x: number, z: number): number => {
-            let inside = false;
-            let minDist = Infinity;
-            const P = polygon!;
-            for (let i = 0, j = P.length - 1; i < P.length; j = i++) {
-              const xi = P[i].x, zi = P[i].z;
-              const xj = P[j].x, zj = P[j].z;
-              if (((zi > z) !== (zj > z)) &&
-                  (x < (xj - xi) * (z - zi) / ((zj - zi) || 1e-12) + xi)) {
-                inside = !inside;
-              }
-              const dx = xi - xj, dz = zi - zj;
-              const len2 = dx * dx + dz * dz;
-              let t = len2 > 0 ? ((x - xj) * dx + (z - zj) * dz) / len2 : 0;
-              t = Math.max(0, Math.min(1, t));
-              const qx = xj + t * dx, qz = zj + t * dz;
-              const d = Math.hypot(x - qx, z - qz);
-              if (d < minDist) minDist = d;
-            }
-            return inside ? -minDist : minDist;
-          }
-        : null;
 
       const boundaryPlanes: SurfacePlane[] = [];
       if (selectsCeiling) boundaryPlanes.push({ id: 'ceiling', normal: [0, 1, 0], d: cy });
@@ -754,39 +715,53 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
 
       const N = data.numSplats;
       const newMask = new Uint8Array(N);
+      const newSurfaceIds = new Array<string>(N).fill('');
       let deletedCount = 0;
       for (let i = 0; i < N; i++) {
         const x = rotPos.x[i], y = rotPos.y[i], z = rotPos.z[i];
-        let outside = false;
+        let bestSurfaceId = '';
+        let bestAmount = -Infinity;
+        const markCandidate = (surfaceId: string | null | undefined, amount: number) => {
+          if (!surfaceId || !(amount > bestAmount)) return;
+          bestSurfaceId = surfaceId;
+          bestAmount = amount;
+        };
         // 천장 — selected 시 ceilingY 위쪽 (cutThreshold 확장) 제거.
-        if (selectsCeiling && y > cy + cutThreshold) outside = true;
+        if (selectsCeiling && y > cy + cutThreshold) markCandidate('ceiling', y - (cy + cutThreshold));
         // 바닥 — selected 시 floorY 아래쪽 제거.
-        if (!outside && selectsFloor && y < fy - cutThreshold) outside = true;
+        if (selectsFloor && y < fy - cutThreshold) markCandidate('floor', (fy - cutThreshold) - y);
         // 벽 — wall 이 하나라도 선택되면 polygon 외부 전체 제거 (polygon signed distance > cutThreshold).
         //   각 wall 의 무한 평면 sd 가 아닌 polygon 경계 자체 기준 → polygon 변 segment 너머도 정확히 처리.
-        if (!outside && selectsAnyWall && polygonSD) {
-          const sd = polygonSD(x, z);
-          if (sd > cutThreshold) outside = true;
+        if (selectsAnyWall && polygonReady) {
+          const { sd, surfaceId } = polygonSignedDistanceWithSurface(polygon!, x, z);
+          if (sd > cutThreshold) markCandidate(surfaceId, sd - cutThreshold);
         }
         // 중심은 방 안쪽이어도 PlayCanvas visible extent 가 선택 경계 밖으로 나가면
         // main GS 에 남기지 않고 wall/ceiling/floor bake 로 넘긴다.
-        if (!outside && canCheckExtent && rr0 && rr1 && rr2 && rr3) {
+        if (canCheckExtent && rr0 && rr1 && rr2 && rr3) {
           const visibleSigma = gsplatVisibleSigmaRadius(sigmoidOpacity(op![i]));
           if (visibleSigma > 0) {
             for (const plane of boundaryPlanes) {
               const sd = signedDistance(plane, x, y, z);
               const sigmaN = gaussianNormalSigma(plane.normal as Vec3, rr0[i], rr1[i], rr2[i], rr3[i], sc0![i], sc1![i], sc2![i]);
-              if (visibleExtentCrossesPlane(sd, sigmaN, visibleSigma, cutThreshold)) { outside = true; break; }
+              if (visibleExtentCrossesPlane(sd, sigmaN, visibleSigma, cutThreshold)) {
+                markCandidate(plane.id, sd + visibleSigma * sigmaN - cutThreshold);
+              }
             }
           }
         }
-        if (outside) { newMask[i] = 1; deletedCount++; }
+        if (bestSurfaceId) {
+          newMask[i] = 1;
+          newSurfaceIds[i] = bestSurfaceId;
+          deletedCount++;
+        }
       }
 
-      // undo 기록 (이전 상태 = 비활성 + 마스크 없음)
-      pushOp({ type: 'boundaryCull', prevMask: null, prevActive: false });
+      // undo 복원 상태: 비활성 + 마스크 없음
+      pushOp({ type: 'boundaryCull', prevMask: null, prevSurfaceIds: null, prevActive: false });
 
       boundaryCullMaskRef.current = newMask;
+      boundaryCullSurfaceIdsRef.current = newSurfaceIds;
       boundaryCullActiveRef.current = true; setBoundaryCullActive(true);
       boundaryCullVisibleRef.current = true; setBoundaryCullVisible(true);
       paintBoundaryCullMask();
@@ -875,7 +850,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       }
       const { syncScalesGPU } = await import('./gpuSync');
       syncScalesGPU(updates.map(u => u.idx), data, float2Half);
-      // undo 기록 — 이전 상태 (clipping 비활성).
+      // undo 복원 상태: clipping 비활성
       pushOp({ type: 'clipping', prevSnapshot: [], prevActive: false });
       clippingSnapshotRef.current = snap;
       clippingActiveRef.current = true;
@@ -991,29 +966,29 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       const { createWallMeshEntity } = await import('@/lib/gs/wallMesh');
       const { filterScene } = await import('@/lib/ply');
 
-      // 텍스처 굽기에 사용할 source scene 구성:
-      //  - boundaryCull 마스크: ❌ 미적용.
-      //    벽/천장/바닥을 가로지르는 Gaussian 기여를 wall mesh 텍스처에 옮겨 담기 위해,
-      //    textureBake 가 평면 교차 covariance 기준으로 필요한 splat 만 채택한다.
-      //  - 브러시/bbox 삭제: ✅ 적용 (origColorData alpha=0으로 누적돼 있음)
       const original = await ensureOriginalScene();
+      const boundaryMask = boundaryCullMaskRef.current;
+      const boundarySurfaceIds = boundaryCullSurfaceIdsRef.current;
+      if (!boundaryCullActiveRef.current || !boundaryMask || !boundarySurfaceIds) {
+        alert('먼저 경계 가우시안 제거를 적용하세요.');
+        return;
+      }
+      if (boundaryMask.length !== original.numSplats || boundarySurfaceIds.length !== original.numSplats) {
+        alert('경계 제거 결과와 현재 PLY가 맞지 않습니다. 경계 가우시안 제거를 다시 적용하세요.');
+        return;
+      }
+
       const splatData0 = coreRef.current?.getSplatData();
       const core0 = coreRef.current;
-      let brushFilteredOriginal = original;
+      let brushKeep: Uint8Array | null = null;
       if (splatData0?.origColorData && core0 && splatData0.numSplats === original.numSplats) {
         const h2f = core0.half2Float;
-        const keep = new Uint8Array(original.numSplats);
-        let kept = 0;
+        brushKeep = new Uint8Array(original.numSplats);
         for (let i = 0; i < original.numSplats; i++) {
           const a = h2f(splatData0.origColorData[i * 4 + 3]);
-          if (a >= 1e-3) { keep[i] = 1; kept++; }
-        }
-        if (kept < original.numSplats) {
-          brushFilteredOriginal = filterScene(original, keep);
+          if (a >= 1e-3) brushKeep[i] = 1;
         }
       }
-      const rotated = await buildRotatedScene(brushFilteredOriginal);
-      const source = rotated;
 
       const polygon = wallPolygonRef.current!;
       const cy = ceilingYRef.current, fy = floorYRef.current;
@@ -1036,50 +1011,35 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
 
       // 메시는 사용자가 정의한 경계 평면(sd=0) 에 정확히 배치.
 
+      const validSurfaceIds = Array.from(selectedSurfaces).filter((surfaceId) => (
+        isFixedSurface(surfaceId) || validWallSurfaceSet.has(surfaceId)
+      ));
+      if (validSurfaceIds.length !== selectedSurfaces.size) {
+        setSelectedSurfaces(new Set(validSurfaceIds));
+      }
+
       lastBakesRef.current.clear();
-      for (const surfaceId of Array.from(selectedSurfaces)) {
-        const input = planeBakeInputForSurface(surfaceId, room);
-        let bake = await bakeTextureForPlane(input, source);
-        if (textureBakeProjection === 'view-dependent') {
-          const target = bakeTargetForPlane(input);
-          const bakeFromView = (view: { point: Vec3 }) => {
-            const viewDirection = normalize3([
-              target[0] - view.point[0],
-              target[1] - view.point[1],
-              target[2] - view.point[2],
-            ]);
-            return bakeTextureForPlane(input, source, { viewpoint: view.point, viewDirection });
-          };
-          const bakeViewpoints = buildSurfaceBakeViewpoints(surfaceId, polygon, cy, fy);
-          const centerView = bakeViewpoints[0];
-          bake = await bakeFromView(centerView);
-          const viewVariants = [{
-            id: centerView.id,
-            viewpoint: centerView.point,
-            rgba: bake.rgba,
-          }];
-          for (const view of bakeViewpoints.slice(1)) {
-            const variant = await bakeFromView(view);
-            viewVariants.push({
-              id: view.id,
-              viewpoint: view.point,
-              rgba: variant.rgba,
-            });
-          }
-          bake.viewVariants = viewVariants;
+      for (const surfaceId of validSurfaceIds) {
+        const keep = new Uint8Array(original.numSplats);
+        for (let i = 0; i < original.numSplats; i++) {
+          if (!boundaryMask[i]) continue;
+          if (boundarySurfaceIds[i] !== surfaceId) continue;
+          if (brushKeep && !brushKeep[i]) continue;
+          keep[i] = 1;
         }
+        const source = await buildRotatedScene(filterScene(original, keep));
+        const input = planeBakeInputForSurface(surfaceId, room);
+        const bake = await bakeTextureForPlane(input, source);
         const ent = createWallMeshEntity(
           pc, app, splatData.splatEntity, bake, `wallMesh_${surfaceId}`,
-          { solidWhite: wallMeshDebugWhite },
         );
         wallMeshEntitiesRef.current.push(ent);
-        // 디버그: 베이크 결과 보관 (PNG 다운로드용)
         lastBakesRef.current.set(surfaceId, {
           rgba: bake.rgba, width: bake.width, height: bake.height, input: bake.input,
-          corners: bake.corners, uvs: bake.uvs, viewVariants: bake.viewVariants,
+          corners: bake.corners, uvs: bake.uvs,
         });
       }
-      // undo 기록 — 이전 상태 (막 없음).
+      // undo 복원 상태: 막 없음
       pushOp({ type: 'wallMesh', prevEntities: [], prevActive: false });
       setWallMeshActive(true);
       dirtyRef.current = true; setDirty(true);
@@ -1089,34 +1049,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     } finally {
       setWallMeshBaking(false);
     }
-  }, [selectedSurfaces, globalOffset, ensureOriginalScene, buildRotatedScene, coreRef, wallMeshDebugWhite, textureBakeProjection, pushOp]);
-
-  // 가장 최근 베이크 결과를 PNG로 다운로드 (디버그)
-  const downloadBakedTextures = useCallback(() => {
-    const bakes = lastBakesRef.current;
-    if (bakes.size === 0) { alert('베이크된 텍스처가 없습니다. 먼저 "막 생성하기" 실행.'); return; }
-    const ts = Date.now();
-    bakes.forEach(({ rgba, width, height }, surfaceId) => {
-      const canvas = document.createElement('canvas');
-      canvas.width = width;
-      canvas.height = height;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) return;
-      const imgData = new ImageData(new Uint8ClampedArray(rgba), width, height);
-      ctx.putImageData(imgData, 0, 0);
-      canvas.toBlob((blob) => {
-        if (!blob) return;
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `bake_${surfaceId}_${ts}.png`;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
-      }, 'image/png');
-    });
-  }, []);
+  }, [selectedSurfaces, globalOffset, ensureOriginalScene, buildRotatedScene, coreRef, pushOp]);
 
   // ── Brush/BBox state ──
   const [paintMode, setPaintMode] = useState<PaintMode>('union');
@@ -1637,11 +1570,16 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     const bytes = serializePly(canonical);
     const blobUrl = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
     skipNextSplatRebakeRef.current = true;
-    setTimeout(() => { skipNextSplatRebakeRef.current = false; }, 5000);
-    await core.reloadSplatFromUrl(blobUrl, { preserveCamera: true });
+    try {
+      await core.reloadSplatFromUrl(blobUrl, { preserveCamera: true });
+    } catch (e) {
+      skipNextSplatRebakeRef.current = false;
+      throw e;
+    }
 
     // 삭제는 canonical PLY geometry 에 반영됐으므로 이후 단계에서는 별도 mask 를 더 들고 가지 않는다.
     boundaryCullMaskRef.current = null;
+    boundaryCullSurfaceIdsRef.current = null;
     boundaryCullActiveRef.current = false;
     setBoundaryCullActive(false);
     floaterMaskRef.current = null;
@@ -1754,7 +1692,6 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     plyBytes: ArrayBuffer | Uint8Array;
     meshJson: string;
     textures: Map<string, Blob>;
-    textureVariants: Map<string, Blob>;
     rotX: number;
     rotZ: number;
     wallAngleRad: number;
@@ -1778,7 +1715,6 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     })();
 
     const textures = new Map<string, Blob>();
-    const textureVariants = new Map<string, Blob>();
     const meshSurfaces: Array<{
       surfaceId: string;
       corners: number[][];
@@ -1787,11 +1723,6 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       textureFilename: string;
       textureWidth: number;
       textureHeight: number;
-      textureVariants?: Array<{
-        id: string;
-        viewpoint: [number, number, number];
-        textureFilename: string;
-      }>;
     }> = [];
 
     if (lastBakesRef.current.size > 0) {
@@ -1815,20 +1746,6 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         const texFilename = `tex_${surfaceId}.png`;
         const pngBlob = await rgbaToPng(bake.rgba, bake.width, bake.height);
         textures.set(surfaceId, pngBlob);
-        const variants: Array<{
-          id: string;
-          viewpoint: [number, number, number];
-          textureFilename: string;
-        }> = [];
-        for (const variant of bake.viewVariants ?? []) {
-          const filename = `tex_${surfaceId}_view_${variant.id}.png`;
-          textureVariants.set(`${surfaceId}_view_${variant.id}`, await rgbaToPng(variant.rgba, bake.width, bake.height));
-          variants.push({
-            id: variant.id,
-            viewpoint: rotateY([variant.viewpoint[0], variant.viewpoint[1], variant.viewpoint[2]]),
-            textureFilename: filename,
-          });
-        }
         const inwardRaw: [number, number, number] = [
           -bake.input.normal[0], -bake.input.normal[1], -bake.input.normal[2],
         ];
@@ -1842,7 +1759,6 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
           textureFilename: texFilename,
           textureWidth: bake.width,
           textureHeight: bake.height,
-          ...(variants.length > 0 ? { textureVariants: variants } : {}),
         });
       }
     }
@@ -1854,7 +1770,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       planes: buildFinalSurfacePlanes(wallPolygonRef.current, ceilingYRef.current, floorYRef.current, wallAngleRad),
     });
 
-    return { plyBytes, meshJson, textures, textureVariants, rotX, rotZ, wallAngleRad, plyFilename };
+    return { plyBytes, meshJson, textures, rotX, rotZ, wallAngleRad, plyFilename };
   }, [buildFinalPlyScene, options?.originalFilename]);
 
   // 베이스맵 등록 흐름의 문 설정 완료 시점에 호출됨 — refined PLY + mesh.json + tex_*.png 일괄 업로드 + SceneOutput 등록.
@@ -1937,11 +1853,6 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         textureFilename: string;
         textureWidth: number;
         textureHeight: number;
-        textureVariants?: Array<{
-          id: string;
-          viewpoint: [number, number, number];
-          textureFilename: string;
-        }>;
       }> = [];
 
       if (lastBakesRef.current.size > 0) {
@@ -1986,28 +1897,6 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
           const cornersOut = bake.corners.map(
             c => rotateY([c[0], c[1], c[2]]),
           );
-          const variants: Array<{
-            id: string;
-            viewpoint: [number, number, number];
-            textureFilename: string;
-          }> = [];
-          for (const variant of bake.viewVariants ?? []) {
-            const variantFilename = `tex_${surfaceId}_view_${variant.id}.png`;
-            const variantUrl = await api.post<{ put_url: string; key: string }>(
-              '/refine/refined-upload-url',
-              { upload_id: activeUploadId, filename: variantFilename, session_id: sessionId },
-            );
-            const variantBlob = await rgbaToPng(variant.rgba, bake.width, bake.height);
-            const variantResp = await fetch(variantUrl.put_url, {
-              method: 'PUT', body: variantBlob, headers: { 'Content-Type': 'image/png' },
-            });
-            if (!variantResp.ok) throw new Error(`tex variant PUT failed (${surfaceId}/${variant.id}): ${variantResp.status}`);
-            variants.push({
-              id: variant.id,
-              viewpoint: rotateY([variant.viewpoint[0], variant.viewpoint[1], variant.viewpoint[2]]),
-              textureFilename: variantFilename,
-            });
-          }
           meshSurfaces.push({
             surfaceId,
             corners: cornersOut,
@@ -2016,7 +1905,6 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
             textureFilename: texFilename,
             textureWidth: bake.width,
             textureHeight: bake.height,
-            ...(variants.length > 0 ? { textureVariants: variants } : {}),
           });
         }
 
@@ -2138,6 +2026,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     setBakedRotation({ rotX: 0, rotZ: 0 });
     refinedCanonicalSceneRef.current = null;
     boundaryCullMaskRef.current = null;
+    boundaryCullSurfaceIdsRef.current = null;
     boundaryCullActiveRef.current = false; setBoundaryCullActive(false);
     boundaryCullVisibleRef.current = true; setBoundaryCullVisible(true);
     floaterMaskRef.current = null;
@@ -2176,6 +2065,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       applyEntityRotation();
     } else if (rec.type === 'boundaryCull') {
       boundaryCullMaskRef.current = rec.prevMask;
+      boundaryCullSurfaceIdsRef.current = rec.prevSurfaceIds ? [...rec.prevSurfaceIds] : null;
       boundaryCullActiveRef.current = rec.prevActive; setBoundaryCullActive(rec.prevActive);
       paintBoundaryCullMask();
     } else if (rec.type === 'floater') {
@@ -2187,7 +2077,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       if (clippingActiveRef.current) {
         try { await applyClipping(); } catch {}
       }
-      // 이전 스냅샷이 있었던 경우 (= clipping 이 ON 이었음) 그 상태로 복원하진 않음. 단순히 OFF 만.
+      // clipping undo 는 현재 활성 상태를 OFF 로 되돌린다.
     } else if (rec.type === 'wallMesh') {
       // 막 제거 — 현재 entity 들 destroy.
       for (const e of wallMeshEntitiesRef.current) { try { e.destroy(); } catch {} }
@@ -2235,6 +2125,23 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     if (data.origColorData) pristineRef.current = new Uint16Array(data.origColorData);
     selectionRef.current = new Uint8Array(data.numSplats);
 
+    if (boundaryCullPreviewMaskRef.current && boundaryCullPreviewMaskRef.current.length !== data.numSplats) {
+      boundaryCullPreviewMaskRef.current = null;
+      boundaryCullPreviewActiveRef.current = false;
+      setBoundaryCullPreviewActive(false);
+    }
+    if (boundaryCullMaskRef.current && boundaryCullMaskRef.current.length !== data.numSplats) {
+      boundaryCullMaskRef.current = null;
+      boundaryCullSurfaceIdsRef.current = null;
+      boundaryCullActiveRef.current = false;
+      setBoundaryCullActive(false);
+    }
+    if (floaterMaskRef.current && floaterMaskRef.current.length !== data.numSplats) {
+      floaterMaskRef.current = null;
+      floaterActiveRef.current = false;
+      setFloaterActive(false);
+    }
+
     // 새 splatData 수신 시 누적 회전 / boundaryCull 마스크가 있으면 즉시 시각 동기화
     // (페이지 새로고침 후 persistence 복원이나 reset 후 등에서 호출됨)
     setTimeout(async () => {
@@ -2268,12 +2175,13 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       }
       applyEntityRotation();
       if (boundaryCullActiveRef.current && boundaryCullMaskRef.current) {
-        // splatData가 새로 로드된 경우, 이전 마스크의 길이가 다를 수 있으니 검사
+        // 현재 splatData 와 마스크 길이가 일치할 때만 재적용한다.
         if (boundaryCullMaskRef.current.length === data.numSplats) {
           paintBoundaryCullMask();
         } else {
           // 길이 불일치 → 마스크 무효
           boundaryCullMaskRef.current = null;
+          boundaryCullSurfaceIdsRef.current = null;
           boundaryCullActiveRef.current = false; setBoundaryCullActive(false);
         }
       }
@@ -2304,6 +2212,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
 
     // ── Local state for mouse handlers ──
     let painting = false;
+    let lastBrushPoint: { x: number; y: number } | null = null;
     let transPainting = false;
     let bboxDragAxis = -1, bboxDragIsMax = false, bboxDragStartVal = 0, bboxDragStartMouseY = 0, bboxDragScale = 1;
 
@@ -2334,6 +2243,58 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     // - diff:  브러시 내부 → 0.
     // - intersect: 스트로크 동안 누적된 strokeMask 와 stroke 시작 시점 sel(=strokeBaseSel) 의 교집합.
     //   매 프레임 sel = strokeBaseSel ∩ strokeMask 로 갱신.
+    const projectSplatPoint = (m: Float32Array | number[], x: number, y: number, z: number, w: number, h: number): { x: number; y: number } | null => {
+      const cw = m[3]*x + m[7]*y + m[11]*z + m[15];
+      if (cw <= 0.01) return null;
+      const inv = 1 / cw;
+      return {
+        x: ((m[0]*x + m[4]*y + m[8]*z + m[12]) * inv + 1) * 0.5 * w,
+        y: (1 - (m[1]*x + m[5]*y + m[9]*z + m[13]) * inv) * 0.5 * h,
+      };
+    };
+
+    const projectedSplatScreenRadius = (
+      sd: SplatData,
+      m: Float32Array | number[],
+      i: number,
+      center: { x: number; y: number },
+      w: number,
+      h: number,
+    ): number => {
+      const sc0 = sd.gsplatData?.getProp?.('scale_0') as Float32Array | undefined;
+      const sc1 = sd.gsplatData?.getProp?.('scale_1') as Float32Array | undefined;
+      const sc2 = sd.gsplatData?.getProp?.('scale_2') as Float32Array | undefined;
+      const r0 = sd.gsplatData?.getProp?.('rot_0') as Float32Array | undefined;
+      const r1 = sd.gsplatData?.getProp?.('rot_1') as Float32Array | undefined;
+      const r2 = sd.gsplatData?.getProp?.('rot_2') as Float32Array | undefined;
+      const r3 = sd.gsplatData?.getProp?.('rot_3') as Float32Array | undefined;
+      const opacity = sd.gsplatData?.getProp?.('opacity') as Float32Array | undefined;
+      if (!sc0 || !sc1 || !sc2 || !r0 || !r1 || !r2 || !r3) return 0;
+      const k = gsplatVisibleSigmaRadius(opacity ? sigmoidOpacity(opacity[i]) : 1);
+      if (!(k > 0)) return 0;
+      const qw0 = r0[i], qx0 = r1[i], qy0 = r2[i], qz0 = r3[i];
+      const qLen = Math.hypot(qw0, qx0, qy0, qz0) || 1;
+      const qw = qw0 / qLen, qx = qx0 / qLen, qy = qy0 / qLen, qz = qz0 / qLen;
+      const xx = qx*qx, yy = qy*qy, zz = qz*qz;
+      const xy = qx*qy, xz = qx*qz, yz = qy*qz;
+      const wx = qw*qx, wy = qw*qy, wz = qw*qz;
+      const s0 = Math.exp(sc0[i]) * k;
+      const s1 = Math.exp(sc1[i]) * k;
+      const s2 = Math.exp(sc2[i]) * k;
+      const axes = [
+        [(1 - 2*(yy + zz)) * s0, (2*(xy + wz)) * s0, (2*(xz - wy)) * s0],
+        [(2*(xy - wz)) * s1, (1 - 2*(xx + zz)) * s1, (2*(yz + wx)) * s1],
+        [(2*(xz + wy)) * s2, (2*(yz - wx)) * s2, (1 - 2*(xx + yy)) * s2],
+      ] as const;
+      let radius = 0;
+      for (const axis of axes) {
+        const p = projectSplatPoint(m, sd.posX[i] + axis[0], sd.posY[i] + axis[1], sd.posZ[i] + axis[2], w, h);
+        if (!p) continue;
+        radius = Math.max(radius, Math.hypot(p.x - center.x, p.y - center.y));
+      }
+      return radius;
+    };
+
     const applyBrush = (mouseX: number, mouseY: number) => {
       const sd = splatDataRef.current; const sel = selectionRef.current;
       const cam = cameraEntity.camera; const pc = pcRef.current;
@@ -2341,20 +2302,19 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       const vpMat = new pc.Mat4(); vpMat.mul2(cam.projectionMatrix, cam.viewMatrix);
       const mvpMat = new pc.Mat4(); mvpMat.mul2(vpMat, sd.splatEntity.getWorldTransform());
       const m = mvpMat.data; const w = canvas.clientWidth, h = canvas.clientHeight;
-      const r2 = brushSizeRef.current**2;
+      const brushRadius = brushSizeRef.current;
       const pmode = paintModeRef.current;
       if (pmode === 'intersect') {
         const baseSel = strokeBaseSelRef.current;
         const strokeMask = strokeMaskRef.current;
         if (!baseSel || !strokeMask) { refreshSelection(); return; }
         for (let i = 0; i < sd.numSplats; i++) {
-          const px=sd.posX[i], py=sd.posY[i], pz=sd.posZ[i];
-          const cw = m[3]*px+m[7]*py+m[11]*pz+m[15]; if (cw<=0.01) continue;
-          const inv = 1/cw;
-          const sx = ((m[0]*px+m[4]*py+m[8]*pz+m[12])*inv+1)*0.5*w;
-          const sy = (1-(m[1]*px+m[5]*py+m[9]*pz+m[13])*inv)*0.5*h;
-          const dx = sx-mouseX, dy = sy-mouseY;
-          if (dx*dx+dy*dy < r2) strokeMask[i] = 1;
+          const center = projectSplatPoint(m, sd.posX[i], sd.posY[i], sd.posZ[i], w, h);
+          if (!center) continue;
+          const splatRadius = projectedSplatScreenRadius(sd, m, i, center, w, h);
+          const hitRadius = brushRadius + splatRadius;
+          const dx = center.x-mouseX, dy = center.y-mouseY;
+          if (dx*dx+dy*dy <= hitRadius*hitRadius) strokeMask[i] = 1;
         }
         for (let i = 0; i < sd.numSplats; i++) sel[i] = (baseSel[i] && strokeMask[i]) ? 1 : 0;
         refreshSelection();
@@ -2362,15 +2322,33 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       }
       const setVal = pmode === 'union' ? 1 : 0;
       for (let i = 0; i < sd.numSplats; i++) {
-        const px=sd.posX[i], py=sd.posY[i], pz=sd.posZ[i];
-        const cw = m[3]*px+m[7]*py+m[11]*pz+m[15]; if (cw<=0.01) continue;
-        const inv = 1/cw;
-        const sx = ((m[0]*px+m[4]*py+m[8]*pz+m[12])*inv+1)*0.5*w;
-        const sy = (1-(m[1]*px+m[5]*py+m[9]*pz+m[13])*inv)*0.5*h;
-        const dx = sx-mouseX, dy = sy-mouseY;
-        if (dx*dx+dy*dy < r2) sel[i] = setVal;
+        const center = projectSplatPoint(m, sd.posX[i], sd.posY[i], sd.posZ[i], w, h);
+        if (!center) continue;
+        const splatRadius = projectedSplatScreenRadius(sd, m, i, center, w, h);
+        const hitRadius = brushRadius + splatRadius;
+        const dx = center.x-mouseX, dy = center.y-mouseY;
+        if (dx*dx+dy*dy <= hitRadius*hitRadius) sel[i] = setVal;
       }
       refreshSelection();
+    };
+
+    const applyBrushStroke = (mouseX: number, mouseY: number) => {
+      const prev = lastBrushPoint;
+      if (!prev) {
+        applyBrush(mouseX, mouseY);
+        lastBrushPoint = { x: mouseX, y: mouseY };
+        return;
+      }
+      const dx = mouseX - prev.x;
+      const dy = mouseY - prev.y;
+      const dist = Math.hypot(dx, dy);
+      const step = Math.max(1, brushSizeRef.current * 0.5);
+      const steps = Math.max(1, Math.ceil(dist / step));
+      for (let i = 1; i <= steps; i++) {
+        const t = i / steps;
+        applyBrush(prev.x + dx * t, prev.y + dy * t);
+      }
+      lastBrushPoint = { x: mouseX, y: mouseY };
     };
 
     // ── Rect select: 화면 직사각형 안에 투영되는 모든 splat 을 선택. 깊이 무한대.
@@ -2649,6 +2627,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       hoveredAxisRef.current = -1;
       strokeBaseSelRef.current = null;
       strokeMaskRef.current = null;
+      lastBrushPoint = null;
       if (brushCursorRef.current) brushCursorRef.current.style.display = 'none';
       if (rectPreviewRef.current) rectPreviewRef.current.style.display = 'none';
       if (transRectPreviewRef.current) transRectPreviewRef.current.style.display = 'none';
@@ -2815,13 +2794,14 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       // ── BRUSH MODE ──
       if (mode === 'brush') {
         painting = true;
+        lastBrushPoint = null;
         pushHistory();
         // intersect: stroke 시작 시점 sel snapshot + 빈 strokeMask 할당.
         if (paintModeRef.current === 'intersect' && selectionRef.current) {
           strokeBaseSelRef.current = new Uint8Array(selectionRef.current);
           strokeMaskRef.current = new Uint8Array(selectionRef.current.length);
         }
-        applyBrush(mx, my);
+        applyBrushStroke(mx, my);
         return;
       }
 
@@ -2913,7 +2893,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
           const rect = canvas.getBoundingClientRect(); const x=e.clientX-rect.left, y=e.clientY-rect.top; const sz=brushSizeRef.current*2;
           brushCursorRef.current.style.display='block'; brushCursorRef.current.style.left=`${x-sz/2}px`; brushCursorRef.current.style.top=`${y-sz/2}px`; brushCursorRef.current.style.width=`${sz}px`; brushCursorRef.current.style.height=`${sz}px`;
         }
-        if (painting) { const rect = canvas.getBoundingClientRect(); applyBrush(e.clientX-rect.left, e.clientY-rect.top); }
+        if (painting) { const rect = canvas.getBoundingClientRect(); applyBrushStroke(e.clientX-rect.left, e.clientY-rect.top); }
         return;
       }
 
@@ -3016,9 +2996,10 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       rectStartScreen = null;
       if (transRectPreviewRef.current) transRectPreviewRef.current.style.display = 'none';
       if (rectPreviewRef.current) rectPreviewRef.current.style.display = 'none';
-      // brush intersect: stroke 종료 시 임시 마스크 해제
+      // brush intersect: stroke 종료 시 stroke 전용 마스크 해제
       strokeBaseSelRef.current = null;
       strokeMaskRef.current = null;
+      lastBrushPoint = null;
       dragRef.current = null; painting = false; transPainting = false; bboxDragAxis = -1;
     };
     const onMouseLeave = () => {
@@ -3301,36 +3282,6 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
 
               {/* 막 생성하기 — 경계 가우시안 제거 활성 후 사용 가능. */}
               <div className={`border-t border-gray-700 pt-2 mt-1 space-y-1.5 ${boundaryCullActive ? '' : 'opacity-50 pointer-events-none'}`}>
-                {!wallMeshActive && (
-                  <div className="grid grid-cols-2 gap-1">
-                    <button
-                      type="button"
-                      onClick={() => setTextureBakeProjection('view-independent')}
-                      disabled={wallMeshBaking}
-                      className={`px-2 py-1 rounded text-[10px] font-bold disabled:opacity-50 ${
-                        textureBakeProjection === 'view-independent'
-                          ? 'bg-cyan-600 text-white'
-                          : 'bg-gray-700 hover:bg-gray-600 text-gray-300'
-                      }`}
-                      title="기존 방식: 면 법선 기준 수직투영으로 단일 텍스처를 굽습니다."
-                    >
-                      수직투영
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setTextureBakeProjection('view-dependent')}
-                      disabled={wallMeshBaking}
-                      className={`px-2 py-1 rounded text-[10px] font-bold disabled:opacity-50 ${
-                        textureBakeProjection === 'view-dependent'
-                          ? 'bg-cyan-600 text-white'
-                          : 'bg-gray-700 hover:bg-gray-600 text-gray-300'
-                      }`}
-                      title="대표 카메라 위치/방향별로 여러 텍스처를 굽고, 런타임 카메라 위치에 맞춰 전환합니다."
-                    >
-                      View dependent
-                    </button>
-                  </div>
-                )}
                 {!wallMeshActive ? (
                   <button onClick={() => bakeWallMesh()}
                     disabled={!boundaryCullActive || wallMeshBaking || selectedSurfaces.size === 0 || wallMode !== 'confirmed' || cfMode !== 'confirmed'}
@@ -3603,10 +3554,11 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
                 setSaved(false);
               }
 
-              // 회전 변경 후 boundaryCull 마스크 / 벽 정의 무효화 (이전 회전 프레임 기준이라 stale).
+              // 회전 변경 후 boundaryCull 마스크 / 벽 정의는 현재 프레임과 맞지 않으므로 무효화.
               if (rotChanged) {
                 if (boundaryCullMaskRef.current) {
                   boundaryCullMaskRef.current = null;
+                  boundaryCullSurfaceIdsRef.current = null;
                   boundaryCullActiveRef.current = false; setBoundaryCullActive(false);
                   paintBoundaryCullMask();
                 }
@@ -3648,13 +3600,14 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
             numSplats={splatDataRef.current.numSplats}
             ceilingY={ceilingY}
             floorY={floorY}
+            initialPolygon={wallPolygon}
             onConfirm={(angleDeg, polygon) => {
               setWallAngle(angleDeg); wallAngleRef.current = angleDeg;
               setWallPolygon(polygon); wallPolygonRef.current = polygon;
               setWallMode('confirmed'); wallModeRef.current = 'confirmed';
               setWallModalOpen(false);
               setSelectedSurfaces(prev => {
-                const next = new Set(prev);
+                const next = new Set(Array.from(prev).filter(s => !isWallSurface(s)));
                 wallSurfaceIds(polygon.length).forEach(s => next.add(s));
                 return next;
               });
@@ -3715,7 +3668,6 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     rgba: Uint8ClampedArray;
     width: number;
     height: number;
-    viewVariants?: Array<{ rgba: Uint8ClampedArray }>;
   } | null => {
     const b = lastBakesRef.current.get(surfaceId);
     if (!b) return null;
@@ -3723,7 +3675,6 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       rgba: b.rgba,
       width: b.width,
       height: b.height,
-      viewVariants: b.viewVariants?.map((variant) => ({ rgba: variant.rgba })),
     };
   }, []);
 
@@ -3780,11 +3731,11 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   }, [buildSceneFromSplatData]);
 
   // 외부 호출자가 다음 splatLoad 에서 re-bake 한 번 건너뛰도록 신호.
-  // 호출 후 정상 흐름에서는 onSplatLoaded 가 flag 를 clear. 호출자가 reload 까지 도달 못 하고 throw
-  // 한 케이스를 대비해 5초 후 자동 clear (dangling 상태로 다른 legitimate load 에 영향 주는 것 방지).
+  // 정상 흐름에서는 onSplatLoaded 가 정확히 한 번 clear 한다.
+  // reload 실패 시 호출자가 반환된 clear 함수를 호출해 dangling skip 을 해제한다.
   const markNextSplatLoadSkipRebake = useCallback(() => {
     skipNextSplatRebakeRef.current = true;
-    setTimeout(() => { skipNextSplatRebakeRef.current = false; }, 5000);
+    return () => { skipNextSplatRebakeRef.current = false; };
   }, []);
 
   return { overlay, panel, modals, onSplatLoaded, planes, saveRefined, commitRefinedToServer, gatherRefinedAssets, getCurrentKeepMask, getBakeRgba, registerPersistedBake, getRemainingRotationToAY, replaceCanonicalSceneFromCurrentSplat, markNextSplatLoadSkipRebake };

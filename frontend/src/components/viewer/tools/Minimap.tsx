@@ -1,18 +1,16 @@
 'use client';
 
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { FloorplanResult } from '@/lib/gs/floorplan';
 
-const MIN_ZOOM = 0.25;
+const MIN_ZOOM = 0.02;
 const MAX_ZOOM = 6;
 
 /**
- * FPS / GTA 스타일 미니맵.
+ * 전체 층 평면도.
  *
- * - 평면도 이미지 (월드 XZ → 픽셀) 를 매 프레임 평행이동해서 사용자(=카메라) 위치를 가운데로.
- * - X/Z 축 고정 (회전 없음).
- * - 가운데 빨강 점: 카메라 위치.
- * - 화살표: cameraEntity.forward 의 (x, z) 성분.
+ * - 기본 상태는 현재 카메라를 중앙에 두고, 카메라가 바라보는 방향이 위로 오도록 그린다.
+ * - 빨강 삼각형은 항상 중앙에 고정된 현재 위치를 표시한다.
  *
  * 카메라는 매번 변하므로 prop 으로 직접 받지 않고 getter 로 주입 (ref-like).
  */
@@ -21,15 +19,13 @@ interface MinimapProps {
   floorplan: FloorplanResult;
   cameraGetter: () => any | null;
   size?: number; // px
-  /** 천장 컷오프 (m) — 천장에서 이만큼 아래까지의 splat 만 평면도에 보임. */
-  cutoff: number;
-  onCutoffChange: (v: number) => void;
 }
 
-export default function Minimap({ floorplan, cameraGetter, size = 220, cutoff, onCutoffChange }: MinimapProps) {
+export default function Minimap({ floorplan, cameraGetter, size = 220 }: MinimapProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const zoomRef = useRef(1);
   const userZoomedRef = useRef(false);
+  const [hidden, setHidden] = useState(false);
 
   // floorplan 변경 시 — 사용자가 휠로 줌 안 했으면 방 전체가 들어오도록 auto-fit.
   useEffect(() => {
@@ -61,53 +57,36 @@ export default function Minimap({ floorplan, cameraGetter, size = 220, cutoff, o
       const playerPx = (pos.x - floorplan.minX) * floorplan.ppm;
       const playerPy = (pos.z - floorplan.minZ) * floorplan.ppm;
 
-      // 평면도 이미지 그리기 (player 가 캔버스 가운데 오도록 평행이동 + zoom 스케일)
-      const z = zoomRef.current;
-      const cx = size / 2, cy = size / 2;
-      ctx.imageSmoothingEnabled = false;
-      ctx.drawImage(
-        floorplan.canvas,
-        cx - playerPx * z,
-        cy - playerPy * z,
-        floorplan.width * z,
-        floorplan.height * z,
-      );
-
-      // 방향 화살표 (player 점 위에 그림)
       const fLen = Math.hypot(fwd.x, fwd.z);
-      if (fLen > 1e-6) {
-        const dx = fwd.x / fLen;
-        const dz = fwd.z / fLen;
-        const nx = -dz, ny = dx; // perpendicular
-        const tipL = 22;
-        const baseL = 6;
-        const baseW = 8;
-        const tipX = cx + dx * tipL;
-        const tipY = cy + dz * tipL;
-        const baseLX = cx + dx * baseL + nx * baseW;
-        const baseLY = cy + dz * baseL + ny * baseW;
-        const baseRX = cx + dx * baseL - nx * baseW;
-        const baseRY = cy + dz * baseL - ny * baseW;
-        ctx.fillStyle = '#ef4444';
-        ctx.strokeStyle = '#fef2f2';
-        ctx.lineWidth = 1.5;
-        ctx.beginPath();
-        ctx.moveTo(tipX, tipY);
-        ctx.lineTo(baseLX, baseLY);
-        ctx.lineTo(baseRX, baseRY);
-        ctx.closePath();
-        ctx.fill();
-        ctx.stroke();
-      }
+      const heading = fLen > 1e-6 ? Math.atan2(fwd.z, fwd.x) : -Math.PI / 2;
+      const headingToUp = -(heading + Math.PI / 2);
 
-      // 가운데 빨강 점
+      const z = zoomRef.current;
+      ctx.imageSmoothingEnabled = false;
+
+      // 사용자 중심 미니맵: playerPx/playerPy 가 항상 패널 중앙에 오도록 translate 하고,
+      // 카메라 forward 가 화면 위쪽을 향하도록 지도 자체를 반대로 회전한다.
+      ctx.save();
+      ctx.translate(size / 2, size / 2);
+      ctx.rotate(headingToUp);
+      ctx.drawImage(floorplan.canvas, -playerPx * z, -playerPy * z, floorplan.width * z, floorplan.height * z);
+      ctx.restore();
+
+      // 사용자 마커 — 지도는 회전하므로 마커는 중앙에서 위쪽을 향한 고정 삼각형.
+      ctx.save();
+      ctx.translate(size / 2, size / 2);
       ctx.fillStyle = '#ef4444';
       ctx.strokeStyle = '#fef2f2';
-      ctx.lineWidth = 2;
+      ctx.lineWidth = 1.5;
       ctx.beginPath();
-      ctx.arc(cx, cy, 6, 0, Math.PI * 2);
+      ctx.moveTo(0, -11);
+      ctx.lineTo(-7, 7);
+      ctx.lineTo(0, 3);
+      ctx.lineTo(7, 7);
+      ctx.closePath();
       ctx.fill();
       ctx.stroke();
+      ctx.restore();
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
@@ -128,30 +107,34 @@ export default function Minimap({ floorplan, cameraGetter, size = 220, cutoff, o
   }, []);
 
   return (
-    <div
-      className="absolute top-3 right-3 z-30 rounded-lg overflow-hidden border-2 border-[var(--rule)] shadow-xl bg-[var(--paper)]"
-      style={{ width: size, height: size }}
-    >
-      <canvas ref={canvasRef} width={size} height={size} className="block" />
-      <div className="absolute top-1 left-1 text-[10px] text-[var(--ink)] bg-black/70 px-1.5 py-0.5 rounded font-bold tracking-wide">
-        평면도
-      </div>
-      <div className="absolute bottom-1 right-1 text-[9px] text-[var(--muted)] bg-black/50 px-1 py-0.5 rounded">
-        휠: 줌
-      </div>
-      {/* 천장 컷 슬라이더 — 천장에서 이만큼 아래까지의 splat 만 평면도에 보임. */}
-      <div
-        className="absolute bottom-1 left-1 right-1 flex items-center gap-1 text-[9px] text-[var(--ink)] bg-black/60 px-1.5 py-1 rounded"
-        title="천장에서 이만큼 아래까지의 splat 만 평면도에 보임"
+    <div className="relative" style={{ width: size }}>
+      <button
+        type="button"
+        onClick={() => setHidden(h => !h)}
+        className="absolute top-2 right-2 z-10 w-6 h-6 flex items-center justify-center rounded bg-black/70 text-white text-xs border border-white/20 hover:bg-black/85 shadow-lg"
+        title={hidden ? '평면도 펼치기' : '평면도 숨기기'}
       >
-        <span className="shrink-0">천장 컷</span>
-        <input type="range" min={0} max={10} step={0.01}
-          value={cutoff}
-          onChange={e => onCutoffChange(parseFloat(e.target.value))}
-          className="flex-1 accent-emerald-500 cursor-pointer" />
-        <span className="font-mono w-10 text-right shrink-0">
-          {cutoff < 1 ? `${(cutoff * 100).toFixed(0)}cm` : `${cutoff.toFixed(2)}m`}
-        </span>
+        {hidden ? '◀' : '▶'}
+      </button>
+
+      {/* 슬라이드 래퍼 — 숨김 시 오른쪽으로 밀어 화면 밖으로. */}
+      <div
+        className="relative transition-transform duration-300 ease-out"
+        style={{ transform: hidden ? 'translateX(calc(100% + 12px))' : 'translateX(0)' }}
+      >
+      {/* 사각 평면도 뷰포트 */}
+      <div
+        className="relative rounded-lg overflow-hidden border-2 border-[var(--rule)] shadow-xl bg-[var(--paper)]"
+        style={{ width: size, height: size }}
+      >
+        <canvas ref={canvasRef} width={size} height={size} className="block" />
+        <div className="absolute top-2 left-1/2 -translate-x-1/2 text-[10px] text-[var(--ink)] bg-black/70 px-1.5 py-0.5 rounded font-bold tracking-wide">
+          평면도
+        </div>
+        <div className="absolute bottom-2 left-1/2 -translate-x-1/2 text-[9px] text-[var(--muted)] bg-black/50 px-1 py-0.5 rounded">
+          휠: 줌 · 내 방향 기준
+        </div>
+      </div>
       </div>
     </div>
   );

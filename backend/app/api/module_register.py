@@ -1,15 +1,14 @@
-"""모듈 등록 새 흐름 — 정합 완료 시점에 모든 영속을 일괄 처리.
+"""모듈 등록 흐름 — 정합 완료 시점에 모든 영속을 일괄 처리.
 
-새 흐름 (Phase 1-2 refactor):
 - 파일 선택 시: PLY 를 백엔드 임시 보관소(/var/lib/sam3-temp)에 백그라운드 업로드 → `POST /uploads/sam3/prepare`.
 - 자동 문 검출 시: 임시 보관소 PLY 를 door-ml 로 forward, 결과만 반환 → `POST /uploads/sam3/detect-temp`.
 - 정합 완료 시: 다듬기 결과 PLY + mesh + tex + doors + alignment_transform 을 일괄 영속화 → `POST /uploads/commit-final`.
 
-기존 흐름의 register-local / refined-upload-url / sam3/start 는 그대로 두고 (basemap 등록 흐름 등에서 사용),
-모듈 등록 흐름에서만 본 파일의 엔드포인트를 사용.
+register-local / refined-upload-url / sam3/start 는 basemap 등록 흐름 등에서 계속 사용한다.
+모듈 등록은 이 파일의 prepare/detect-temp/commit-final 엔드포인트를 사용한다.
 
-⚠️ 주의: 같은 사용자가 같은 호수 재등록 시 기존 modules 행을 재사용하고 옛 uploads/tasks/scene_outputs +
-MinIO 객체를 삭제(덮어쓰기). 다른 사용자의 모듈은 영향 없음.
+⚠️ 주의: 같은 사용자가 같은 호수 재등록 시 modules 행을 재사용하고 교체 대상
+uploads/tasks/scene_outputs + MinIO 객체를 삭제(덮어쓰기). 다른 사용자의 모듈은 영향 없음.
 """
 from __future__ import annotations
 
@@ -31,6 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import get_settings
 from app.core.database import get_db
 from app.core.security import get_current_user
+from app.core.storage_keys import is_key_under_prefix, normalize_minio_key
 from app.models import (
     Building, Floor, Module, SceneOutput, Task, Upload, User, UserRole,
     PlyTarget, UploadStatus, TaskType, TaskStatus,
@@ -40,8 +40,7 @@ from app.services.minio_service import get_minio_service
 from app.services.sam3_temp_storage import (
     delete_temp, is_expired, new_session_id, temp_path,
 )
-from app.services.storage_paths import module_base_path
-from app.core.storage_keys import is_key_under_prefix, normalize_minio_key
+from app.services.storage_paths import module_base_path, object_dir
 
 router = APIRouter(prefix="/uploads", tags=["module-register"])
 settings = get_settings()
@@ -324,28 +323,26 @@ async def commit_final(
         raise HTTPException(status_code=400, detail="업로드된 PLY(staging)를 찾을 수 없습니다. 다시 업로드하세요.")
     final_ply_size = int(minio.stat_object(staging_key).size)
 
-    # ── 덮어쓰기 처리: 옛 uploads/tasks/scene_outputs + MinIO 객체 정리 ──
+    old_upload_ids: list = []
+    old_cleanup_prefixes: list[str] = []
+    # ── 덮어쓰기 준비: 교체 대상은 새 commit 이 성공한 뒤 정리 ──
     if existing_module is not None:
-        # 옛 uploads 모두 가져와 MinIO prefix 청소
+        if user.role != UserRole.admin and existing_module.user_id != user.id:
+            raise HTTPException(status_code=403, detail="이 모듈을 덮어쓸 권한이 없습니다.")
         old_uploads = (await db.execute(
             select(Upload).where(Upload.module_id == existing_module.id)
         )).scalars().all()
         old_upload_ids = [u.id for u in old_uploads]
-
-        # MinIO: 옛 module_base_path 하위 전부 삭제
-        try:
-            base = module_base_path(
-                str(building_id), str(floor_id), str(existing_module.id), existing_module.name,
-            )
-            minio.delete_prefix(base)
-        except Exception as e:
-            logger.exception(f"[commit-final] MinIO 옛 객체 삭제 실패: {e}")
-
-        # 옛 scene_outputs → tasks → uploads 순으로 삭제
-        if old_upload_ids:
-            await db.execute(sa_delete(SceneOutput).where(SceneOutput.module_id == existing_module.id))
-            await db.execute(sa_delete(Task).where(Task.upload_id.in_(old_upload_ids)))
-            await db.execute(sa_delete(Upload).where(Upload.id.in_(old_upload_ids)))
+        old_base = module_base_path(
+            str(building_id), str(floor_id), str(existing_module.id), existing_module.name,
+        )
+        old_scene_paths = (await db.execute(
+            select(SceneOutput.ply_path).where(SceneOutput.module_id == existing_module.id)
+        )).scalars().all()
+        old_cleanup_prefixes = [object_dir(path) for path in old_scene_paths if path]
+        old_cleanup_prefixes.extend([
+            f"{old_base}/alignment/refined/door_assets",
+        ])
 
         module = existing_module
     else:
@@ -363,10 +360,10 @@ async def commit_final(
     refined_dir = f"{base}/alignment/refined/{refined_session}"
     final_ply_key = f"{refined_dir}/final.ply"
     mesh_key = f"{refined_dir}/mesh.json"
-    doors_key = f"{base}/alignment/refined/doors.json"  # CLAUDE.md 규약과 일관 (doors 는 refined 디렉터리 직속)
+    doors_key = f"{refined_dir}/doors.json"
     tex_keys = {tid: f"{refined_dir}/tex_{tid}.png" for tid in tex_uploads.keys()}
     tex_variant_keys = {tid: f"{refined_dir}/tex_{tid}.png" for tid in tex_variant_uploads.keys()}
-    door_asset_dir = f"{base}/alignment/refined/door_assets"
+    door_asset_dir = f"{refined_dir}/door_assets"
     door_tex_keys = {field: f"{door_asset_dir}/{field}.png" for field in door_tex_uploads.keys()}
     door_splat_keys = {field: f"{door_asset_dir}/{field}.ply" for field in door_splat_uploads.keys()}
 
@@ -380,7 +377,7 @@ async def commit_final(
         minio_path=placeholder_key,
         ply_target=PlyTarget.alignment,
         status=UploadStatus.completed,
-        sam3_status=None,  # 새 흐름에선 임시 검출이라 dispatch 안 함
+        sam3_status=None,  # module flow uses synchronous detect-temp, so no SAM3 task dispatch.
     )
     db.add(upload)
     await db.flush()
@@ -414,33 +411,42 @@ async def commit_final(
         raise HTTPException(status_code=400, detail=f"doors_json 형식 오류: {e}")
 
     # ── MinIO 업로드 (final.ply + mesh.json + tex_*.png + doors.json + door assets) ──
+    uploaded_keys: list[str] = []
     try:
         # 대용량 PLY: staging → 최종 키로 MinIO 서버사이드 복사 (데이터가 백엔드/Cloudflare 미경유).
         minio.copy_object(final_ply_key, staging_key)
+        uploaded_keys.append(final_ply_key)
 
         mesh_bytes = await mesh_json.read()
         minio.put_object_bytes(mesh_key, mesh_bytes, "application/json")
+        uploaded_keys.append(mesh_key)
 
         minio.put_object_bytes(doors_key, doors_bytes, "application/json")
+        uploaded_keys.append(doors_key)
 
         for tid, f in tex_uploads.items():
             data = await f.read()
             minio.put_object_bytes(tex_keys[tid], data, "image/png")
+            uploaded_keys.append(tex_keys[tid])
         for tid, f in tex_variant_uploads.items():
             data = await f.read()
             minio.put_object_bytes(tex_variant_keys[tid], data, "image/png")
+            uploaded_keys.append(tex_variant_keys[tid])
         for field, f in door_tex_uploads.items():
             data = await f.read()
             minio.put_object_bytes(door_tex_keys[field], data, "image/png")
+            uploaded_keys.append(door_tex_keys[field])
         for field, f in door_splat_uploads.items():
             data = await f.read()
             minio.put_object_bytes(door_splat_keys[field], data, "application/octet-stream")
+            uploaded_keys.append(door_splat_keys[field])
     except Exception as e:
-        # 부분 실패 — 이미 일부 객체가 올라갔을 수 있어 정리 시도.
-        try:
-            minio.delete_prefix(base)
-        except Exception:
-            pass
+        # 부분 실패 — 이번 요청에서 새로 올린 키만 정리한다.
+        for key in uploaded_keys:
+            try:
+                minio.delete_object(key)
+            except Exception:
+                pass
         await db.rollback()
         raise HTTPException(status_code=500, detail=f"MinIO 업로드 실패: {e}")
 
@@ -495,6 +501,18 @@ async def commit_final(
         minio.delete_object(staging_key)
     except Exception:
         pass
+
+    if old_upload_ids:
+        try:
+            await db.execute(sa_delete(SceneOutput).where(SceneOutput.module_id == module.id, SceneOutput.id != scene_output.id))
+            await db.execute(sa_delete(Task).where(Task.upload_id.in_(old_upload_ids)))
+            await db.execute(sa_delete(Upload).where(Upload.id.in_(old_upload_ids)))
+            await db.commit()
+            for prefix in old_cleanup_prefixes:
+                minio.delete_prefix(prefix)
+        except Exception as e:
+            await db.rollback()
+            logger.exception(f"[commit-final] 교체 대상 정리 실패: {e}")
 
     # refined(정합 완료) PLY → SOG 변환 비동기 발행. 뷰어용 경량 파생물이라 브로커
     # 미가용 등으로 실패해도 무시 — sog_path 는 None 으로 남고 표시는 PLY 로 폴백된다.

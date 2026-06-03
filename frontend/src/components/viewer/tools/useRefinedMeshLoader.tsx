@@ -3,6 +3,7 @@
 import { RefObject, useEffect, useRef } from 'react';
 import type { SplatViewerCoreRef } from '../SplatViewerCore';
 import type { AdditionalGsplatsApi } from './useAdditionalGsplats';
+import type { DoorHandle } from '@/lib/gs/doorInteraction';
 
 /**
  * 정합/베이스 뷰어용: upload_id 의 정제 결과를 자동 로드해 door 자산과 wall mesh 를 씬에 추가한다.
@@ -49,11 +50,33 @@ export function useRefinedMeshLoader(
     uvs: number[][];
     normalInward: [number, number, number];
   }) => void,
+  /**
+   * 모든 wallMesh 엔티티가 생성된 직후 1회 호출. 호출자가 ceiling 엔티티/corners 등을
+   * 잡아 천장제거 같은 후속 토글 기능에 사용.
+   *
+   * 호출 시점: mesh.json fetch + 모든 surface 의 createWallMeshFromPersisted 완료 후.
+   * 도어 mesh/splat 은 별도 비동기 — 이 콜백에는 포함되지 않음 (천장 제거 대상 아님).
+   */
+  onLoaded?: (info: {
+    surfaces: Array<{ surfaceId: string; entity: any; corners: number[][] }>;
+  }) => void,
+  /**
+   * 옵션: 도어 wrapper 생성 시 호출 — 층 뷰어의 문 hover/열기·닫기 상호작용 등록용.
+   * 힌지/normalInward 메타가 있는 도어만 핸들이 전달된다.
+   */
+  onDoorRegister?: (handle: DoorHandle) => void,
+  /** 옵션: 도어 wrapper 정리 시 호출 — 상호작용 등록 해제용. */
+  onDoorUnregister?: (wrapper: any) => void,
 ): void {
   const entitiesRef = useRef<any[]>([]);
+  const doorWrappersRef = useRef<any[]>([]);
   const doorSplatIdsRef = useRef<string[]>([]);
   const labelOverlayRef = useRef<HTMLDivElement | null>(null);
   const labelRafRef = useRef<number>(0);
+  // onLoaded 콜백을 ref 로 보관 — 호출자가 인라인 함수로 넘겨도 effect 가 매 렌더 재실행되지 않게.
+  // 토글 같은 부모 state 변경 → 콜백 identity 변경 → mesh 전체 destroy+refetch 회귀를 방지.
+  const onLoadedRef = useRef(onLoaded);
+  useEffect(() => { onLoadedRef.current = onLoaded; }, [onLoaded]);
   const addDoorSplat = additionalForDoorSplats?.add;
   const removeDoorSplat = additionalForDoorSplats?.remove;
   const getDoorSplatEntity = additionalForDoorSplats?.getEntity;
@@ -63,6 +86,10 @@ export function useRefinedMeshLoader(
 
     let cancelled = false;
     const cleanup = () => {
+      for (const w of doorWrappersRef.current) {
+        try { onDoorUnregister?.(w); } catch { /* ignore */ }
+      }
+      doorWrappersRef.current = [];
       for (const e of entitiesRef.current) {
         try { e.destroy(); } catch { /* ignore */ }
       }
@@ -91,13 +118,14 @@ export function useRefinedMeshLoader(
           ply_url: string;
           mesh_meta_url: string | null;
           textures: Record<string, string>;
-          texture_variants?: Record<string, Record<string, string>>;
           scene_id: string;
           doors?: Array<{
             id: string;
             corners: number[][];
             unitName?: string | null;
             wallSurfaceId?: string | null;
+            hingeEdge?: number | null;
+            swing?: number | null;
             door_mesh?: {
               corners: number[][];
               uvs: number[][];
@@ -138,10 +166,31 @@ export function useRefinedMeshLoader(
         //   정합 시 Door (doorPivotGroup) 의 자식으로 reparent → 통합 회전.
         for (const door of doorsToLoad) {
           if (cancelled) return;
-          const basemapDoorWrapper = new pc.Entity(`basemapDoor_${door.id}`);
+          const basemapDoorWrapper = new pc.Entity(`basemapDoor_${door.id}`, app);
+          (basemapDoorWrapper as any).__doorId = door.id;
+          (basemapDoorWrapper as any).__doorUnitName = door.unitName ?? null;
           try { basemapDoorWrapper.tags?.add?.('basemap'); } catch {}
           app.root.addChild(basemapDoorWrapper);
           entitiesRef.current.push(basemapDoorWrapper); // cleanup 시 wrapper destroy → 자식 cascade
+          doorWrappersRef.current.push(basemapDoorWrapper);
+
+          // 층 뷰어 문 상호작용 등록 — 힌지 + normalInward 메타가 있는 도어만.
+          const ni = door.door_mesh?.normalInward;
+          if (
+            onDoorRegister &&
+            typeof door.hingeEdge === 'number' &&
+            Array.isArray(door.corners) && door.corners.length === 4 &&
+            Array.isArray(ni) && ni.length === 3
+          ) {
+            onDoorRegister({
+              id: `basemap_${door.id}`,
+              wrapper: basemapDoorWrapper,
+              corners: door.corners.map((c) => [c[0], c[1], c[2]] as [number, number, number]),
+              hingeEdge: door.hingeEdge,
+              swing: typeof door.swing === 'number' ? door.swing : 1,
+              normalInward: [ni[0], ni[1], ni[2]],
+            });
+          }
 
           // 1) 도어 mesh quad → wrapper 자식으로
           if (door.door_mesh) {
@@ -215,30 +264,9 @@ export function useRefinedMeshLoader(
             });
           });
           const images = await Promise.all(imgPromises);
-          const viewImageMatrix = await Promise.all(
-            surfaces.map((surface: any) => Promise.all(
-              ((surface.textureVariants ?? []) as any[]).map((variant: any) => {
-                const url = bundle.texture_variants?.[surface.surfaceId]?.[variant.id];
-                if (!url) return Promise.resolve(null);
-                return new Promise<{ id: string; viewpoint: [number, number, number]; image: HTMLImageElement } | null>((res) => {
-                  const img = new Image();
-                  img.crossOrigin = 'anonymous';
-                  img.onload = () => res({
-                    id: String(variant.id),
-                    viewpoint: variant.viewpoint as [number, number, number],
-                    image: img,
-                  });
-                  img.onerror = () => {
-                    console.warn(`[useRefinedMeshLoader] view texture load failed: ${surface.surfaceId}/${variant.id}`);
-                    res(null);
-                  };
-                  img.src = url;
-                });
-              }),
-            )),
-          );
           if (cancelled) return;
 
+          const loadedSurfaces: Array<{ surfaceId: string; entity: any; corners: number[][] }> = [];
           for (let i = 0; i < surfaces.length; i++) {
             const surface = surfaces[i];
             const img = images[i];
@@ -249,13 +277,6 @@ export function useRefinedMeshLoader(
               uvs: surface.uvs,
               normalInward: surface.normalInward,
               textureImage: img,
-              viewTextures: viewImageMatrix[i]
-                .filter(Boolean)
-                .map((variant: any) => ({
-                  id: variant.id,
-                  viewpoint: variant.viewpoint,
-                  textureImage: variant.image,
-                })),
             }, {
               mutableTexture: mutableTextures,
               onTextureData: (texture) => onWallTextureData?.({
@@ -271,6 +292,13 @@ export function useRefinedMeshLoader(
             // basemap 자산 — enterAlignmentMode 가 module-side 와 구분해서 reparent 안 하도록 tag.
             try { ent.tags?.add?.('basemap'); } catch {}
             entitiesRef.current.push(ent);
+            loadedSurfaces.push({ surfaceId: surface.surfaceId, entity: ent, corners: surface.corners });
+          }
+          // 모든 wallMesh 엔티티 생성 후 콜백 — 호출자가 visual ceiling entity / corners 를 잡아 마스킹 토글에 사용.
+          if (!cancelled && loadedSurfaces.length > 0) {
+            try { onLoadedRef.current?.({ surfaces: loadedSurfaces }); } catch (e) {
+              console.warn('[useRefinedMeshLoader] onLoaded callback threw:', e);
+            }
           }
         }
         // 도어 호수 라벨 — 말풍선 HTML overlay. 도어 corners 는 A'+Y 프레임이므로
@@ -359,6 +387,8 @@ export function useRefinedMeshLoader(
     })();
 
     return () => { cancelled = true; cleanup(); };
+    // onLoaded 는 ref 로 보관 (위 onLoadedRef) 해 deps 에 넣지 않는다.
+    // 호출자가 인라인 함수로 넘겨도 mesh 전체 재로드 회귀 없음.
   }, [
     coreRef,
     uploadId,
@@ -369,5 +399,7 @@ export function useRefinedMeshLoader(
     onlyDoorUnitName,
     mutableTextures,
     onWallTextureData,
+    onDoorRegister,
+    onDoorUnregister,
   ]);
 }

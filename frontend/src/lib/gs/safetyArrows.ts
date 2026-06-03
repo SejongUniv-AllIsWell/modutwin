@@ -93,6 +93,7 @@ function buildFaces(geom: SafetyVizGeometry): FaceDef[] {
 
 function createArrow(
   pc: any,
+  app: any,
   center: Vec3,
   dir: Vec3,
   length: number,
@@ -107,19 +108,19 @@ function createArrow(
   mat.cull = pc.CULLFACE_NONE;
   mat.update();
 
-  const root = new pc.Entity(name);
+  const root = new pc.Entity(name, app);
 
   const bodyLen = length * 0.8;
   const tipLen = length * 0.2;
 
-  const body = new pc.Entity('body');
+  const body = new pc.Entity('body', app);
   body.addComponent('render', { type: 'cylinder' });
   body.render.material = mat;
   body.setLocalScale(thickness * 2, bodyLen, thickness * 2);
   body.setLocalPosition(0, bodyLen / 2, 0);
   root.addChild(body);
 
-  const tip = new pc.Entity('tip');
+  const tip = new pc.Entity('tip', app);
   tip.addComponent('render', { type: 'cone' });
   tip.render.material = mat;
   tip.setLocalScale(thickness * 5, tipLen, thickness * 5);
@@ -166,11 +167,12 @@ export interface OffsetArrowsOptions {
  */
 export function createOffsetArrows(
   pc: any,
+  app: any,
   geom: SafetyVizGeometry,
   offset: number,
   opts: OffsetArrowsOptions,
 ): any {
-  const parent = new pc.Entity(opts.name ?? 'offsetArrows');
+  const parent = new pc.Entity(opts.name ?? 'offsetArrows', app);
   parent.setLocalEulerAngles(0, 0, 180);
   if (offset <= 0) return parent;
 
@@ -185,11 +187,11 @@ export function createOffsetArrows(
       f.center[2] + originOffset * f.normal[2],
     ];
     if (opts.direction === 'both' || opts.direction === 'outward') {
-      parent.addChild(createArrow(pc, originCenter, f.normal, offset, color, thickness, `${f.id}_out`));
+      parent.addChild(createArrow(pc, app, originCenter, f.normal, offset, color, thickness, `${f.id}_out`));
     }
     if (opts.direction === 'both' || opts.direction === 'inward') {
       const negDir: Vec3 = [-f.normal[0], -f.normal[1], -f.normal[2]];
-      parent.addChild(createArrow(pc, originCenter, negDir, offset, color, thickness, `${f.id}_in`));
+      parent.addChild(createArrow(pc, app, originCenter, negDir, offset, color, thickness, `${f.id}_in`));
     }
   }
   return parent;
