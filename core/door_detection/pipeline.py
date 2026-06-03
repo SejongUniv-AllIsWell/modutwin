@@ -35,10 +35,19 @@ from .io.writer import write_result
 from .render.camera_sampler import (
     sample_coarse_cameras,
     sample_walk_cameras,
+    sample_wall_facing_cameras,
     save_cameras,
 )
 from .render.splat_renderer import render_views
-from .room.interior import estimate_eye_height_y, estimate_room
+from .room.interior import (
+    build_room_info_known,
+    estimate_eye_height_y,
+    estimate_room,
+)
+from .room.frame import bake_rotation_matrix
+from .room.wall_planes import build_wall_planes, ray_wall_hit, pick_door_wall
+
+
 from .segmentation.sam3_runner import list_input_pngs, run_sam3
 from .view_selection.iterative_approach import run_iterative_approach
 from .corner_extraction.ordering import order_all_selected
@@ -126,6 +135,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="walk 모드 카메라 Y 절대값 지정. 설정 시 자동 추정 무시.",
     )
+    p.add_argument(
+        "--eye_height_ratio",
+        type=float,
+        default=None,
+        help="walk 모드 카메라 Y 를 floor~ceiling 거리 비율로 지정 "
+             "(예: 0.7 → 바닥에서 70%%, 천장에서 30%% 지점). "
+             "--eye_height (절대 m) 대신 사용. --eye_height_abs 지정 시 무시.",
+    )
 
     # SAM3
     p.add_argument(
@@ -155,10 +172,71 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="RANSAC inlier threshold = robust_bbox_diagonal * ratio (D6 default 0.005)",
     )
 
+    # Room interior gate (Phase 1)
+    p.add_argument(
+        "--interior_min_hits",
+        type=int,
+        default=22,
+        help="Phase 1 interior gate: 26-ray 중 최소 hit 수 (default 22). "
+             "길거나 비볼록한 방은 낮추면 통과 가능 (대신 부정확 room 추정 위험).",
+    )
+    p.add_argument(
+        "--interior_perp_ratio",
+        type=float,
+        default=0.01,
+        help="interior ray perp threshold = robust_bbox_diagonal * ratio (default 0.01). "
+             "키우면 레이가 더 먼 점도 hit 으로 인정.",
+    )
+    p.add_argument(
+        "--no_interior_strict",
+        dest="interior_strict",
+        action="store_false",
+        default=True,
+        help="interior gate 미달이어도 fail-fast 하지 않고 경고만 하고 계속 진행.",
+    )
+
+    # 방법 B — 다듬기에서 확정된 A' 프레임 천장/바닥 활용 (known-room mode)
+    p.add_argument(
+        "--rot_x", type=float, default=None,
+        help="raw→A' 정렬 회전 X (rad). --rot_z/--floor_y/--ceiling_y 와 함께 주면 "
+             "추론을 A' 프레임에서 수행 (천장/바닥 추정 대신 확정값 사용).",
+    )
+    p.add_argument("--rot_z", type=float, default=None, help="raw→A' 정렬 회전 Z (rad).")
+    p.add_argument("--floor_y", type=float, default=None, help="A' 프레임 바닥 Y (확정값).")
+    p.add_argument("--ceiling_y", type=float, default=None, help="A' 프레임 천장 Y (확정값).")
+    p.add_argument(
+        "--wall_polygon", type=str, default=None,
+        help="A' 프레임 방 footprint 폴리곤 JSON: '[[x,z],...]' 또는 '[{\"x\":..,\"z\":..},..]'. "
+             "known-room + 이 값이 있으면 중앙 disk 대신 벽-정면 카메라로 coarse 샘플링.",
+    )
+
     p.add_argument("--device", type=str, default="cuda", help="compute device")
     p.add_argument("--debug", action="store_true", help="debug 시각화 저장")
 
     return p
+
+
+def _parse_wall_polygon(raw: str | None):
+    """'[[x,z],...]' 또는 '[{"x":..,"z":..},...]' → (N,2) np.array (A' X-Z). 실패 시 None."""
+    if not raw:
+        return None
+    import json as _json
+
+    import numpy as _np
+    try:
+        data = _json.loads(raw)
+        pts = []
+        for it in data:
+            if isinstance(it, dict):
+                pts.append([float(it["x"]), float(it["z"])])
+            else:
+                pts.append([float(it[0]), float(it[1])])
+        arr = _np.asarray(pts, dtype=_np.float64)
+        if arr.ndim != 2 or arr.shape[0] < 3 or arr.shape[1] != 2:
+            return None
+        return arr
+    except Exception:
+        return None
 
 
 def _resolve_cache_dir(args: argparse.Namespace) -> str:
@@ -198,11 +276,56 @@ def main(argv: list[str] | None = None) -> int:
     result = empty_result(source_ply=args.ply)
     result.config = config
 
+    import numpy as np
+
+    # 방법 B — 다듬기에서 확정된 A' 프레임 천장/바닥 활용 여부.
+    # 추론(방 추정·카메라 배치·ray)을 A' 에서 하고, 렌더만 cam_rot 으로 raw 가우시안에.
+    known_room = (
+        args.rot_x is not None and args.rot_z is not None
+        and args.floor_y is not None and args.ceiling_y is not None
+    )
+    cam_rot = None        # 렌더 시 A'→raw (Rᵀ). known-room 에서만 설정.
+    means_ap = None       # A' 프레임 means (opacity 필터). known-room 에서만.
+    # 방 footprint 폴리곤 (A'). 있으면 벽-정면 카메라 + ray∩벽평면 코너 추출.
+    wall_poly = _parse_wall_polygon(args.wall_polygon) if known_room else None
+    # A' 프레임은 Z-180 컨벤션상 +Y 가 시각적 '아래'(중력 down) — CLAUDE.md "ceiling(PLY+Y)=화면 바닥".
+    # 따라서 시각 바닥(문 하단이 닿는 면) = floor/ceiling 중 큰 Y, 시각 천장 = 작은 Y.
+    real_floor_y = max(float(args.floor_y), float(args.ceiling_y)) if known_room else None
+    real_ceiling_y = min(float(args.floor_y), float(args.ceiling_y)) if known_room else None
+
     # ------------------------------------------------------------------
-    # Phase 1 — Room interior estimation
+    # Phase 1 — Room interior estimation (or known-room from refine)
     # ------------------------------------------------------------------
-    print("[Phase 1] estimating room interior ...", file=sys.stderr)
-    room_info = estimate_room(ply_path=args.ply, cache_dir=cache_dir)
+    if known_room:
+        print(
+            f"[Phase 1] known-room mode: rotX={args.rot_x:.4f} rotZ={args.rot_z:.4f} "
+            f"floorY={args.floor_y:.3f} ceilingY={args.ceiling_y:.3f}",
+            file=sys.stderr,
+        )
+        rot_raw_to_ap = bake_rotation_matrix(args.rot_x, args.rot_z)  # raw→A'
+        cam_rot = rot_raw_to_ap.T                                     # A'→raw (렌더용)
+        _splats0 = load_ply(args.ply)
+        _means_raw = np.asarray(_splats0["means"], dtype=np.float64)
+        _opac0 = np.asarray(_splats0["opacities"], dtype=np.float64)
+        del _splats0
+        _keep0 = (1.0 / (1.0 + np.exp(-_opac0))) >= 0.1
+        means_ap = _means_raw[_keep0] @ rot_raw_to_ap.T              # raw→A', opacity 필터
+        del _means_raw, _opac0, _keep0
+        room_info = build_room_info_known(
+            means_ap=means_ap,
+            floor_y=float(args.floor_y),
+            ceiling_y=float(args.ceiling_y),
+        )
+        room_info.save(cache_dir)
+    else:
+        print("[Phase 1] estimating room interior ...", file=sys.stderr)
+        room_info = estimate_room(
+            ply_path=args.ply,
+            cache_dir=cache_dir,
+            interior_perp_ratio=args.interior_perp_ratio,
+            interior_min_hits=args.interior_min_hits,
+            strict=args.interior_strict,
+        )
     print(
         f"[Phase 1] center={tuple(round(v, 4) for v in room_info.room_center)} "
         f"diag={room_info.robust_bbox_diagonal:.4f} "
@@ -213,8 +336,6 @@ def main(argv: list[str] | None = None) -> int:
     config.robust_bbox_diagonal = room_info.robust_bbox_diagonal
     config.ransac_threshold_abs = room_info.robust_bbox_diagonal * config.ransac_ratio
     result.config = config
-
-    import numpy as np
 
     # ------------------------------------------------------------------
     # Phase 2 — Coarse view generation (sphere inside room) + RGB render
@@ -231,63 +352,110 @@ def main(argv: list[str] | None = None) -> int:
         bz = room_info.robust_bbox_max[2] - room_info.robust_bbox_min[2]
         horizontal_half = float(min(bx, bz) / 2.0)
 
-        # air-space 검사를 위해 PLY means 미리 로드 (opacity 필터)
-        splats_for_air = load_ply(args.ply)
-        means_air = np.asarray(splats_for_air["means"], dtype=np.float64)
-        opac_logit = np.asarray(splats_for_air["opacities"], dtype=np.float64)
-        opac_sigmoid = 1.0 / (1.0 + np.exp(-opac_logit))
-        means_air = means_air[opac_sigmoid >= 0.1]
-        del splats_for_air
+        # air-space 검사를 위해 means (opacity 필터). known-room 은 A' means 재사용.
+        if means_ap is not None:
+            means_air = means_ap
+        else:
+            splats_for_air = load_ply(args.ply)
+            means_air = np.asarray(splats_for_air["means"], dtype=np.float64)
+            opac_logit = np.asarray(splats_for_air["opacities"], dtype=np.float64)
+            opac_sigmoid = 1.0 / (1.0 + np.exp(-opac_logit))
+            means_air = means_air[opac_sigmoid >= 0.1]
+            del splats_for_air
 
         # 눈높이 Y 계산
         if args.eye_height_abs is not None:
             eye_y = float(args.eye_height_abs)
             print(f"[Phase 2] eye_height_abs={eye_y:.3f} (user specified)", file=sys.stderr)
+        elif known_room:
+            # ratio: 시각 바닥에서 시각 천장 쪽으로의 비율. 0.9 = 천장에 가깝게.
+            # (시각 천장 = real_ceiling_y. A' Y 부호 함정 보정됨.)
+            ratio = args.eye_height_ratio if args.eye_height_ratio is not None else 0.7
+            eye_y = float(real_floor_y + ratio * (real_ceiling_y - real_floor_y))
+            print(
+                f"[Phase 2] eye_height_Y={eye_y:.3f} (known-room ratio={ratio}, "
+                f"visual floor={real_floor_y:.3f}→ceiling={real_ceiling_y:.3f})",
+                file=sys.stderr,
+            )
         else:
             eye_y = estimate_eye_height_y(
                 means=means_air,
                 bbox_min_y=float(room_info.robust_bbox_min[1]),
                 bbox_max_y=float(room_info.robust_bbox_max[1]),
                 eye_height_m=args.eye_height,
+                eye_height_ratio=args.eye_height_ratio,
+            )
+            _mode = (
+                f"ratio={args.eye_height_ratio}"
+                if args.eye_height_ratio is not None
+                else f"floor+{args.eye_height}m"
             )
             print(
-                f"[Phase 2] floor_Y → eye_height_Y={eye_y:.3f} "
+                f"[Phase 2] eye_height_Y={eye_y:.3f} ({_mode}) "
                 f"(bbox_Y [{room_info.robust_bbox_min[1]:.2f}, "
                 f"{room_info.robust_bbox_max[1]:.2f}])",
                 file=sys.stderr,
             )
 
-        coarse_cameras, r_coarse = sample_walk_cameras(
-            room_center=np.asarray(room_info.room_center, dtype=np.float64),
-            min_half_extent=room_info.min_half_extent,
-            horizontal_half_extent=horizontal_half,
-            n_positions=args.n_walk_positions,
-            n_yaw_per_position=n_yaw,
-            pitch_deg=args.walk_pitch_deg,
-            means_for_air_check=means_air,
-            air_radius=args.air_radius,
-            air_max_count=args.air_max_count,
-            eye_height_y=eye_y,
-        )
-        meta = {
-            "mode": "walk",
-            "r_walk": r_coarse,
-            "horizontal_half_extent": horizontal_half,
-            "eye_height_y": eye_y,
-            "fov_x_deg": 60.0,
-            "n_positions": args.n_walk_positions,
-            "n_yaw_per_position": n_yaw,
-            "pitch_deg": args.walk_pitch_deg,
-            "air_radius": args.air_radius,
-            "air_max_count": args.air_max_count,
-            "n_views": len(coarse_cameras),
-        }
-        print(
-            f"[Phase 2] walk mode: eye_y={eye_y:.3f}, r_walk={r_coarse:.3f}, "
-            f"{args.n_walk_positions} air positions × {n_yaw} yaw = "
-            f"{len(coarse_cameras)} cameras",
-            file=sys.stderr,
-        )
+        if wall_poly is not None:
+            # 벽-정면 커버리지: 방 모든 벽을 정면으로 (중앙 disk 갇힘 해소).
+            coarse_cameras, horizontal_half = sample_wall_facing_cameras(
+                polygon_xz=wall_poly,
+                floor_y=float(args.floor_y),
+                ceiling_y=float(args.ceiling_y),
+                eye_y=eye_y,
+                means_for_air=means_air,
+                n_total=args.n_coarse,
+                fov_x_deg=60.0,
+                air_radius=args.air_radius,
+                air_max_count=args.air_max_count,
+            )
+            r_coarse = horizontal_half
+            meta = {
+                "mode": "wall_facing",
+                "n_walls": int(wall_poly.shape[0]),
+                "horizontal_half_extent": horizontal_half,
+                "eye_height_y": eye_y,
+                "fov_x_deg": 60.0,
+                "n_views": len(coarse_cameras),
+            }
+            print(
+                f"[Phase 2] wall-facing mode: {len(coarse_cameras)} cameras over "
+                f"{wall_poly.shape[0]} walls, eye_y={eye_y:.3f}, half_extent={horizontal_half:.3f}",
+                file=sys.stderr,
+            )
+        else:
+            coarse_cameras, r_coarse = sample_walk_cameras(
+                room_center=np.asarray(room_info.room_center, dtype=np.float64),
+                min_half_extent=room_info.min_half_extent,
+                horizontal_half_extent=horizontal_half,
+                n_positions=args.n_walk_positions,
+                n_yaw_per_position=n_yaw,
+                pitch_deg=args.walk_pitch_deg,
+                means_for_air_check=means_air,
+                air_radius=args.air_radius,
+                air_max_count=args.air_max_count,
+                eye_height_y=eye_y,
+            )
+            meta = {
+                "mode": "walk",
+                "r_walk": r_coarse,
+                "horizontal_half_extent": horizontal_half,
+                "eye_height_y": eye_y,
+                "fov_x_deg": 60.0,
+                "n_positions": args.n_walk_positions,
+                "n_yaw_per_position": n_yaw,
+                "pitch_deg": args.walk_pitch_deg,
+                "air_radius": args.air_radius,
+                "air_max_count": args.air_max_count,
+                "n_views": len(coarse_cameras),
+            }
+            print(
+                f"[Phase 2] walk mode: eye_y={eye_y:.3f}, r_walk={r_coarse:.3f}, "
+                f"{args.n_walk_positions} air positions × {n_yaw} yaw = "
+                f"{len(coarse_cameras)} cameras",
+                file=sys.stderr,
+            )
     else:
         coarse_cameras, r_coarse = sample_coarse_cameras(
             room_center=np.asarray(room_info.room_center, dtype=np.float64),
@@ -309,7 +477,9 @@ def main(argv: list[str] | None = None) -> int:
 
     # PLY 한 번 더 로드해서 렌더 (Phase 1과 분리: Phase 1은 means만 필요).
     splats = load_ply(args.ply)
-    saved_pngs = render_views(splats, coarse_cameras, coarse_renders_dir, device=args.device)
+    saved_pngs = render_views(
+        splats, coarse_cameras, coarse_renders_dir, device=args.device, cam_rot=cam_rot
+    )
     print(f"[Phase 2] rendered {len(saved_pngs)} PNGs to {coarse_renders_dir}", file=sys.stderr)
 
     # 메모리 회수
@@ -365,6 +535,8 @@ def main(argv: list[str] | None = None) -> int:
         means_for_air_check=_means_air_for_iter,
         air_radius=args.air_radius,
         air_max_count=args.air_max_count,
+        cam_rot=cam_rot,
+        require_all_corners=wall_poly is None,
     )
     del splats
     print(
@@ -377,13 +549,13 @@ def main(argv: list[str] | None = None) -> int:
     # Phase 7+8 — Quadrilateral extraction + LT/RT/LB/RB ordering (chained)
     # ------------------------------------------------------------------
     print("[Phase 7+8] extracting quadrilaterals + ordering corners ...", file=sys.stderr)
-    # cam_by_key: coarse + iterative (fine cameras 없음)
     cam_by_key: dict = {("coarse", c.view_idx): c for c in coarse_cameras}
     cam_by_key.update(iterative_cam_by_key)
     ordered_cache = order_all_selected(
         selection=selection,
         cam_by_key=cam_by_key,
         cache_dir=cache_dir,
+        min_views=1 if wall_poly is not None else 2,
     )
     print(
         f"[Phase 7+8] {len(ordered_cache.views)}/{selection.n_selected} views "
@@ -403,7 +575,6 @@ def main(argv: list[str] | None = None) -> int:
         c2w_arr = np.asarray(cam.c2w, dtype=np.float64)
         img_size = cam.w
         for ck in CORNER_KEYS_TUPLE:
-            # OrderedCornersView 좌표는 stored(90° CW) 이미지 기준 → 역변환 필요
             u_stored, v_stored = getattr(ov, ck)
             u_orig, v_orig = pixel_rotate_cw_to_orig(u_stored, v_stored, img_size)
             r = pixel_to_world_ray(u_orig, v_orig, K_arr, c2w_arr)
@@ -417,33 +588,92 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[Phase 9] rays per corner: {counts}", file=sys.stderr)
 
     # ------------------------------------------------------------------
-    # Phase 10 — Robust multi-view triangulation per corner
+    # Phase 10 — corner 3D 산출
     # ------------------------------------------------------------------
-    print("[Phase 10] RANSAC + LSQ triangulation per corner ...", file=sys.stderr)
-    threshold_abs = config.ransac_threshold_abs
     tri_results: dict[str, object] = {}
-    for ck in CORNER_KEYS_TUPLE:
-        if ck not in by_corner:
+    if wall_poly is not None:
+        print("[Phase 10] ray ∩ wall-plane corner extraction ...", file=sys.stderr)
+        walls = build_wall_planes(wall_poly, float(args.floor_y), float(args.ceiling_y))
+
+        def _rays_of(ck: str):
+            d = by_corner.get(ck)
+            if d is None:
+                return []
+            return list(zip(d["origins"], d["directions"]))
+
+        top_rays = _rays_of("left_top") + _rays_of("right_top")
+        wall_idx = pick_door_wall(top_rays, walls)
+        if wall_idx is None:
             raise RuntimeError(
-                f"Phase 10: corner '{ck}' has no rays after Phase 8 ordering. (D10)"
+                "Phase 10: 문이 놓인 벽 평면을 찾지 못함 (상단 ray 가 어느 벽도 유효 교차 안 함). (D10)"
             )
-        d = by_corner[ck]
-        tri = ransac_triangulate(
-            origins=d["origins"],
-            directions=d["directions"],
-            view_idx=d["view_idx"],
-            threshold_abs=threshold_abs,
-            min_inliers=2,
-        )
-        tri_results[ck] = tri
+        door_wall = walls[wall_idx]
+
+        def _corner_on_wall(ck: str):
+            pts = []
+            for (o, dr) in _rays_of(ck):
+                p = ray_wall_hit(o, dr, door_wall)
+                if p is not None:
+                    pts.append(p)
+            if not pts:
+                return None
+            return np.mean(np.stack(pts, axis=0), axis=0)
+
+        tl = _corner_on_wall("left_top")
+        tr = _corner_on_wall("right_top")
+        if tl is None or tr is None:
+            raise RuntimeError("Phase 10: 상단 코너 ray∩벽평면 교점 실패. (D10)")
+
+        floor_y = float(real_floor_y)
+        bl = _corner_on_wall("left_bottom")
+        br = _corner_on_wall("right_bottom")
+        bottom_source = "ray∩wall"
+        if bl is None or br is None:
+            bl = np.array([tl[0], floor_y, tl[2]], dtype=np.float64)
+            br = np.array([tr[0], floor_y, tr[2]], dtype=np.float64)
+            bottom_source = f"floorY={floor_y:.3f} fallback"
+
+        corners_3d_dict = {
+            "left_top": tuple(float(x) for x in tl),
+            "right_top": tuple(float(x) for x in tr),
+            "left_bottom": tuple(float(x) for x in bl),
+            "right_bottom": tuple(float(x) for x in br),
+        }
+        for ck in CORNER_KEYS_TUPLE:
+            tri_results[ck] = TriangulationResult(
+                point=corners_3d_dict[ck], inlier_view_idx=[], n_inliers=1,
+                mean_perp_dist=0.0, max_perp_dist=0.0, condition_number=1.0,
+            )
         print(
-            f"[Phase 10] {ck}: point={tuple(round(x,4) for x in tri.point)}, "
-            f"inliers={tri.n_inliers}, mean_perp={tri.mean_perp_dist:.4f}, "
-            f"cond={tri.condition_number:.2e}",
+            f"[Phase 10] wall #{wall_idx} | "
+            f"TL={tuple(round(x,3) for x in tl)} TR={tuple(round(x,3) for x in tr)} | "
+            f"BL={tuple(round(x,3) for x in bl)} ({bottom_source})",
             file=sys.stderr,
         )
-
-    corners_3d_dict = {ck: tri_results[ck].point for ck in CORNER_KEYS_TUPLE}  # type: ignore[union-attr]
+    else:
+        print("[Phase 10] RANSAC + LSQ triangulation per corner ...", file=sys.stderr)
+        threshold_abs = config.ransac_threshold_abs
+        for ck in CORNER_KEYS_TUPLE:
+            if ck not in by_corner:
+                raise RuntimeError(
+                    f"Phase 10: corner '{ck}' has no rays after Phase 8 ordering. (D10)"
+                )
+            d = by_corner[ck]
+            tri = ransac_triangulate(
+                origins=d["origins"],
+                directions=d["directions"],
+                view_idx=d["view_idx"],
+                threshold_abs=threshold_abs,
+                min_inliers=2,
+            )
+            tri_results[ck] = tri
+            print(
+                f"[Phase 10] {ck}: point={tuple(round(x,4) for x in tri.point)}, "
+                f"inliers={tri.n_inliers}, mean_perp={tri.mean_perp_dist:.4f}, "
+                f"cond={tri.condition_number:.2e}",
+                file=sys.stderr,
+            )
+        corners_3d_dict = {ck: tri_results[ck].point for ck in CORNER_KEYS_TUPLE}  # type: ignore[union-attr]
 
     # ------------------------------------------------------------------
     # Phase 11 — Quality metrics + JSON output

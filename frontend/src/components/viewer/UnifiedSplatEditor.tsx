@@ -1069,7 +1069,7 @@ export default function UnifiedSplatEditor({
         {mode === 'door' && sam3PromptOpen && !isBasemapPurpose && (
           <Suspense fallback={null}>
             <Sam3PromptModal
-              onStartAuto={(prompt) => {
+              onStartAuto={(prompt, opts) => {
                 setSam3Prompt(prompt);
                 setSam3PromptOpen(false);
                 setAutoExtracting(true);
@@ -1088,9 +1088,25 @@ export default function UnifiedSplatEditor({
                       return;
                     }
                     const bake = refine.getRemainingRotationToAY?.() ?? { rotX: 0, rotZ: 0, wallAngleRad: 0 };
+                    // 방법 B — 다듬기 확정 천장/바닥(A') + raw→A' 회전(bakedRotation) 전달.
+                    // null 이면 known-room 비활성 → door-ml 기본 추정 fallback.
+                    const roomFrame = refine.getRefinedRoomFrame?.() ?? null;
                     const resp = await api.post<{ corners: { left_top: { x: number; y: number; z: number }; right_top: { x: number; y: number; z: number }; right_bottom: { x: number; y: number; z: number }; left_bottom: { x: number; y: number; z: number } } }>(
                       '/uploads/sam3/detect-temp',
-                      { session_id: sid, prompt, bake_rotation: bake },
+                      {
+                        session_id: sid,
+                        prompt,
+                        bake_rotation: bake,
+                        interior_min_hits: opts.interiorMinHits,
+                        interior_strict: opts.interiorStrict,
+                        ...(roomFrame ? {
+                          rot_x: roomFrame.rotX,
+                          rot_z: roomFrame.rotZ,
+                          floor_y: roomFrame.floorY,
+                          ceiling_y: roomFrame.ceilingY,
+                          ...(roomFrame.wallPolygon ? { wall_polygon: roomFrame.wallPolygon } : {}),
+                        } : {}),
+                      },
                     );
                     const c = resp.corners;
                     // SAM3 응답은 A'+Y 프레임 (bake_rotation 적용). raw 프레임 통일 컨벤션 (corners 는 메모리 내 raw 유지)

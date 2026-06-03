@@ -5,7 +5,7 @@
 
 - 위치: /var/lib/sam3-temp/ (Docker volume `sam3-temp`)
 - 파일명: {session_uuid}.ply
-- TTL: 30분 (mtime 기준). 만료 파일은 주기적으로 자동 삭제.
+- TTL: 4시간 (mtime 기준). 만료 파일은 주기적으로 자동 삭제.
 - 청소 주기: 5분.
 """
 
@@ -18,7 +18,7 @@ import uuid
 from pathlib import Path
 
 TEMP_DIR = Path("/var/lib/sam3-temp")
-TTL_SECONDS = 30 * 60
+TTL_SECONDS = 4 * 60 * 60  # 4시간 (반복 테스트 편의)
 CLEANUP_INTERVAL_SECONDS = 5 * 60
 logger = logging.getLogger(__name__)
 

@@ -110,6 +110,7 @@ def render_views(
     device: str = "cuda",
     near_plane: float = 0.01,
     far_plane: float = 1e10,
+    cam_rot: "np.ndarray | None" = None,
 ) -> list[str]:
     """gsplat.rasterization으로 각 카메라의 RGB PNG 렌더.
 
@@ -118,6 +119,9 @@ def render_views(
         cameras: CameraView 리스트.
         output_dir: PNG 저장 디렉터리.
         device: 'cuda' | 'cpu'.
+        cam_rot: (3,3) or None. 주어지면 각 카메라 c2w 상단 3행에 선곱(=Rᵀ, A'→raw).
+            방법 B: 카메라는 A' 프레임이고 가우시안은 raw 프레임일 때, SH 회전 없이
+            raw 가우시안을 정확히 렌더하기 위해 카메라만 raw 로 역변환한다.
 
     Returns:
         저장된 canonical PNG 경로 리스트 (view_idx 순).
@@ -176,36 +180,30 @@ def render_views(
         alpha_np = alphas[0, ..., 0].clamp(0.0, 1.0).cpu().numpy()
         return rgb_np, alpha_np
 
+    cam_rot_np = None if cam_rot is None else np.asarray(cam_rot, dtype=np.float64)
+
     saved: list[str] = []
     for cam in cameras:
         K_t = torch.tensor(cam.K, dtype=torch.float32, device=device)
-        c2w_t = torch.tensor(cam.c2w, dtype=torch.float32, device=device)
+        c2w_np = np.asarray(cam.c2w, dtype=np.float64)
+        if cam_rot_np is not None:
+            # A' 카메라 → raw 프레임 (가우시안이 raw 일 때 정확 렌더).
+            c2w_np = c2w_np.copy()
+            c2w_np[:3, :3] = cam_rot_np @ c2w_np[:3, :3]
+            c2w_np[:3, 3] = cam_rot_np @ c2w_np[:3, 3]
+        c2w_t = torch.tensor(c2w_np, dtype=torch.float32, device=device)
         viewmat = torch.linalg.inv(c2w_t)
 
+        # vanilla render만 저장 (albedo/dark_bg/bright_bg variant 제거).
+        # variant는 SAM3 속도 저하(4× 추론) 원인이었고, canonical만으로 충분.
         rgb_full, alpha_np = _render_single(viewmat, K_t, sh_degree)
-        if sh_degree > 0:
-            rgb_dc, _ = _render_single(viewmat, K_t, 0)
-        else:
-            rgb_dc = rgb_full
-
-        variants = _build_render_variants(rgb_full, rgb_dc, alpha_np)
-
-        # PLY 좌표계가 사람 시점 기준 90° CCW 돌아있어서 CW 보정 저장.
-        # SAM3는 직립 이미지로 학습됐으므로 이 보정이 detection 신뢰도를 높임.
-        # 주의: 이후 pixel_to_world_ray 호출 시 역변환(pixel_rotate_cw_to_orig) 필요.
-        rotated_variants = {
-            name: np.rot90(img_u8, k=-1) for name, img_u8 in variants.items()
-        }
-
+        neutral_bg = (0.74, 0.74, 0.74)
+        canonical = _to_u8(_tone_balance(
+            _compose_on_background(rgb_full, alpha_np, neutral_bg), alpha_np
+        ))
+        # 상하 flip: gsplat 렌더가 뒤집혀 나오므로 직립 저장 (SAM3 직립 학습 기준).
         png_path = os.path.join(output_dir, f"view_{cam.view_idx:04d}.png")
-        Image.fromarray(rotated_variants["canonical"]).save(png_path)
-        for variant_name, img_u8 in rotated_variants.items():
-            if variant_name == "canonical":
-                continue
-            variant_path = os.path.join(
-                output_dir, f"view_{cam.view_idx:04d}__{variant_name}.png"
-            )
-            Image.fromarray(img_u8).save(variant_path)
+        Image.fromarray(np.flipud(canonical)).save(png_path)
         saved.append(png_path)
 
     return saved

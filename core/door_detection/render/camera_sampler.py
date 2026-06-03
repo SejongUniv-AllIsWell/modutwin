@@ -364,6 +364,113 @@ def sample_walk_cameras(
     return cameras, r_walk
 
 
+def sample_wall_facing_cameras(
+    polygon_xz: np.ndarray,
+    floor_y: float,
+    ceiling_y: float,
+    eye_y: float,
+    means_for_air: np.ndarray,
+    n_total: int = 32,
+    width: int = 1024,
+    height: int = 1024,
+    fov_x_deg: float = 60.0,
+    air_radius: float = 0.15,
+    air_max_count: int = 20,
+    min_standoff: float = 0.6,
+    depth_frac: float = 0.85,
+) -> tuple[list["CameraView"], float]:
+    """벽 폴리곤(A' footprint) 기반 — 각 벽을 방 안에서 정면으로 보는 카메라들.
+
+    중앙 disk 에 갇히는 walk 샘플링과 달리, 방의 모든 벽(과 그 위 문)을 정면으로
+    포착하도록 벽마다 길이에 비례한 수의 카메라를 벽을 따라 깔고 안쪽을 향하게 한다.
+    긴 방/복도형에서도 모든 벽이 커버된다.
+
+    Args:
+        polygon_xz: (N, 2) 방 footprint 폴리곤 (A' 프레임 X-Z, cycle 순).
+        floor_y, ceiling_y: A' 천장/바닥 Y (확정값).
+        eye_y: 카메라 Y.
+        means_for_air: (M, 3) A' 가우시안 means (opacity 필터). air 검사용.
+        n_total: 전체 카메라 예산 (벽 길이 비례 분배).
+
+    Returns:
+        (cameras, horizontal_half_extent) — 후자는 iterative clamp 용 (폴리곤 bbox).
+    """
+    from scipy.spatial import cKDTree
+
+    poly = np.asarray(polygon_xz, dtype=np.float64).reshape(-1, 2)
+    n_edges = poly.shape[0]
+    if n_edges < 3:
+        raise ValueError(f"wall polygon needs ≥3 points, got {n_edges}")
+
+    centroid = poly.mean(axis=0)
+    tree = cKDTree(np.asarray(means_for_air, dtype=np.float64))
+    K = make_intrinsic(width, height, fov_x_deg)
+
+    # 천장 mesh 까지 보이도록 표준 수직 화각 기준 standoff (정사각 이미지 → fov_y≈fov_x).
+    room_h = abs(float(ceiling_y) - float(floor_y))
+    half_fov = np.deg2rad(fov_x_deg) / 2.0
+    standoff_for_height = (room_h / 2.0) / max(np.tan(half_fov), 1e-6)
+    target_y = (float(floor_y) + float(ceiling_y)) / 2.0  # 벽 중간 높이를 바라봄
+
+    # 폴리곤 bbox 반경 (iterative clamp).
+    half_extent = float(max(poly[:, 0].ptp(), poly[:, 1].ptp()) / 2.0)
+
+    perim = 0.0
+    edges = []
+    for i in range(n_edges):
+        a = poly[i]
+        b = poly[(i + 1) % n_edges]
+        seg = b - a
+        L = float(np.hypot(seg[0], seg[1]))
+        if L < 1e-6:
+            continue
+        edges.append((a, b, seg / L, L))
+        perim += L
+    if not edges or perim <= 0:
+        raise ValueError("degenerate wall polygon")
+
+    def _air_ok(px: float, pz: float) -> bool:
+        cnt = tree.query_ball_point([px, eye_y, pz], r=air_radius, return_length=True)
+        return int(cnt) <= air_max_count
+
+    cameras: list[CameraView] = []
+    view_idx = 0
+    for (a, b, edir, L) in edges:
+        # 안쪽 normal (centroid 향하는 쪽).
+        n1 = np.array([edir[1], -edir[0]], dtype=np.float64)
+        mid = (a + b) / 2.0
+        inward = n1 if np.dot(n1, centroid - mid) > 0 else -n1
+
+        # 이 벽에서 방 안쪽으로의 깊이 (반대편까지) → standoff 상한.
+        proj = (poly - mid) @ inward
+        depth = float(max(proj.max(), 0.0))
+        standoff = float(np.clip(standoff_for_height, min_standoff, max(min_standoff, depth * depth_frac)))
+
+        # 벽 길이에 비례한 카메라 수.
+        n_along = max(1, int(round(n_total * L / perim)))
+        for k in range(n_along):
+            t = (k + 0.5) / n_along
+            wall_pt = a + edir * (t * L)
+            cam_xz = wall_pt + inward * standoff
+            # air 검사 + 안쪽으로 back-off (가우시안 속이면 standoff 줄임).
+            s = standoff
+            while s > min_standoff and not _air_ok(cam_xz[0], cam_xz[1]):
+                s *= 0.7
+                cam_xz = wall_pt + inward * s
+            position = np.array([cam_xz[0], eye_y, cam_xz[1]], dtype=np.float64)
+            target = np.array([wall_pt[0], target_y, wall_pt[1]], dtype=np.float64)
+            cameras.append(
+                build_lookat_camera(
+                    position=position, target=target,
+                    view_idx=view_idx, source="coarse",
+                    width=width, height=height, fov_x_deg=fov_x_deg,
+                )
+            )
+            view_idx += 1
+
+    return cameras, half_extent
+
+
 def _sunflower_disk(n: int) -> np.ndarray:
     """단위 디스크 위 N개 균등 분포 점 (sunflower / 2D fibonacci). returns (N, 2)."""
     if n <= 0:
