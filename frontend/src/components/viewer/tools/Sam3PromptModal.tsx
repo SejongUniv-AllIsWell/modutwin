@@ -15,7 +15,6 @@ import { createPortal } from 'react-dom';
 export interface Sam3AutoOptions {
   interiorMinHits: number;
   interiorStrict: boolean;
-  maxDoors: number;
 }
 
 interface Props {
@@ -29,7 +28,6 @@ export default function Sam3PromptModal({ onStartAuto, onSkipToManual, onClose }
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [interiorMinHits, setInteriorMinHits] = useState(22);
   const [interiorStrict, setInteriorStrict] = useState(true);
-  const [maxDoors, setMaxDoors] = useState(1);
 
   // ESC 로 닫기.
   useEffect(() => {
@@ -74,20 +72,9 @@ export default function Sam3PromptModal({ onStartAuto, onSkipToManual, onClose }
           {showAdvanced && (
             <div className="mt-3 space-y-3 text-sm">
               <div className="text-xs text-[var(--muted)] leading-relaxed">
-                For rooms with multiple doors, increase max doors.
-                For long/non-convex rooms, lower min hits or disable strict check.
+                문 개수는 자동 검출됩니다 (입력 불필요).
+                긴/비볼록 방에서 실패 시 아래 설정을 조정하세요.
               </div>
-              <label className="flex items-center justify-between gap-3">
-                <span>Max doors to extract</span>
-                <input
-                  type="number"
-                  min={1}
-                  max={10}
-                  value={maxDoors}
-                  onChange={(e) => setMaxDoors(Math.max(1, Math.min(10, Number(e.target.value) || 1)))}
-                  className="w-20 bg-[var(--bg-soft)] border border-[var(--rule)] rounded-md px-2 py-1 text-right focus:outline-none focus:border-indigo-500"
-                />
-              </label>
               <label className="flex items-center justify-between gap-3">
                 <span>Min interior hits (default 22 / 26)</span>
                 <input
@@ -116,7 +103,7 @@ export default function Sam3PromptModal({ onStartAuto, onSkipToManual, onClose }
             onClick={() => {
               // 빈 입력 / 공백만 입력이면 기본 프롬프트 'door' 사용.
               const trimmed = prompt.trim();
-              onStartAuto(trimmed || 'door', { interiorMinHits, interiorStrict, maxDoors });
+              onStartAuto(trimmed || 'door', { interiorMinHits, interiorStrict });
             }}
             className="flex-1 px-4 py-3 bg-indigo-600 hover:bg-indigo-500 text-[var(--ink)] rounded-lg cursor-pointer text-sm font-bold"
             title="입력한 설명 (또는 빈 입력 시 기본 'door' 프롬프트) 으로 자동 문 추출 시작"

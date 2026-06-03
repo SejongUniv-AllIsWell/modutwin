@@ -112,8 +112,6 @@ class Sam3DetectTempRequest(BaseModel):
     rot_z: float | None = None
     # 방 footprint 폴리곤 (A' X-Z). 있으면 door-ml 이 벽-정면 카메라 커버리지 사용.
     wall_polygon: list[dict] | None = None
-    # N-door: 추출할 최대 문 개수. 기본 1 = 단일 문.
-    max_doors: int = 1
 
 
 class Sam3DetectTempResponse(BaseModel):
@@ -171,8 +169,6 @@ def _detect_params(body: "Sam3DetectTempRequest") -> dict:
         })
         if body.wall_polygon:
             params["wall_polygon"] = json.dumps(body.wall_polygon)
-    if body.max_doors > 1:
-        params["max_doors"] = body.max_doors
     return params
 
 

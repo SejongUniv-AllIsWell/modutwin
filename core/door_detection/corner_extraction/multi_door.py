@@ -306,18 +306,20 @@ def extract_n_doors(
     pixel_rotate_fn,
     pixel_to_ray_fn,
     ray_hit_fn,
-    max_doors: int = 8,
     adjacency_window: int = 2,
     gap: int = 2,
     merge_dist: float = 0.4,
 ) -> list[DoorStructure]:
-    """Step A-D 통합 실행. DoorStructure 리스트 반환 (최대 max_doors)."""
+    """Step A-D 통합 실행. 문 개수는 클러스터링으로 자동 결정 (개수 입력 불필요).
+
+    DoorStructure 리스트(score 내림차순) 반환.
+    """
     # Step A
     candidates = collect_door_candidates(sam3_summary, coarse_cam_map, adjacency_window)
     if not candidates:
         return []
 
-    # Step B
+    # Step B — 인접 클러스터링 (문 개수 자동)
     clusters = cluster_by_adjacency(candidates, gap=gap)
 
     # Step C
@@ -330,9 +332,7 @@ def extract_n_doors(
         if ds is not None:
             structures.append(ds)
 
-    # Step D
+    # Step D — 유사 구조체 병합 (같은 문 dedup)
     structures = merge_similar_structures(structures, merge_dist=merge_dist)
 
-    # max_doors 제한: score 내림차순
-    structures = sorted(structures, key=lambda d: -d.score)[:max_doors]
-    return structures
+    return sorted(structures, key=lambda d: -d.score)

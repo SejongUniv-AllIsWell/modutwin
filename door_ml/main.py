@@ -68,7 +68,6 @@ async def detect(
     floor_y: float | None = None,
     ceiling_y: float | None = None,
     wall_polygon: str | None = None,
-    max_doors: int = 1,
 ):
     """
     PLY 파일을 받아 문의 4개 코너 3D 좌표를 반환한다.
@@ -113,9 +112,6 @@ async def detect(
             ]
             if wall_polygon:
                 pipeline_args += ["--wall_polygon", wall_polygon]
-
-        if max_doors > 1:
-            pipeline_args += ["--max_doors", str(max_doors)]
 
         exit_code = pipeline_main(pipeline_args)
 
