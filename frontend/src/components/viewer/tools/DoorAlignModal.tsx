@@ -51,6 +51,22 @@ interface BasemapPendingDoor {
   bakeRotation: { rotX: number; rotZ: number; wallAngleRad: number };
 }
 
+export interface NonAlignmentDoorEntry {
+  id: string;
+  cornersAY: number[][];
+  wallSurfaceId: string;
+  hingeEdge: number;
+  swing: 1 | -1;
+  doorMesh?: {
+    corners: number[][];
+    uvs: number[][];
+    normalInward: number[];
+    textureWidth: number;
+    textureHeight: number;
+    textureBlob: Blob;
+  };
+}
+
 export interface ModuleDoorAssetPayload {
   wallSurfaceId: string;
   doorExtractionDepth: number;
@@ -69,6 +85,8 @@ export interface ModuleDoorAssetPayload {
   doorSplat?: {
     plyBlob: Blob;
   };
+  // 비정합 문들 — door mesh texture 포함, 여닫기 등록에 필요한 모든 메타.
+  nonAlignmentDoors?: NonAlignmentDoorEntry[];
 }
 
 interface Props {
@@ -82,6 +100,8 @@ interface Props {
   /** SAM3 자동 추출 완료 시 부모가 doors.json 에서 가져온 4 코너 (현재 PLY local frame).
    *  값이 들어오면 picked 슬롯에 채워지고 사용자는 즉시 보거나 보정 후 저장 가능. */
   autoExtractedCorners?: Array<[number, number, number]> | null;
+  /** 비정합 문 corners (raw 프레임). 문 설정 완료 시 door mesh texture 를 bake 해 onSetupDoorAssetsFinalized 에 포함. */
+  nonAlignmentDoorCorners?: Array<Array<[number, number, number]>> | null;
   /** 사용자가 "문 수동 지정" 을 누르면 호출 — 부모가 autoExtracting 을 false 로 내릴 수 있게. */
   onManualPickStart?: () => void;
   /** "문 설정 완료" 가 성공한 후 호출 — 부모가 정합 단계로 진입할 수 있게.
@@ -287,7 +307,7 @@ function derivePlanesFromMeshSurfaces(surfaces: any[]): SurfacePlane[] {
  * 정합 단계는 별도 `AlignPanel` 이 담당.
  */
 export default function DoorAlignModal({
-  coreRef, uploadId, currentUrl, onDone, onClose, autoExtracting = false, autoExtractedCorners = null, onManualPickStart, onSetupSaveDone, ensureUploadId, onCommitRefined, getCurrentKeepMask, getBakeRgba, getRemainingRotationToAY, markNextSplatLoadSkipRebake, onMainSplatReplaced, basemapMode = false, basemapEditMode = false, basemapId, basemapUnitName, basemapFloorId, basemapFloorNumber, onBasemapDone, deferPersistenceToAlign = false, onSetupCornersFinalized, onSetupDoorAssetsFinalized, onCleanupOpenChange, sharedAdditional,
+  coreRef, uploadId, currentUrl, onDone, onClose, autoExtracting = false, autoExtractedCorners = null, nonAlignmentDoorCorners = null, onManualPickStart, onSetupSaveDone, ensureUploadId, onCommitRefined, getCurrentKeepMask, getBakeRgba, getRemainingRotationToAY, markNextSplatLoadSkipRebake, onMainSplatReplaced, basemapMode = false, basemapEditMode = false, basemapId, basemapUnitName, basemapFloorId, basemapFloorNumber, onBasemapDone, deferPersistenceToAlign = false, onSetupCornersFinalized, onSetupDoorAssetsFinalized, onCleanupOpenChange, sharedAdditional,
 }: Props) {
   const [picked, setPicked] = useState<Array<PickedCorner | null>>(() => emptyPicked());
   // 모듈 등록 흐름: 문 설정 완료 시 메모리 보관 → 정합 완료 시 commit-final 페이로드에 포함.
@@ -1483,6 +1503,64 @@ export default function DoorAlignModal({
       setDoorCleanupBusy(false);
     }
   }, [additional, coreRef, markNextSplatLoadSkipRebake, onMainSplatReplaced]);
+
+  // 비정합 문 door mesh bake — 문 설정 완료 시 호출, 각 비정합 문 텍스처를 wall mesh 에서 추출.
+  const bakeNonAlignmentDoors = useCallback(async (): Promise<NonAlignmentDoorEntry[]> => {
+    if (!nonAlignmentDoorCorners?.length || !planes) return [];
+    const core = coreRef.current;
+    const app = core?.getApp?.();
+    if (!app) return [];
+    const { extractDoorRegionTexture } = await import('@/lib/gs/doorTrim');
+    const rotR = getCurrentEditorRotation();
+    const bakeRot = getRemainingRotationToAY?.() ?? { rotX: 0, rotZ: 0, wallAngleRad: 0 };
+    const results: NonAlignmentDoorEntry[] = [];
+
+    for (let i = 0; i < nonAlignmentDoorCorners.length; i++) {
+      const dc = nonAlignmentDoorCorners[i];
+      const refA = rawToA(dc[0] as Vec3, rotR);
+      let bestId = '', bestDist = Infinity;
+      for (const p of planes) {
+        if (p.id === 'ceiling' || p.id === 'floor') continue;
+        const sd = Math.abs(p.normal[0]*refA[0] + p.normal[1]*refA[1] + p.normal[2]*refA[2] - p.d);
+        if (sd < bestDist) { bestDist = sd; bestId = p.id; }
+      }
+      const cornersAY = dc.map(c => Array.from(rawToAY(c as Vec3, bakeRot as FrameRotation)));
+      const entry: NonAlignmentDoorEntry = { id: `door_${i + 2}`, cornersAY, wallSurfaceId: bestId, hingeEdge: 3, swing: 1 };
+      if (bestId) {
+        try {
+          const mi = app.root?.findByName?.(`wallMesh_${bestId}`)?.render?.meshInstances?.[0];
+          const wallMeshObj = mi?.mesh;
+          const wallMeshTex = mi?.material?.emissiveMap;
+          if (wallMeshObj && wallMeshTex) {
+            const pos = new Float32Array(12), uvArr = new Float32Array(8);
+            wallMeshObj.getPositions?.(pos); wallMeshObj.getUvs?.(0, uvArr);
+            const wC: [Vec3,Vec3,Vec3,Vec3] = [[pos[0],pos[1],pos[2]],[pos[3],pos[4],pos[5]],[pos[6],pos[7],pos[8]],[pos[9],pos[10],pos[11]]];
+            const wU: [[number,number],[number,number],[number,number],[number,number]] = [[uvArr[0],uvArr[1]],[uvArr[2],uvArr[3]],[uvArr[4],uvArr[5]],[uvArr[6],uvArr[7]]];
+            const cA = dc.map(c => rawToA(c as Vec3, rotR)) as [Vec3,Vec3,Vec3,Vec3];
+            const texLvl = wallMeshTex.lock?.();
+            if (texLvl) {
+              const cut = extractDoorRegionTexture(texLvl, wallMeshTex.width, wallMeshTex.height, wC, wU, cA);
+              wallMeshTex.unlock?.();
+              const wn = planes.find(p => p.id === bestId)?.normal as Vec3 | undefined;
+              const inwardRaw = wn ? aToRaw([-wn[0],-wn[1],-wn[2]] as Vec3, rotR) : [0,0,1] as Vec3;
+              const inwardAY = rawToAY(inwardRaw as Vec3, bakeRot as FrameRotation);
+              const muvs = cut.doorCornerPx.map((px: [number,number]) => [px[0]/cut.width, px[1]/cut.height]);
+              const canvas = document.createElement('canvas');
+              canvas.width = cut.width; canvas.height = cut.height;
+              const ctx = canvas.getContext('2d');
+              if (ctx) {
+                ctx.putImageData(new ImageData(new Uint8ClampedArray(cut.rgba), cut.width, cut.height), 0, 0);
+                const blob = await new Promise<Blob|null>(res => canvas.toBlob(b => res(b), 'image/png'));
+                if (blob) entry.doorMesh = { corners: cornersAY, uvs: muvs, normalInward: [inwardAY[0],inwardAY[1],inwardAY[2]], textureWidth: cut.width, textureHeight: cut.height, textureBlob: blob };
+              }
+            } else { wallMeshTex.unlock?.(); }
+          }
+        } catch (e) { console.warn('[NonAlignDoor] bake failed', i, e); }
+      }
+      results.push(entry);
+    }
+    return results;
+  }, [nonAlignmentDoorCorners, planes, coreRef, getCurrentEditorRotation, getRemainingRotationToAY]);
 
   // 토글 OFF: 모든 변경 원복. 메인 splat 을 추출 전 snapshot 으로 reload.
   const revertDoorRefine = useCallback(async () => {
@@ -3239,6 +3317,11 @@ export default function DoorAlignModal({
                       ...(doorMesh ? { doorMesh } : {}),
                       ...(doorSplat ? { doorSplat } : {}),
                     };
+                  }
+                  // 비정합 문 door mesh bake (백그라운드)
+                  const nonAlignDoors = await bakeNonAlignmentDoors();
+                  if (nonAlignDoors.length > 0) {
+                    payload = payload ? { ...payload, nonAlignmentDoors: nonAlignDoors } : null;
                   }
                   onSetupDoorAssetsFinalized(payload);
                 }

@@ -1020,6 +1020,11 @@ export default function UnifiedSplatEditor({
               onClose={() => { if (!isBasemapPurpose) { void handleToggleMode('align'); } }}
               autoExtracting={autoExtracting}
               autoExtractedCorners={autoExtractedCorners}
+              nonAlignmentDoorCorners={
+                allExtractedDoors && allExtractedDoors.length > 1
+                  ? allExtractedDoors.filter((_, i) => i !== alignmentDoorIdx)
+                  : null
+              }
               basemapMode={isBasemapPurpose}
               basemapEditMode={isBasemapEditMode}
               basemapId={isBasemapEditMode ? initialBasemapId : undefined}
@@ -1378,58 +1383,9 @@ export default function UnifiedSplatEditor({
                     const doorAssets = setupDoorAssetsRef.current;
                     const doorTextureField = 'door_tex_door_1';
                     const doorSplatField = 'door_splat_door_1';
-                    // ── 비정합 문 자동 메타 계산 헬퍼 ──────────────────────────────
-                    // normalInward: 문 quad 의 두 윗점→아랫점 수직 방향 (A'+Y 프레임, 방 안쪽).
-                    // hingeEdge: 4변 중 인접 변에 붙어있는(door center XZ에서 더 먼) 쪽을 hinge로.
-                    const _computeNonAlignDoorMeta = (
-                      cornersRaw: Array<[number, number, number]>,
-                      bakeRot: FrameRotation,
-                    ): { normalInward: [number, number, number]; hingeEdge: number; swing: 1 | -1 } => {
-                      const ay = cornersRaw.map(c => rawToAY(c as [number, number, number], bakeRot));
-                      // LT, RT, RB, LB 순서 (autoExtractedCorners 컨벤션)
-                      const [lt, rt, rb, lb] = ay;
-                      // 벽 법선: (RT-LT) × (LB-LT) 정규화 → 방 안쪽
-                      const u = [rt[0]-lt[0], rt[1]-lt[1], rt[2]-lt[2]];
-                      const v = [lb[0]-lt[0], lb[1]-lt[1], lb[2]-lt[2]];
-                      const nx = u[1]*v[2] - u[2]*v[1];
-                      const ny = u[2]*v[0] - u[0]*v[2];
-                      const nz = u[0]*v[1] - u[1]*v[0];
-                      const nl = Math.hypot(nx, ny, nz) || 1;
-                      // hinge: LT-LB (left, edge 3) vs RT-RB (right, edge 1)
-                      // 문 중심에서 더 먼 변을 hinge 로 (문손잡이가 중심에서 가까운 쪽).
-                      // 단순화: 항상 left edge(3) 를 hinge 로 (일반 문 관행).
-                      return {
-                        normalInward: [nx/nl, ny/nl, nz/nl],
-                        hingeEdge: 3,
-                        swing: 1,
-                      };
-                    };
-
-                    // 비정합 문 목록 (allExtractedDoors 에서 정합 문 제외)
-                    const _bake = refine.getRemainingRotationToAY?.() ?? { rotX: 0, rotZ: 0, wallAngleRad: 0 };
-                    const _nonAlignDoors = (allExtractedDoors ?? [])
-                      .filter((_, i) => i !== alignmentDoorIdx)
-                      .map((corners, i) => {
-                        const meta = _computeNonAlignDoorMeta(corners, _bake as FrameRotation);
-                        const cornersAY = corners.map(c => rawToAY(c as [number, number, number], _bake as FrameRotation));
-                        return {
-                          id: `door_${i + 2}`,       // door_1 = 정합 문, door_2~ = 비정합
-                          corners: cornersAY,
-                          unitName: '',               // 미설정 (층 뷰어에서는 문 id 로 식별)
-                          hingeEdge: meta.hingeEdge,
-                          swing: meta.swing,
-                          // normalInward 를 doorMesh 로 감싸야 floor view 가 인식함
-                          doorMesh: {
-                            corners: cornersAY,
-                            uvs: [[0,0],[1,0],[1,1],[0,1]],
-                            normalInward: meta.normalInward,
-                            // 텍스처 없이 투명 문 (여닫기만 작동)
-                            textureFilename: null,
-                            textureWidth: 1,
-                            textureHeight: 1,
-                          },
-                        };
-                      });
+                    // 비정합 문 — DoorAlignModal 이 bakeNonAlignmentDoors 로 bake 한 결과 사용.
+                    // doorAssets.nonAlignmentDoors 없으면 빈 배열 (정합 문만 저장).
+                    const _nonAlignDoors = (doorAssets?.nonAlignmentDoors ?? []);
 
                     const doorsJson = JSON.stringify({
                       version: 1,
@@ -1465,8 +1421,25 @@ export default function UnifiedSplatEditor({
                           ...(pairedBasemapDoorId ? { pairedBasemapDoorId } : {}),
                           alignDoorThickness,
                         },
-                        // 비정합 문들 (자동 메타, 여닫기만 등록)
-                        ..._nonAlignDoors,
+                        // 비정합 문들 (door mesh texture 포함)
+                        ..._nonAlignDoors.map(d => ({
+                          id: d.id,
+                          corners: d.cornersAY,
+                          unitName: '',
+                          wallSurfaceId: d.wallSurfaceId,
+                          hingeEdge: d.hingeEdge,
+                          swing: d.swing,
+                          ...(d.doorMesh ? {
+                            doorMesh: {
+                              corners: d.doorMesh.corners,
+                              uvs: d.doorMesh.uvs,
+                              normalInward: d.doorMesh.normalInward,
+                              textureFilename: `form:door_tex_${d.id}`,
+                              textureWidth: d.doorMesh.textureWidth,
+                              textureHeight: d.doorMesh.textureHeight,
+                            },
+                          } : {}),
+                        })),
                       ],
                     });
 
@@ -1506,6 +1479,12 @@ export default function UnifiedSplatEditor({
                       const tex = assets.textures.get(sid);
                       if (!tex) throw new Error(`텍스처 누락: ${sid} (다듬기 단계에서 모든 면 베이크 필요)`);
                       form.append(`tex_${sid}`, tex, `tex_${sid}.png`);
+                    }
+                    // 비정합 문 texture blob
+                    for (const d of _nonAlignDoors) {
+                      if (d.doorMesh?.textureBlob) {
+                        form.append(`door_tex_${d.id}`, d.doorMesh.textureBlob, `${d.id}.png`);
+                      }
                     }
                     if (sam3PrepareSessionIdRef.current) {
                       form.append('sam3_session_id', sam3PrepareSessionIdRef.current);
