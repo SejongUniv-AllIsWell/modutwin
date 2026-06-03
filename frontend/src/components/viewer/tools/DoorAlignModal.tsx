@@ -609,6 +609,9 @@ export default function DoorAlignModal({
   // forcePickOverrideRef: 다음 autoExtractedCorners effect 에서 allEmpty 게이트 우회.
   const forcePickOverrideRef = useRef(false);
   const activeDoorIndexMountedRef = useRef(false);
+  // bakeNonAlignmentDoors 진행 중: revertDoorRefine 에서 메인 PLY 재로드 + 벽 텍스처 복원을 건너뜀.
+  // 각 비정합 문 추출이 직전 문의 구멍 위에 순차 누적되도록 PLY를 보존.
+  const bakeNonAlignDoorModeRef = useRef(false);
   useEffect(() => {
     if (basemapEditMode) return;
     if (activeDoorIndex === undefined) return;
@@ -1582,59 +1585,62 @@ export default function DoorAlignModal({
       } catch (e) { console.error('[DoorRefine] revert step 2 (mesh/wrapper destroy):', e); }
 
       // 3. 메인 splat 을 추출 전 snapshot 으로 reload — 도어 가우시안 복귀.
-      try {
-        if (core && revertMainPlyBlobUrlRef.current) {
-          const clearSkipRebake = markNextSplatLoadSkipRebake?.();
-          try {
-            await core.reloadSplatFromUrl(revertMainPlyBlobUrlRef.current, { preserveCamera: true });
-          } catch (e) {
-            clearSkipRebake?.();
-            throw e;
+      // bakeNonAlignDoorMode 중에는 건너뜀: 구멍이 누적돼야 하므로 PLY 재로드 불가.
+      if (!bakeNonAlignDoorModeRef.current) {
+        try {
+          if (core && revertMainPlyBlobUrlRef.current) {
+            const clearSkipRebake = markNextSplatLoadSkipRebake?.();
+            try {
+              await core.reloadSplatFromUrl(revertMainPlyBlobUrlRef.current, { preserveCamera: true });
+            } catch (e) {
+              clearSkipRebake?.();
+              throw e;
+            }
+            onMainSplatReplaced?.();
+            // 현재 main blob 참조를 추출 전 snapshot 으로 되돌린다.
+            if (currentMainPlyBlobUrlRef.current && currentMainPlyBlobUrlRef.current !== revertMainPlyBlobUrlRef.current) {
+              try { URL.revokeObjectURL(currentMainPlyBlobUrlRef.current); } catch {}
+            }
+            currentMainPlyBlobUrlRef.current = revertMainPlyBlobUrlRef.current;
           }
-          onMainSplatReplaced?.();
-          // 현재 main blob 참조를 추출 전 snapshot 으로 되돌린다.
-          if (currentMainPlyBlobUrlRef.current && currentMainPlyBlobUrlRef.current !== revertMainPlyBlobUrlRef.current) {
-            try { URL.revokeObjectURL(currentMainPlyBlobUrlRef.current); } catch {}
-          }
-          currentMainPlyBlobUrlRef.current = revertMainPlyBlobUrlRef.current;
-        }
-      } catch (e) { console.error('[DoorRefine] revert step 3 (main reload):', e); }
+        } catch (e) { console.error('[DoorRefine] revert step 3 (main reload):', e); }
 
-      // 4. wall mesh 텍스처 복원 — lvl 이 TypedArray 가 아닐 수 있어 인덱스 복사로 수행.
-      try {
-        if (wallTexSnapshotRef.current && wallMeshNameRef.current) {
-          const app = core?.getApp();
-          if (app) {
-            const wallEnt = findEntityByName(app.root, wallMeshNameRef.current);
-            const tex = wallEnt?.render?.meshInstances?.[0]?.material?.emissiveMap;
-            if (tex) {
-              const lvl: any = tex.lock();
-              if (lvl) {
-                const src = wallTexSnapshotRef.current;
-                const len = Math.min(lvl.length ?? 0, src.length);
-                if (typeof lvl.set === 'function' && lvl.length === src.length) {
-                  lvl.set(src);
-                } else {
-                  for (let i = 0; i < len; i++) lvl[i] = src[i];
+        // 4. wall mesh 텍스처 복원 — lvl 이 TypedArray 가 아닐 수 있어 인덱스 복사로 수행.
+        try {
+          if (wallTexSnapshotRef.current && wallMeshNameRef.current) {
+            const app = core?.getApp();
+            if (app) {
+              const wallEnt = findEntityByName(app.root, wallMeshNameRef.current);
+              const tex = wallEnt?.render?.meshInstances?.[0]?.material?.emissiveMap;
+              if (tex) {
+                const lvl: any = tex.lock();
+                if (lvl) {
+                  const src = wallTexSnapshotRef.current;
+                  const len = Math.min(lvl.length ?? 0, src.length);
+                  if (typeof lvl.set === 'function' && lvl.length === src.length) {
+                    lvl.set(src);
+                  } else {
+                    for (let i = 0; i < len; i++) lvl[i] = src[i];
+                  }
                 }
+                tex.unlock();
               }
-              tex.unlock();
-            }
-            for (const snap of wallViewTexSnapshotsRef.current ?? []) {
-              const lvl: any = snap.texture.lock();
-              if (lvl) {
-                const len = Math.min(lvl.length ?? 0, snap.rgba.length);
-                if (typeof lvl.set === 'function' && lvl.length === snap.rgba.length) {
-                  lvl.set(snap.rgba);
-                } else {
-                  for (let i = 0; i < len; i++) lvl[i] = snap.rgba[i];
+              for (const snap of wallViewTexSnapshotsRef.current ?? []) {
+                const lvl: any = snap.texture.lock();
+                if (lvl) {
+                  const len = Math.min(lvl.length ?? 0, snap.rgba.length);
+                  if (typeof lvl.set === 'function' && lvl.length === snap.rgba.length) {
+                    lvl.set(snap.rgba);
+                  } else {
+                    for (let i = 0; i < len; i++) lvl[i] = snap.rgba[i];
+                  }
                 }
+                snap.texture.unlock();
               }
-              snap.texture.unlock();
             }
           }
-        }
-      } catch (e) { console.error('[DoorRefine] revert step 4 (wall tex restore):', e); }
+        } catch (e) { console.error('[DoorRefine] revert step 4 (wall tex restore):', e); }
+      }
       wallTexSnapshotRef.current = null;
       wallViewTexSnapshotsRef.current = null;
       wallMeshNameRef.current = null;
@@ -2267,64 +2273,81 @@ export default function DoorAlignModal({
       setDoorCleanupOpenSynced]);
 
   // 비정합 문 일괄 bake — applyDoorRefine(cornersOverride) 재사용으로 full punch+bake+splat.
+  // bakeNonAlignDoorModeRef=true 구간에서 revertDoorRefine 은 오버레이만 제거(PLY 재로드 없음) →
+  // 각 문 구멍이 직전 문 구멍 위에 순차 누적됨. canonical scene 도 매 문마다 갱신(onMainSplatReplaced).
   const bakeNonAlignmentDoors = useCallback(async (): Promise<NonAlignmentDoorEntry[]> => {
     if (!nonAlignmentDoorCorners?.length || !planes) return [];
-    const rotR = getCurrentEditorRotation();
-    const bakeRot = getRemainingRotationToAY?.() ?? { rotX: 0, rotZ: 0, wallAngleRad: 0 };
-    const results: NonAlignmentDoorEntry[] = [];
+    bakeNonAlignDoorModeRef.current = true;
+    try {
+      const rotR = getCurrentEditorRotation();
+      const bakeRot = getRemainingRotationToAY?.() ?? { rotX: 0, rotZ: 0, wallAngleRad: 0 };
+      const results: NonAlignmentDoorEntry[] = [];
 
-    for (let i = 0; i < nonAlignmentDoorCorners.length; i++) {
-      const dc = nonAlignmentDoorCorners[i];
-      const refA = rawToA(dc[0] as Vec3, rotR);
-      let bestId = '', bestDist = Infinity;
-      for (const p of planes) {
-        if (p.id === 'ceiling' || p.id === 'floor') continue;
-        const sd = Math.abs(p.normal[0]*refA[0] + p.normal[1]*refA[1] + p.normal[2]*refA[2] - p.d);
-        if (sd < bestDist) { bestDist = sd; bestId = p.id; }
-      }
-      if (!bestId) continue;
+      for (let i = 0; i < nonAlignmentDoorCorners.length; i++) {
+        const dc = nonAlignmentDoorCorners[i];
+        const refA = rawToA(dc[0] as Vec3, rotR);
+        let bestId = '', bestDist = Infinity;
+        for (const p of planes) {
+          if (p.id === 'ceiling' || p.id === 'floor') continue;
+          const sd = Math.abs(p.normal[0]*refA[0] + p.normal[1]*refA[1] + p.normal[2]*refA[2] - p.d);
+          if (sd < bestDist) { bestDist = sd; bestId = p.id; }
+        }
+        if (!bestId) continue;
 
-      const overrideCorners: PickedCorner[] = dc.map(c => ({ pos: c as Vec3, surfaceId: bestId }));
-      try {
-        await applyDoorRefine({ cornersOverride: overrideCorners });
-      } catch (e) {
-        console.warn('[NonAlignDoor] applyDoorRefine failed', i, e);
-        continue;
-      }
+        // applyDoorRefine 전: revertMainPlyBlobUrlRef 를 null 로 → 이미 구멍이 뚫린 현재 scene 을
+        // 새 스냅샷 기준으로 삼아 이번 문 추출 실패 시 정확히 직전 상태로 복귀 가능.
+        // (bakeNonAlignDoorMode 에서 revertDoorRefine 은 PLY를 건드리지 않으므로 실질적 revert는 없음)
+        revertMainPlyBlobUrlRef.current = null;
 
-      const meshInput = lastDoorMeshInputRef.current;
-      const splatBlobUrl = doorSubBlobUrlRef.current;
-      const cornersAY = dc.map(c => Array.from(rawToAY(c as Vec3, bakeRot as FrameRotation)));
-      // suggested_hinge_edge 우선 사용 → 없으면 현재 정합 문 힌지 → 최후 fallback 3(왼쪽 변)
-      const doorHinge = nonAlignmentDoorHinges?.[i] ?? hingeEdgeRef.current ?? 3;
-      const entry: NonAlignmentDoorEntry = { id: `door_${i + 2}`, cornersAY, wallSurfaceId: bestId, hingeEdge: doorHinge, swing: 1 };
-
-      if (meshInput && meshInput.rgba.length > 0) {
+        const overrideCorners: PickedCorner[] = dc.map(c => ({ pos: c as Vec3, surfaceId: bestId }));
         try {
-          const canvas = document.createElement('canvas');
-          canvas.width = meshInput.width; canvas.height = meshInput.height;
-          const ctx = canvas.getContext('2d');
-          if (ctx) {
-            ctx.putImageData(new ImageData(new Uint8ClampedArray(meshInput.rgba), meshInput.width, meshInput.height), 0, 0);
-            const blob = await new Promise<Blob | null>(res => canvas.toBlob(b => res(b), 'image/png'));
-            if (blob) {
-              entry.doorMesh = {
-                corners: meshInput.corners.map(c => [c[0], c[1], c[2]]),
-                uvs: meshInput.uvs.map(u => [u[0], u[1]]),
-                normalInward: [meshInput.normalInward[0], meshInput.normalInward[1], meshInput.normalInward[2]],
-                textureWidth: meshInput.width, textureHeight: meshInput.height, textureBlob: blob,
-              };
+          await applyDoorRefine({ cornersOverride: overrideCorners });
+        } catch (e) {
+          console.warn('[NonAlignDoor] applyDoorRefine failed', i, e);
+          continue;
+        }
+
+        const meshInput = lastDoorMeshInputRef.current;
+        const splatBlobUrl = doorSubBlobUrlRef.current;
+        const cornersAY = dc.map(c => Array.from(rawToAY(c as Vec3, bakeRot as FrameRotation)));
+        // suggested_hinge_edge 우선 사용 → 없으면 현재 정합 문 힌지 → 최후 fallback 3(왼쪽 변)
+        const doorHinge = nonAlignmentDoorHinges?.[i] ?? hingeEdgeRef.current ?? 3;
+        const entry: NonAlignmentDoorEntry = { id: `door_${i + 2}`, cornersAY, wallSurfaceId: bestId, hingeEdge: doorHinge, swing: 1 };
+
+        if (meshInput && meshInput.rgba.length > 0) {
+          try {
+            const canvas = document.createElement('canvas');
+            canvas.width = meshInput.width; canvas.height = meshInput.height;
+            const ctx = canvas.getContext('2d');
+            if (ctx) {
+              ctx.putImageData(new ImageData(new Uint8ClampedArray(meshInput.rgba), meshInput.width, meshInput.height), 0, 0);
+              const blob = await new Promise<Blob | null>(res => canvas.toBlob(b => res(b), 'image/png'));
+              if (blob) {
+                entry.doorMesh = {
+                  corners: meshInput.corners.map(c => [c[0], c[1], c[2]]),
+                  uvs: meshInput.uvs.map(u => [u[0], u[1]]),
+                  normalInward: [meshInput.normalInward[0], meshInput.normalInward[1], meshInput.normalInward[2]],
+                  textureWidth: meshInput.width, textureHeight: meshInput.height, textureBlob: blob,
+                };
+              }
             }
-          }
-        } catch (e) { console.warn('[NonAlignDoor] texture encode failed', i, e); }
+          } catch (e) { console.warn('[NonAlignDoor] texture encode failed', i, e); }
+        }
+        if (splatBlobUrl) entry.doorSplatBlobUrl = splatBlobUrl;
+        lastDoorMeshInputRef.current = null;
+        doorSubBlobUrlRef.current = null;
+        results.push(entry);
       }
-      if (splatBlobUrl) entry.doorSplatBlobUrl = splatBlobUrl;
-      lastDoorMeshInputRef.current = null;
-      doorSubBlobUrlRef.current = null;
-      results.push(entry);
+
+      // 마지막 문의 scene 오버레이(splat layer, mesh entity) 정리 — PLY는 유지.
+      // bakeNonAlignDoorMode 에서 revertDoorRefine 은 PLY 재로드를 건너뛰므로 안전하게 호출 가능.
+      try { await revertDoorRefine(); } catch (e) { console.warn('[NonAlignDoor] final cleanup failed', e); }
+
+      return results;
+    } finally {
+      bakeNonAlignDoorModeRef.current = false;
     }
-    return results;
-  }, [nonAlignmentDoorCorners, nonAlignmentDoorHinges, planes, getCurrentEditorRotation, getRemainingRotationToAY, applyDoorRefine]);
+  }, [nonAlignmentDoorCorners, nonAlignmentDoorHinges, planes, getCurrentEditorRotation, getRemainingRotationToAY, applyDoorRefine, revertDoorRefine]);
 
   // 서버에서 corners 복원 후 1회 자동 문 추출 — 다시 들어와도 회전이 바로 활성.
   // 수동 픽 (사용자가 4점 직접 클릭) 일 때는 발동 안 함 (serverHydratedRef 게이트).
