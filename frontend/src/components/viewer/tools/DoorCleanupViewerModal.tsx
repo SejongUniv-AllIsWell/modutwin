@@ -63,6 +63,8 @@ interface DoorCleanupViewerModalProps {
   busy: boolean;
   onApply: (nextStates: Map<number, DoorCleanupState>) => Promise<void> | void;
   onClose: () => void;
+  /** 모달 헤더에 표시할 문 번호 라벨. 예: "문 1 다듬기". */
+  doorLabel?: string;
 }
 
 export default function DoorCleanupViewerModal({
@@ -73,6 +75,7 @@ export default function DoorCleanupViewerModal({
   busy,
   onApply,
   onClose,
+  doorLabel,
 }: DoorCleanupViewerModalProps) {
   const splatDataRef = useRef<CleanupSplatData | null>(null);
   const colorSnapshotRef = useRef<Uint16Array | null>(null);
@@ -409,7 +412,7 @@ export default function DoorCleanupViewerModal({
         style={{ left: 24, top: 112 }}
       >
         <div className="flex items-center justify-between">
-          <div className="text-sm font-bold">문 추출</div>
+          <div className="text-sm font-bold">{doorLabel ?? '문 추출'}</div>
           <button type="button" onClick={onClose} className="text-[var(--muted)] hover:text-[var(--ink)]">x</button>
         </div>
         <div className="mt-3 grid grid-cols-2 gap-2">

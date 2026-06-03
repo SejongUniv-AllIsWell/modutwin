@@ -1023,6 +1023,7 @@ export default function UnifiedSplatEditor({
               onClose={() => { if (!isBasemapPurpose) { void handleToggleMode('align'); } }}
               autoExtracting={autoExtracting}
               autoExtractedCorners={autoExtractedCorners}
+              activeDoorIndex={allExtractedDoors && allExtractedDoors.length > 1 ? alignmentDoorIdx : undefined}
               suggestedHingeEdge={
                 allExtractedDoorHinges && allExtractedDoorHinges.length > alignmentDoorIdx
                   ? allExtractedDoorHinges[alignmentDoorIdx]

@@ -107,6 +107,11 @@ interface Props {
   suggestedHingeEdge?: number | null;
   /** 비정합 문별 suggested_hinge_edge. nonAlignmentDoorCorners 와 1:1 대응. */
   nonAlignmentDoorHinges?: Array<number | null> | null;
+  /**
+   * 현재 활성(정합) 문 인덱스 (0-based). N개 문이 있을 때 부모가 전달.
+   * 값이 바뀌면 picked / hinge 를 초기화하고 이전 추출을 revert — 새 문 corners 를 수신할 준비.
+   */
+  activeDoorIndex?: number;
   /** 사용자가 "문 수동 지정" 을 누르면 호출 — 부모가 autoExtracting 을 false 로 내릴 수 있게. */
   onManualPickStart?: () => void;
   /** "문 설정 완료" 가 성공한 후 호출 — 부모가 정합 단계로 진입할 수 있게.
@@ -312,7 +317,7 @@ function derivePlanesFromMeshSurfaces(surfaces: any[]): SurfacePlane[] {
  * 정합 단계는 별도 `AlignPanel` 이 담당.
  */
 export default function DoorAlignModal({
-  coreRef, uploadId, currentUrl, onDone, onClose, autoExtracting = false, autoExtractedCorners = null, suggestedHingeEdge = null, nonAlignmentDoorCorners = null, nonAlignmentDoorHinges = null, onManualPickStart, onSetupSaveDone, ensureUploadId, onCommitRefined, getCurrentKeepMask, getBakeRgba, getRemainingRotationToAY, markNextSplatLoadSkipRebake, onMainSplatReplaced, basemapMode = false, basemapEditMode = false, basemapId, basemapUnitName, basemapFloorId, basemapFloorNumber, onBasemapDone, deferPersistenceToAlign = false, onSetupCornersFinalized, onSetupDoorAssetsFinalized, onCleanupOpenChange, sharedAdditional,
+  coreRef, uploadId, currentUrl, onDone, onClose, autoExtracting = false, autoExtractedCorners = null, suggestedHingeEdge = null, nonAlignmentDoorCorners = null, nonAlignmentDoorHinges = null, activeDoorIndex, onManualPickStart, onSetupSaveDone, ensureUploadId, onCommitRefined, getCurrentKeepMask, getBakeRgba, getRemainingRotationToAY, markNextSplatLoadSkipRebake, onMainSplatReplaced, basemapMode = false, basemapEditMode = false, basemapId, basemapUnitName, basemapFloorId, basemapFloorNumber, onBasemapDone, deferPersistenceToAlign = false, onSetupCornersFinalized, onSetupDoorAssetsFinalized, onCleanupOpenChange, sharedAdditional,
 }: Props) {
   const [picked, setPicked] = useState<Array<PickedCorner | null>>(() => emptyPicked());
   // 모듈 등록 흐름: 문 설정 완료 시 메모리 보관 → 정합 완료 시 commit-final 페이로드에 포함.
@@ -600,6 +605,27 @@ export default function DoorAlignModal({
     return getEditorRotation(uploadId);
   }, [basemapEditMode, getRemainingRotationToAY, uploadId]);
 
+  // activeDoorIndex 가 바뀌면 (N-door: 사용자가 다른 문 클릭) picked / hinge 초기화 + 이전 추출 revert.
+  // forcePickOverrideRef: 다음 autoExtractedCorners effect 에서 allEmpty 게이트 우회.
+  const forcePickOverrideRef = useRef(false);
+  const activeDoorIndexMountedRef = useRef(false);
+  useEffect(() => {
+    if (basemapEditMode) return;
+    if (activeDoorIndex === undefined) return;
+    if (!activeDoorIndexMountedRef.current) { activeDoorIndexMountedRef.current = true; return; }
+    // 문 전환 — picked + hinge 초기화, 이전 추출 revert
+    forcePickOverrideRef.current = true;
+    setPicked(emptyPicked());
+    setSeqArmed(false);
+    setHingeEdge(null);
+    setEdgePickArmed(false);
+    hoveredEdgeRef.current = null;
+    if (doorSubGsplatIdRef.current || doorMeshEntityRef.current) {
+      void revertDoorRefine();
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeDoorIndex, basemapEditMode]);
+
   // SAM3 자동 추출 완료 시 부모가 넘겨준 4 코너로 picked 초기 채움.
   // autoExtractedCorners 는 현재 PLY local frame 기준으로 전달된다.
   // surfaceId 는 closest-plane 으로 추정한다. 신규 등록 중에는 rawToA 로 live 평면 프레임에 맞추고,
@@ -610,7 +636,9 @@ export default function DoorAlignModal({
     if (!planes) return;
     setPicked(prev => {
       const allEmpty = prev.every(p => p === null);
-      if (!allEmpty) return prev;
+      const force = forcePickOverrideRef.current;
+      if (!allEmpty && !force) return prev;
+      forcePickOverrideRef.current = false;
       const r = getCurrentEditorRotation();
       const ref = autoExtractedCorners[0];
       const refA = rawToA([ref[0], ref[1], ref[2]] as Vec3, r);
@@ -2898,7 +2926,9 @@ export default function DoorAlignModal({
                   : 'bg-blue-600 hover:bg-blue-500 text-[var(--ink)]'
               }`}
             >
-              {doorRefining ? '처리 중...' : (doorRefineActive ? '문 추출 취소' : '문 추출')}
+              {doorRefining ? '처리 중...' : (doorRefineActive ? '문 추출 취소' : (
+                activeDoorIndex !== undefined ? `문 ${activeDoorIndex + 1} 추출` : '문 추출'
+              ))}
             </button>
           </div>
         </div>
@@ -3600,6 +3630,7 @@ export default function DoorAlignModal({
           origIndexOrder={doorCleanupDoorOrigOrderRef.current}
           initialStates={doorCleanupStateRef.current}
           busy={doorCleanupBusy}
+          doorLabel={activeDoorIndex !== undefined ? `문 ${activeDoorIndex + 1} 다듬기` : '문 다듬기'}
           onClose={() => {
             if (basemapMode) {
               void finalizeBasemapDoorExtraction().catch((e) => {
