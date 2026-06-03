@@ -19,6 +19,7 @@ import type { ModuleDoorAssetPayload } from './tools/DoorAlignModal';
 
 const DoorAlignModal = lazy(() => import('./tools/DoorAlignModal'));
 const Sam3PromptModal = lazy(() => import('./tools/Sam3PromptModal'));
+const NDoorSelectPanel = lazy(() => import('./tools/NDoorSelectPanel'));
 const AlignPanel = lazy(() => import('./tools/AlignPanel'));
 
 export type EditorMode = 'refine' | 'door' | 'align' | null;
@@ -127,6 +128,11 @@ export default function UnifiedSplatEditor({
   const [, setSam3Prompt] = useState('');
   // SAM3 자동 추출 완료 시 doors.json 에서 가져온 4 corner. DoorAlignModal 에 prefill 로 전달.
   const [autoExtractedCorners, setAutoExtractedCorners] = useState<Array<[number, number, number]> | null>(null);
+  // N-door: 자동 추출된 모든 문 corners (raw 프레임). 2개 이상이면 선택 패널 표시.
+  const [allExtractedDoors, setAllExtractedDoors] = useState<Array<Array<[number, number, number]>> | null>(null);
+  const [nDoorSelectOpen, setNDoorSelectOpen] = useState(false);
+  const [nDoorHoverIdx, setNDoorHoverIdx] = useState<number | null>(null);
+  const nDoorOutlinesRef = useRef<any[]>([]); // PlayCanvas DoorOutlineHandle[]
   // /sam3/start 응답을 받아 backend 가 sam3_status='running' 으로 commit 한 시점 이후에만 폴링을
   // 시작하기 위한 가드. 완료된 dispatch 결과가 새 시도에 섞이는 race 차단.
   const [sam3DispatchSent, setSam3DispatchSent] = useState(false);
@@ -706,6 +712,72 @@ export default function UnifiedSplatEditor({
     };
   }, []);
 
+  // ── N-door 와이어프레임 관리 ──
+  // allExtractedDoors 변경 시 PlayCanvas 씬에 컬러 와이어프레임 생성·파괴.
+  // nDoorSelectOpen 닫힐 때 / mode 변경 시 정리.
+  useEffect(() => {
+    // 기존 와이어프레임 전부 파괴
+    nDoorOutlinesRef.current.forEach(h => { try { h.destroy(); } catch {} });
+    nDoorOutlinesRef.current = [];
+
+    if (!allExtractedDoors || allExtractedDoors.length <= 1) return;
+    const pc = coreRef.current?.getPC?.();
+    const app = coreRef.current?.getApp?.();
+    if (!pc || !app) return;
+
+    const { createDoorOutlineEntity } = require('@/lib/gs/doorOutline');
+    const COLORS: [number, number, number][] = [
+      [0.376, 0.647, 0.980], // blue
+      [0.204, 0.827, 0.600], // emerald
+      [0.957, 0.443, 0.714], // pink
+      [0.984, 0.573, 0.188], // orange
+      [0.655, 0.545, 0.980], // violet
+      [0.980, 0.800, 0.082], // yellow
+    ];
+
+    allExtractedDoors.forEach((corners, idx) => {
+      if (corners.length < 4) return;
+      const color = COLORS[idx % COLORS.length];
+      const handle = createDoorOutlineEntity(pc, app, {
+        corners: corners as [number, number, number][],
+        unitName: `문 ${idx + 1}`,
+      });
+      // 컬러 override
+      try {
+        const mat = handle.outlineEntity?.children?.[0]?.render?.meshInstances?.[0]?.material;
+        if (mat) {
+          mat.emissive = new pc.Color(color[0], color[1], color[2]);
+          mat.update();
+        }
+      } catch {}
+      nDoorOutlinesRef.current.push(handle);
+    });
+
+    return () => {
+      nDoorOutlinesRef.current.forEach(h => { try { h.destroy(); } catch {} });
+      nDoorOutlinesRef.current = [];
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [allExtractedDoors]);
+
+  // 호버 시 해당 와이어프레임 강조 (scale)
+  useEffect(() => {
+    nDoorOutlinesRef.current.forEach((h, idx) => {
+      try {
+        const isHovered = nDoorHoverIdx === idx;
+        h.outlineEntity?.setLocalScale?.(isHovered ? 1.02 : 1.0, isHovered ? 1.02 : 1.0, isHovered ? 1.02 : 1.0);
+      } catch {}
+    });
+  }, [nDoorHoverIdx]);
+
+  // 문 설정 단계 벗어나거나 선택 완료 시 와이어프레임 정리
+  useEffect(() => {
+    if (mode !== 'door' || !nDoorSelectOpen) {
+      nDoorOutlinesRef.current.forEach(h => { try { h.destroy(); } catch {} });
+      nDoorOutlinesRef.current = [];
+    }
+  }, [mode, nDoorSelectOpen]);
+
   // ── 레이어 ↔ mesh 연동 helper ──
   // 각 레이어는 자기 splat 외에도 연관된 wall/door mesh entity 들을 같이 hide/show 해야 함.
   //   module-main: wallMesh_* (basemap tag 없음)
@@ -1075,6 +1147,8 @@ export default function UnifiedSplatEditor({
                 setAutoExtracting(true);
                 setSam3DispatchSent(false);
                 setAutoExtractedCorners(null);
+                setAllExtractedDoors(null);
+                setNDoorSelectOpen(false);
                 // 백엔드 임시 보관 PLY 로 door-ml 직행. MinIO/DB 안 건드림.
                 // 백그라운드 업로드가 끝나기를 기다리고 detect-temp 호출.
                 (async () => {
@@ -1091,7 +1165,10 @@ export default function UnifiedSplatEditor({
                     // 방법 B — 다듬기 확정 천장/바닥(A') + raw→A' 회전(bakedRotation) 전달.
                     // null 이면 known-room 비활성 → door-ml 기본 추정 fallback.
                     const roomFrame = refine.getRefinedRoomFrame?.() ?? null;
-                    const resp = await api.post<{ corners: { left_top: { x: number; y: number; z: number }; right_top: { x: number; y: number; z: number }; right_bottom: { x: number; y: number; z: number }; left_bottom: { x: number; y: number; z: number } } }>(
+                    const resp = await api.post<{
+                      corners: { left_top: { x: number; y: number; z: number }; right_top: { x: number; y: number; z: number }; right_bottom: { x: number; y: number; z: number }; left_bottom: { x: number; y: number; z: number } };
+                      all_doors?: Array<{ left_top: { x: number; y: number; z: number }; right_top: { x: number; y: number; z: number }; right_bottom: { x: number; y: number; z: number }; left_bottom: { x: number; y: number; z: number } }>;
+                    }>(
                       '/uploads/sam3/detect-temp',
                       {
                         session_id: sid,
@@ -1108,17 +1185,32 @@ export default function UnifiedSplatEditor({
                         } : {}),
                       },
                     );
-                    const c = resp.corners;
-                    // SAM3 응답은 A'+Y 프레임 (bake_rotation 적용). raw 프레임 통일 컨벤션 (corners 는 메모리 내 raw 유지)
-                    // 에 맞추기 위해 ayToRaw 적용해 저장. commit-final 에서 다시 A'+Y 로 변환해 서버 저장.
-                    const orderAY: Array<[number, number, number]> = [
-                      [c.left_top.x, c.left_top.y, c.left_top.z],
-                      [c.right_top.x, c.right_top.y, c.right_top.z],
-                      [c.right_bottom.x, c.right_bottom.y, c.right_bottom.z],
-                      [c.left_bottom.x, c.left_bottom.y, c.left_bottom.z],
-                    ];
-                    const order = orderAY.map(ay => ayToRaw(ay, bake as FrameRotation));
-                    setAutoExtractedCorners(order);
+
+                    // A'+Y 프레임 → raw 변환 헬퍼
+                    const cornersAYtoRaw = (c: { left_top: {x:number;y:number;z:number}; right_top: {x:number;y:number;z:number}; right_bottom: {x:number;y:number;z:number}; left_bottom: {x:number;y:number;z:number} }): Array<[number,number,number]> => {
+                      const ay: Array<[number,number,number]> = [
+                        [c.left_top.x, c.left_top.y, c.left_top.z],
+                        [c.right_top.x, c.right_top.y, c.right_top.z],
+                        [c.right_bottom.x, c.right_bottom.y, c.right_bottom.z],
+                        [c.left_bottom.x, c.left_bottom.y, c.left_bottom.z],
+                      ];
+                      return ay.map(p => ayToRaw(p, bake as FrameRotation)) as Array<[number,number,number]>;
+                    };
+
+                    const primaryOrder = cornersAYtoRaw(resp.corners);
+
+                    // N-door: all_doors 파싱
+                    const rawAllDoors = (resp.all_doors ?? [resp.corners]).map(cornersAYtoRaw);
+                    setAllExtractedDoors(rawAllDoors);
+
+                    if (rawAllDoors.length > 1) {
+                      // 복수 문: 선택 패널 표시 (첫 번째는 미리 세팅)
+                      setAutoExtractedCorners(primaryOrder);
+                      setNDoorSelectOpen(true);
+                    } else {
+                      // 단일 문: 기존과 동일하게 즉시 세팅
+                      setAutoExtractedCorners(primaryOrder);
+                    }
                     setSam3DispatchSent(true);
                     setAutoExtracting(false);
                   } catch (e: any) {
@@ -1133,6 +1225,24 @@ export default function UnifiedSplatEditor({
                 setSam3DispatchSent(false);
               }}
               onClose={() => setSam3PromptOpen(false)}
+            />
+          </Suspense>
+        )}
+        {/* N-door 선택 패널 — 자동 추출로 문이 2개 이상 검출됐을 때 표시. */}
+        {mode === 'door' && nDoorSelectOpen && allExtractedDoors && allExtractedDoors.length > 1 && !isBasemapPurpose && (
+          <Suspense fallback={null}>
+            <NDoorSelectPanel
+              doors={allExtractedDoors}
+              onSelect={(idx) => {
+                setAutoExtractedCorners(allExtractedDoors[idx]);
+                setNDoorSelectOpen(false);
+                setNDoorHoverIdx(null);
+              }}
+              onHover={setNDoorHoverIdx}
+              onClose={() => {
+                setNDoorSelectOpen(false);
+                setNDoorHoverIdx(null);
+              }}
             />
           </Suspense>
         )}
