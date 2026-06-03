@@ -213,6 +213,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "known-room + 이 값이 있으면 중앙 disk 대신 벽-정면 카메라로 coarse 샘플링.",
     )
 
+    p.add_argument(
+        "--render_size",
+        type=int,
+        default=256,
+        help="렌더 이미지 해상도 (width=height, default 256). 낮출수록 렌더 속도 상승.",
+    )
+    p.add_argument(
+        "--standoff_scale",
+        type=float,
+        default=1.2,
+        help="wall-facing 카메라 standoff 배율 (default 1.2 = 20%% 더 멀리). "
+             "1.0 = 기존 계산값 그대로.",
+    )
     p.add_argument("--device", type=str, default="cuda", help="compute device")
     p.add_argument("--debug", action="store_true", help="debug 시각화 저장")
 
@@ -441,6 +454,9 @@ def main(argv: list[str] | None = None) -> int:
                 fov_x_deg=60.0,
                 air_radius=args.air_radius,
                 air_max_count=args.air_max_count,
+                width=args.render_size,
+                height=args.render_size,
+                standoff_scale=args.standoff_scale,
             )
             r_coarse = horizontal_half
             meta = {
@@ -468,6 +484,8 @@ def main(argv: list[str] | None = None) -> int:
                 air_radius=args.air_radius,
                 air_max_count=args.air_max_count,
                 eye_height_y=eye_y,
+                width=args.render_size,
+                height=args.render_size,
             )
             meta = {
                 "mode": "walk",
@@ -493,6 +511,8 @@ def main(argv: list[str] | None = None) -> int:
             room_center=np.asarray(room_info.room_center, dtype=np.float64),
             min_half_extent=room_info.min_half_extent,
             n_views=args.n_coarse,
+            width=args.render_size,
+            height=args.render_size,
         )
         meta = {
             "mode": "sphere",

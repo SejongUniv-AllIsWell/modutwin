@@ -125,8 +125,8 @@ def sample_coarse_cameras(
     room_center: np.ndarray,
     min_half_extent: float,
     n_views: int,
-    width: int = 1024,
-    height: int = 1024,
+    width: int = 256,
+    height: int = 256,
     fov_x_deg: float = 60.0,
     radius_ratio: float = 0.3,
 ) -> tuple[list[CameraView], float]:
@@ -264,8 +264,8 @@ def sample_walk_cameras(
     min_half_extent: float,
     n_positions: int,
     n_yaw_per_position: int,
-    width: int = 1024,
-    height: int = 1024,
+    width: int = 256,
+    height: int = 256,
     fov_x_deg: float = 60.0,
     radius_ratio: float = 0.6,
     pitch_deg: float = 0.0,
@@ -372,13 +372,14 @@ def sample_wall_facing_cameras(
     eye_y: float,
     means_for_air: np.ndarray,
     n_total: int = 32,
-    width: int = 1024,
-    height: int = 1024,
+    width: int = 256,
+    height: int = 256,
     fov_x_deg: float = 60.0,
     air_radius: float = 0.15,
     air_max_count: int = 20,
     min_standoff: float = 0.6,
     depth_frac: float = 0.85,
+    standoff_scale: float = 1.0,
 ) -> tuple[list["CameraView"], float]:
     """벽 폴리곤(A' footprint) 기반 — 각 벽을 방 안에서 정면으로 보는 카메라들.
 
@@ -446,6 +447,7 @@ def sample_wall_facing_cameras(
         proj = (poly - mid) @ inward
         depth = float(max(proj.max(), 0.0))
         standoff = float(np.clip(standoff_for_height, min_standoff, max(min_standoff, depth * depth_frac)))
+        standoff *= standoff_scale
 
         # 벽 길이에 비례한 카메라 수.
         n_along = max(1, int(round(n_total * L / perim)))
@@ -489,8 +491,8 @@ def sample_fine_cameras(
     cluster_dir: np.ndarray,
     base_positions: np.ndarray,
     n_views: int,
-    width: int = 1024,
-    height: int = 1024,
+    width: int = 256,
+    height: int = 256,
     fov_x_deg: float = 60.0,
     radius_ratio: float = 0.3,
     lateral_ratio: float = 0.4,
