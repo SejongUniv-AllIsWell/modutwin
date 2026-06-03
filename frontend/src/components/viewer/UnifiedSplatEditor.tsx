@@ -1176,6 +1176,7 @@ export default function UnifiedSplatEditor({
                         bake_rotation: bake,
                         interior_min_hits: opts.interiorMinHits,
                         interior_strict: opts.interiorStrict,
+                        ...(opts.maxDoors > 1 ? { max_doors: opts.maxDoors } : {}),
                         ...(roomFrame ? {
                           rot_x: roomFrame.rotX,
                           rot_z: roomFrame.rotZ,
