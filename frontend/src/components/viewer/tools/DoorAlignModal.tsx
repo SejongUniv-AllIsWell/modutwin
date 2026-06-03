@@ -65,6 +65,7 @@ export interface NonAlignmentDoorEntry {
     textureHeight: number;
     textureBlob: Blob;
   };
+  doorSplatBlobUrl?: string | null;  // door-side gaussian PLY (blob URL)
 }
 
 export interface ModuleDoorAssetPayload {
@@ -1505,63 +1506,8 @@ export default function DoorAlignModal({
   }, [additional, coreRef, markNextSplatLoadSkipRebake, onMainSplatReplaced]);
 
   // 비정합 문 door mesh bake — 문 설정 완료 시 호출, 각 비정합 문 텍스처를 wall mesh 에서 추출.
-  const bakeNonAlignmentDoors = useCallback(async (): Promise<NonAlignmentDoorEntry[]> => {
-    if (!nonAlignmentDoorCorners?.length || !planes) return [];
-    const core = coreRef.current;
-    const app = core?.getApp?.();
-    if (!app) return [];
-    const { extractDoorRegionTexture } = await import('@/lib/gs/doorTrim');
-    const rotR = getCurrentEditorRotation();
-    const bakeRot = getRemainingRotationToAY?.() ?? { rotX: 0, rotZ: 0, wallAngleRad: 0 };
-    const results: NonAlignmentDoorEntry[] = [];
-
-    for (let i = 0; i < nonAlignmentDoorCorners.length; i++) {
-      const dc = nonAlignmentDoorCorners[i];
-      const refA = rawToA(dc[0] as Vec3, rotR);
-      let bestId = '', bestDist = Infinity;
-      for (const p of planes) {
-        if (p.id === 'ceiling' || p.id === 'floor') continue;
-        const sd = Math.abs(p.normal[0]*refA[0] + p.normal[1]*refA[1] + p.normal[2]*refA[2] - p.d);
-        if (sd < bestDist) { bestDist = sd; bestId = p.id; }
-      }
-      const cornersAY = dc.map(c => Array.from(rawToAY(c as Vec3, bakeRot as FrameRotation)));
-      const entry: NonAlignmentDoorEntry = { id: `door_${i + 2}`, cornersAY, wallSurfaceId: bestId, hingeEdge: 3, swing: 1 };
-      if (bestId) {
-        try {
-          const mi = app.root?.findByName?.(`wallMesh_${bestId}`)?.render?.meshInstances?.[0];
-          const wallMeshObj = mi?.mesh;
-          const wallMeshTex = mi?.material?.emissiveMap;
-          if (wallMeshObj && wallMeshTex) {
-            const pos = new Float32Array(12), uvArr = new Float32Array(8);
-            wallMeshObj.getPositions?.(pos); wallMeshObj.getUvs?.(0, uvArr);
-            const wC: [Vec3,Vec3,Vec3,Vec3] = [[pos[0],pos[1],pos[2]],[pos[3],pos[4],pos[5]],[pos[6],pos[7],pos[8]],[pos[9],pos[10],pos[11]]];
-            const wU: [[number,number],[number,number],[number,number],[number,number]] = [[uvArr[0],uvArr[1]],[uvArr[2],uvArr[3]],[uvArr[4],uvArr[5]],[uvArr[6],uvArr[7]]];
-            const cA = dc.map(c => rawToA(c as Vec3, rotR)) as [Vec3,Vec3,Vec3,Vec3];
-            const texLvl = wallMeshTex.lock?.();
-            if (texLvl) {
-              const cut = extractDoorRegionTexture(texLvl, wallMeshTex.width, wallMeshTex.height, wC, wU, cA);
-              wallMeshTex.unlock?.();
-              const wn = planes.find(p => p.id === bestId)?.normal as Vec3 | undefined;
-              const inwardRaw = wn ? aToRaw([-wn[0],-wn[1],-wn[2]] as Vec3, rotR) : [0,0,1] as Vec3;
-              const inwardAY = rawToAY(inwardRaw as Vec3, bakeRot as FrameRotation);
-              const muvs = cut.doorCornerPx.map((px: [number,number]) => [px[0]/cut.width, px[1]/cut.height]);
-              const canvas = document.createElement('canvas');
-              canvas.width = cut.width; canvas.height = cut.height;
-              const ctx = canvas.getContext('2d');
-              if (ctx) {
-                ctx.putImageData(new ImageData(new Uint8ClampedArray(cut.rgba), cut.width, cut.height), 0, 0);
-                const blob = await new Promise<Blob|null>(res => canvas.toBlob(b => res(b), 'image/png'));
-                if (blob) entry.doorMesh = { corners: cornersAY, uvs: muvs, normalInward: [inwardAY[0],inwardAY[1],inwardAY[2]], textureWidth: cut.width, textureHeight: cut.height, textureBlob: blob };
-              }
-            } else { wallMeshTex.unlock?.(); }
-          }
-        } catch (e) { console.warn('[NonAlignDoor] bake failed', i, e); }
-      }
-      results.push(entry);
-    }
-    return results;
-  }, [nonAlignmentDoorCorners, planes, coreRef, getCurrentEditorRotation, getRemainingRotationToAY]);
-
+  // bakeNonAlignmentDoors: applyDoorRefine(cornersOverride) 로 각 비정합 문을 full bake.
+  // wall punch(가우시안 + wall mesh 텍스처) + door mesh texture + door splat 모두 수행.
   // 토글 OFF: 모든 변경 원복. 메인 splat 을 추출 전 snapshot 으로 reload.
   const revertDoorRefine = useCallback(async () => {
     try {
@@ -1780,13 +1726,20 @@ export default function DoorAlignModal({
   ]);
 
   // 토글 ON 또는 슬라이더 변경 시 재적용.
-  const applyDoorRefine = useCallback(async (opts: { openCleanup?: boolean } = {}) => {
+  const applyDoorRefine = useCallback(async (opts: {
+    openCleanup?: boolean;
+    /** 외부 코너를 직접 지정할 때 사용 (비정합 문 일괄 bake 등).
+     *  지정 시 현재 picked 상태 대신 이 코너를 사용. */
+    cornersOverride?: PickedCorner[];
+  } = {}) => {
     setDoorRefineError(null);
     setDoorRefining(true);
     try {
-      // 0. 검증
-      if (!allPicked) throw new Error('도어 4점을 먼저 추출하세요');
-      const surfaceIds = picked.map(p => p!.surfaceId);
+      // 0. 검증 — cornersOverride 가 있으면 picked 대신 사용.
+      const effectivePicked: (PickedCorner | null)[] = opts.cornersOverride ?? picked;
+      const allPickedEffective = effectivePicked.every(p => p !== null);
+      if (!allPickedEffective) throw new Error('도어 4점을 먼저 추출하세요');
+      const surfaceIds = effectivePicked.map(p => p!.surfaceId);
       if (new Set(surfaceIds).size > 1) throw new Error('도어 4점이 같은 면 위에 있어야 합니다');
       const wallSurfaceId = surfaceIds[0];
 
@@ -1858,10 +1811,10 @@ export default function DoorAlignModal({
         return [p[0] - sd0*n[0], p[1] - sd0*n[1], p[2] - sd0*n[2]];
       };
       const corners: [Vec3, Vec3, Vec3, Vec3] = [
-        projectOnWall(picked[0]!.pos),
-        projectOnWall(picked[1]!.pos),
-        projectOnWall(picked[2]!.pos),
-        projectOnWall(picked[3]!.pos),
+        projectOnWall(effectivePicked[0]!.pos),
+        projectOnWall(effectivePicked[1]!.pos),
+        projectOnWall(effectivePicked[2]!.pos),
+        projectOnWall(effectivePicked[3]!.pos),
       ];
       // wall mesh corners (A' 프레임) 와 매칭하기 위한 A' 변환본 (punch/extract 가 사용).
       const cornersA: [Vec3, Vec3, Vec3, Vec3] = [
@@ -2270,6 +2223,64 @@ export default function DoorAlignModal({
       doorRefineActive, boundarySplitEnabled, findEntityByName, revertDoorRefine, getCurrentEditorRotation,
       basemapMode, basemapEditMode, getRemainingRotationToAY, onMainSplatReplaced, finalizeBasemapDoorExtraction,
       setDoorCleanupOpenSynced]);
+
+  // 비정합 문 일괄 bake — applyDoorRefine(cornersOverride) 재사용으로 full punch+bake+splat.
+  const bakeNonAlignmentDoors = useCallback(async (): Promise<NonAlignmentDoorEntry[]> => {
+    if (!nonAlignmentDoorCorners?.length || !planes) return [];
+    const rotR = getCurrentEditorRotation();
+    const bakeRot = getRemainingRotationToAY?.() ?? { rotX: 0, rotZ: 0, wallAngleRad: 0 };
+    const results: NonAlignmentDoorEntry[] = [];
+
+    for (let i = 0; i < nonAlignmentDoorCorners.length; i++) {
+      const dc = nonAlignmentDoorCorners[i];
+      const refA = rawToA(dc[0] as Vec3, rotR);
+      let bestId = '', bestDist = Infinity;
+      for (const p of planes) {
+        if (p.id === 'ceiling' || p.id === 'floor') continue;
+        const sd = Math.abs(p.normal[0]*refA[0] + p.normal[1]*refA[1] + p.normal[2]*refA[2] - p.d);
+        if (sd < bestDist) { bestDist = sd; bestId = p.id; }
+      }
+      if (!bestId) continue;
+
+      const overrideCorners: PickedCorner[] = dc.map(c => ({ pos: c as Vec3, surfaceId: bestId }));
+      try {
+        await applyDoorRefine({ cornersOverride: overrideCorners });
+      } catch (e) {
+        console.warn('[NonAlignDoor] applyDoorRefine failed', i, e);
+        continue;
+      }
+
+      const meshInput = lastDoorMeshInputRef.current;
+      const splatBlobUrl = doorSubBlobUrlRef.current;
+      const cornersAY = dc.map(c => Array.from(rawToAY(c as Vec3, bakeRot as FrameRotation)));
+      const entry: NonAlignmentDoorEntry = { id: `door_${i + 2}`, cornersAY, wallSurfaceId: bestId, hingeEdge: 3, swing: 1 };
+
+      if (meshInput && meshInput.rgba.length > 0) {
+        try {
+          const canvas = document.createElement('canvas');
+          canvas.width = meshInput.width; canvas.height = meshInput.height;
+          const ctx = canvas.getContext('2d');
+          if (ctx) {
+            ctx.putImageData(new ImageData(new Uint8ClampedArray(meshInput.rgba), meshInput.width, meshInput.height), 0, 0);
+            const blob = await new Promise<Blob | null>(res => canvas.toBlob(b => res(b), 'image/png'));
+            if (blob) {
+              entry.doorMesh = {
+                corners: meshInput.corners.map(c => [c[0], c[1], c[2]]),
+                uvs: meshInput.uvs.map(u => [u[0], u[1]]),
+                normalInward: [meshInput.normalInward[0], meshInput.normalInward[1], meshInput.normalInward[2]],
+                textureWidth: meshInput.width, textureHeight: meshInput.height, textureBlob: blob,
+              };
+            }
+          }
+        } catch (e) { console.warn('[NonAlignDoor] texture encode failed', i, e); }
+      }
+      if (splatBlobUrl) entry.doorSplatBlobUrl = splatBlobUrl;
+      lastDoorMeshInputRef.current = null;
+      doorSubBlobUrlRef.current = null;
+      results.push(entry);
+    }
+    return results;
+  }, [nonAlignmentDoorCorners, planes, getCurrentEditorRotation, getRemainingRotationToAY, applyDoorRefine]);
 
   // 서버에서 corners 복원 후 1회 자동 문 추출 — 다시 들어와도 회전이 바로 활성.
   // 수동 픽 (사용자가 4점 직접 클릭) 일 때는 발동 안 함 (serverHydratedRef 게이트).

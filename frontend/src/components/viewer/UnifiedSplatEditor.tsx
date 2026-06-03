@@ -1439,6 +1439,9 @@ export default function UnifiedSplatEditor({
                               textureHeight: d.doorMesh.textureHeight,
                             },
                           } : {}),
+                          ...(d.doorSplatBlobUrl ? {
+                            doorSplat: { filename: `form:door_splat_${d.id}` },
+                          } : {}),
                         })),
                       ],
                     });
@@ -1480,10 +1483,23 @@ export default function UnifiedSplatEditor({
                       if (!tex) throw new Error(`텍스처 누락: ${sid} (다듬기 단계에서 모든 면 베이크 필요)`);
                       form.append(`tex_${sid}`, tex, `tex_${sid}.png`);
                     }
-                    // 비정합 문 texture blob
+                    // 비정합 문 texture / splat blob
                     for (const d of _nonAlignDoors) {
                       if (d.doorMesh?.textureBlob) {
                         form.append(`door_tex_${d.id}`, d.doorMesh.textureBlob, `${d.id}.png`);
+                      }
+                      if (d.doorSplatBlobUrl) {
+                        try {
+                          const resp = await fetch(d.doorSplatBlobUrl);
+                          const buf = await resp.arrayBuffer();
+                          const { parsePly, serializePly } = await import('@/lib/ply');
+                          const { rotateScene, rotateSceneY } = await import('@/lib/gs');
+                          const doorScene = parsePly(buf);
+                          const br = refine.getRemainingRotationToAY?.() ?? { rotX: 0, rotZ: 0, wallAngleRad: 0 };
+                          if (br.rotX !== 0 || br.rotZ !== 0) rotateScene(doorScene, br.rotX, br.rotZ);
+                          if (br.wallAngleRad !== 0) rotateSceneY(doorScene, br.wallAngleRad);
+                          form.append(`door_splat_${d.id}`, new Blob([serializePly(doorScene) as unknown as BlobPart], { type: 'application/octet-stream' }), `${d.id}.ply`);
+                        } catch (e) { console.warn('[NonAlignDoor] splat bake failed', e); }
                       }
                     }
                     if (sam3PrepareSessionIdRef.current) {

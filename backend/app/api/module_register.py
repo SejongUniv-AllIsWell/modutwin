@@ -231,7 +231,12 @@ async def sam3_detect_temp(
         return c
 
     corners = _transform_corners(corners)
-    all_doors_transformed = [_transform_corners(d) for d in raw_all_doors]
+    all_doors_transformed = []
+    for d in raw_all_doors:
+        transformed = _transform_corners(d)
+        # suggested_hinge_edge 는 좌표 변환 불필요 — 그대로 전달.
+        transformed["suggested_hinge_edge"] = d.get("suggested_hinge_edge")
+        all_doors_transformed.append(transformed)
 
     return Sam3DetectTempResponse(corners=corners, all_doors=all_doors_transformed)
 

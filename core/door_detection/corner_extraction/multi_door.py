@@ -46,7 +46,50 @@ class DoorStructure:
     score: float
     src_view_idx: int          # 대표 뷰 (single-view mode)
     mode: str                  # "4-corner-single" | "top-2-floorY"
+    # SAM3 마스크 손잡이(검은 hole) 위치로 추정한 hinge 변 (0=상,1=우,2=하,3=좌). None=손잡이 미검출.
+    suggested_hinge_edge: int | None = None
     cluster_view_idxs: list[int] = field(default_factory=list)  # 클러스터에 속한 뷰들
+
+
+def detect_hinge_edge_from_mask(mask_path: str, min_hole_frac: float = 0.002) -> int | None:
+    """SAM3 마스크에서 문 손잡이(흰색 내부 검은 hole) 위치로 hinge 변 추정.
+
+    손잡이가 문 중심보다 왼쪽 → hinge 는 오른쪽 변(1), 오른쪽 → 왼쪽 변(3).
+    (hinge 는 손잡이 반대편 = 자유 회전하는 쪽이 손잡이.)
+    손잡이 hole 이 없거나 작으면 None (프론트 마법사 fallback).
+
+    변 인덱스: 0=상(LT-RT), 1=우(RT-RB), 2=하(RB-LB), 3=좌(LB-LT).
+    """
+    try:
+        import numpy as _np
+        from PIL import Image as _PIL
+        from scipy.ndimage import binary_fill_holes, label as _label
+    except Exception:
+        return None
+    try:
+        mask = _np.asarray(_PIL.open(mask_path).convert("L")) > 127
+    except Exception:
+        return None
+    door_area = float(mask.sum())
+    if door_area <= 0:
+        return None
+    filled = binary_fill_holes(mask)
+    holes = filled & (~mask)
+    if float(holes.sum()) < door_area * min_hole_frac:
+        return None  # 유의미한 손잡이 hole 없음
+    lbl, n = _label(holes)
+    if n == 0:
+        return None
+    sizes = _np.bincount(lbl.ravel())
+    sizes[0] = 0  # 배경 제외
+    largest = int(sizes.argmax())
+    hxs = _np.where(lbl == largest)[1]
+    if hxs.size == 0:
+        return None
+    handle_cx = float(hxs.mean())
+    door_cx = float(_np.where(mask)[1].mean())
+    # 손잡이가 왼쪽(handle_cx < door_cx) → hinge 오른쪽 변(1), 아니면 왼쪽 변(3).
+    return 1 if handle_cx < door_cx else 3
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +268,9 @@ def extract_door_structure(
     def _t(p) -> tuple[float, float, float]:
         return (float(p[0]), float(p[1]), float(p[2]))
 
+    # hinge 자동 검출 — 대표 뷰 마스크의 손잡이 위치로 추정.
+    suggested_hinge = detect_hinge_edge_from_mask(best.mask_path) if best.mask_path else None
+
     return DoorStructure(
         corners={"left_top": _t(tl), "right_top": _t(tr),
                  "left_bottom": _t(bl), "right_bottom": _t(br)},
@@ -232,6 +278,7 @@ def extract_door_structure(
         score=best.score,
         src_view_idx=best.view_idx,
         mode=mode,
+        suggested_hinge_edge=suggested_hinge,
         cluster_view_idxs=[c.view_idx for c in cluster],
     )
 

@@ -573,7 +573,11 @@ def main(argv: list[str] | None = None) -> int:
             )
             primary = door_structures[0]
             result.door_corners_3d = primary.corners  # type: ignore[assignment]
-            result.all_doors = [d.corners for d in door_structures]
+            # suggested_hinge_edge 포함 — 프론트에서 hinge 자동 적용에 사용.
+            result.all_doors = [
+                {**d.corners, "suggested_hinge_edge": d.suggested_hinge_edge}
+                for d in door_structures
+            ]
             result.warnings = []
 
             _tock()

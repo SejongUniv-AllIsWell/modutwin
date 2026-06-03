@@ -124,10 +124,16 @@ async def detect(
         corners = data["door_corners_3d"]
         # N-door: all_doors 리스트 직렬화 (없으면 primary 1개)
         raw_all = data.get("all_doors", [corners])
-        all_doors_resp = [
-            {k: {"x": float(v[0]), "y": float(v[1]), "z": float(v[2])} for k, v in door.items()}
-            for door in raw_all
-        ]
+        all_doors_resp = []
+        for door in raw_all:
+            entry: dict = {
+                k: {"x": float(v[0]), "y": float(v[1]), "z": float(v[2])}
+                for k, v in door.items()
+                if isinstance(v, (list, tuple))  # 코너 좌표만
+            }
+            # suggested_hinge_edge (int or null) 그대로 전달
+            entry["suggested_hinge_edge"] = door.get("suggested_hinge_edge")
+            all_doors_resp.append(entry)
         return DetectResponse(
             left_top=CornerPoint(x=corners["left_top"][0],    y=corners["left_top"][1],    z=corners["left_top"][2]),
             right_top=CornerPoint(x=corners["right_top"][0],  y=corners["right_top"][1],   z=corners["right_top"][2]),
