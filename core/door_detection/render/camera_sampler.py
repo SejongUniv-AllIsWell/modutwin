@@ -30,6 +30,7 @@ class CameraView:
     position: tuple[float, float, float]
     look_at: tuple[float, float, float]
     source: str                   # "coarse" | "fine"
+    wall_idx: int = -1            # wall-facing 샘플러에서 이 카메라가 바라보는 벽 index (-1 = 미설정)
 
 
 def _fibonacci_sphere(n: int) -> np.ndarray:
@@ -413,7 +414,7 @@ def sample_wall_facing_cameras(
     target_y = (float(floor_y) + float(ceiling_y)) / 2.0  # 벽 중간 높이를 바라봄
 
     # 폴리곤 bbox 반경 (iterative clamp).
-    half_extent = float(max(poly[:, 0].ptp(), poly[:, 1].ptp()) / 2.0)
+    half_extent = float(max(np.ptp(poly[:, 0]), np.ptp(poly[:, 1])) / 2.0)
 
     perim = 0.0
     edges = []
@@ -435,7 +436,7 @@ def sample_wall_facing_cameras(
 
     cameras: list[CameraView] = []
     view_idx = 0
-    for (a, b, edir, L) in edges:
+    for edge_idx, (a, b, edir, L) in enumerate(edges):
         # 안쪽 normal (centroid 향하는 쪽).
         n1 = np.array([edir[1], -edir[0]], dtype=np.float64)
         mid = (a + b) / 2.0
@@ -459,13 +460,13 @@ def sample_wall_facing_cameras(
                 cam_xz = wall_pt + inward * s
             position = np.array([cam_xz[0], eye_y, cam_xz[1]], dtype=np.float64)
             target = np.array([wall_pt[0], target_y, wall_pt[1]], dtype=np.float64)
-            cameras.append(
-                build_lookat_camera(
-                    position=position, target=target,
-                    view_idx=view_idx, source="coarse",
-                    width=width, height=height, fov_x_deg=fov_x_deg,
-                )
+            cam = build_lookat_camera(
+                position=position, target=target,
+                view_idx=view_idx, source="coarse",
+                width=width, height=height, fov_x_deg=fov_x_deg,
             )
+            cam.wall_idx = edge_idx  # 이 카메라가 바라보는 벽 index 기록
+            cameras.append(cam)
             view_idx += 1
 
     return cameras, half_extent

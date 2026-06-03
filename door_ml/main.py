@@ -45,6 +45,8 @@ class DetectResponse(BaseModel):
     right_top: CornerPoint
     right_bottom: CornerPoint
     left_bottom: CornerPoint
+    # N-door: 추출된 모든 문 목록. 단일 문이면 길이 1.
+    all_doors: list[dict] = []
 
 
 @app.get("/health")
@@ -66,6 +68,7 @@ async def detect(
     floor_y: float | None = None,
     ceiling_y: float | None = None,
     wall_polygon: str | None = None,
+    max_doors: int = 1,
 ):
     """
     PLY 파일을 받아 문의 4개 코너 3D 좌표를 반환한다.
@@ -111,6 +114,9 @@ async def detect(
             if wall_polygon:
                 pipeline_args += ["--wall_polygon", wall_polygon]
 
+        if max_doors > 1:
+            pipeline_args += ["--max_doors", str(max_doors)]
+
         exit_code = pipeline_main(pipeline_args)
 
         if exit_code != 0:
@@ -120,11 +126,18 @@ async def detect(
             data = json.load(f)
 
         corners = data["door_corners_3d"]
+        # N-door: all_doors 리스트 직렬화 (없으면 primary 1개)
+        raw_all = data.get("all_doors", [corners])
+        all_doors_resp = [
+            {k: {"x": float(v[0]), "y": float(v[1]), "z": float(v[2])} for k, v in door.items()}
+            for door in raw_all
+        ]
         return DetectResponse(
             left_top=CornerPoint(x=corners["left_top"][0],    y=corners["left_top"][1],    z=corners["left_top"][2]),
             right_top=CornerPoint(x=corners["right_top"][0],  y=corners["right_top"][1],   z=corners["right_top"][2]),
             right_bottom=CornerPoint(x=corners["right_bottom"][0], y=corners["right_bottom"][1], z=corners["right_bottom"][2]),
             left_bottom=CornerPoint(x=corners["left_bottom"][0],   y=corners["left_bottom"][1],  z=corners["left_bottom"][2]),
+            all_doors=all_doors_resp,
         )
 
     except HTTPException:

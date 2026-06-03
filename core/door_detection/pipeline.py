@@ -53,6 +53,7 @@ from .segmentation.sam3_runner import list_input_pngs, run_sam3
 from .view_selection.iterative_approach import run_iterative_approach, analyze_mask_quad, IterativeView
 from .view_selection.filter import SelectedView, ViewSelection
 from .corner_extraction.ordering import order_all_selected
+from .corner_extraction.multi_door import extract_n_doors
 from .triangulation.ray import (
     Ray,
     pixel_rotate_cw_to_orig,
@@ -214,6 +215,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--device", type=str, default="cuda", help="compute device")
     p.add_argument("--debug", action="store_true", help="debug 시각화 저장")
+    p.add_argument(
+        "--max_doors", type=int, default=1,
+        help="추출할 최대 문 개수 (기본 1 = 단일 문). 2 이상이면 N-door 클러스터 경로 사용.",
+    )
 
     return p
 
@@ -542,7 +547,51 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     # ------------------------------------------------------------------
-    # Phase 4-6 — Iterative door approach
+    # N-door 경로 (max_doors ≥ 2): Phase 4-11 전체를 클러스터 방식으로 대체
+    # ------------------------------------------------------------------
+    if args.max_doors >= 2 and wall_poly is not None:
+        _tick("Phase4-11-ndoor")
+        print(f"[N-door] max_doors={args.max_doors}, running cluster extraction ...", file=sys.stderr)
+
+        _coarse_cam_map_nd = {c.view_idx: c for c in coarse_cameras}
+        _cam_by_key_nd: dict = {("coarse", c.view_idx): c for c in coarse_cameras}
+
+        _nd_walls = build_wall_planes(wall_poly, float(args.floor_y), float(args.ceiling_y))
+
+        door_structures = extract_n_doors(
+            sam3_summary=sam3_summary,
+            coarse_cam_map=_coarse_cam_map_nd,
+            cam_by_key=_cam_by_key_nd,
+            walls=_nd_walls,
+            real_floor_y=float(real_floor_y),
+            pixel_rotate_fn=pixel_rotate_cw_to_orig,
+            pixel_to_ray_fn=pixel_to_world_ray,
+            ray_hit_fn=ray_wall_hit,
+            max_doors=args.max_doors,
+        )
+
+        if not door_structures:
+            raise RuntimeError("N-door: 유효한 문 구조체 추출 실패. (D10)")
+
+        print(
+            f"[N-door] {len(door_structures)} door(s) extracted: "
+            + ", ".join(f"v{d.src_view_idx}({d.mode})" for d in door_structures),
+            file=sys.stderr,
+        )
+
+        # 결과 조립 (첫 번째 문 = backward compat, all_doors = 전체)
+        primary = door_structures[0]
+        result.door_corners_3d = primary.corners  # type: ignore[assignment]
+        result.all_doors = [d.corners for d in door_structures]
+        result.warnings = []
+
+        _tock()
+        write_result(result, args.output_json)
+        print(f"[done] result written to {args.output_json}", file=sys.stderr)
+        return 0
+
+    # ------------------------------------------------------------------
+    # Phase 4-6 — Iterative door approach (max_doors == 1 단일 문 경로)
     #   - coarse 뷰에서 이미 4코너 보이면 iterative 전체 skip (SAM3 재로딩 불필요)
     #   - 없으면 top-3 후보 접근 반복
     # ------------------------------------------------------------------

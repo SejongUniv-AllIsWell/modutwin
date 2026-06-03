@@ -112,10 +112,13 @@ class Sam3DetectTempRequest(BaseModel):
     rot_z: float | None = None
     # 방 footprint 폴리곤 (A' X-Z). 있으면 door-ml 이 벽-정면 카메라 커버리지 사용.
     wall_polygon: list[dict] | None = None
+    # N-door: 추출할 최대 문 개수. 기본 1 = 단일 문.
+    max_doors: int = 1
 
 
 class Sam3DetectTempResponse(BaseModel):
-    corners: dict
+    corners: dict           # 첫 번째(주) 문 코너 (backward compat)
+    all_doors: list[dict] = []  # N-door: 모든 문 코너 목록
 
 
 def _apply_bake_rotation_to_corner(c: dict, rot_x: float, rot_z: float, wall_angle_rad: float) -> dict:
@@ -168,6 +171,8 @@ def _detect_params(body: "Sam3DetectTempRequest") -> dict:
         })
         if body.wall_polygon:
             params["wall_polygon"] = json.dumps(body.wall_polygon)
+    if body.max_doors > 1:
+        params["max_doors"] = body.max_doors
     return params
 
 
@@ -212,26 +217,27 @@ async def sam3_detect_temp(
             detail=f"door-ml HTTP {resp.status_code}: {resp.text[:300]}",
         )
 
-    corners = resp.json()
+    resp_json = resp.json()
     required = ("left_top", "right_top", "right_bottom", "left_bottom")
-    if not all(k in corners for k in required):
-        raise HTTPException(status_code=502, detail=f"door-ml 응답 형식 오류: keys={list(corners.keys())}")
+    corners = {k: resp_json[k] for k in required} if all(k in resp_json for k in required) else None
+    if corners is None:
+        raise HTTPException(status_code=502, detail=f"door-ml 응답 형식 오류: keys={list(resp_json.keys())}")
 
-    if body.bake_rotation:
-        br = body.bake_rotation
-        if _is_known_room(body):
-            # 방법 B — door-ml 이 A' 코너 반환 → A'→A'+Y (wallAngle) 만 적용.
-            corners = {
-                k: _apply_wall_angle_to_corner(corners[k], br.wallAngleRad)
-                for k in required
-            }
-        else:
-            corners = {
-                k: _apply_bake_rotation_to_corner(corners[k], br.rotX, br.rotZ, br.wallAngleRad)
-                for k in required
-            }
+    # N-door: all_doors 리스트 (없으면 primary 1개)
+    raw_all_doors: list[dict] = resp_json.get("all_doors", [corners])
 
-    return Sam3DetectTempResponse(corners=corners)
+    def _transform_corners(c: dict) -> dict:
+        if body.bake_rotation:
+            br = body.bake_rotation
+            if _is_known_room(body):
+                return {k: _apply_wall_angle_to_corner(c[k], br.wallAngleRad) for k in required}
+            return {k: _apply_bake_rotation_to_corner(c[k], br.rotX, br.rotZ, br.wallAngleRad) for k in required}
+        return c
+
+    corners = _transform_corners(corners)
+    all_doors_transformed = [_transform_corners(d) for d in raw_all_doors]
+
+    return Sam3DetectTempResponse(corners=corners, all_doors=all_doors_transformed)
 
 
 # ── 3. 정합 완료 — 일괄 영속화 ────────────────────────────────────────────────
