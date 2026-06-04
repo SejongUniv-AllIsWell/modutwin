@@ -10,6 +10,7 @@ import {
   getLookDir,
   getRightDir,
 } from './tools/cameraMath';
+import { getPlayCanvasGsplatAssetHint } from './tools/gsplatAssetHints';
 
 // ── 외부 노출 타입 ──
 
@@ -80,7 +81,7 @@ export interface SplatViewerCoreRef {
   /** 현재 alignmentGroup entity. 진입 안 했으면 null. */
   getAlignmentGroup: () => any | null;
   /** 메인 splat 을 새 URL (blob URL 가능) 로 재로드. 카메라 보존 옵션 지원. asset.ready 까지 await. */
-  reloadSplatFromUrl: (url: string, opts?: { preserveCamera?: boolean }) => Promise<void>;
+  reloadSplatFromUrl: (url: string, opts?: { preserveCamera?: boolean; filename?: string | null }) => Promise<void>;
   /**
    * 현재 씬을 일시적으로 ortho top-down 카메라로 렌더해 PNG Blob 으로 캡처.
    * 캡처 후 카메라 원상 복구. 천장제거 토글이 ON 인 상태에서 호출하면 위에서 본 실내 평면도 형태.
@@ -108,12 +109,18 @@ export interface SnapshotMeta {
 interface SplatViewerCoreProps {
   /** 없으면 빈 viewer만 표시 (카메라/기즈모만 활성). */
   sogUrl?: string | null;
+  /** blob URL 처럼 URL 만으로 확장자를 알 수 없을 때 PlayCanvas parser 선택에 쓰는 파일명 힌트. */
+  assetFilename?: string | null;
   onSplatLoaded?: (data: SplatData) => void;
   children?: React.ReactNode;
 }
 
+const hasEditableGsplatProps = (gsplatData: any): boolean => (
+  !!gsplatData && typeof gsplatData.getProp === 'function'
+);
+
 const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
-  ({ sogUrl, onSplatLoaded, children }, ref) => {
+  ({ sogUrl, assetFilename, onSplatLoaded, children }, ref) => {
     const containerRef = useRef<HTMLDivElement>(null);
     const rootRef = useRef<HTMLDivElement>(null);
     const [loading, setLoading] = useState(true);
@@ -147,7 +154,7 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
     const pcRef = useRef<any>(null);
     // splat 로드 인터페이스 — init 완료 후 첫 useEffect에서 채워짐.
     // 두 번째 useEffect (sogUrl 변경 트리거) 가 호출.
-    const loadSplatRef = useRef<((url: string, opts?: { preserveCamera?: boolean }) => Promise<void>) | null>(null);
+    const loadSplatRef = useRef<((url: string, opts?: { preserveCamera?: boolean; filename?: string | null }) => Promise<void>) | null>(null);
     const clearSplatRef = useRef<(() => void) | null>(null);
     // 콜백 identity가 매 렌더마다 바뀌어도 effect가 재실행되지 않도록 ref로 보관
     const onSplatLoadedRef = useRef(onSplatLoaded);
@@ -689,7 +696,7 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
 
           // ── splat 로드/교체 인터페이스 ──
           // 새 asset 준비가 끝난 뒤 splat entity 를 교체해 화면 공백을 줄인다.
-          const loadSplat = (url: string, opts?: { preserveCamera?: boolean }): Promise<void> => {
+          const loadSplat = (url: string, opts?: { preserveCamera?: boolean; filename?: string | null }): Promise<void> => {
             // 진행 중인 로드를 취소해 asset.ready 콜백이 entity를 만들지 않게 한다.
             activeCancel?.();
 
@@ -704,10 +711,12 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
             // reorder=false: PlayCanvas 의 기본 Morton order 재배치 비활성. 활성 시 splatData 의
             // 인덱스가 원본 PLY 순서와 달라져 save 시 alpha mask 가 엉뚱한 splat 에 매핑됨.
             // blob URL 은 확장자가 없어 PC parser 가 형식 판별을 못할 수 있어 filename 힌트 부여.
-            const ext = url.split('?')[0].split('.').pop()?.toLowerCase();
-            const isBlob = url.startsWith('blob:');
-            const filename = isBlob ? 'splat.ply' : (ext ?? 'ply');
-            const asset = new pc.Asset('splat', 'gsplat', { url, filename }, { reorder: false } as any);
+            const { filename, extension } = getPlayCanvasGsplatAssetHint(url, opts?.filename);
+            const assetData = {
+              reorder: false,
+              ...(extension === 'sog' ? { decompress: true } : {}),
+            };
+            const asset = new pc.Asset('splat', 'gsplat', { url, filename }, assetData as any);
             app.assets.add(asset);
 
             return new Promise<void>((resolve, reject) => {
@@ -731,8 +740,7 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
 
                 const splatEntity = new pc.Entity('splat', app);
                 // SuperSplat과 동일한 PLY 로드 기본 회전 (SPZ는 (0,0,0), PLY/기타는 Z축 180°)
-                const ext = url.split('?')[0].split('.').pop()?.toLowerCase();
-                if (ext !== 'spz') {
+                if (extension !== 'spz') {
                   splatEntity.setLocalEulerAngles(0, 0, 180);
                 }
                 splatEntity.addComponent('gsplat', { asset });
@@ -758,10 +766,11 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
                   }
                 }
 
-                // PlayCanvas 2.x: gsplatData
+                // PlayCanvas 2.x: PLY/compatible resources expose gsplatData.getProp().
+                // SOG is loaded with asset.data.decompress=true above so registration flows can edit it.
                 const resource = asset.resource as any;
                 const gsplatData = resource?.gsplatData;
-                if (gsplatData) {
+                if (hasEditableGsplatProps(gsplatData)) {
                   const n = gsplatData.numSplats;
                   const posX = gsplatData.getProp('x') as Float32Array;
                   const posY = gsplatData.getProp('y') as Float32Array;
@@ -866,11 +875,11 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
       if (!appReady) return;
       if (sogUrl) {
         // sogUrl prop 변경 → 카메라 fit 모드로 로드. 에러는 내부 setError 가 처리.
-        void loadSplatRef.current?.(sogUrl);
+        void loadSplatRef.current?.(sogUrl, { filename: assetFilename });
       } else {
         clearSplatRef.current?.();
       }
-    }, [sogUrl, appReady]);
+    }, [sogUrl, assetFilename, appReady]);
 
     const toggleMode = () => {
       const next = cameraMode === 'fly' ? 'orbit' : 'fly';

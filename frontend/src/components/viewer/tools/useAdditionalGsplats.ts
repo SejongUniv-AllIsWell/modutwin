@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { SplatViewerCoreRef } from '../SplatViewerCore';
+import { getPlayCanvasGsplatAssetHint } from './gsplatAssetHints';
 
 export type AdditionalGsplatSource = 'local' | 'server' | 'basemap';
 
@@ -123,7 +124,7 @@ export function useAdditionalGsplats(
   };
 
   /** 단일 항목을 현재 PlayCanvas app에 로드. app 준비 전이면 50ms 간격으로 재시도. */
-  const loadEntity = useCallback((id: string, url: string, source: AdditionalGsplatSource, visible: boolean) => {
+  const loadEntity = useCallback((id: string, url: string, source: AdditionalGsplatSource, visible: boolean, filenameHint?: string | null) => {
     let cancelled = false;
     cancelMapRef.current.set(id, () => { cancelled = true; });
 
@@ -137,9 +138,7 @@ export function useAdditionalGsplats(
         return;
       }
 
-      const ext = url.split('?')[0].split('.').pop()?.toLowerCase();
-      const isBlob = url.startsWith('blob:');
-      const filename = isBlob ? 'splat.ply' : (ext ?? 'ply');
+      const { filename, extension: ext } = getPlayCanvasGsplatAssetHint(url, filenameHint);
       const asset = new pc.Asset(`add_splat_${id}`, 'gsplat', { url, filename }, { reorder: false } as any);
       app.assets.add(asset);
       assetMapRef.current.set(id, asset);
@@ -275,7 +274,7 @@ export function useAdditionalGsplats(
     ]);
     urlMapRef.current.set(id, url);
 
-    loadEntity(id, url, source, visible);
+    loadEntity(id, url, source, visible, name);
 
     return { id, ready };
   }, [loadEntity]);
@@ -348,7 +347,7 @@ export function useAdditionalGsplats(
     // 3) 모든 항목을 unloaded 로 표시 후 현재 app 에 재로드
     const list = itemsRef.current;
     setItems(prev => prev.map(it => ({ ...it, loaded: false, error: null })));
-    list.forEach(item => loadEntity(item.id, item.url, item.source, item.visible));
+    list.forEach(item => loadEntity(item.id, item.url, item.source, item.visible, item.name));
   }, [loadEntity]);
 
   // 언마운트 시 모두 정리

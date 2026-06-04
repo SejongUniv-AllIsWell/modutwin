@@ -255,7 +255,8 @@ export default function ExplorePage() {
 
   // 건물 목록 로드 — 백엔드 has_output 필터는
   //   (관리자가 표시관리에서 추가한 건물) OR (표시 중인 floor/module 에 SceneOutput 등록)
-  // 둘 중 하나라도 만족하는 visible 건물을 내려준다.
+  //   OR (표시 중인 floor 에 활성/승인대기 basemap 등록)
+  // 중 하나라도 만족하는 visible 건물을 내려준다.
   // floor_count 는 응답에 포함되므로 추가 fetch 없음.
   const fetchBuildings = useCallback(async () => {
     try {

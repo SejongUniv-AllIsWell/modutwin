@@ -20,6 +20,8 @@ from app.services.metadata_options import (
     parse_module_name_input,
     validate_floor_number as validate_floor_number_value,
 )
+from app.services.scene_assets import pick_scene_viewer_key
+from app.services.storage_access import safe_object_exists
 from app.services.storage_paths import doors_json_key
 
 router = APIRouter(prefix="/admin/basemaps", tags=["basemaps"])
@@ -84,8 +86,11 @@ async def get_active_basemap(
         )
 
     minio = get_minio_service()
-    url = minio.get_presigned_download_url(basemap.minio_path)
-    filename = basemap.minio_path.rsplit("/", 1)[-1]
+    viewer_key = await _resolve_basemap_viewer_key(db, minio, basemap)
+    if viewer_key is None:
+        raise HTTPException(status_code=404, detail="basemap 파일을 찾을 수 없습니다.")
+    url = minio.get_presigned_download_url(viewer_key)
+    filename = viewer_key.rsplit("/", 1)[-1]
 
     source_upload_id = await _resolve_source_upload_id(db, basemap)
 
@@ -284,6 +289,22 @@ async def _resolve_source_upload_id(db: AsyncSession, basemap: Basemap) -> UUID 
         .limit(1)
     )
     return src_q.scalar_one_or_none()
+
+
+async def _resolve_basemap_viewer_key(db: AsyncSession, minio, basemap: Basemap) -> str | None:
+    scene_q = await db.execute(
+        select(SceneOutput)
+        .where(SceneOutput.ply_path == basemap.minio_path)
+        .order_by(SceneOutput.created_at.desc())
+        .limit(1)
+    )
+    scene = scene_q.scalar_one_or_none()
+    viewer_key = pick_scene_viewer_key(minio, scene)
+    if viewer_key is not None:
+        return viewer_key
+    if safe_object_exists(minio, basemap.minio_path):
+        return basemap.minio_path
+    return None
 
 
 async def _get_basemap_with_building(

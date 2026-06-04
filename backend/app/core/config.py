@@ -59,8 +59,10 @@ class Settings(BaseSettings):
     ENABLE_SAM3: bool = False
     ENABLE_SAM3_DISPATCH: bool | None = None
 
-    # 워커 → 백엔드 콜백 인증 (공유 시크릿). 빈 값이면 콜백 endpoint 가 항상 401.
+    # 내부 API 인증 (공유 시크릿). 빈 값이면 internal endpoint 가 비활성.
     INTERNAL_API_TOKEN: str = ""
+    # Celery worker → 백엔드 콜백 인증. RTX/DGX worker 의 WORKER_CALLBACK_TOKEN 과 일치해야 한다.
+    WORKER_CALLBACK_TOKEN: str = ""
 
     # door-ml SAM3 inference 서비스 (GPU 머신의 door-ml HTTP 컨테이너).
     DOOR_ML_URL: str = "http://door-ml:8000"
@@ -81,6 +83,8 @@ class Settings(BaseSettings):
             )
         if self.ENABLE_SAM3_DISPATCH is not None:
             self.ENABLE_SAM3 = self.ENABLE_SAM3_DISPATCH
+        if not self.WORKER_CALLBACK_TOKEN and self.INTERNAL_API_TOKEN:
+            self.WORKER_CALLBACK_TOKEN = self.INTERNAL_API_TOKEN
         return self
 
     class Config:

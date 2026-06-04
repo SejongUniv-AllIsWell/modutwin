@@ -25,6 +25,7 @@ from app.services.storage_access import (
     safe_object_exists,
     safe_presigned_download_url,
 )
+from app.services.scene_assets import pick_scene_viewer_key
 from app.services.storage_paths import module_base_path
 
 router = APIRouter(tags=["buildings"])
@@ -281,13 +282,7 @@ class AdminDeleteResponse(BaseModel):
 
 
 def _pick_scene_output_path(minio, scene: SceneOutput | None) -> str | None:
-    if scene is None:
-        return None
-    if scene.sog_path and safe_object_exists(minio, scene.sog_path):
-        return scene.sog_path
-    if safe_object_exists(minio, scene.ply_path):
-        return scene.ply_path
-    return None
+    return pick_scene_viewer_key(minio, scene)
 
 
 async def _collect_delete_scope(
@@ -481,21 +476,36 @@ async def list_buildings(
         # /explore 노출 조건:
         #   1) 관리자가 표시관리에서 직접 추가한 건물 (is_confirmed=True, 자동 확정 경로)
         #   2) 표시 중인 floor/module 에 SceneOutput 이 등록된 건물
-        # 둘 중 하나라도 만족하면 지도 마커/좌측 목록에 노출한다.
+        #   3) 표시 중인 floor 에 활성 또는 승인 대기 basemap 이 등록된 건물
+        # 하나라도 만족하면 지도 마커/좌측 목록에 노출한다.
+        has_visible_scene_output = exists(
+            select(SceneOutput.id)
+            .join(Module, Module.id == SceneOutput.module_id)
+            .join(Floor, Floor.id == Module.floor_id)
+            .where(
+                Floor.building_id == Building.id,
+                Floor.is_visible == True,
+                Module.is_visible == True,
+                Module.name != "__basemap__",
+            )
+        )
+        has_visible_registered_basemap = exists(
+            select(Basemap.id)
+            .join(Floor, Floor.id == Basemap.floor_id)
+            .where(
+                Floor.building_id == Building.id,
+                Floor.is_visible == True,
+                or_(
+                    Basemap.is_active == True,
+                    Basemap.status == BasemapStatus.pending,
+                ),
+            )
+        )
         stmt = stmt.where(
             or_(
                 Building.is_confirmed == True,
-                exists(
-                    select(SceneOutput.id)
-                    .join(Module, Module.id == SceneOutput.module_id)
-                    .join(Floor, Floor.id == Module.floor_id)
-                    .where(
-                        Floor.building_id == Building.id,
-                        Floor.is_visible == True,
-                        Module.is_visible == True,
-                        Module.name != "__basemap__",
-                    )
-                ),
+                has_visible_scene_output,
+                has_visible_registered_basemap,
             )
         )
     result = await db.execute(stmt)
@@ -1092,14 +1102,21 @@ async def get_floor_detail_manifest(
             .limit(1)
         )
         has_pending_basemap = pending_check.scalar_one_or_none() is not None
-    # basemap 서빙 키 — 경량 SOG 파생물(worker/DGX 가 refined PLY 옆에 '{name}.sog' 로 생성)이
-    # 있으면 우선, 없으면 원본 PLY 로 폴백. (모듈 _scene_active_key 와 동일한 sog 우선 규약.)
+    # basemap 서빙 키 — PLY 가 canonical, SOG 는 SceneOutput.sog_path 에 명시적으로
+    # 연결된 viewer derivative 일 때만 우선한다. MinIO sibling .sog 존재 여부만으로
+    # 전환하면 worker 콜백 실패/부분 배포 시 페이지 로드 형식이 예고 없이 바뀐다.
     basemap_serve_key = None
     if basemap is not None:
-        sog_candidate = os.path.splitext(basemap.minio_path)[0] + ".sog"
-        basemap_serve_key = (
-            sog_candidate if safe_object_exists(minio, sog_candidate) else basemap.minio_path
+        basemap_scene_result = await db.execute(
+            select(SceneOutput)
+            .where(SceneOutput.ply_path == basemap.minio_path)
+            .order_by(SceneOutput.created_at.desc())
+            .limit(1)
         )
+        basemap_scene = basemap_scene_result.scalar_one_or_none()
+        basemap_serve_key = pick_scene_viewer_key(minio, basemap_scene)
+        if basemap_serve_key is None and safe_object_exists(minio, basemap.minio_path):
+            basemap_serve_key = basemap.minio_path
     basemap_url = safe_presigned_download_url(minio, basemap_serve_key) if basemap_serve_key else None
     basemap_entry = (
         DetailBasemapEntry(
@@ -1498,7 +1515,7 @@ async def update_alignment_transform(
 #     - 모듈 show → 부모 floor + 부모 building 모두 show
 #
 # Show cascade 가 양방향인 이유: /explore 의 has_output 필터에서
-# SceneOutput 분기는 건물·층·모듈 셋이 모두 visible 이어야 노출되므로,
+# SceneOutput 분기는 건물·층·모듈 셋, basemap 분기는 건물·층이 visible 이어야 노출되므로,
 # 한 단계만 풀면 UI 상 "표시" 가 실제로는 효과가 없어 보인다.
 # (관리자 추가 분기 is_confirmed=True 는 건물 visibility 만 따른다.)
 

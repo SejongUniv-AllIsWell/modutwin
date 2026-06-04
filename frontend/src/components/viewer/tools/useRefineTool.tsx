@@ -7,6 +7,7 @@ import { surfacePlanesFromPolygon, signedDistance, type SurfacePlane, type Polyg
 import { loadRefineState, saveRefineState, clearRefineState } from '@/lib/refine/persistence';
 import type { GaussianScene } from '@/lib/ply/types';
 import { gsplatVisibleSigmaRadius, sigmoidOpacity } from '@/lib/gs/playcanvasGsplat';
+import { getPlayCanvasGsplatAssetHint } from './gsplatAssetHints';
 import {
   AXIS_COLORS,
   AXIS_COLORS_DIM,
@@ -61,6 +62,31 @@ function buildFinalSurfacePlanes(
         }
       : undefined,
   }));
+}
+
+function buildGaussianSceneFromSplatData(data: SplatData): GaussianScene {
+  const vertexElement = data.gsplatData?.getElement?.('vertex');
+  const propertyOrder: string[] = (vertexElement?.properties ?? [])
+    .map((p: { name: string }) => p.name);
+  const fallbackOrder = [
+    'x', 'y', 'z',
+    'f_dc_0', 'f_dc_1', 'f_dc_2',
+    'opacity',
+    'scale_0', 'scale_1', 'scale_2',
+    'rot_0', 'rot_1', 'rot_2', 'rot_3',
+  ];
+  const orderedProps = propertyOrder.length > 0
+    ? propertyOrder
+    : fallbackOrder.filter((prop) => data.gsplatData?.getProp?.(prop));
+  const attrs = new Map<string, Float32Array>();
+  for (const prop of orderedProps) {
+    const a = data.gsplatData?.getProp(prop) as Float32Array | undefined;
+    if (a) attrs.set(prop, new Float32Array(a));
+  }
+  attrs.set('x', new Float32Array(data.posX));
+  attrs.set('y', new Float32Array(data.posY));
+  attrs.set('z', new Float32Array(data.posZ));
+  return { numSplats: data.numSplats, attrs, propertyOrder: orderedProps };
 }
 
 function gaussianNormalSigma(
@@ -251,6 +277,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   const originalSceneRef = useRef<GaussianScene | null>(null);
   // 다듬기 완료 후 기준 PLY. 회전/삭제가 모두 반영된 A' 프레임이며 문 설정 이후 흐름의 canonical source.
   const refinedCanonicalSceneRef = useRef<GaussianScene | null>(null);
+  const canonicalNeedsLiveRebuildRef = useRef(false);
 
   // 누적 회전 (rotX, rotZ) 라디안. CF 모달이 누적 입력.
   // 다듬기 단계 동안 살아있다가 saveRefined() 시 splatData 에 in-place 베이크 → 0 으로 리셋.
@@ -414,11 +441,21 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   const ensureOriginalScene = useCallback(async (): Promise<GaussianScene> => {
     if (originalSceneRef.current) return originalSceneRef.current;
     if (!options?.currentUrl) throw new Error('currentUrl 없음');
+    const { extension } = getPlayCanvasGsplatAssetHint(options.currentUrl, options.originalFilename);
+    if (extension && extension !== 'ply') {
+      const data = splatDataRef.current;
+      if (!data?.gsplatData) {
+        throw new Error(`${extension.toUpperCase()} 파일이 아직 편집 가능한 splat 데이터로 준비되지 않았습니다.`);
+      }
+      const scene = buildGaussianSceneFromSplatData(data);
+      originalSceneRef.current = scene;
+      return scene;
+    }
     const { fetchAndParsePly } = await import('@/lib/ply');
     const scene = await fetchAndParsePly(options.currentUrl);
     originalSceneRef.current = scene;
     return scene;
-  }, [options]);
+  }, [options?.currentUrl, options?.originalFilename]);
 
   // ── 회전된 source scene 빌드 (A → A' = pendingRotation · A) ──
   // 주의: posX/Y/Z + rot_0..3 만 새 배열, 나머지는 reference 공유 (메모리 절약)
@@ -1125,6 +1162,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   useEffect(() => {
     splatDataRef.current = null;
     refinedCanonicalSceneRef.current = null;
+    canonicalNeedsLiveRebuildRef.current = false;
     setSplatLoaded(false);
   }, [options?.currentUrl]);
 
@@ -1520,18 +1558,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   }, [applyEntityRotation]);
 
   const buildSceneFromSplatData = useCallback((data: SplatData): GaussianScene => {
-    const vertexElement = data.gsplatData?.getElement?.('vertex');
-    const propertyOrder: string[] = (vertexElement?.properties ?? [])
-      .map((p: { name: string }) => p.name);
-    const attrs = new Map<string, Float32Array>();
-    for (const prop of propertyOrder) {
-      const a = data.gsplatData?.getProp(prop) as Float32Array | undefined;
-      if (a) attrs.set(prop, new Float32Array(a));
-    }
-    attrs.set('x', new Float32Array(data.posX));
-    attrs.set('y', new Float32Array(data.posY));
-    attrs.set('z', new Float32Array(data.posZ));
-    return { numSplats: data.numSplats, attrs, propertyOrder };
+    return buildGaussianSceneFromSplatData(data);
   }, []);
 
   const buildKeepMaskFromCurrentState = useCallback((data: SplatData, core: SplatViewerCoreRef): Uint8Array => {
@@ -1566,6 +1593,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     const keep = buildKeepMaskFromCurrentState(data, core);
     const canonical = filterScene(scene, keep);
     refinedCanonicalSceneRef.current = canonical;
+    canonicalNeedsLiveRebuildRef.current = false;
 
     const bytes = serializePly(canonical);
     const blobUrl = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
@@ -1622,8 +1650,16 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     const wallAngleDeg = wallAngleRef.current ?? 0;
     const wallAngleRad = (wallAngleDeg * Math.PI) / 180;
 
-    const canonical = refinedCanonicalSceneRef.current;
+    let canonical = refinedCanonicalSceneRef.current;
+    if (!canonical && canonicalNeedsLiveRebuildRef.current) {
+      const data = splatDataRef.current;
+      if (data?.gsplatData) {
+        canonical = buildSceneFromSplatData(data);
+      }
+    }
     if (canonical) {
+      canonicalNeedsLiveRebuildRef.current = false;
+      refinedCanonicalSceneRef.current = canonical;
       const { rotX, rotZ } = bakedRotationRef.current;
       const baked = cloneScene(canonical);
       if (wallAngleRad !== 0) rotateSceneY(baked, wallAngleRad);
@@ -2025,6 +2061,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     bakedRotationRef.current = { rotX: 0, rotZ: 0 };
     setBakedRotation({ rotX: 0, rotZ: 0 });
     refinedCanonicalSceneRef.current = null;
+    canonicalNeedsLiveRebuildRef.current = false;
     boundaryCullMaskRef.current = null;
     boundaryCullSurfaceIdsRef.current = null;
     boundaryCullActiveRef.current = false; setBoundaryCullActive(false);
@@ -3744,11 +3781,11 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
   const replaceCanonicalSceneFromCurrentSplat = useCallback((scene?: GaussianScene) => {
     if (scene) {
       refinedCanonicalSceneRef.current = scene;
+      canonicalNeedsLiveRebuildRef.current = false;
       return;
     }
-    const data = splatDataRef.current;
-    if (!data?.gsplatData) return;
-    refinedCanonicalSceneRef.current = buildSceneFromSplatData(data);
+    refinedCanonicalSceneRef.current = null;
+    canonicalNeedsLiveRebuildRef.current = true;
   }, [buildSceneFromSplatData]);
 
   // 외부 호출자가 다음 splatLoad 에서 re-bake 한 번 건너뛰도록 신호.

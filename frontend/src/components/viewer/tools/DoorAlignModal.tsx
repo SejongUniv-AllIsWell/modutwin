@@ -11,6 +11,7 @@ import { useAdditionalGsplats, type AdditionalGsplatsApi } from './useAdditional
 import { useDoorLabels } from './useDoorLabels';
 import type { GaussianScene } from '@/lib/ply/types';
 import DoorCleanupViewerModal, { type DoorCleanupState } from './DoorCleanupViewerModal';
+import { refreshGPUFromSplatData } from './gpuSync';
 import {
   clearDoorsOnServer,
   emptyPicked,
@@ -62,6 +63,14 @@ interface CleanupDoorEntry {
 // 면(surfaceId)별 punch 누적 — combine 시 base 텍스처에 합성 (한 문 적용이 타 문 hole 안 지우게).
 interface CleanupWallPunch {
   cornersA: Vec3[];                // A' 프레임 문 코너
+}
+
+interface MainDoorMutationSnapshot {
+  indices: number[];
+  offsetByIndex: Map<number, number>;
+  positions: Float32Array;
+  scales: Float32Array;
+  alpha: Uint16Array;
 }
 
 interface BasemapPendingDoor {
@@ -350,6 +359,7 @@ function derivePlanesFromMeshSurfaces(surfaces: any[]): SurfacePlane[] {
 export default function DoorAlignModal({
   coreRef, uploadId, currentUrl, onDone, onClose, autoExtracting = false, autoExtractedCorners = null, suggestedHingeEdge = null, nonAlignmentDoorCorners = null, nonAlignmentDoorHinges = null, nonAlignmentDoorSwings = null, nonAlignmentDoorLabels = null, activeDoorIndex, onManualPickStart, onSetupSaveDone, ensureUploadId, onCommitRefined, getCurrentKeepMask, getBakeRgba, getRemainingRotationToAY, markNextSplatLoadSkipRebake, onMainSplatReplaced, basemapMode = false, basemapEditMode = false, basemapId, basemapUnitName, basemapFloorId, basemapFloorNumber, onBasemapDone, deferPersistenceToAlign = false, onSetupCornersFinalized, onSetupDoorAssetsFinalized, onCleanupOpenChange, onNDoorRefineFinalizedChange, sharedAdditional,
 }: Props) {
+  void markNextSplatLoadSkipRebake;
   const [picked, setPicked] = useState<Array<PickedCorner | null>>(() => emptyPicked());
   // 모듈 등록 흐름: 문 설정 완료 시 메모리 보관 → 정합 완료 시 commit-final 페이로드에 포함.
   const pendingDoorPersistenceRef = useRef<{
@@ -1316,9 +1326,8 @@ export default function DoorAlignModal({
   const doorMeshEntityRef = useRef<any>(null);
   // 활성 도어 wrapper (mesh + splat 의 부모, 회전 transform 보유).
   const activeDoorWrapperRef = useRef<any>(null);
-  // 메인 splat blob URL 두 개. apply 가 currentMainPly 갱신, revert 가 revertMainPly 로 reload.
-  const currentMainPlyBlobUrlRef = useRef<string | null>(null);
-  const revertMainPlyBlobUrlRef = useRef<string | null>(null);
+  // 메인 splat 은 큰 PLY 를 재생성하지 않고, 변경된 원본 인덱스만 snapshot 후 in-place 갱신한다.
+  const mainDoorMutationSnapshotRef = useRef<MainDoorMutationSnapshot | null>(null);
   const wallMeshNameRef = useRef<string | null>(null);
   const wallTexSnapshotRef = useRef<Uint8ClampedArray | null>(null);
   const wallViewTexSnapshotsRef = useRef<Array<{ texture: any; rgba: Uint8ClampedArray }> | null>(null);
@@ -1386,6 +1395,28 @@ export default function DoorAlignModal({
   const doorPaintedIndicesRef = useRef<number[]>([]);
   const doorPaintedSplatDataRef = useRef<SplatData | null>(null);
   const [doorInternalShow, setDoorInternalShow] = useState(false);
+
+  const restoreMainDoorPreviewPaints = useCallback(() => {
+    const core = coreRef.current;
+    const sd = core?.getSplatData();
+    if (core && sd?.colorTexture && sd?.origColorData && doorPaintedSplatDataRef.current === sd) {
+      const painted = doorPaintedIndicesRef.current;
+      if (painted.length > 0) {
+        const td = sd.colorTexture.lock();
+        if (td) {
+          for (const i of painted) {
+            if (i < 0 || i >= sd.numSplats) continue;
+            td[i * 4 + 0] = sd.origColorData[i * 4 + 0];
+            td[i * 4 + 1] = sd.origColorData[i * 4 + 1];
+            td[i * 4 + 2] = sd.origColorData[i * 4 + 2];
+          }
+          sd.colorTexture.unlock();
+        }
+      }
+    }
+    doorPaintedIndicesRef.current = [];
+    doorPaintedSplatDataRef.current = null;
+  }, [coreRef]);
 
   const doorCleanupStateRef = useRef<Map<number, DoorCleanupState>>(new Map());
   const doorCleanupSnapshotRef = useRef<DoorCleanupSnapshot | null>(null);
@@ -1504,66 +1535,197 @@ export default function DoorAlignModal({
     return null;
   }, []);
 
+  const getMainDoorMutationIndices = useCallback((decomp: DoorCleanupSnapshot['decomp']): number[] => {
+    const indices = new Set<number>();
+    for (const i of decomp.doorOriginalIndices) indices.add(i);
+    for (const u of decomp.wallSideUpdates) indices.add(u.idx);
+    return Array.from(indices).sort((a, b) => a - b);
+  }, []);
+
+  const getScaleProps = useCallback((sd: SplatData): [Float32Array, Float32Array, Float32Array] => {
+    const sc0 = sd.gsplatData?.getProp('scale_0') as Float32Array | undefined;
+    const sc1 = sd.gsplatData?.getProp('scale_1') as Float32Array | undefined;
+    const sc2 = sd.gsplatData?.getProp('scale_2') as Float32Array | undefined;
+    if (!sc0 || !sc1 || !sc2) throw new Error('gsplatData scale props missing');
+    return [sc0, sc1, sc2];
+  }, []);
+
+  const ensureMainDoorMutationSnapshot = useCallback((
+    sd: SplatData,
+    indices: number[],
+  ): MainDoorMutationSnapshot => {
+    const existing = mainDoorMutationSnapshotRef.current;
+    if (existing && indices.every(i => existing.offsetByIndex.has(i))) {
+      return existing;
+    }
+
+    if (!sd.origColorData || !sd.colorTexture) {
+      throw new Error('splat color data missing');
+    }
+    const [sc0, sc1, sc2] = getScaleProps(sd);
+    const merged = new Set<number>(existing?.indices ?? []);
+    for (const i of indices) merged.add(i);
+    const mergedIndices = Array.from(merged).sort((a, b) => a - b);
+    const offsetByIndex = new Map<number, number>();
+    const positions = new Float32Array(mergedIndices.length * 3);
+    const scales = new Float32Array(mergedIndices.length * 3);
+    const alpha = new Uint16Array(mergedIndices.length);
+
+    for (let o = 0; o < mergedIndices.length; o++) {
+      const idx = mergedIndices[o];
+      offsetByIndex.set(idx, o);
+      const prev = existing?.offsetByIndex.get(idx);
+      if (existing && prev !== undefined) {
+        positions[o * 3 + 0] = existing.positions[prev * 3 + 0];
+        positions[o * 3 + 1] = existing.positions[prev * 3 + 1];
+        positions[o * 3 + 2] = existing.positions[prev * 3 + 2];
+        scales[o * 3 + 0] = existing.scales[prev * 3 + 0];
+        scales[o * 3 + 1] = existing.scales[prev * 3 + 1];
+        scales[o * 3 + 2] = existing.scales[prev * 3 + 2];
+        alpha[o] = existing.alpha[prev];
+        continue;
+      }
+      positions[o * 3 + 0] = sd.posX[idx];
+      positions[o * 3 + 1] = sd.posY[idx];
+      positions[o * 3 + 2] = sd.posZ[idx];
+      scales[o * 3 + 0] = sc0[idx];
+      scales[o * 3 + 1] = sc1[idx];
+      scales[o * 3 + 2] = sc2[idx];
+      alpha[o] = sd.origColorData[idx * 4 + 3];
+    }
+
+    const snap = { indices: mergedIndices, offsetByIndex, positions, scales, alpha };
+    mainDoorMutationSnapshotRef.current = snap;
+    return snap;
+  }, [getScaleProps]);
+
+  const writeMainPosition = useCallback((sd: SplatData, idx: number, pos: [number, number, number]) => {
+    sd.posX[idx] = pos[0];
+    sd.posY[idx] = pos[1];
+    sd.posZ[idx] = pos[2];
+    const gx = sd.gsplatData?.getProp('x') as Float32Array | undefined;
+    const gy = sd.gsplatData?.getProp('y') as Float32Array | undefined;
+    const gz = sd.gsplatData?.getProp('z') as Float32Array | undefined;
+    if (gx && gx !== sd.posX) gx[idx] = pos[0];
+    if (gy && gy !== sd.posY) gy[idx] = pos[1];
+    if (gz && gz !== sd.posZ) gz[idx] = pos[2];
+  }, []);
+
+  const restoreMainDoorMutation = useCallback(() => {
+    const snap = mainDoorMutationSnapshotRef.current;
+    if (!snap) return;
+    const core = coreRef.current;
+    const sd = core?.getSplatData();
+    if (!sd) {
+      mainDoorMutationSnapshotRef.current = null;
+      return;
+    }
+    const [sc0, sc1, sc2] = getScaleProps(sd);
+    let colorLevel: any = null;
+    if (sd.colorTexture?.lock) colorLevel = sd.colorTexture.lock();
+    try {
+      for (let o = 0; o < snap.indices.length; o++) {
+        const idx = snap.indices[o];
+        writeMainPosition(sd, idx, [
+          snap.positions[o * 3 + 0],
+          snap.positions[o * 3 + 1],
+          snap.positions[o * 3 + 2],
+        ]);
+        sc0[idx] = snap.scales[o * 3 + 0];
+        sc1[idx] = snap.scales[o * 3 + 1];
+        sc2[idx] = snap.scales[o * 3 + 2];
+        if (sd.origColorData) sd.origColorData[idx * 4 + 3] = snap.alpha[o];
+        if (colorLevel) colorLevel[idx * 4 + 3] = snap.alpha[o];
+      }
+    } finally {
+      if (colorLevel) sd.colorTexture.unlock();
+    }
+    refreshGPUFromSplatData(sd);
+    mainDoorMutationSnapshotRef.current = null;
+    onMainSplatReplaced?.();
+  }, [coreRef, getScaleProps, onMainSplatReplaced, writeMainPosition]);
+
+  const applyMainDoorStateFromCleanupSnapshot = useCallback((
+    snap: DoorCleanupSnapshot,
+    states: Map<number, DoorCleanupState>,
+  ) => {
+    const core = coreRef.current;
+    const sd = core?.getSplatData();
+    if (!core || !sd) throw new Error('PlayCanvas splatData 미준비');
+    if (!sd.origColorData || !sd.colorTexture) throw new Error('splat color data missing');
+
+    const indices = getMainDoorMutationIndices(snap.decomp);
+    const original = ensureMainDoorMutationSnapshot(sd, indices);
+    const [sc0, sc1, sc2] = getScaleProps(sd);
+    const zeroH = core.float2Half(0);
+
+    const restoreTransform = (idx: number) => {
+      const o = original.offsetByIndex.get(idx);
+      if (o === undefined) return;
+      writeMainPosition(sd, idx, [
+        original.positions[o * 3 + 0],
+        original.positions[o * 3 + 1],
+        original.positions[o * 3 + 2],
+      ]);
+      sc0[idx] = original.scales[o * 3 + 0];
+      sc1[idx] = original.scales[o * 3 + 1];
+      sc2[idx] = original.scales[o * 3 + 2];
+    };
+
+    for (const u of snap.decomp.wallSideUpdates) {
+      const st = states.get(u.idx) ?? 'included';
+      if (snap.boundarySplitEnabled && st !== 'excluded') {
+        writeMainPosition(sd, u.idx, u.wallNewPos);
+        sc0[u.idx] = u.wallNewLogScale[0];
+        sc1[u.idx] = u.wallNewLogScale[1];
+        sc2[u.idx] = u.wallNewLogScale[2];
+      } else {
+        restoreTransform(u.idx);
+      }
+    }
+
+    const colorLevel = sd.colorTexture.lock();
+    try {
+      for (const idx of snap.decomp.doorOriginalIndices) {
+        const st = states.get(idx) ?? 'included';
+        const o = original.offsetByIndex.get(idx);
+        const restoredAlpha = o !== undefined ? original.alpha[o] : sd.origColorData[idx * 4 + 3];
+        const nextAlpha = (st === 'excluded' && !snap.alphaDeleted[idx]) ? restoredAlpha : zeroH;
+        sd.origColorData[idx * 4 + 3] = nextAlpha;
+        if (colorLevel) colorLevel[idx * 4 + 3] = nextAlpha;
+      }
+    } finally {
+      if (colorLevel) sd.colorTexture.unlock();
+    }
+
+    refreshGPUFromSplatData(sd);
+    onMainSplatReplaced?.();
+  }, [
+    coreRef,
+    ensureMainDoorMutationSnapshot,
+    getMainDoorMutationIndices,
+    getScaleProps,
+    onMainSplatReplaced,
+    writeMainPosition,
+  ]);
+
   const rebuildDoorRefineFromCleanup = useCallback(async () => {
     const snap = doorCleanupSnapshotRef.current;
     const core = coreRef.current;
     if (!snap || !core) return;
     setDoorCleanupBusy(true);
     try {
-      const { cloneScene, filterScene, serializePly, concatScenes } = await import('@/lib/ply');
+      const { filterScene, serializePly, concatScenes } = await import('@/lib/ply');
       const { buildDoorSubScene } = await import('@/lib/gs/doorTrim');
-      const sceneForMain = cloneScene(snap.scene);
-      if (snap.boundarySplitEnabled) {
-        const sx = sceneForMain.attrs.get('x')!;
-        const sy = sceneForMain.attrs.get('y')!;
-        const sz = sceneForMain.attrs.get('z')!;
-        const ss0 = sceneForMain.attrs.get('scale_0')!;
-        const ss1 = sceneForMain.attrs.get('scale_1')!;
-        const ss2 = sceneForMain.attrs.get('scale_2')!;
-        for (const u of snap.decomp.wallSideUpdates) {
-          // boundary splat 을 "문에서 제외"하면 전체 원본 splat 이 메인 asset 에 남아야 한다.
-          // wall-side 로 잘라버리면 door-side 조각이 사라져 방 내부/문 가장자리 splat 이 비게 된다.
-          const st = doorCleanupStateRef.current.get(u.idx) ?? 'included';
-          if (st === 'excluded') continue;
-          sx[u.idx] = u.wallNewPos[0];
-          sy[u.idx] = u.wallNewPos[1];
-          sz[u.idx] = u.wallNewPos[2];
-          ss0[u.idx] = u.wallNewLogScale[0];
-          ss1[u.idx] = u.wallNewLogScale[1];
-          ss2[u.idx] = u.wallNewLogScale[2];
-        }
-      }
-
       const states = doorCleanupStateRef.current;
-      const doorSet = new Set(snap.decomp.doorOriginalIndices);
-      const boundarySet = new Set(snap.decomp.boundaryIndices);
-      const keepMain = new Uint8Array(snap.scene.numSplats);
       const keepDoor = new Uint8Array(snap.scene.numSplats);
-      for (let i = 0; i < snap.scene.numSplats; i++) {
+      for (const i of snap.decomp.doorOriginalIndices) {
         if (snap.alphaDeleted[i]) {
           continue;
         }
         const st = states.get(i) ?? 'included';
-        if (doorSet.has(i)) {
-          if (st === 'included') {
-            keepDoor[i] = 1;
-          } else if (st === 'excluded') {
-            keepMain[i] = 1;
-          }
-          continue;
-        }
-        if (boundarySet.has(i)) {
-          // 문 추출 overlay 에서 선택하는 boundary 항목은 문 쪽으로 분리된 door-side sub 이다.
-          // 따라서 영구 삭제는 그 sub 만 제거하고, 사용자가 직접 보지 않은 main 쪽 wall-side 조각은 유지한다.
-          keepMain[i] = 1;
-          continue;
-        }
-        keepMain[i] = 1;
+        if (st === 'included') keepDoor[i] = 1;
       }
-
-      const mainScene = filterScene(sceneForMain, keepMain);
-      const mainBytes = serializePly(mainScene);
-      const mainBlobUrl = URL.createObjectURL(new Blob([mainBytes], { type: 'application/octet-stream' }));
 
       const doorOrigScene = filterScene(snap.scene, keepDoor);
       const filteredSubMeta = snap.decomp.doorSubMetadata.filter((m: any) =>
@@ -1580,6 +1742,9 @@ export default function DoorAlignModal({
       if (doorSubGsplatIdRef.current) {
         try { additional.remove(doorSubGsplatIdRef.current); } catch {}
         doorSubGsplatIdRef.current = null;
+      }
+      if (doorSubBlobUrlRef.current) {
+        try { URL.revokeObjectURL(doorSubBlobUrlRef.current); } catch {}
       }
       doorSubBlobUrlRef.current = null;
       doorCleanupDoorOrigOrderRef.current = [];
@@ -1604,33 +1769,21 @@ export default function DoorAlignModal({
         }
       }
 
-      const prev = currentMainPlyBlobUrlRef.current;
-      if (prev && prev !== revertMainPlyBlobUrlRef.current) {
-        try { URL.revokeObjectURL(prev); } catch {}
-      }
-      currentMainPlyBlobUrlRef.current = mainBlobUrl;
-      const clearSkipRebake = markNextSplatLoadSkipRebake?.();
-      try {
-        await core.reloadSplatFromUrl(mainBlobUrl, { preserveCamera: true });
-      } catch (e) {
-        clearSkipRebake?.();
-        throw e;
-      }
-      onMainSplatReplaced?.(mainScene);
+      applyMainDoorStateFromCleanupSnapshot(snap, states);
     } finally {
       setDoorCleanupBusy(false);
     }
-  }, [additional, coreRef, markNextSplatLoadSkipRebake, onMainSplatReplaced]);
+  }, [additional, applyMainDoorStateFromCleanupSnapshot, coreRef]);
 
   // 비정합 문 door mesh bake — 문 설정 완료 시 호출, 각 비정합 문 텍스처를 wall mesh 에서 추출.
   // bakeNonAlignmentDoors: applyDoorRefine(cornersOverride) 로 각 비정합 문을 full bake.
   // wall punch(가우시안 + wall mesh 텍스처) + door mesh texture + door splat 모두 수행.
-  // 토글 OFF: 모든 변경 원복. 메인 splat 을 추출 전 snapshot 으로 reload.
+  // 토글 OFF: 모든 변경 원복. 메인 splat 은 인덱스 snapshot 으로 in-place 복구.
   const revertDoorRefine = useCallback(async () => {
     try {
       const core = coreRef.current;
 
-      // 1. additional door splat 제거 (메인 reload 전에 — reload 후 entity 가 alignmentGroup 등으로 옮겨갈 수 있어 미리 정리)
+      // 1. additional door splat 제거.
       try {
         if (doorSubGsplatIdRef.current) {
           additional.remove(doorSubGsplatIdRef.current);
@@ -1656,26 +1809,12 @@ export default function DoorAlignModal({
         }
       } catch (e) { console.error('[DoorRefine] revert step 2 (mesh/wrapper destroy):', e); }
 
-      // 3. 메인 splat 을 추출 전 snapshot 으로 reload — 도어 가우시안 복귀.
-      // bakeNonAlignDoorMode 중에는 건너뜀: 구멍이 누적돼야 하므로 PLY 재로드 불가.
+      // 3. 메인 splat 을 추출 전 인덱스 snapshot 으로 복구 — 도어 가우시안 복귀.
+      // bakeNonAlignDoorMode 중에는 건너뜀: 구멍이 누적돼야 하므로 메인 splat 복구 불가.
       if (!bakeNonAlignDoorModeRef.current) {
         try {
-          if (core && revertMainPlyBlobUrlRef.current) {
-            const clearSkipRebake = markNextSplatLoadSkipRebake?.();
-            try {
-              await core.reloadSplatFromUrl(revertMainPlyBlobUrlRef.current, { preserveCamera: true });
-            } catch (e) {
-              clearSkipRebake?.();
-              throw e;
-            }
-            onMainSplatReplaced?.();
-            // 현재 main blob 참조를 추출 전 snapshot 으로 되돌린다.
-            if (currentMainPlyBlobUrlRef.current && currentMainPlyBlobUrlRef.current !== revertMainPlyBlobUrlRef.current) {
-              try { URL.revokeObjectURL(currentMainPlyBlobUrlRef.current); } catch {}
-            }
-            currentMainPlyBlobUrlRef.current = revertMainPlyBlobUrlRef.current;
-          }
-        } catch (e) { console.error('[DoorRefine] revert step 3 (main reload):', e); }
+          restoreMainDoorMutation();
+        } catch (e) { console.error('[DoorRefine] revert step 3 (main restore):', e); }
 
         // 4. wall mesh 텍스처 복원 — lvl 이 TypedArray 가 아닐 수 있어 인덱스 복사로 수행.
         try {
@@ -1720,8 +1859,6 @@ export default function DoorAlignModal({
       doorMeshPreviewInputRef.current = null;
       lastDoorMeshBboxRef.current = null;
       lastDoorMeshWallSurfaceIdRef.current = null;
-      // 취소 후 다음 추출은 현재 scene 에서 새 revert snapshot 을 만든다.
-      revertMainPlyBlobUrlRef.current = null;
 
       // 5. 회전 애니메이션 / 상태 정리
       doorAnimRef.current = null;
@@ -1757,7 +1894,7 @@ export default function DoorAlignModal({
       setEdgePickArmed(false);
       hoveredEdgeRef.current = null;
     }
-  }, [coreRef, additional, findEntityByName, setDoorCleanupOpenSynced]);
+  }, [coreRef, additional, findEntityByName, restoreMainDoorMutation, setDoorCleanupOpenSynced]);
 
   const finalizeBasemapDoorExtraction = useCallback(async () => {
     if (!basemapMode) return;
@@ -1823,6 +1960,10 @@ export default function DoorAlignModal({
     doorSubBlobUrlRef.current = null;
     doorMeshEntityRef.current = null;
     activeDoorWrapperRef.current = null;
+    mainDoorMutationSnapshotRef.current = null;
+    doorCleanupSnapshotRef.current = null;
+    doorCleanupStateRef.current = new Map();
+    doorCleanupDoorOrigOrderRef.current = [];
     basemapPendingDoorRef.current = null;
     setDoorCleanupOpenSynced(false);
     setDoorCleanupViewerUrl(null);
@@ -1874,10 +2015,11 @@ export default function DoorAlignModal({
       const core = coreRef.current;
       const pc = core?.getPC();
       const app = core?.getApp();
-      // 메인 splat reload 후 새 splatData 로 재할당해야 하므로 let.
-      let sd = core?.getSplatData();
-      const float2Half = core?.float2Half;
-      if (!pc || !app || !sd || !float2Half) throw new Error('PlayCanvas 미준비');
+      const sd = core?.getSplatData();
+      if (!pc || !app || !sd || !core?.float2Half) throw new Error('PlayCanvas 미준비');
+
+      restoreMainDoorPreviewPaints();
+      setDoorInternalShow(false);
 
       // 1. 활성 추출 상태가 있으면 먼저 원복
       if (doorRefineActive || doorSubGsplatIdRef.current || doorMeshEntityRef.current) {
@@ -1894,14 +2036,14 @@ export default function DoorAlignModal({
           .map((p: { name: string }) => p.name);
         const attrs = new Map<string, Float32Array>();
         for (const prop of propertyOrder) {
-          const a = g?.getProp(prop);
-          if (a) attrs.set(prop, new Float32Array(a));
+          const a = g?.getProp(prop) as Float32Array | undefined;
+          if (a) attrs.set(prop, a);
         }
         // posX/Y/Z 는 splatData 의 별도 참조와 동일해야 함 — gsplatData 의 x/y/z 와 같은 버퍼.
         // 안전 보장으로 sd.posX/Y/Z 로 덮어씀.
-        if (sd.posX) attrs.set('x', new Float32Array(sd.posX));
-        if (sd.posY) attrs.set('y', new Float32Array(sd.posY));
-        if (sd.posZ) attrs.set('z', new Float32Array(sd.posZ));
+        if (sd.posX) attrs.set('x', sd.posX);
+        if (sd.posY) attrs.set('y', sd.posY);
+        if (sd.posZ) attrs.set('z', sd.posZ);
         return { numSplats: sd.numSplats, attrs, propertyOrder };
       })();
       // 다듬기 단계의 keep mask (boundaryCull/floater/brush 삭제). decomp 결과를 이걸로 거르면
@@ -1943,7 +2085,7 @@ export default function DoorAlignModal({
         rawToA(corners[2], rotR),
         rawToA(corners[3], rotR),
       ];
-      const { decomposeBoundaryGaussians, buildDoorSubScene, doorPlaneBakeInput, punchAlphaZeroInDoorRegion }
+      const { decomposeBoundaryGaussians, buildDoorSubScene, punchAlphaZeroInDoorRegion }
         = await import('@/lib/gs/doorTrim');
       // wallOutwardNormal: scene/corners 가 raw 프레임이므로 raw 프레임 wall normal 을 넘겨줘야 isInDoorSlab 의 sdOut 부호가 정합.
       // (wallPlaneForRefine.normal 은 A' 프레임. wallNormalRaw 는 위에서 pendingRotation^-1 으로 계산해뒀음.)
@@ -1976,11 +2118,6 @@ export default function DoorAlignModal({
       // 보지 않고, 자연 도어 → 완성 도어 (회전/노랑) 로 한 번에 전환됨.
 
       // 도어 풀 씬을 먼저 로드하고 entity ready 를 기다린 뒤 메인 PLY 변형을 적용한다.
-      const sc0 = sd.gsplatData?.getProp('scale_0');
-      const sc1 = sd.gsplatData?.getProp('scale_1');
-      const sc2 = sd.gsplatData?.getProp('scale_2');
-      if (!sc0 || !sc1 || !sc2) throw new Error('gsplatData scale props missing');
-
       const { filterScene, concatScenes, serializePly } = await import('@/lib/ply');
       // boundaryCull/brush 로 alpha=0 처리된 splat (origColorData[i*4+3] ≈ 0) 은 도어 entity 에도 포함하지 않음.
       // 안 그러면 cachedScene 의 원본 alpha 로 부활해 방 밖 잔여물 다시 보임.
@@ -2170,78 +2307,10 @@ export default function DoorAlignModal({
         }
       }
 
-      // 메인 splat 을 도어 가우시안 빠진 새 PLY 로 reload.
-      //   1) 새 메인 PLY: cachedScene 클론 → boundary 슬롯에 wall-side sub 데이터 in-place 적용 →
-      //      doorOriginalIndices / alpha-deleted 제외하고 filter + serialize.
-      //   2) revert snapshot PLY: cachedScene 에서 alpha-deleted 만 제외하고 filter + serialize (도어 포함 상태).
-      //   3) markNextSplatLoadSkipRebake 호출 — 새 PLY 는 A' 프레임이라 onSplatLoaded 의 자동 re-bake 가
-      //      double 회전 일으킴, 한 번만 skip.
-      //   4) core.reloadSplatFromUrl(mainBlob, preserveCamera) await — 카메라 위치 유지하며 메인 교체.
-      {
-        const { cloneScene } = await import('@/lib/ply');
-        const doorSet = new Set(decomp.doorOriginalIndices);
-
-        // (1) 새 메인 PLY — 클론 후 boundary 슬롯을 wall-side sub 데이터로 in-place 덮어씀.
-        const sceneForMain = cloneScene(scene);
-        if (boundarySplitEnabled) {
-          const sx = sceneForMain.attrs.get('x')!;
-          const sy = sceneForMain.attrs.get('y')!;
-          const sz = sceneForMain.attrs.get('z')!;
-          const ss0 = sceneForMain.attrs.get('scale_0')!;
-          const ss1 = sceneForMain.attrs.get('scale_1')!;
-          const ss2 = sceneForMain.attrs.get('scale_2')!;
-          for (const u of decomp.wallSideUpdates) {
-            sx[u.idx] = u.wallNewPos[0];
-            sy[u.idx] = u.wallNewPos[1];
-            sz[u.idx] = u.wallNewPos[2];
-            ss0[u.idx] = u.wallNewLogScale[0];
-            ss1[u.idx] = u.wallNewLogScale[1];
-            ss2[u.idx] = u.wallNewLogScale[2];
-          }
-        }
-        const keepMain = new Uint8Array(scene.numSplats);
-        for (let i = 0; i < scene.numSplats; i++) {
-          if (doorSet.has(i)) continue;
-          if (isAlphaDeleted(i)) continue;
-          keepMain[i] = 1;
-        }
-        const mainScene = filterScene(sceneForMain, keepMain);
-        const mainBytes = serializePly(mainScene);
-        const mainBlobUrl = URL.createObjectURL(new Blob([mainBytes], { type: 'application/octet-stream' }));
-
-        // (2) revert 용 snapshot — 도어 추출 전 상태 (alpha-deleted 만 제외).
-        //   revertDoorRefine 이 이걸로 reload 하면 추출 전과 동일 visible 가우시안.
-        if (!revertMainPlyBlobUrlRef.current) {
-          const keepOrig = new Uint8Array(scene.numSplats);
-          for (let i = 0; i < scene.numSplats; i++) {
-            if (!isAlphaDeleted(i)) keepOrig[i] = 1;
-          }
-          const origScene = filterScene(scene, keepOrig);
-          const origBytes = serializePly(origScene);
-          revertMainPlyBlobUrlRef.current = URL.createObjectURL(new Blob([origBytes], { type: 'application/octet-stream' }));
-        }
-
-        // (3) 직전 메인 blob URL revoke (메모리 누수 방지). revert snapshot 과 같은 URL 이면 보존.
-        const prev = currentMainPlyBlobUrlRef.current;
-        if (prev && prev !== revertMainPlyBlobUrlRef.current) {
-          try { URL.revokeObjectURL(prev); } catch {}
-        }
-        currentMainPlyBlobUrlRef.current = mainBlobUrl;
-
-        // (4) re-bake skip 신호 + reload await. 새 splatData 가 onSplatLoaded 콜백으로 refine tool 에 등록.
-        const clearSkipRebake = markNextSplatLoadSkipRebake?.();
-        try {
-          await core.reloadSplatFromUrl(mainBlobUrl, { preserveCamera: true });
-        } catch (e) {
-          clearSkipRebake?.();
-          throw e;
-        }
-
-        // reload 후 새 splatData 를 기준으로 후속 mesh/splat 작업을 진행한다.
-        const sdNew = core.getSplatData();
-        if (!sdNew) throw new Error('reload 후 splatData 미준비');
-        sd = sdNew;
-        onMainSplatReplaced?.(mainScene);
+      // 메인 splat 은 큰 PLY blob 을 만들지 않는다. 현재 버퍼에서 도어 원본 alpha 와
+      // boundary wall-side 위치/스케일만 바꿔 브라우저 ArrayBuffer 피크를 낮춘다.
+      if (doorCleanupSnapshotRef.current) {
+        applyMainDoorStateFromCleanupSnapshot(doorCleanupSnapshotRef.current, doorCleanupStateRef.current);
       }
 
       if (wallMeshTex && wallCorners && wallUvs && wallEntName) {
@@ -2341,8 +2410,8 @@ export default function DoorAlignModal({
     }
   }, [allPicked, picked, currentUrl, coreRef, additional, planes, doorExtractionDepth,
       doorRefineActive, boundarySplitEnabled, findEntityByName, revertDoorRefine, getCurrentEditorRotation,
-      basemapMode, basemapEditMode, getRemainingRotationToAY, onMainSplatReplaced, finalizeBasemapDoorExtraction,
-      setDoorCleanupOpenSynced]);
+      basemapMode, basemapEditMode, getRemainingRotationToAY, finalizeBasemapDoorExtraction,
+      setDoorCleanupOpenSynced, applyMainDoorStateFromCleanupSnapshot, restoreMainDoorPreviewPaints]);
 
   // ── ③-1 N-door 동시 다듬기: base scene 캡처 + 단일 문 추출 헬퍼 (no-compaction) ──
   // applyDoorRefine 의 decomp 경로(1820~1947)를 그대로 재사용하되, 메인 reload/면 punch 는 하지 않는다.
@@ -2635,10 +2704,10 @@ export default function DoorAlignModal({
         }
         if (!bestId) continue;
 
-        // applyDoorRefine 전: revertMainPlyBlobUrlRef 를 null 로 → 이미 구멍이 뚫린 현재 scene 을
-        // 새 스냅샷 기준으로 삼아 이번 문 추출 실패 시 정확히 직전 상태로 복귀 가능.
+        // applyDoorRefine 전: 이전 mutation snapshot 을 비워 이미 구멍이 뚫린 현재 scene 을
+        // 새 스냅샷 기준으로 삼는다. 이번 문 추출 실패 시 정확히 직전 상태로 복귀 가능.
         // (bakeNonAlignDoorMode 에서 revertDoorRefine 은 PLY를 건드리지 않으므로 실질적 revert는 없음)
-        revertMainPlyBlobUrlRef.current = null;
+        mainDoorMutationSnapshotRef.current = null;
 
         const overrideCorners: PickedCorner[] = dc.map(c => ({ pos: c as Vec3, surfaceId: bestId }));
         try {
@@ -2772,25 +2841,8 @@ export default function DoorAlignModal({
   // 문 내부 가우시안 색칠 (정제 전/후 모두 사용 가능).
   // ON 시: 4 코너 + 두께 기준 door region 을 lazy 계산 → 노랑 틴트.
   const restoreDoorPreviewPaints = useCallback(() => {
+    restoreMainDoorPreviewPaints();
     const core = coreRef.current;
-    const sd = core?.getSplatData();
-    if (core && sd?.colorTexture && sd?.origColorData && doorPaintedSplatDataRef.current === sd) {
-      const painted = doorPaintedIndicesRef.current;
-      if (painted.length > 0) {
-        const td = sd.colorTexture.lock();
-        if (td) {
-          for (const i of painted) {
-            if (i < 0 || i >= sd.numSplats) continue;
-            td[i * 4 + 0] = sd.origColorData[i * 4 + 0];
-            td[i * 4 + 1] = sd.origColorData[i * 4 + 1];
-            td[i * 4 + 2] = sd.origColorData[i * 4 + 2];
-          }
-          sd.colorTexture.unlock();
-        }
-      }
-    }
-    doorPaintedIndicesRef.current = [];
-    doorPaintedSplatDataRef.current = null;
 
     if (doorGsplatOrigColorsRef.current && doorSubGsplatIdRef.current) {
       const doorEnt = additionalRef.current.getEntity(doorSubGsplatIdRef.current);
@@ -2829,7 +2881,7 @@ export default function DoorAlignModal({
       }
       doorMeshOrigEmissiveRef.current = null;
     }
-  }, [coreRef]);
+  }, [coreRef, restoreMainDoorPreviewPaints]);
 
   useEffect(() => () => {
     restoreDoorPreviewPaints();

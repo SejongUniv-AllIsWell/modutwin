@@ -18,6 +18,7 @@ from app.schemas.uploads import SceneResponse, SceneDownloadResponse
 from app.services.storage_paths import door_position_key
 from app.services.minio_service import get_minio_service
 from app.services.celery_service import dispatch_alignment_task
+from app.services.scene_assets import pick_scene_viewer_key
 
 router = APIRouter(prefix="/scenes", tags=["scenes"])
 
@@ -112,10 +113,8 @@ async def download_scene(
 
     minio = get_minio_service()
 
-    scene_key = scene.sog_path if scene.sog_path and minio.object_exists(scene.sog_path) else None
-    if scene_key is None and minio.object_exists(scene.ply_path):
-        scene_key = scene.ply_path
-    if not scene_key or not minio.object_exists(scene_key):
+    scene_key = pick_scene_viewer_key(minio, scene)
+    if not scene_key:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="씬 파일을 찾을 수 없습니다.")
 
     expires = 3600

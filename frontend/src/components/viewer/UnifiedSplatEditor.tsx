@@ -461,7 +461,7 @@ export default function UnifiedSplatEditor({
     setBasemapMatchError(null);
     try {
       const bm = await api.get<ActiveBasemapResponse>(`/basemaps/active?floor_id=${meta.floor_id}`);
-      // basemap PLY 를 layer 로 추가 (이미 있으면 스킵)
+      // basemap viewer asset(가능하면 SOG, 없으면 PLY)을 layer 로 추가 (이미 있으면 스킵)
       const alreadyHas = additional.items.some(
         it => it.source === 'basemap' && it.url === bm.url,
       );
@@ -1006,7 +1006,12 @@ export default function UnifiedSplatEditor({
   ) : null;
 
   return (
-    <SplatViewerCore ref={coreRef} sogUrl={currentUrl} onSplatLoaded={handleSplatLoaded}>
+    <SplatViewerCore
+      ref={coreRef}
+      sogUrl={currentUrl}
+      assetFilename={displayName}
+      onSplatLoaded={handleSplatLoaded}
+    >
       {/* 패널 숨김 시: 좌측 가장자리에 펼치기 핸들 노출 */}
       {panelHidden && !doorCleanupOverlayOpen && (
         <button
