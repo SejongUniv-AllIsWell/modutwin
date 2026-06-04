@@ -102,10 +102,23 @@ class Sam3DetectTempRequest(BaseModel):
     session_id: str
     prompt: str = "door"
     bake_rotation: BakeRotation | None = None
+    # Phase 1 interior gate 튜닝 (긴/비볼록 방에서 fail-fast 회피용). 미지정 시 파이프라인 기본값.
+    interior_min_hits: int = 22
+    interior_perp_ratio: float = 0.01
+    interior_strict: bool = True
+    # 방법 B — 다듬기 확정 천장/바닥 (A' 프레임) + raw→A' 회전(bakedRotation).
+    # 4개 모두 주면 door-ml 이 A' 에서 추론하고 A' 코너를 반환 → 여기서 wallAngle 만 적용.
+    floor_y: float | None = None
+    ceiling_y: float | None = None
+    rot_x: float | None = None
+    rot_z: float | None = None
+    # 방 footprint 폴리곤 (A' X-Z). 있으면 door-ml 이 벽-정면 카메라 커버리지 사용.
+    wall_polygon: list[dict] | None = None
 
 
 class Sam3DetectTempResponse(BaseModel):
-    corners: dict
+    corners: dict           # 첫 번째(주) 문 코너 (backward compat)
+    all_doors: list[dict] = []  # N-door: 모든 문 코너 목록
 
 
 def _apply_bake_rotation_to_corner(c: dict, rot_x: float, rot_z: float, wall_angle_rad: float) -> dict:
@@ -126,6 +139,40 @@ def _apply_bake_rotation_to_corner(c: dict, rot_x: float, rot_z: float, wall_ang
     y2 = y1
     z2 = -s_y * x1 + c_y * z1
     return {"x": x2, "y": y2, "z": z2}
+
+
+def _apply_wall_angle_to_corner(c: dict, wall_angle_rad: float) -> dict:
+    """A' 프레임 corner → A'+Y. (방법 B: door-ml 이 이미 A' 로 반환하므로 Y회전만.)"""
+    x1, y1, z1 = float(c["x"]), float(c["y"]), float(c["z"])
+    c_y = math.cos(wall_angle_rad); s_y = math.sin(wall_angle_rad)
+    return {"x": c_y * x1 + s_y * z1, "y": y1, "z": -s_y * x1 + c_y * z1}
+
+
+def _is_known_room(body: "Sam3DetectTempRequest") -> bool:
+    return (
+        body.floor_y is not None and body.ceiling_y is not None
+        and body.rot_x is not None and body.rot_z is not None
+    )
+
+
+def _detect_params(body: "Sam3DetectTempRequest") -> dict:
+    """door-ml /detect 쿼리 파라미터. known-room 이면 A' 천장/바닥 전달."""
+    params: dict = {
+        "prompt": body.prompt or "door",
+        "sam3_prob": 0.86,
+        "interior_min_hits": body.interior_min_hits,
+        "interior_perp_ratio": body.interior_perp_ratio,
+        "interior_strict": body.interior_strict,
+    }
+    if _is_known_room(body):
+        params.update({
+            "rot_x": body.rot_x, "rot_z": body.rot_z,
+            "floor_y": body.floor_y, "ceiling_y": body.ceiling_y,
+        })
+        if body.wall_polygon:
+            params["wall_polygon"] = json.dumps(body.wall_polygon)
+    return params
+
 
 
 @router.post("/sam3/detect-temp", response_model=Sam3DetectTempResponse)
@@ -157,7 +204,7 @@ async def sam3_detect_temp(
             resp = await client.post(
                 f"{settings.DOOR_ML_URL}/detect",
                 files={"file": ("scene.ply", ply_bytes, "application/octet-stream")},
-                params={"prompt": body.prompt or "door", "sam3_prob": 0.55},
+                params=_detect_params(body),
             )
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"door-ml 통신 실패: {e}")
@@ -168,19 +215,32 @@ async def sam3_detect_temp(
             detail=f"door-ml HTTP {resp.status_code}: {resp.text[:300]}",
         )
 
-    corners = resp.json()
+    resp_json = resp.json()
     required = ("left_top", "right_top", "right_bottom", "left_bottom")
-    if not all(k in corners for k in required):
-        raise HTTPException(status_code=502, detail=f"door-ml 응답 형식 오류: keys={list(corners.keys())}")
+    corners = {k: resp_json[k] for k in required} if all(k in resp_json for k in required) else None
+    if corners is None:
+        raise HTTPException(status_code=502, detail=f"door-ml 응답 형식 오류: keys={list(resp_json.keys())}")
 
-    if body.bake_rotation:
-        br = body.bake_rotation
-        corners = {
-            k: _apply_bake_rotation_to_corner(corners[k], br.rotX, br.rotZ, br.wallAngleRad)
-            for k in required
-        }
+    # N-door: all_doors 리스트 (없으면 primary 1개)
+    raw_all_doors: list[dict] = resp_json.get("all_doors", [corners])
 
-    return Sam3DetectTempResponse(corners=corners)
+    def _transform_corners(c: dict) -> dict:
+        if body.bake_rotation:
+            br = body.bake_rotation
+            if _is_known_room(body):
+                return {k: _apply_wall_angle_to_corner(c[k], br.wallAngleRad) for k in required}
+            return {k: _apply_bake_rotation_to_corner(c[k], br.rotX, br.rotZ, br.wallAngleRad) for k in required}
+        return c
+
+    corners = _transform_corners(corners)
+    all_doors_transformed = []
+    for d in raw_all_doors:
+        transformed = _transform_corners(d)
+        # suggested_hinge_edge 는 좌표 변환 불필요 — 그대로 전달.
+        transformed["suggested_hinge_edge"] = d.get("suggested_hinge_edge")
+        all_doors_transformed.append(transformed)
+
+    return Sam3DetectTempResponse(corners=corners, all_doors=all_doors_transformed)
 
 
 # ── 3. 정합 완료 — 일괄 영속화 ────────────────────────────────────────────────
@@ -378,6 +438,10 @@ async def commit_final(
         ply_target=PlyTarget.alignment,
         status=UploadStatus.completed,
         sam3_status=None,  # module flow uses synchronous detect-temp, so no SAM3 task dispatch.
+        # 표준 조회 경로(uploads.py)가 doors.json / refined PLY 를 찾을 수 있도록 키를 기록.
+        # 누락 시 has_doors_json=False 가 되어 "문 정보 없음" 으로 끝난다 (commit-final 계약).
+        refined_ply_path=final_ply_key,
+        door_corners_json_path=doors_key,
     )
     db.add(upload)
     await db.flush()

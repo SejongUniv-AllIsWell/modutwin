@@ -219,7 +219,8 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
           const isDoor = name.startsWith('doorMesh_');
           const isAddSplat = name.startsWith('add_splat_');
           // moduleDoor wrapper — mesh + splat 자식 통째로 정합 transform 대상.
-          const isModuleDoorWrapper = name === 'moduleDoor';
+          // 'moduleDoorExtra_*' = N-door 비정합 문 wrapper (정합 문과 함께 정합되어야 mesh 가 보임).
+          const isModuleDoorWrapper = name === 'moduleDoor' || name.startsWith('moduleDoorExtra_');
           // basemap tag 가 붙은 entity 는 module 정합 transform 적용 대상이 아님 → 무조건 제외.
           // (useRefinedMeshLoader 가 추가하는 basemap 의 wallMesh/doorMesh/add_splat 모두 'basemap' tag.)
           const hasBasemapTag = c.tags?.has?.('basemap');

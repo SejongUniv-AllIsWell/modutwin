@@ -3720,6 +3720,27 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     return { rotX, rotZ, wallAngleRad: (wallAngleDeg * Math.PI) / 180 };
   }, []);
 
+  // 방법 B — door-ml 이 A' 에서 추론하도록, 다듬기에서 확정된 A' 천장/바닥 +
+  // 실제 적용된 raw→A' 회전(bakedRotation)을 노출. (pendingRotation 아님 — 다듬기
+  // 완료 후 pending 은 0 이고, raw 원본 PLY → A' 변환엔 bakedRotation 이 정답.)
+  const getRefinedRoomFrame = useCallback((): {
+    rotX: number; rotZ: number; floorY: number; ceilingY: number;
+    wallPolygon: { x: number; z: number }[] | null;
+  } | null => {
+    const { rotX, rotZ } = bakedRotationRef.current;
+    const floorY = floorYRef.current;
+    const ceilingY = ceilingYRef.current;
+    if (!Number.isFinite(floorY) || !Number.isFinite(ceilingY) || floorY === ceilingY) {
+      return null;  // 천장/바닥 미확정 → known-room 비활성 (door-ml 기본 추정으로 fallback).
+    }
+    // 방 footprint 폴리곤(A' X-Z). 있으면 door-ml 이 벽-정면 카메라 커버리지를 씀.
+    const poly = wallPolygonRef.current;
+    const wallPolygon = poly && poly.length >= 3
+      ? poly.map((p) => ({ x: p.x, z: p.z }))
+      : null;
+    return { rotX, rotZ, floorY, ceilingY, wallPolygon };
+  }, []);
+
   const replaceCanonicalSceneFromCurrentSplat = useCallback((scene?: GaussianScene) => {
     if (scene) {
       refinedCanonicalSceneRef.current = scene;
@@ -3738,5 +3759,5 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     return () => { skipNextSplatRebakeRef.current = false; };
   }, []);
 
-  return { overlay, panel, modals, onSplatLoaded, planes, saveRefined, commitRefinedToServer, gatherRefinedAssets, getCurrentKeepMask, getBakeRgba, registerPersistedBake, getRemainingRotationToAY, replaceCanonicalSceneFromCurrentSplat, markNextSplatLoadSkipRebake };
+  return { overlay, panel, modals, onSplatLoaded, planes, saveRefined, commitRefinedToServer, gatherRefinedAssets, getCurrentKeepMask, getBakeRgba, registerPersistedBake, getRemainingRotationToAY, getRefinedRoomFrame, replaceCanonicalSceneFromCurrentSplat, markNextSplatLoadSkipRebake };
 }

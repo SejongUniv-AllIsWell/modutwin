@@ -63,6 +63,19 @@ interface DoorCleanupViewerModalProps {
   busy: boolean;
   onApply: (nextStates: Map<number, DoorCleanupState>) => Promise<void> | void;
   onClose: () => void;
+  /** 모달 헤더에 표시할 문 번호 라벨. 예: "문 1 다듬기". */
+  doorLabel?: string;
+  /**
+   * N-door: 검출된 모든 문 목록 (기준 문 + 비정합 문). 다듬기 중 전체 문 맥락을 보여준다.
+   * active=true 인 문이 현재 브러시 대상. onSelectDoor 지정 시 chip 클릭으로 활성 문 전환(③ 단계).
+   */
+  cleanupDoors?: Array<{ label: string; isAlign: boolean; active: boolean }>;
+  onSelectDoor?: (idx: number) => void;
+  /**
+   * ③ N-door: 활성 문 세션 키. 값이 바뀌면(문 전환) 브러시 상태/undo 히스토리를 새 문 기준으로 재초기화.
+   * → per-door undo 범위 (다른 문으로 넘어가면 이전 문은 완료 처리, undo 대상에서 제외).
+   */
+  cleanupSessionKey?: number | string;
 }
 
 export default function DoorCleanupViewerModal({
@@ -73,6 +86,10 @@ export default function DoorCleanupViewerModal({
   busy,
   onApply,
   onClose,
+  doorLabel,
+  cleanupDoors,
+  onSelectDoor,
+  cleanupSessionKey,
 }: DoorCleanupViewerModalProps) {
   const splatDataRef = useRef<CleanupSplatData | null>(null);
   const colorSnapshotRef = useRef<Uint16Array | null>(null);
@@ -142,6 +159,20 @@ export default function DoorCleanupViewerModal({
     setViewerReadyVersion(v => v + 1);
     setTimeout(paint, 0);
   }, [doorSplatEntity, origIndexOrder.length, paint]);
+
+  // ③ N-door: 문 전환(cleanupSessionKey 변경) 시 브러시 상태/undo 히스토리를 새 문 기준으로 재초기화.
+  // 이전 문의 다듬기는 완료 처리(applied)되어 새 문의 undo 범위에 포함되지 않는다.
+  useEffect(() => {
+    if (cleanupSessionKey === undefined) return;
+    statesRef.current = new Map(initialStates);
+    appliedStatesRef.current = new Map(initialStates);
+    historyRef.current = [];
+    setUndoDepth(0);
+    colorSnapshotRef.current = null;
+    setTimeout(paint, 0);
+    // initialStates 는 문별 stable Map — cleanupSessionKey 변화에만 반응.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cleanupSessionKey]);
 
   const pushHistory = useCallback((applied: boolean) => {
     historyRef.current.push({ states: new Map(statesRef.current), applied });
@@ -409,9 +440,33 @@ export default function DoorCleanupViewerModal({
         style={{ left: 24, top: 112 }}
       >
         <div className="flex items-center justify-between">
-          <div className="text-sm font-bold">문 추출</div>
+          <div className="text-sm font-bold">{doorLabel ?? '문 추출'}</div>
           <button type="button" onClick={onClose} className="text-[var(--muted)] hover:text-[var(--ink)]">x</button>
         </div>
+        {/* N-door: 검출된 모든 문 chip. active=현재 다듬는 문. onSelectDoor 있으면 클릭으로 전환(③). */}
+        {cleanupDoors && cleanupDoors.length > 1 && (
+          <div className="mt-2 flex flex-wrap gap-1">
+            {cleanupDoors.map((d, i) => {
+              const clickable = !!onSelectDoor && !d.active && !busy;
+              return (
+                <button
+                  key={i}
+                  type="button"
+                  disabled={!clickable}
+                  onClick={clickable ? () => onSelectDoor!(i) : undefined}
+                  title={onSelectDoor ? (d.active ? '현재 다듬는 문' : '이 문 다듬기') : '검출된 문'}
+                  className={`px-2 py-1 rounded text-[11px] font-bold border ${
+                    d.active
+                      ? 'bg-red-700/70 border-red-400 text-white'
+                      : `bg-[var(--bg-soft)] border-white/15 text-[var(--ink-2)] ${clickable ? 'hover:bg-[var(--rule)] cursor-pointer' : 'cursor-default'}`
+                  }`}
+                >
+                  {d.isAlign ? `🔴 ${d.label}` : d.label}{d.active ? ' ✎' : ''}
+                </button>
+              );
+            })}
+          </div>
+        )}
         <div className="mt-3 grid grid-cols-2 gap-2">
           <button type="button" onClick={() => { setMode('excluded'); setEraser(false); }} className={`rounded px-2 py-2 font-bold ${mode === 'excluded' && !eraser ? 'bg-cyan-700' : 'bg-[var(--bg-soft)]'}`}>문에서 제외하기</button>
           <button type="button" onClick={() => { setMode('deleted'); setEraser(false); }} className={`rounded px-2 py-2 font-bold ${mode === 'deleted' && !eraser ? 'bg-red-700' : 'bg-[var(--bg-soft)]'}`}>제거하기</button>

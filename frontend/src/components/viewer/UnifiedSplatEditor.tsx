@@ -8,6 +8,7 @@ import LayerPanel from './LayerPanel';
 import MetadataPickerModal, { MetadataResult } from './MetadataPickerModal';
 import { useRefineTool } from './tools/useRefineTool';
 import { useRefinedMeshLoader } from './tools/useRefinedMeshLoader';
+import { useDoorLabels, type DoorLabelEntry } from './tools/useDoorLabels';
 import { useAdditionalGsplats, AdditionalGsplatSource } from './tools/useAdditionalGsplats';
 import { destroyMainDerivedMeshes, splitSceneFilesByExtension } from './tools/sourceManager';
 import { api } from '@/lib/api';
@@ -127,6 +128,23 @@ export default function UnifiedSplatEditor({
   const [, setSam3Prompt] = useState('');
   // SAM3 자동 추출 완료 시 doors.json 에서 가져온 4 corner. DoorAlignModal 에 prefill 로 전달.
   const [autoExtractedCorners, setAutoExtractedCorners] = useState<Array<[number, number, number]> | null>(null);
+  // N-door: 자동 추출된 모든 문 corners (raw 프레임). 3D 윤곽선으로 표시, 클릭으로 정합 문 지정.
+  const [allExtractedDoors, setAllExtractedDoors] = useState<Array<Array<[number, number, number]>> | null>(null);
+  // N-door: 각 문의 suggested_hinge_edge (door-ml 에서 감지한 손잡이 반대 변 인덱스, null=미감지).
+  const [allExtractedDoorHinges, setAllExtractedDoorHinges] = useState<Array<number | null> | null>(null);
+  const [alignmentDoorIdx, setAlignmentDoorIdx] = useState<number>(0); // 정합 문 index (기본 0)
+  // 비정합 문 회전 메타 오버라이드 (문 index → {hingeEdge, swing}). 미설정 시 검출 hinge + 안쪽(1).
+  //   hingeEdge: 회전축 변 인덱스 (3=좌측 수직변, 1=우측 수직변).
+  //   swing: 1=방 안쪽으로 열림, -1=방 바깥쪽.
+  const [doorRotMeta, setDoorRotMeta] = useState<Record<number, { hingeEdge?: number; swing: 1 | -1 }>>({});
+  const [nDoorHoverIdx, setNDoorHoverIdx] = useState<number | null>(null);
+  // 다듬기(cleanup) 모달 열림 — DoorAlignModal onCleanupOpenChange 가 갱신.
+  // 다듬기 중에는 좌클릭이 브러시이므로 N-door 정합문 클릭 지정 핸들러를 끈다.
+  const [doorCleanupOverlayOpen, setDoorCleanupOverlayOpen] = useState(false);
+  // N-door "모두 다듬기" 의 다듬기/finalize 가 완료되면 true → 기준 문 클릭 지정을 잠근다 (요청1).
+  // 재-다듬기 진입 시 DoorAlignModal 이 false 로 되돌린다.
+  const [nDoorRefineFinalized, setNDoorRefineFinalized] = useState(false);
+  const nDoorOutlinesRef = useRef<any[]>([]); // PlayCanvas DoorOutlineHandle[]
   // /sam3/start 응답을 받아 backend 가 sam3_status='running' 으로 commit 한 시점 이후에만 폴링을
   // 시작하기 위한 가드. 완료된 dispatch 결과가 새 시도에 섞이는 race 차단.
   const [sam3DispatchSent, setSam3DispatchSent] = useState(false);
@@ -706,6 +724,148 @@ export default function UnifiedSplatEditor({
     };
   }, []);
 
+  // ── N-door 와이어프레임 관리 ──
+  // allExtractedDoors 변경 시 PlayCanvas 씬에 컬러 와이어프레임 생성·파괴.
+  // nDoorSelectOpen 닫힐 때 / mode 변경 시 정리.
+  useEffect(() => {
+    nDoorOutlinesRef.current.forEach(h => { try { h.destroy(); } catch {} });
+    nDoorOutlinesRef.current = [];
+
+    if (!allExtractedDoors || allExtractedDoors.length === 0) return;
+    const pc = coreRef.current?.getPC?.();
+    const app = coreRef.current?.getApp?.();
+    if (!pc || !app) return;
+
+    const { createDoorOutlineEntity } = require('@/lib/gs/doorOutline');
+    // 기준(정합) 문 = 빨강, 나머지 = 구분되는 색 계열 (선분 색).
+    const ALIGN_COLOR: [number, number, number] = [1.0, 0.22, 0.22]; // red
+    const NON_ALIGN_COLORS: [number, number, number][] = [
+      [0.376, 0.647, 0.980], // blue
+      [0.204, 0.827, 0.600], // emerald
+      [0.957, 0.443, 0.714], // pink
+      [0.984, 0.573, 0.188], // orange
+    ];
+    allExtractedDoors.forEach((corners, idx) => {
+      if (corners.length < 4) return;
+      const isAlign = idx === alignmentDoorIdx;
+      const color: [number, number, number] = isAlign
+        ? ALIGN_COLOR
+        : NON_ALIGN_COLORS[idx % NON_ALIGN_COLORS.length];
+
+      const handle = createDoorOutlineEntity(pc, app, {
+        corners: corners as [number, number, number][],
+        unitName: isAlign ? '기준 문' : `문 ${idx + 1}`,
+        color,
+      });
+      nDoorOutlinesRef.current.push(handle);
+    });
+
+    return () => {
+      nDoorOutlinesRef.current.forEach(h => { try { h.destroy(); } catch {} });
+      nDoorOutlinesRef.current = [];
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [allExtractedDoors, alignmentDoorIdx]);
+
+  // 호버 시 해당 와이어프레임 강조 (scale)
+  useEffect(() => {
+    nDoorOutlinesRef.current.forEach((h, idx) => {
+      try {
+        const isHovered = nDoorHoverIdx === idx;
+        h.outlineEntity?.setLocalScale?.(isHovered ? 1.02 : 1.0, isHovered ? 1.02 : 1.0, isHovered ? 1.02 : 1.0);
+      } catch {}
+    });
+  }, [nDoorHoverIdx]);
+
+  // 문 설정 단계 벗어나면 와이어프레임 정리
+  useEffect(() => {
+    if (mode !== 'door') {
+      nDoorOutlinesRef.current.forEach(h => { try { h.destroy(); } catch {} });
+      nDoorOutlinesRef.current = [];
+      setAllExtractedDoors(null);
+      setAllExtractedDoorHinges(null);
+      setNDoorRefineFinalized(false);
+    }
+  }, [mode]);
+
+  // ── N-door 3D 클릭 → 정합 문 지정 ──
+  // 문 설정 중 + N개 문 있을 때 canvas 클릭 시,
+  // 클릭 ray 와 가장 가까운 문 quad 를 찾아 정합 문으로 지정.
+  // 단, 다듬기(cleanup) 중에는 좌클릭이 가우시안 브러시이므로 정합 문 지정 핸들러를 끈다
+  // (안 끄면 비정합 문 클릭이 정합 문 전환으로 오작동).
+  useEffect(() => {
+    if (mode !== 'door' || !allExtractedDoors || allExtractedDoors.length <= 1) return;
+    if (doorCleanupOverlayOpen) return;
+    // 다듬기/finalize 완료 후에는 기준 문을 고정 — 클릭으로 전환 불가 (요청1).
+    if (nDoorRefineFinalized) return;
+
+    const canvas = coreRef.current?.getCanvas?.();
+    if (!canvas) return;
+
+    const onClick = (e: MouseEvent) => {
+      if (e.button !== 0) return; // 좌클릭만
+      const core = coreRef.current;
+      const cam = core?.getCamera?.()?.camera;
+      const sd = core?.getSplatData?.();
+      const pc = core?.getPC?.();
+      if (!cam || !sd || !pc) return;
+
+      // world ray
+      const nearW = new pc.Vec3(), farW = new pc.Vec3();
+      cam.screenToWorld(e.clientX, e.clientY, cam.nearClip, nearW);
+      cam.screenToWorld(e.clientX, e.clientY, cam.farClip, farW);
+
+      // world → raw (splatEntity worldTransform 역변환)
+      const inv = new pc.Mat4().copy(sd.splatEntity.getWorldTransform()).invert();
+      const nearR = new pc.Vec3(), farR = new pc.Vec3();
+      inv.transformPoint(nearW, nearR);
+      inv.transformPoint(farW, farR);
+
+      const ox = nearR.x, oy = nearR.y, oz = nearR.z;
+      let dx = farR.x - ox, dy = farR.y - oy, dz = farR.z - oz;
+      const dl = Math.hypot(dx, dy, dz) || 1;
+      dx /= dl; dy /= dl; dz /= dl;
+
+      // ── ray ∩ 문 quad (Möller–Trumbore, 두 삼각형) → 가장 가까운(t 최소) 문 선택 ──
+      // 정확한 교차 테스트라 카메라 거리/각도와 무관하게 어느 문이든 자유롭게 (재)선택 가능.
+      type V3 = [number, number, number];
+      const rayTri = (a: V3, b: V3, c: V3): number | null => {
+        const e1x = b[0]-a[0], e1y = b[1]-a[1], e1z = b[2]-a[2];
+        const e2x = c[0]-a[0], e2y = c[1]-a[1], e2z = c[2]-a[2];
+        const px = dy*e2z - dz*e2y, py = dz*e2x - dx*e2z, pz = dx*e2y - dy*e2x;
+        const det = e1x*px + e1y*py + e1z*pz;
+        if (Math.abs(det) < 1e-9) return null;
+        const inv2 = 1/det;
+        const tx = ox-a[0], ty = oy-a[1], tz = oz-a[2];
+        const u = (tx*px + ty*py + tz*pz) * inv2;
+        if (u < -1e-4 || u > 1+1e-4) return null;
+        const qx = ty*e1z - tz*e1y, qy = tz*e1x - tx*e1z, qz = tx*e1y - ty*e1x;
+        const w = (dx*qx + dy*qy + dz*qz) * inv2;
+        if (w < -1e-4 || u + w > 1+1e-4) return null;
+        const t = (e2x*qx + e2y*qy + e2z*qz) * inv2;
+        return t > 0 ? t : null;
+      };
+
+      let bestIdx = -1, bestT = Infinity;
+      allExtractedDoors.forEach((corners, idx) => {
+        if (corners.length < 4) return;
+        const c0 = corners[0] as V3, c1 = corners[1] as V3, c2 = corners[2] as V3, c3 = corners[3] as V3;
+        const t = rayTri(c0, c1, c2) ?? rayTri(c0, c2, c3);
+        if (t !== null && t < bestT) { bestT = t; bestIdx = idx; }
+      });
+
+      if (bestIdx >= 0 && bestIdx !== alignmentDoorIdx) {
+        setAlignmentDoorIdx(bestIdx);
+        setAutoExtractedCorners(allExtractedDoors[bestIdx]);
+      }
+    };
+
+    canvas.addEventListener('mouseup', onClick);
+    return () => canvas.removeEventListener('mouseup', onClick);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  // (nDoorRefineFinalized 포함 — 잠금 상태가 바뀌면 핸들러를 재바인딩)
+  }, [mode, allExtractedDoors, alignmentDoorIdx, doorCleanupOverlayOpen, nDoorRefineFinalized]);
+
   // ── 레이어 ↔ mesh 연동 helper ──
   // 각 레이어는 자기 splat 외에도 연관된 wall/door mesh entity 들을 같이 hide/show 해야 함.
   //   module-main: wallMesh_* (basemap tag 없음)
@@ -775,9 +935,42 @@ export default function UnifiedSplatEditor({
     };
   }, [currentUrl, displayName, source, mainVisible]);
 
+  // ── N-door 라벨 (편집기): 기준 문 = "기준 문"(빨강), 나머지 = "문 N" ──
+  // raw 프레임 corners → 매 프레임 splatEntity.worldTransform 투영 (useDoorLabels).
+  const nDoorLabels = useMemo<DoorLabelEntry[]>(() => {
+    if (!allExtractedDoors || allExtractedDoors.length === 0) return [];
+    return allExtractedDoors.map((corners, idx) => ({
+      id: `ndoor_${idx}`,
+      unitName: idx === alignmentDoorIdx ? '기준 문' : `문 ${idx + 1}`,
+      corners: corners as number[][],
+      accent: idx === alignmentDoorIdx,
+    }));
+  }, [allExtractedDoors, alignmentDoorIdx]);
+  useDoorLabels(
+    coreRef,
+    nDoorLabels,
+    mode === 'door' && !isBasemapPurpose && nDoorLabels.length > 0,
+  );
+
+  // 비정합 문 (정합 문 제외) 원본 index 목록 — hinge/swing 메타를 필터 순서로 매핑할 때 사용.
+  const nonAlignDoorIndices = useMemo<number[]>(() => {
+    if (!allExtractedDoors || allExtractedDoors.length <= 1) return [];
+    return allExtractedDoors.map((_, i) => i).filter(i => i !== alignmentDoorIdx);
+  }, [allExtractedDoors, alignmentDoorIdx]);
+
+  // DoorAlignModal bake 로 내려보낼 비정합 문 hinge/swing (오버라이드 → 검출 hinge → 기본).
+  const nonAlignmentDoorHinges = useMemo<Array<number | null> | null>(() => {
+    if (nonAlignDoorIndices.length === 0) return null;
+    return nonAlignDoorIndices.map(i =>
+      doorRotMeta[i]?.hingeEdge ?? allExtractedDoorHinges?.[i] ?? null);
+  }, [nonAlignDoorIndices, doorRotMeta, allExtractedDoorHinges]);
+  const nonAlignmentDoorSwings = useMemo<Array<1 | -1> | null>(() => {
+    if (nonAlignDoorIndices.length === 0) return null;
+    return nonAlignDoorIndices.map(i => doorRotMeta[i]?.swing ?? 1);
+  }, [nonAlignDoorIndices, doorRotMeta]);
+
   // 좌측 패널(사이드바 + 레이어 + 툴) 숨김 토글 — 캔버스 가득 보고 싶을 때.
   const [panelHidden, setPanelHidden] = useState(false);
-  const [doorCleanupOverlayOpen, setDoorCleanupOverlayOpen] = useState(false);
   const handleCollapsePanel = useCallback(() => setPanelHidden(true), []);
   const handleExpandPanel = useCallback(() => setPanelHidden(false), []);
 
@@ -890,6 +1083,20 @@ export default function UnifiedSplatEditor({
               onClose={() => { if (!isBasemapPurpose) { void handleToggleMode('align'); } }}
               autoExtracting={autoExtracting}
               autoExtractedCorners={autoExtractedCorners}
+              activeDoorIndex={allExtractedDoors && allExtractedDoors.length > 1 ? alignmentDoorIdx : undefined}
+              suggestedHingeEdge={
+                allExtractedDoorHinges && allExtractedDoorHinges.length > alignmentDoorIdx
+                  ? allExtractedDoorHinges[alignmentDoorIdx]
+                  : null
+              }
+              nonAlignmentDoorCorners={
+                allExtractedDoors && allExtractedDoors.length > 1
+                  ? allExtractedDoors.filter((_, i) => i !== alignmentDoorIdx)
+                  : null
+              }
+              nonAlignmentDoorHinges={nonAlignmentDoorHinges}
+              nonAlignmentDoorSwings={nonAlignmentDoorSwings}
+              nonAlignmentDoorLabels={nonAlignDoorIndices.map(i => `문 ${i + 1}`)}
               basemapMode={isBasemapPurpose}
               basemapEditMode={isBasemapEditMode}
               basemapId={isBasemapEditMode ? initialBasemapId : undefined}
@@ -914,6 +1121,7 @@ export default function UnifiedSplatEditor({
                 setModuleDoorHingeEdge(typeof payload?.hingeEdge === 'number' ? payload.hingeEdge : null);
               }}
               onCleanupOpenChange={setDoorCleanupOverlayOpen}
+              onNDoorRefineFinalizedChange={setNDoorRefineFinalized}
               onManualPickStart={() => {
                 setAutoExtracting(false);
                 setSam3DispatchSent(false);
@@ -1069,12 +1277,15 @@ export default function UnifiedSplatEditor({
         {mode === 'door' && sam3PromptOpen && !isBasemapPurpose && (
           <Suspense fallback={null}>
             <Sam3PromptModal
-              onStartAuto={(prompt) => {
+              onStartAuto={(prompt, opts) => {
                 setSam3Prompt(prompt);
                 setSam3PromptOpen(false);
                 setAutoExtracting(true);
                 setSam3DispatchSent(false);
                 setAutoExtractedCorners(null);
+                setAllExtractedDoors(null);
+                setAlignmentDoorIdx(0);
+                setNDoorRefineFinalized(false);
                 // 백엔드 임시 보관 PLY 로 door-ml 직행. MinIO/DB 안 건드림.
                 // 백그라운드 업로드가 끝나기를 기다리고 detect-temp 호출.
                 (async () => {
@@ -1090,21 +1301,52 @@ export default function UnifiedSplatEditor({
                       return;
                     }
                     const bake = refine.getRemainingRotationToAY?.() ?? { rotX: 0, rotZ: 0, wallAngleRad: 0 };
-                    const resp = await api.post<{ corners: { left_top: { x: number; y: number; z: number }; right_top: { x: number; y: number; z: number }; right_bottom: { x: number; y: number; z: number }; left_bottom: { x: number; y: number; z: number } } }>(
+                    // 방법 B — 다듬기 확정 천장/바닥(A') + raw→A' 회전(bakedRotation) 전달.
+                    // null 이면 known-room 비활성 → door-ml 기본 추정 fallback.
+                    const roomFrame = refine.getRefinedRoomFrame?.() ?? null;
+                    const resp = await api.post<{
+                      corners: { left_top: { x: number; y: number; z: number }; right_top: { x: number; y: number; z: number }; right_bottom: { x: number; y: number; z: number }; left_bottom: { x: number; y: number; z: number } };
+                      all_doors?: Array<{ left_top: { x: number; y: number; z: number }; right_top: { x: number; y: number; z: number }; right_bottom: { x: number; y: number; z: number }; left_bottom: { x: number; y: number; z: number }; suggested_hinge_edge?: number | null }>;
+                    }>(
                       '/uploads/sam3/detect-temp',
-                      { session_id: sid, prompt, bake_rotation: bake },
+                      {
+                        session_id: sid,
+                        prompt,
+                        bake_rotation: bake,
+                        interior_min_hits: opts.interiorMinHits,
+                        interior_strict: opts.interiorStrict,
+                        ...(roomFrame ? {
+                          rot_x: roomFrame.rotX,
+                          rot_z: roomFrame.rotZ,
+                          floor_y: roomFrame.floorY,
+                          ceiling_y: roomFrame.ceilingY,
+                          ...(roomFrame.wallPolygon ? { wall_polygon: roomFrame.wallPolygon } : {}),
+                        } : {}),
+                      },
                     );
-                    const c = resp.corners;
-                    // SAM3 응답은 A'+Y 프레임 (bake_rotation 적용). raw 프레임 통일 컨벤션 (corners 는 메모리 내 raw 유지)
-                    // 에 맞추기 위해 ayToRaw 적용해 저장. commit-final 에서 다시 A'+Y 로 변환해 서버 저장.
-                    const orderAY: Array<[number, number, number]> = [
-                      [c.left_top.x, c.left_top.y, c.left_top.z],
-                      [c.right_top.x, c.right_top.y, c.right_top.z],
-                      [c.right_bottom.x, c.right_bottom.y, c.right_bottom.z],
-                      [c.left_bottom.x, c.left_bottom.y, c.left_bottom.z],
-                    ];
-                    const order = orderAY.map(ay => ayToRaw(ay, bake as FrameRotation));
-                    setAutoExtractedCorners(order);
+
+                    // A'+Y 프레임 → raw 변환 헬퍼
+                    const cornersAYtoRaw = (c: { left_top: {x:number;y:number;z:number}; right_top: {x:number;y:number;z:number}; right_bottom: {x:number;y:number;z:number}; left_bottom: {x:number;y:number;z:number} }): Array<[number,number,number]> => {
+                      const ay: Array<[number,number,number]> = [
+                        [c.left_top.x, c.left_top.y, c.left_top.z],
+                        [c.right_top.x, c.right_top.y, c.right_top.z],
+                        [c.right_bottom.x, c.right_bottom.y, c.right_bottom.z],
+                        [c.left_bottom.x, c.left_bottom.y, c.left_bottom.z],
+                      ];
+                      return ay.map(p => ayToRaw(p, bake as FrameRotation)) as Array<[number,number,number]>;
+                    };
+
+                    const primaryOrder = cornersAYtoRaw(resp.corners);
+
+                    // N-door: all_doors 파싱
+                    const rawAllDoors = (resp.all_doors ?? [resp.corners]).map(cornersAYtoRaw);
+                    setAllExtractedDoors(rawAllDoors);
+                    // N-door: suggested_hinge_edge 파싱 (없으면 null)
+                    const hinges = (resp.all_doors ?? []).map(d => d.suggested_hinge_edge ?? null);
+                    setAllExtractedDoorHinges(hinges.length > 0 ? hinges : null);
+                    setAlignmentDoorIdx(0); // score 최고(첫 번째)를 기본 정합 문으로
+                    // 정합 문(idx=0) corners 를 autoExtractedCorners 에 세팅
+                    setAutoExtractedCorners(primaryOrder);
                     setSam3DispatchSent(true);
                     setAutoExtracting(false);
                   } catch (e: any) {
@@ -1121,6 +1363,62 @@ export default function UnifiedSplatEditor({
               onClose={() => setSam3PromptOpen(false)}
             />
           </Suspense>
+        )}
+        {/* N-door: 문이 여러 개 검출됐을 때 안내 + 문별 회전(여닫기) 메타 설정. */}
+        {mode === 'door' && allExtractedDoors && allExtractedDoors.length > 1 && !autoExtracting && !isBasemapPurpose && (
+          <div className="bg-indigo-900/80 border border-indigo-500 rounded-lg px-4 py-2 text-xs text-indigo-100 space-y-2">
+            <div className="flex items-center gap-3">
+              <span className="font-bold">🚪 문 {allExtractedDoors.length}개 검출</span>
+              <span>빨간 윤곽선 = 기준 문 (기본: 가장 높은 확률). 다른 문을 기준 문으로 쓰려면 3D 뷰어에서 해당 문을 클릭하세요.</span>
+            </div>
+            <div className="grid gap-1">
+              {allExtractedDoors.map((_, idx) => {
+                const isAlign = idx === alignmentDoorIdx;
+                const meta = doorRotMeta[idx];
+                const hinge = meta?.hingeEdge ?? allExtractedDoorHinges?.[idx] ?? 3;
+                const swing = meta?.swing ?? 1;
+                // hinge/swing 은 이미 prev[idx] → 검출값 → 기본 순으로 해소된 현재 값.
+                const setMeta = (patch: { hingeEdge?: number; swing?: 1 | -1 }) =>
+                  setDoorRotMeta(prev => ({ ...prev, [idx]: { hingeEdge: hinge, swing, ...patch } }));
+                return (
+                  <div
+                    key={idx}
+                    className={`flex items-center gap-2 rounded px-2 py-1 ${isAlign ? 'bg-red-900/40 border border-red-500/60' : 'bg-black/20'}`}
+                    onMouseEnter={() => setNDoorHoverIdx(idx)}
+                    onMouseLeave={() => setNDoorHoverIdx(null)}
+                  >
+                    <span className={`w-16 font-bold ${isAlign ? 'text-red-300' : 'text-indigo-200'}`}>
+                      {isAlign ? '기준 문' : `문 ${idx + 1}`}
+                    </span>
+                    {isAlign ? (
+                      <span className="text-indigo-300/80">회전축·여닫기는 다듬기 단계에서 설정</span>
+                    ) : (
+                      <>
+                        <span className="text-indigo-300/80">경첩</span>
+                        <div className="flex rounded overflow-hidden border border-indigo-500/50">
+                          <button type="button"
+                            onClick={() => setMeta({ hingeEdge: 3 })}
+                            className={`px-2 py-0.5 ${hinge === 3 ? 'bg-indigo-500 text-white' : 'bg-transparent text-indigo-200'}`}>좌</button>
+                          <button type="button"
+                            onClick={() => setMeta({ hingeEdge: 1 })}
+                            className={`px-2 py-0.5 ${hinge === 1 ? 'bg-indigo-500 text-white' : 'bg-transparent text-indigo-200'}`}>우</button>
+                        </div>
+                        <span className="ml-2 text-indigo-300/80">방향</span>
+                        <div className="flex rounded overflow-hidden border border-indigo-500/50">
+                          <button type="button"
+                            onClick={() => setMeta({ swing: 1 })}
+                            className={`px-2 py-0.5 ${swing === 1 ? 'bg-indigo-500 text-white' : 'bg-transparent text-indigo-200'}`}>안쪽</button>
+                          <button type="button"
+                            onClick={() => setMeta({ swing: -1 })}
+                            className={`px-2 py-0.5 ${swing === -1 ? 'bg-indigo-500 text-white' : 'bg-transparent text-indigo-200'}`}>바깥</button>
+                        </div>
+                      </>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
         )}
         {/* 정합 단계 — 새 AlignPanel (basemap 자동 매칭 + 슝 애니메이션 + 수동 핸들 + 4×4 저장). */}
         {mode === 'align' && !isBasemapPurpose && (
@@ -1213,40 +1511,90 @@ export default function UnifiedSplatEditor({
                     const doorAssets = setupDoorAssetsRef.current;
                     const doorTextureField = 'door_tex_door_1';
                     const doorSplatField = 'door_splat_door_1';
+                    // 비정합 문 — DoorAlignModal 이 bakeNonAlignmentDoors 로 bake 한 결과 사용.
+                    // doorAssets.nonAlignmentDoors 없으면 빈 배열 (정합 문만 저장).
+                    const _nonAlignDoors = (doorAssets?.nonAlignmentDoors ?? []);
+
+                    // Bug fix: doorsJson 의 doorSplat ref 와 multipart 첨부를 일관되게 — splat 직렬화를
+                    // 먼저 수행해 성공한 문만 ref/첨부한다. (이전엔 ref 는 항상 넣고 첨부는 try/catch 로
+                    // 실패 시 누락 → 백엔드 "door splat 파일 누락 door_splat_*" 오류.)
+                    const nonAlignSplatBlobs = new Map<string, Blob>();
+                    {
+                      const { parsePly, serializePly } = await import('@/lib/ply');
+                      const { rotateScene, rotateSceneY } = await import('@/lib/gs');
+                      const br = refine.getRemainingRotationToAY?.() ?? { rotX: 0, rotZ: 0, wallAngleRad: 0 };
+                      for (const d of _nonAlignDoors) {
+                        if (!d.doorSplatBlobUrl) continue;
+                        try {
+                          const resp = await fetch(d.doorSplatBlobUrl);
+                          const buf = await resp.arrayBuffer();
+                          const doorScene = parsePly(buf);
+                          if (br.rotX !== 0 || br.rotZ !== 0) rotateScene(doorScene, br.rotX, br.rotZ);
+                          if (br.wallAngleRad !== 0) rotateSceneY(doorScene, br.wallAngleRad);
+                          nonAlignSplatBlobs.set(d.id, new Blob([serializePly(doorScene) as unknown as BlobPart], { type: 'application/octet-stream' }));
+                        } catch (e) {
+                          console.warn('[NonAlignDoor] splat 직렬화 실패 — doorSplat 생략', d.id, e);
+                        }
+                      }
+                    }
+
                     const doorsJson = JSON.stringify({
                       version: 1,
-                      doors: [{
-                        id: 'door_1',
-                        corners: doorCornersAY,
-                        unitName: initialRegistrationContext.module_name.trim(),
-                        ...(doorAssets ? {
-                          wallSurfaceId: doorAssets.wallSurfaceId,
-                          doorExtractionDepth: doorAssets.doorExtractionDepth,
-                          boundarySplitEnabled: doorAssets.boundarySplitEnabled,
-                          hingeEdge: doorAssets.hingeEdge,
-                          swing: doorAssets.swing,
-                          angleDeg: doorAssets.angleDeg,
-                        } : {}),
-                        ...(doorAssets?.doorMesh ? {
-                          doorMesh: {
-                            corners: doorAssets.doorMesh.corners,
-                            uvs: doorAssets.doorMesh.uvs,
-                            normalInward: doorAssets.doorMesh.normalInward,
-                            textureFilename: `form:${doorTextureField}`,
-                            textureWidth: doorAssets.doorMesh.textureWidth,
-                            textureHeight: doorAssets.doorMesh.textureHeight,
-                          },
-                        } : {}),
-                        ...(doorAssets?.doorSplat ? {
-                          doorSplat: {
-                            filename: `form:${doorSplatField}`,
-                          },
-                        } : {}),
-                        ...(doorFrame ? { doorFrame } : {}),
-                        ...(doorLeafSide ? { doorLeafSide } : {}),
-                        ...(pairedBasemapDoorId ? { pairedBasemapDoorId } : {}),
-                        alignDoorThickness,
-                      }],
+                      doors: [
+                        // 정합 문 (기존)
+                        {
+                          id: 'door_1',
+                          corners: doorCornersAY,
+                          unitName: initialRegistrationContext.module_name.trim(),
+                          ...(doorAssets ? {
+                            wallSurfaceId: doorAssets.wallSurfaceId,
+                            doorExtractionDepth: doorAssets.doorExtractionDepth,
+                            boundarySplitEnabled: doorAssets.boundarySplitEnabled,
+                            hingeEdge: doorAssets.hingeEdge,
+                            swing: doorAssets.swing,
+                            angleDeg: doorAssets.angleDeg,
+                          } : {}),
+                          ...(doorAssets?.doorMesh ? {
+                            doorMesh: {
+                              corners: doorAssets.doorMesh.corners,
+                              uvs: doorAssets.doorMesh.uvs,
+                              normalInward: doorAssets.doorMesh.normalInward,
+                              textureFilename: `form:${doorTextureField}`,
+                              textureWidth: doorAssets.doorMesh.textureWidth,
+                              textureHeight: doorAssets.doorMesh.textureHeight,
+                            },
+                          } : {}),
+                          ...(doorAssets?.doorSplat ? {
+                            doorSplat: { filename: `form:${doorSplatField}` },
+                          } : {}),
+                          ...(doorFrame ? { doorFrame } : {}),
+                          ...(doorLeafSide ? { doorLeafSide } : {}),
+                          ...(pairedBasemapDoorId ? { pairedBasemapDoorId } : {}),
+                          alignDoorThickness,
+                        },
+                        // 비정합 문들 (door mesh texture 포함)
+                        ..._nonAlignDoors.map(d => ({
+                          id: d.id,
+                          corners: d.cornersAY,
+                          unitName: '',
+                          wallSurfaceId: d.wallSurfaceId,
+                          hingeEdge: d.hingeEdge,
+                          swing: d.swing,
+                          ...(d.doorMesh ? {
+                            doorMesh: {
+                              corners: d.doorMesh.corners,
+                              uvs: d.doorMesh.uvs,
+                              normalInward: d.doorMesh.normalInward,
+                              textureFilename: `form:door_tex_${d.id}`,
+                              textureWidth: d.doorMesh.textureWidth,
+                              textureHeight: d.doorMesh.textureHeight,
+                            },
+                          } : {}),
+                          ...(nonAlignSplatBlobs.has(d.id) ? {
+                            doorSplat: { filename: `form:door_splat_${d.id}` },
+                          } : {}),
+                        })),
+                      ],
                     });
 
                     // 3) 덮어쓰기 사전 확인은 호수 휠 피커의 "호수 등록" 버튼에서 처리됨
@@ -1317,6 +1665,16 @@ export default function UnifiedSplatEditor({
                       const tex = assets.textures.get(sid);
                       if (!tex) throw new Error(`텍스처 누락: ${sid} (다듬기 단계에서 모든 면 베이크 필요)`);
                       form.append(`tex_${sid}`, tex, `tex_${sid}.png`);
+                    }
+                    // 비정합 문 texture / splat blob — splat 은 위에서 직렬화 성공한 것만 (doorsJson ref 와 일치).
+                    for (const d of _nonAlignDoors) {
+                      if (d.doorMesh?.textureBlob) {
+                        form.append(`door_tex_${d.id}`, d.doorMesh.textureBlob, `${d.id}.png`);
+                      }
+                      const splatBlob = nonAlignSplatBlobs.get(d.id);
+                      if (splatBlob) {
+                        form.append(`door_splat_${d.id}`, splatBlob, `${d.id}.ply`);
+                      }
                     }
                     if (sam3PrepareSessionIdRef.current) {
                       form.append('sam3_session_id', sam3PrepareSessionIdRef.current);

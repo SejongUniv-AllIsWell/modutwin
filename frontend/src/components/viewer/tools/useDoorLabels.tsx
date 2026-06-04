@@ -8,6 +8,8 @@ export interface DoorLabelEntry {
   unitName: string | null;       // null = 미설정 (회색 라벨로 "미설정" 표시)
   /** raw 프레임 4 corners. centroid 로 라벨 world 좌표 계산 (매 프레임 splatEntity.worldTransform 적용). */
   corners: number[][];
+  /** 기준(정합) 문 강조 — 빨강 라벨. 미지정 시 기존 스타일. */
+  accent?: boolean;
 }
 
 /**
@@ -60,13 +62,16 @@ export function useDoorLabels(
 
         const el = document.createElement('div');
         const hasName = !!door.unitName;
+        const accent = !!door.accent;
+        const bg = accent ? 'rgba(180,20,20,0.92)' : (hasName ? 'rgba(20,20,20,0.88)' : 'rgba(120,60,0,0.88)');
+        const border = accent ? 'rgba(255,120,120,0.95)' : (hasName ? 'rgba(250,204,21,0.85)' : 'rgba(250,200,100,0.85)');
         el.style.cssText = [
           'position:absolute',
           'transform:translate(-50%,calc(-100% - 10px))',
           'padding:4px 10px',
-          hasName ? 'background:rgba(20,20,20,0.88)' : 'background:rgba(120,60,0,0.88)',
+          `background:${bg}`,
           'color:#fff',
-          hasName ? 'border:1px solid rgba(250,204,21,0.85)' : 'border:1px solid rgba(250,200,100,0.85)',
+          `border:1px solid ${border}`,
           'border-radius:8px',
           'font-size:12px',
           'font-weight:600',
@@ -85,7 +90,7 @@ export function useDoorLabels(
           'width:0','height:0',
           'border-left:6px solid transparent',
           'border-right:6px solid transparent',
-          hasName ? 'border-top:6px solid rgba(20,20,20,0.88)' : 'border-top:6px solid rgba(120,60,0,0.88)',
+          `border-top:6px solid ${bg}`,
         ].join(';');
         el.appendChild(tail);
         overlay.appendChild(el);

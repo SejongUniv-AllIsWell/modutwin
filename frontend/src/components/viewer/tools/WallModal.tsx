@@ -1040,24 +1040,73 @@ export default function WallModal({
             <>
               ① 좌클릭으로 <span style={{color:'#22d3ee', fontWeight:'bold'}}>기준 선분</span> 선택 → ② <span style={{color:'#f59e0b', fontWeight:'bold'}}>대상 선분</span>들을 순서대로 클릭으로 평행화.
               <br />
-              우클릭 드래그로 선분을 수직 평행이동하고, 휠클릭 또는 스페이스+좌클릭 드래그로 화면을 이동합니다.
+              우클릭 드래그로 선분을 수직 평행이동하고, 휠클릭 또는 스페이스+좌클릭 드래그로 화면을 이동합니다. 되돌리기는 오른쪽 버튼을 사용합니다.
             </>
           ) : (
             <>
               좌클릭으로 점과 선을 추가, 기존 점은 드래그로 이동. 점을 클릭하면 직전에 선택한 점과 연결됩니다.
               <br />
-              모든 점이 닫힌 cycle 로 연결되어야 확인이 활성화됩니다. 우클릭/휠클릭 또는 스페이스+좌클릭 드래그로 화면 이동, 마우스 휠로 줌, 더블클릭으로 초기화.
+              모든 점이 닫힌 cycle 로 연결되어야 확인이 활성화됩니다. 우클릭/휠클릭 또는 스페이스+좌클릭 드래그로 화면 이동, 마우스 휠로 줌, 더블클릭으로 초기화. 되돌리기는 오른쪽 버튼을 사용합니다.
             </>
           )}
         </div>
-        <div>
-          <div className="text-[var(--muted)] text-[10px] mb-1 text-center">Top-down (XZ)</div>
-          <canvas ref={xzRef} style={{ width: CW, height: CH, userSelect: 'none' }}
-            className={`border border-[var(--rule)] rounded ${mode === 'parallel' ? 'cursor-pointer' : 'cursor-crosshair'}`}
-            onMouseDown={handleMouseDown}
-            onMouseMove={handleMouseMove}
-            onContextMenu={handleContextMenu} />
+        <div className="flex gap-3 items-start">
+          {/* 좌: top-down 캔버스 */}
+          <div>
+            <div className="text-[var(--muted)] text-[10px] mb-1 text-center">Top-down (XZ)</div>
+            <canvas ref={xzRef} style={{ width: CW, height: CH, userSelect: 'none' }}
+              className={`border border-[var(--rule)] rounded ${mode === 'parallel' ? 'cursor-pointer' : 'cursor-crosshair'}`}
+              onMouseDown={handleMouseDown}
+              onMouseMove={handleMouseMove}
+              onContextMenu={handleContextMenu} />
+          </div>
+          {/* 우: 세로 도구 사이드바 (되돌리기 → 초기화 → 평행 관련, 수직 순서) */}
+          <div className="flex flex-col gap-2 w-28 shrink-0" style={{ paddingTop: 18 }}>
+            <button
+              onClick={() => undoLastAction()}
+              disabled={undoDepth === 0}
+              className="w-full px-3 py-2 bg-[var(--bg-soft)] hover:bg-[var(--rule)] disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] disabled:cursor-not-allowed text-[var(--ink-2)] rounded text-xs cursor-pointer">
+              되돌리기
+            </button>
+            <button
+              onClick={() => resetPath()}
+              disabled={pathPoints.length === 0 && pathEdges.length === 0}
+              className="w-full px-3 py-2 bg-[var(--bg-soft)] hover:bg-[var(--rule)] disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] disabled:cursor-not-allowed text-[var(--ink-2)] rounded text-xs cursor-pointer">
+              초기화
+            </button>
+            {mode === 'parallel' ? (
+              <>
+                <button
+                  onClick={() => { parallelSelectedRef.current = []; setParallelSelected([]); }}
+                  disabled={parallelSelected.length === 0}
+                  className="w-full px-3 py-2 bg-[var(--bg-soft)] hover:bg-[var(--rule)] disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] disabled:cursor-not-allowed text-[var(--ink-2)] rounded text-xs cursor-pointer">
+                  선택 초기화
+                </button>
+                <button
+                  onClick={() => applyParallel()}
+                  disabled={parallelSelected.length < 2}
+                  title={parallelSelected.length < 2 ? '기준 + 대상 선분 2개 이상 선택 필요' : ''}
+                  className="w-full px-3 py-2 bg-cyan-600 hover:bg-cyan-500 disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] disabled:cursor-not-allowed text-[var(--ink)] rounded text-xs cursor-pointer font-bold">
+                  적용
+                </button>
+                <button
+                  onClick={() => toggleParallelMode()}
+                  className="w-full px-3 py-2 bg-amber-600 hover:bg-amber-500 text-[var(--ink)] rounded text-xs cursor-pointer">
+                  모드 해제
+                </button>
+              </>
+            ) : (
+              <button
+                onClick={() => toggleParallelMode()}
+                disabled={!derivedPolygon}
+                title={derivedPolygon ? '' : 'cycle 형성 후 사용 가능'}
+                className="w-full px-3 py-2 bg-cyan-700 hover:bg-cyan-600 disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] disabled:cursor-not-allowed text-[var(--ink)] rounded text-xs cursor-pointer">
+                평행하게 만들기
+              </button>
+            )}
+          </div>
         </div>
+        {/* 하단: 상태 텍스트 + 취소/확인 (modal 액션). parallel 모드는 취소/확인 미표시 (기존 동작 보존). */}
         <div className="flex items-center justify-between mt-3 gap-3">
           <div className="text-xs font-mono flex-1 min-w-0">
             <div className="text-[var(--muted)]">{`점 ${pathPoints.length}개, 선 ${pathEdges.length}개`}</div>
@@ -1074,61 +1123,19 @@ export default function WallModal({
               </div>
             )}
           </div>
-          <div className="flex gap-2 shrink-0">
-            <button
-              onClick={() => undoLastAction()}
-              disabled={undoDepth === 0}
-              className="px-3 py-2 bg-[var(--bg-soft)] hover:bg-[var(--rule)] disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] disabled:cursor-not-allowed text-[var(--ink-2)] rounded text-xs cursor-pointer">
-              되돌리기
-            </button>
-            <button
-              onClick={() => resetPath()}
-              disabled={pathPoints.length === 0 && pathEdges.length === 0}
-              className="px-3 py-2 bg-[var(--bg-soft)] hover:bg-[var(--rule)] disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] disabled:cursor-not-allowed text-[var(--ink-2)] rounded text-xs cursor-pointer">
-              초기화
-            </button>
-            {mode === 'parallel' ? (
-              <>
-                <button
-                  onClick={() => { parallelSelectedRef.current = []; setParallelSelected([]); }}
-                  disabled={parallelSelected.length === 0}
-                  className="px-3 py-2 bg-[var(--bg-soft)] hover:bg-[var(--rule)] disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] disabled:cursor-not-allowed text-[var(--ink-2)] rounded text-xs cursor-pointer">
-                  선택 초기화
-                </button>
-                <button
-                  onClick={() => applyParallel()}
-                  disabled={parallelSelected.length < 2}
-                  title={parallelSelected.length < 2 ? '기준 + 대상 선분 2개 이상 선택 필요' : ''}
-                  className="px-3 py-2 bg-cyan-600 hover:bg-cyan-500 disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] disabled:cursor-not-allowed text-[var(--ink)] rounded text-xs cursor-pointer font-bold">
-                  적용
-                </button>
-                <button
-                  onClick={() => toggleParallelMode()}
-                  className="px-3 py-2 bg-amber-600 hover:bg-amber-500 text-[var(--ink)] rounded text-xs cursor-pointer">
-                  모드 해제
-                </button>
-              </>
-            ) : (
-              <>
-                <button
-                  onClick={() => toggleParallelMode()}
-                  disabled={!derivedPolygon}
-                  title={derivedPolygon ? '' : 'cycle 형성 후 사용 가능'}
-                  className="px-3 py-2 bg-cyan-700 hover:bg-cyan-600 disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] disabled:cursor-not-allowed text-[var(--ink)] rounded text-xs cursor-pointer">
-                  평행하게 만들기
-                </button>
-                <button onClick={onClose}
-                  className="px-4 py-2 bg-[var(--bg-soft)] hover:bg-[var(--rule)] text-[var(--ink-2)] rounded text-sm cursor-pointer">취소</button>
-                <button onClick={() => {
-                  if (!derivedPolygon) return;
-                  onConfirm(derivedPolygon.angleDeg, derivedPolygon.polygon);
-                }}
-                  disabled={!derivedPolygon}
-                  title={derivedPolygon ? '' : cycleStatus}
-                  className="px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] disabled:cursor-not-allowed text-[var(--ink)] rounded text-sm cursor-pointer font-bold">확인</button>
-              </>
-            )}
-          </div>
+          {mode !== 'parallel' && (
+            <div className="flex gap-2 shrink-0">
+              <button onClick={onClose}
+                className="px-4 py-2 bg-[var(--bg-soft)] hover:bg-[var(--rule)] text-[var(--ink-2)] rounded text-sm cursor-pointer">취소</button>
+              <button onClick={() => {
+                if (!derivedPolygon) return;
+                onConfirm(derivedPolygon.angleDeg, derivedPolygon.polygon);
+              }}
+                disabled={!derivedPolygon}
+                title={derivedPolygon ? '' : cycleStatus}
+                className="px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] disabled:cursor-not-allowed text-[var(--ink)] rounded text-sm cursor-pointer font-bold">확인</button>
+            </div>
+          )}
         </div>
       </div>
     </div>

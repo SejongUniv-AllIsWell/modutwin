@@ -48,6 +48,7 @@ class TrapezoidMetrics:
     h_ratio: float               # min(top_w, bot_w) / max → 1.0=직사각
     v_ratio: float               # min(left_h, right_h) / max → 1.0=직사각
     all_corners_visible: bool    # 네 코너 모두 boundary margin 밖에 있음
+    top_corners_visible: bool    # 상단 2코너(TL,TR)만 margin 밖 (ray∩벽평면 방식용)
     img_size: int                # assumed square
 
 
@@ -132,10 +133,11 @@ def analyze_mask_quad(
 
     m = float(boundary_margin)
     hi = float(img_size - 1 - boundary_margin)
-    all_visible = all(
-        m <= float(pt[0]) <= hi and m <= float(pt[1]) <= hi
-        for pt in [TL, TR, BL, BR]
-    )
+    def _in(pt) -> bool:
+        return m <= float(pt[0]) <= hi and m <= float(pt[1]) <= hi
+
+    all_visible = all(_in(pt) for pt in [TL, TR, BL, BR])
+    top_visible = _in(TL) and _in(TR)
 
     return TrapezoidMetrics(
         quad_2d=ordered,
@@ -145,6 +147,7 @@ def analyze_mask_quad(
         h_ratio=h_ratio,
         v_ratio=v_ratio,
         all_corners_visible=all_visible,
+        top_corners_visible=top_visible,
         img_size=img_size,
     )
 
@@ -357,6 +360,8 @@ def run_iterative_approach(
     means_for_air_check: Optional[np.ndarray] = None,
     air_radius: float = 0.15,
     air_max_count: int = 20,
+    cam_rot: Optional[np.ndarray] = None,
+    require_all_corners: bool = True,
 ) -> tuple[list[IterativeView], ViewSelection, dict[tuple[str, int], CameraView]]:
     """Iterative door approach: Phase 4+5+6 통합 대체.
 
@@ -425,6 +430,11 @@ def run_iterative_approach(
 
     all_good_views: list[IterativeView] = []
 
+    # good view 판정: 기본은 네 코너 모두. ray∩벽평면 방식은 상단 2코너만 있으면 충분
+    # (하단은 floorY 로 도출) → require_all_corners=False.
+    def _is_good(m: "TrapezoidMetrics") -> bool:
+        return m.all_corners_visible if require_all_corners else m.top_corners_visible
+
     # ── 각 candidate 반복 ──
     for rank, (coarse_cam, coarse_mask_path, coarse_score) in enumerate(candidates):
         cand_dir = os.path.join(iterative_dir, f"candidate_{rank:02d}")
@@ -450,7 +460,7 @@ def run_iterative_approach(
         )
 
         # coarse view 자체가 good이면 포함
-        if metrics.all_corners_visible:
+        if _is_good(metrics):
             all_good_views.append(IterativeView(
                 camera=current_cam,
                 render_path="",  # coarse render은 외부에 있음
@@ -466,7 +476,7 @@ def run_iterative_approach(
 
         # 이미 충분히 직사각형이면 접근 불필요
         if (metrics.h_ratio >= rect_h_thresh and metrics.v_ratio >= rect_v_thresh
-                and metrics.all_corners_visible):
+                and _is_good(metrics)):
             print(f"[Iterative] candidate {rank}: early exit at coarse (already rectangular)", flush=True)
             continue
 
@@ -492,7 +502,7 @@ def run_iterative_approach(
 
             # 렌더
             iter_renders_dir = os.path.join(cand_dir, f"iter_{it:02d}", "renders")
-            render_paths = render_views(splats, [new_cam], iter_renders_dir, device=device)
+            render_paths = render_views(splats, [new_cam], iter_renders_dir, device=device, cam_rot=cam_rot)
             render_path = render_paths[0]
 
             # SAM3
@@ -542,7 +552,7 @@ def run_iterative_approach(
                 current_mask_path = new_mask_path
                 metrics = new_metrics
 
-                if new_metrics.all_corners_visible:
+                if _is_good(new_metrics):
                     all_good_views.append(IterativeView(
                         camera=new_cam,
                         render_path=render_path,
@@ -556,10 +566,10 @@ def run_iterative_approach(
                         candidate_rank=rank,
                     ))
 
-                # 조기 종료: 충분히 직사각형 + 네 코너 다 보임
+                # 조기 종료: 충분히 직사각형 + good view
                 if (new_metrics.h_ratio >= rect_h_thresh
                         and new_metrics.v_ratio >= rect_v_thresh
-                        and new_metrics.all_corners_visible):
+                        and _is_good(new_metrics)):
                     print(
                         f"[Iterative] candidate {rank} iter {it}: "
                         f"early exit (rectangular enough)",
@@ -581,9 +591,12 @@ def run_iterative_approach(
             "PLY/SAM3 품질, boundary_margin, min_score 점검. (D10 fail-fast)"
         )
 
+    # 4코너 보이는 뷰를 앞으로 정렬 → diversity filter 와 ray 생성 시 우선 사용.
+    all_good_views.sort(key=lambda v: (0 if v.all_corners_visible else 1, -v.score))
+    n_all4 = sum(1 for v in all_good_views if v.all_corners_visible)
     print(
         f"[Iterative] {len(all_good_views)} good views collected "
-        f"(all_corners_visible=True)",
+        f"({n_all4} with all-4-corners, {len(all_good_views)-n_all4} with top-2-only)",
         flush=True,
     )
 
