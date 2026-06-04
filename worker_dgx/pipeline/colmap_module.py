@@ -1,5 +1,6 @@
 import os
 import re
+import shlex
 import shutil
 import logging
 import subprocess
@@ -40,14 +41,22 @@ class ColmapModule(PipelineModule):
         return True
 
     def _run_cmd(self, cmd: list, step: str) -> str:
-        logger.info(f"[{self.name}] {step}: {' '.join(cmd)}")
+        cmd_text = shlex.join(cmd)
+        logger.info(f"[{self.name}] {step}: {cmd_text}")
         env = os.environ.copy()
         env.setdefault("QT_QPA_PLATFORM", "offscreen")
+        env.setdefault("GLOG_logtostderr", "1")
         try:
             result = subprocess.run(cmd, check=True, capture_output=True, text=True, env=env)
             return result.stdout + result.stderr
         except subprocess.CalledProcessError as e:
-            raise PipelineError(self.name, f"{step} 실패:\n{(e.stderr or '')[-500:]}")
+            output = "\n".join(part for part in [e.stdout, e.stderr] if part)
+            if not output:
+                output = "(stdout/stderr 비어 있음)"
+            raise PipelineError(
+                self.name,
+                f"{step} 실패 (exit={e.returncode}, cmd={cmd_text}):\n{output[-4000:]}",
+            )
         except FileNotFoundError:
             raise PipelineError(self.name, f"colmap 바이너리를 찾을 수 없습니다: {COLMAP_BIN}")
 
@@ -68,8 +77,8 @@ class ColmapModule(PipelineModule):
         self.validate_input(input_path)
         total_images = self._total_images
 
-        work_dir = os.path.join(tempfile.gettempdir(), f"colmap_{os.getpid()}")
-        os.makedirs(work_dir, exist_ok=True)
+        parent_dir = os.path.dirname(os.path.abspath(input_path.rstrip(os.sep)))
+        work_dir = tempfile.mkdtemp(prefix="colmap_", dir=parent_dir)
 
         database_path = os.path.join(work_dir, "database.db")
         sparse_dir    = os.path.join(work_dir, "sparse")
