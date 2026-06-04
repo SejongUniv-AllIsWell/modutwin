@@ -157,7 +157,7 @@ def _detect_params(body: "Sam3DetectTempRequest") -> dict:
     """door-ml /detect 쿼리 파라미터. known-room 이면 A' 천장/바닥 전달."""
     params: dict = {
         "prompt": body.prompt or "door",
-        "sam3_prob": 0.55,
+        "sam3_prob": 0.86,
         "interior_min_hits": body.interior_min_hits,
         "interior_perp_ratio": body.interior_perp_ratio,
         "interior_strict": body.interior_strict,
@@ -415,6 +415,10 @@ async def commit_final(
         ply_target=PlyTarget.alignment,
         status=UploadStatus.completed,
         sam3_status=None,  # module flow uses synchronous detect-temp, so no SAM3 task dispatch.
+        # 표준 조회 경로(uploads.py)가 doors.json / refined PLY 를 찾을 수 있도록 키를 기록.
+        # 누락 시 has_doors_json=False 가 되어 "문 정보 없음" 으로 끝난다 (commit-final 계약).
+        refined_ply_path=final_ply_key,
+        door_corners_json_path=doors_key,
     )
     db.add(upload)
     await db.flush()

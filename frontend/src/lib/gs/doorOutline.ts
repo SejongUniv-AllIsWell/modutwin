@@ -19,6 +19,7 @@ export interface DoorOutlineHandle {
   labelEntity: any | null;
   setUnitName(name: string | null): void;
   setCorners(corners: Vec3[]): void;
+  setColor(color: [number, number, number]): void;
   destroy(): void;
 }
 
@@ -30,6 +31,7 @@ export function createDoorOutlineEntity(
   opts: {
     corners: Vec3[];
     unitName: string | null;
+    color?: [number, number, number];          // 선분 색. 미지정 시 노랑.
     rotation?: [number, number, number, number]; // local quaternion. 미지정 시 Z-180.
   },
 ): DoorOutlineHandle {
@@ -38,12 +40,19 @@ export function createDoorOutlineEntity(
   root.addChild(outlineEnt);
 
   let cornersRef: Vec3[] = opts.corners.slice() as Vec3[];
+  const col = opts.color ?? OUTLINE_COLOR;
 
   // 광원 없는 씬 → emissive 만 보임.
+  // depthTest off + 투명 패스(BLEND_NORMAL, opacity 1) → 불투명 문 mesh/splat 위에 항상 또렷하게 렌더.
+  //   (불투명 패스로 두면 coplanar 한 문 mesh 와 draw order 가 엇갈려 선분이 가려질 수 있음.)
   const material = new pc.StandardMaterial();
-  material.emissive = new pc.Color(OUTLINE_COLOR[0], OUTLINE_COLOR[1], OUTLINE_COLOR[2]);
+  material.emissive = new pc.Color(col[0], col[1], col[2]);
   material.useLighting = false;
   material.cull = pc.CULLFACE_NONE;
+  material.depthTest = false;
+  material.depthWrite = false;
+  material.blendType = pc.BLEND_NORMAL;
+  material.opacity = 1;
   material.update();
 
   // corners 를 잇는 닫힌 line strip mesh (pc.PRIMITIVE_LINES).
@@ -96,6 +105,10 @@ export function createDoorOutlineEntity(
     setCorners(corners: Vec3[]): void {
       cornersRef = corners.slice() as Vec3[];
       rebuild();
+    },
+    setColor(color: [number, number, number]): void {
+      material.emissive = new pc.Color(color[0], color[1], color[2]);
+      material.update();
     },
     destroy(): void {
       try { root.destroy(); } catch {}

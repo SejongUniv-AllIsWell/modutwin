@@ -43,6 +43,27 @@ interface DoorCleanupSnapshot {
   boundarySplitEnabled: boolean;
 }
 
+// ── ③ N-door 동시 다듬기 (no-compaction 모델, docs/n_door_cleanup_plan.md) ──
+// 한 base scene 인덱스 공간에서 모든 문을 추출·유지. 메인 재구성/면 punch 는 combine 1회.
+interface CleanupDoorEntry {
+  doorIdx: number;                 // allExtractedDoors 원본 index (라벨/선택 매핑)
+  isAlign: boolean;
+  label: string;                   // "기준 문" | "문 N"
+  cornersRaw: Vec3[];              // raw 4코너 (base 기준)
+  wallSurfaceId: string;
+  splatId: string;                 // additional 레이어 id (생존 유지)
+  wrapper: any;                    // pc.Entity (Z-180 wrapper)
+  origIndexOrder: number[];        // 문 splat local idx ↔ base scene orig idx
+  snapshot: DoorCleanupSnapshot;   // base 기준 scene/decomp/alphaDeleted
+  states: Map<number, DoorCleanupState>; // 가우시안별 included/excluded/deleted
+  meshInput?: any;                 // door mesh texture 입력 (저장 자산용)
+  blobUrl?: string | null;         // door splat blob URL
+}
+// 면(surfaceId)별 punch 누적 — combine 시 base 텍스처에 합성 (한 문 적용이 타 문 hole 안 지우게).
+interface CleanupWallPunch {
+  cornersA: Vec3[];                // A' 프레임 문 코너
+}
+
 interface BasemapPendingDoor {
   doorId: string;
   cornersRaw: Vec3[];
@@ -107,6 +128,10 @@ interface Props {
   suggestedHingeEdge?: number | null;
   /** 비정합 문별 suggested_hinge_edge. nonAlignmentDoorCorners 와 1:1 대응. */
   nonAlignmentDoorHinges?: Array<number | null> | null;
+  /** 비정합 문별 swing 방향 (1=방 안쪽, -1=방 바깥쪽). nonAlignmentDoorCorners 와 1:1 대응. 미지정 시 1. */
+  nonAlignmentDoorSwings?: Array<1 | -1> | null;
+  /** 비정합 문 표시 라벨 (예: ["문 2","문 3"]). 다듬기 모달 chip 에 사용. nonAlignmentDoorCorners 와 1:1. */
+  nonAlignmentDoorLabels?: string[] | null;
   /**
    * 현재 활성(정합) 문 인덱스 (0-based). N개 문이 있을 때 부모가 전달.
    * 값이 바뀌면 picked / hinge 를 초기화하고 이전 추출을 revert — 새 문 corners 를 수신할 준비.
@@ -169,6 +194,12 @@ interface Props {
   /** 모듈 등록 흐름: 정합 완료 시 commit-final multipart 에 함께 넣을 문 옆면 mesh/texture/splat 자산. */
   onSetupDoorAssetsFinalized?: (payload: ModuleDoorAssetPayload | null) => void;
   onCleanupOpenChange?: (open: boolean) => void;
+  /**
+   * N-door "모두 다듬기" 의 다듬기/finalize 완료 여부를 부모에 통지.
+   * true → 부모가 N-door 정합문 클릭 지정 핸들러를 비활성화 (기준 문 고정).
+   * false → 재-다듬기 진입 시 (다시 선택 허용).
+   */
+  onNDoorRefineFinalizedChange?: (finalized: boolean) => void;
   /**
    * 부모 컴포넌트의 `useAdditionalGsplats` 인스턴스. 제공되면 자체 인스턴스 대신 사용.
    * DoorAlignModal 언마운트 시 자체 인스턴스의 cleanup 이 도어 splat entity 까지 destroy 하던 버그를 회피.
@@ -317,7 +348,7 @@ function derivePlanesFromMeshSurfaces(surfaces: any[]): SurfacePlane[] {
  * 정합 단계는 별도 `AlignPanel` 이 담당.
  */
 export default function DoorAlignModal({
-  coreRef, uploadId, currentUrl, onDone, onClose, autoExtracting = false, autoExtractedCorners = null, suggestedHingeEdge = null, nonAlignmentDoorCorners = null, nonAlignmentDoorHinges = null, activeDoorIndex, onManualPickStart, onSetupSaveDone, ensureUploadId, onCommitRefined, getCurrentKeepMask, getBakeRgba, getRemainingRotationToAY, markNextSplatLoadSkipRebake, onMainSplatReplaced, basemapMode = false, basemapEditMode = false, basemapId, basemapUnitName, basemapFloorId, basemapFloorNumber, onBasemapDone, deferPersistenceToAlign = false, onSetupCornersFinalized, onSetupDoorAssetsFinalized, onCleanupOpenChange, sharedAdditional,
+  coreRef, uploadId, currentUrl, onDone, onClose, autoExtracting = false, autoExtractedCorners = null, suggestedHingeEdge = null, nonAlignmentDoorCorners = null, nonAlignmentDoorHinges = null, nonAlignmentDoorSwings = null, nonAlignmentDoorLabels = null, activeDoorIndex, onManualPickStart, onSetupSaveDone, ensureUploadId, onCommitRefined, getCurrentKeepMask, getBakeRgba, getRemainingRotationToAY, markNextSplatLoadSkipRebake, onMainSplatReplaced, basemapMode = false, basemapEditMode = false, basemapId, basemapUnitName, basemapFloorId, basemapFloorNumber, onBasemapDone, deferPersistenceToAlign = false, onSetupCornersFinalized, onSetupDoorAssetsFinalized, onCleanupOpenChange, onNDoorRefineFinalizedChange, sharedAdditional,
 }: Props) {
   const [picked, setPicked] = useState<Array<PickedCorner | null>>(() => emptyPicked());
   // 모듈 등록 흐름: 문 설정 완료 시 메모리 보관 → 정합 완료 시 commit-final 페이로드에 포함.
@@ -618,6 +649,7 @@ export default function DoorAlignModal({
     if (!activeDoorIndexMountedRef.current) { activeDoorIndexMountedRef.current = true; return; }
     // 문 전환 — picked + hinge 초기화, 이전 추출 revert
     forcePickOverrideRef.current = true;
+    setNDoorRefineDone(false);  // 새 문 세트 → 다듬기 다시 허용 (옵션C)
     setPicked(emptyPicked());
     setSeqArmed(false);
     setHingeEdge(null);
@@ -1257,6 +1289,8 @@ export default function DoorAlignModal({
   // 슬라이더 변경 (활성 상태 시) → 600ms 디바운스 후 재적용.
   // ────────────────────────────────────────────────────────────────────
   const [doorRefineActive, setDoorRefineActive] = useState(false);
+  // N-door "모두 다듬기" 는 1회만 허용 (옵션C). finalize 완료 시 true → 버튼 비활성화.
+  const [nDoorRefineDone, setNDoorRefineDone] = useState(false);
   const [doorRefining, setDoorRefining] = useState(false);
   const [doorRefineError, setDoorRefineError] = useState<string | null>(null);
   const [doorCleanupOpen, setDoorCleanupOpen] = useState(false);
@@ -1317,10 +1351,14 @@ export default function DoorAlignModal({
 
     restore();
     const snapshot: Array<{ ent: any; enabled: boolean }> = [];
-    const keepRoot = activeDoorWrapperRef.current;
+    // 멀티도어(③) 면 모든 문 wrapper 를 keep-set 으로 유지 → N개 문 splat 동시 표시.
+    // 단일 문이면 기존대로 활성 wrapper 하나만 유지.
+    const keepRoots: Set<any> = multiDoorCleanupActiveRef.current && cleanupDoorsRef.current.length > 0
+      ? new Set(cleanupDoorsRef.current.map(e => e.wrapper))
+      : new Set([activeDoorWrapperRef.current]);
     const visit = (ent: any, insideDoorWrapper: boolean) => {
       if (!ent) return;
-      const isInsideDoor = insideDoorWrapper || ent === keepRoot;
+      const isInsideDoor = insideDoorWrapper || keepRoots.has(ent);
       const name = String(ent.name ?? '');
       const hide =
         !isInsideDoor &&
@@ -1353,6 +1391,40 @@ export default function DoorAlignModal({
   const doorCleanupSnapshotRef = useRef<DoorCleanupSnapshot | null>(null);
   const doorCleanupDoorOrigOrderRef = useRef<number[]>([]);
   const basemapPendingDoorRef = useRef<BasemapPendingDoor | null>(null);
+
+  // ── ③ N-door 동시 다듬기 상태 (docs/n_door_cleanup_plan.md) ──
+  // multiDoorCleanupActiveRef=true 동안 메인 compaction/reload·면 punch 통째 복원을 금지(no-compaction).
+  const multiDoorCleanupActiveRef = useRef(false);
+  // 모든 문 추출의 기준이 되는 base scene (compaction 전 메인). 진입 시 1회 캡처.
+  const cleanupBaseSceneRef = useRef<GaussianScene | null>(null);
+  // 문별 엔트리 (splat 생존 유지 + per-door 상태/스냅샷/자산).
+  const cleanupDoorsRef = useRef<CleanupDoorEntry[]>([]);
+  // 면(surfaceId)별 punch 누적 → combine 시 base 텍스처에 합성.
+  const cleanupWallPunchRef = useRef<Map<string, CleanupWallPunch[]>>(new Map());
+  // 현재 브러시/색칠 대상 문 (cleanupDoorsRef index). chip 클릭으로 전환(③-3).
+  const [activeCleanupDoorIdx, setActiveCleanupDoorIdx] = useState(0);
+  // ⑤ 다듬기 저장 영속화: 비정합 문별 cleaned splat blob URL (door id → url). bake 가 fresh 대신 사용.
+  const cleanedNonAlignSplatsRef = useRef<Map<string, string>>(new Map());
+  // ⑤ 기준 문 cleaned 상태 — 다듬기 종료 후 기준 문 재추출 시 적용.
+  const cleanedAlignStatesRef = useRef<Map<number, DoorCleanupState> | null>(null);
+  // ⑤ Part2 여닫기-all: 다듬기 종료 시 비정합 문도 bake 해 wrapper 를 살려둠.
+  //   bake 는 closeMultiDoorCleanup 보다 뒤에 정의되므로 ref 로 호출 (TDZ 회피).
+  const bakeNonAlignmentDoorsRef = useRef<(() => Promise<NonAlignmentDoorEntry[]>) | null>(null);
+  const finalizeNonAlignForSetupRef = useRef<(() => Promise<void>) | null>(null);
+  const nDoorFinalizedRef = useRef(false);                       // 비정합 문 bake 완료 → 완료 시 재bake 스킵.
+  const finalizedNonAlignDoorsRef = useRef<NonAlignmentDoorEntry[] | null>(null);
+  // 비정합 문 live wrapper + 코너/면 + 비정합 index(naIdx) + 현재 각도.
+  //   hinge/swing 은 여닫기 시점에 prop(nonAlignmentDoorHinges/Swings)에서 읽어 배너 변경 반영.
+  const extraDoorWrappersRef = useRef<Array<{
+    wrapper: any; cornersRaw: Vec3[]; naIdx: number; surfaceId: string; curAngle: number;
+  }>>([]);
+  // 비정합 문 여닫기 애니메이션 상태 (onUpdate 에서 기준 문 doorAnimRef 와 함께 처리).
+  const extraDoorAnimsRef = useRef<Array<{
+    entryIdx: number; hingeAxisA: [number, number, number]; hingeOriginA: [number, number, number];
+    fromAngleRad: number; toAngleRad: number; start: number; duration: number;
+  }>>([]);
+  // 멀티도어 다듬기 활성 (JSX 분기/리렌더용 — ref 와 동기).
+  const [multiDoorCleanupActive, setMultiDoorCleanupActive] = useState(false);
 
   // ── 힌지 회전 (edge state 는 위쪽 line/cylinder/edge-pick 효과 블록에서 선언) ──
   const hingeIndices = useMemo<number[]>(
@@ -2272,6 +2344,275 @@ export default function DoorAlignModal({
       basemapMode, basemapEditMode, getRemainingRotationToAY, onMainSplatReplaced, finalizeBasemapDoorExtraction,
       setDoorCleanupOpenSynced]);
 
+  // ── ③-1 N-door 동시 다듬기: base scene 캡처 + 단일 문 추출 헬퍼 (no-compaction) ──
+  // applyDoorRefine 의 decomp 경로(1820~1947)를 그대로 재사용하되, 메인 reload/면 punch 는 하지 않는다.
+  // 모든 문이 같은 base 인덱스 공간을 공유하도록, scene/alphaDeleted/keepMask 를 1회 캡처해 공유한다.
+
+  // 현재 메인 splat → GaussianScene + alphaDeleted + keepMask 캡처 (applyDoorRefine 1820-1839,1917-1926 동일).
+  const captureBaseSceneForCleanup = useCallback((): {
+    scene: GaussianScene; alphaDeleted: Uint8Array; keepMask: Uint8Array | null;
+  } | null => {
+    const core = coreRef.current;
+    const sd = core?.getSplatData();
+    const h2f = core?.half2Float;
+    if (!sd || !h2f) return null;
+    const g = sd.gsplatData;
+    const vertexElement = g?.getElement?.('vertex');
+    const propertyOrder: string[] = (vertexElement?.properties ?? []).map((p: { name: string }) => p.name);
+    const attrs = new Map<string, Float32Array>();
+    for (const prop of propertyOrder) {
+      const a = g?.getProp(prop);
+      if (a) attrs.set(prop, new Float32Array(a));
+    }
+    if (sd.posX) attrs.set('x', new Float32Array(sd.posX));
+    if (sd.posY) attrs.set('y', new Float32Array(sd.posY));
+    if (sd.posZ) attrs.set('z', new Float32Array(sd.posZ));
+    const scene: GaussianScene = { numSplats: sd.numSplats, attrs, propertyOrder };
+    const origColor = sd.origColorData;
+    const alphaDeleted = new Uint8Array(scene.numSplats);
+    if (origColor) {
+      for (let i = 0; i < scene.numSplats; i++) {
+        if (h2f(origColor[i * 4 + 3]) < 1e-3) alphaDeleted[i] = 1;
+      }
+    }
+    const keepMask = getCurrentKeepMask?.() ?? null;
+    return { scene, alphaDeleted, keepMask };
+  }, [coreRef, getCurrentKeepMask]);
+
+  // base scene 기준 단일 문 추출 — 도어 가우시안 scene + local↔orig 매핑 + snapshot 반환.
+  // 메인 splat / 면 텍스처는 건드리지 않는다 (no-compaction). 실패 시 null.
+  const extractOneDoorForCleanup = useCallback(async (
+    base: { scene: GaussianScene; alphaDeleted: Uint8Array; keepMask: Uint8Array | null },
+    cornersRaw: Vec3[],
+    surfaceId: string,
+  ): Promise<{ doorFullScene: GaussianScene; origIndexOrder: number[]; snapshot: DoorCleanupSnapshot } | null> => {
+    if (!planes || cornersRaw.length !== 4) return null;
+    const { scene, alphaDeleted, keepMask } = base;
+    const rotR = getCurrentEditorRotation();
+    const wallPlane = planes.find(p => p.id === surfaceId);
+    const wallNormalRaw: Vec3 | null = wallPlane ? aToRaw(wallPlane.normal as Vec3, rotR) : null;
+    const projectOnWall = (p: Vec3): Vec3 => {
+      if (!wallPlane || !wallNormalRaw) return p;
+      const n = wallNormalRaw;
+      const sd0 = n[0] * p[0] + n[1] * p[1] + n[2] * p[2] - wallPlane.d;
+      return [p[0] - sd0 * n[0], p[1] - sd0 * n[1], p[2] - sd0 * n[2]];
+    };
+    const corners: [Vec3, Vec3, Vec3, Vec3] = [
+      projectOnWall(cornersRaw[0]), projectOnWall(cornersRaw[1]),
+      projectOnWall(cornersRaw[2]), projectOnWall(cornersRaw[3]),
+    ];
+    const { decomposeBoundaryGaussians, buildDoorSubScene } = await import('@/lib/gs/doorTrim');
+    const { filterScene, concatScenes } = await import('@/lib/ply');
+    const decompRaw = decomposeBoundaryGaussians(scene, { corners }, {
+      doorExtractionDepth,
+      wallOutwardNormal: wallNormalRaw ?? wallPlane?.normal,
+    });
+    const decomp = keepMask
+      ? {
+          boundaryIndices: decompRaw.boundaryIndices.filter(i => keepMask[i] === 1),
+          doorOriginalIndices: decompRaw.doorOriginalIndices.filter(i => keepMask[i] === 1),
+          wallOriginalIndices: decompRaw.wallOriginalIndices.filter(i => keepMask[i] === 1),
+          wallSideUpdates: decompRaw.wallSideUpdates.filter(u => keepMask[u.idx] === 1),
+          doorSubMetadata: decompRaw.doorSubMetadata.filter(m => keepMask[m.origIdx] === 1),
+        }
+      : decompRaw;
+    const keepDoor = new Uint8Array(scene.numSplats);
+    for (const i of decomp.doorOriginalIndices) {
+      if (alphaDeleted[i]) continue;
+      keepDoor[i] = 1;
+    }
+    const filteredSubMeta = decomp.doorSubMetadata.filter((m: any) => !alphaDeleted[m.origIdx]);
+    const doorOrigScene = filterScene(scene, keepDoor);
+    const doorSubsScene = (boundarySplitEnabled && filteredSubMeta.length > 0)
+      ? buildDoorSubScene(scene, filteredSubMeta)
+      : null;
+    const doorFullScene = doorSubsScene ? concatScenes(doorOrigScene, doorSubsScene) : doorOrigScene;
+    if (doorFullScene.numSplats === 0) return null;
+    const origIndexOrder = decomp.doorOriginalIndices
+      .filter(i => keepDoor[i] === 1)
+      .concat(filteredSubMeta.map((m: any) => m.origIdx));
+    const snapshot: DoorCleanupSnapshot = { scene, decomp, alphaDeleted, boundarySplitEnabled };
+    return { doorFullScene, origIndexOrder, snapshot };
+  }, [planes, getCurrentEditorRotation, doorExtractionDepth, boundarySplitEnabled]);
+
+  // 멀티도어 cleanup 상태 정리 — splat 레이어 제거 + wrapper destroy + ref 초기화.
+  const closeMultiDoorCleanup = useCallback(() => {
+    // ⑤ 저장 영속화: teardown 전에 cleaned 결과를 보관.
+    //   - 비정합 문: cleaned splat blob URL 을 door id 별로 보관 (bake 가 fresh 대신 사용).
+    //   - 기준 문: cleaned states 보관 (재추출 후 rebuild 로 적용).
+    const alignEntry = cleanupDoorsRef.current.find(e => e.isAlign);
+    cleanedAlignStatesRef.current = (alignEntry && alignEntry.states.size > 0) ? new Map(alignEntry.states) : null;
+    cleanedNonAlignSplatsRef.current = new Map();
+    let naIdx = 0;
+    for (const e of cleanupDoorsRef.current) {
+      if (e.isAlign) continue;
+      if (e.blobUrl) cleanedNonAlignSplatsRef.current.set(`door_${naIdx + 2}`, e.blobUrl);
+      naIdx++;
+    }
+    const keepBlobs = new Set(cleanedNonAlignSplatsRef.current.values());
+
+    for (const e of cleanupDoorsRef.current) {
+      try { additional.remove(e.splatId); } catch {}
+      try { if (e.blobUrl && !keepBlobs.has(e.blobUrl)) URL.revokeObjectURL(e.blobUrl); } catch {}
+      try { e.wrapper?.destroy(); } catch {}
+    }
+    cleanupDoorsRef.current = [];
+    cleanupWallPunchRef.current = new Map();
+    cleanupBaseSceneRef.current = null;
+    multiDoorCleanupActiveRef.current = false;
+    setMultiDoorCleanupActive(false);
+    // 단일-문 ref 는 건드리지 않는다 (멀티도어는 cleanupDoorsRef 로만 동작 — 단일-문 추출 상태 보존).
+    setDoorCleanupOpenSynced(false);
+    setDoorCleanupViewerUrl(null);
+    // N-door 흐름: 다듬기 종료 → 기준 문 추출(applyDoorRefine)로 회전/완료 단계 활성화.
+    //   단일 "문 추출" 버튼을 대체한다. 추출 후 기준 문 cleaned states 를 적용해 다듬기 결과 영속화.
+    void (async () => {
+      try {
+        await applyDoorRefine();
+        const st = cleanedAlignStatesRef.current;
+        if (st && st.size > 0) {
+          doorCleanupStateRef.current = st;
+          await rebuildDoorRefineFromCleanup();
+        }
+        // ⑤ Part2: 비정합 문도 추출해 wrapper 를 살려둠 → setup 여닫기 + 정합 visibility.
+        await (finalizeNonAlignForSetupRef.current?.() ?? Promise.resolve());
+        // finalize 의 bakeNonAlignmentDoors 가 끝에 revertDoorRefine()(step5: doorRefineActive=false)을
+        // 호출해 게이트가 꺼진다. 기준 문은 실제 추출/생존 상태이므로 doorRefineActive 를 다시 켠다
+        // (회전/완료 단계 활성화).
+        setDoorRefineActive(true);
+        // 다듬기/finalize 완료 — 부모가 기준 문 클릭 지정을 잠근다 (요청1).
+        onNDoorRefineFinalizedChange?.(true);
+        // 옵션C: 다듬기는 1회만 — 이후 "모두 다듬기" 버튼 비활성화.
+        setNDoorRefineDone(true);
+      } catch (e) { console.warn('[NDoor] 기준 문 자동 추출/영속화 실패', e); }
+    })();
+  }, [additional, setDoorCleanupOpenSynced, applyDoorRefine, rebuildDoorRefineFromCleanup, onNDoorRefineFinalizedChange]);
+
+  // ③-2 모든 문(기준 + 비정합)을 base scene 기준으로 추출, splat 레이어 N개 동시 생존 → 다듬기 열기.
+  // no-compaction: 메인 splat/면 텍스처는 건드리지 않음. 단일-문 applyDoorRefine 경로와 독립.
+  const extractAllDoorsForCleanup = useCallback(async (): Promise<boolean> => {
+    const core = coreRef.current;
+    const pc = core?.getPC();
+    const app = core?.getApp();
+    const sd = core?.getSplatData();
+    if (!pc || !app || !sd || !planes || !allPicked) return false;
+    const base = captureBaseSceneForCleanup();
+    if (!base) return false;
+    cleanupBaseSceneRef.current = base.scene;
+    // 재-다듬기 진입 — 부모의 기준 문 클릭 잠금 해제 (요청1). close 시 다시 true 로.
+    onNDoorRefineFinalizedChange?.(false);
+    // 재-다듬기: 이전 finalize 결과/여닫기 wrapper 초기화 (close 시 다시 채워짐).
+    for (const w of extraDoorWrappersRef.current) { try { w.wrapper?.destroy(); } catch {} }
+    nDoorFinalizedRef.current = false;
+    finalizedNonAlignDoorsRef.current = null;
+    extraDoorWrappersRef.current = [];
+    extraDoorAnimsRef.current = [];
+
+    const rotR = getCurrentEditorRotation();
+    type DoorSpec = { doorIdx: number; isAlign: boolean; label: string; cornersRaw: Vec3[]; surfaceId: string };
+    const specs: DoorSpec[] = [];
+    const alignCorners = picked.filter((p): p is PickedCorner => p !== null).map(p => p.pos as Vec3);
+    if (alignCorners.length === 4) {
+      specs.push({ doorIdx: activeDoorIndex ?? 0, isAlign: true, label: '기준 문', cornersRaw: alignCorners, surfaceId: picked[0]!.surfaceId });
+    }
+    (nonAlignmentDoorCorners ?? []).forEach((dc, i) => {
+      const refA = rawToA(dc[0] as Vec3, rotR);
+      let bestId = '', bestDist = Infinity;
+      for (const p of planes) {
+        if (p.id === 'ceiling' || p.id === 'floor') continue;
+        const sdist = Math.abs(p.normal[0] * refA[0] + p.normal[1] * refA[1] + p.normal[2] * refA[2] - p.d);
+        if (sdist < bestDist) { bestDist = sdist; bestId = p.id; }
+      }
+      if (bestId) specs.push({ doorIdx: -1, isAlign: false, label: nonAlignmentDoorLabels?.[i] ?? `문 ${i + 2}`, cornersRaw: dc.map(c => c as Vec3), surfaceId: bestId });
+    });
+
+    // 기존 멀티도어 잔여 정리 (재진입).
+    for (const e of cleanupDoorsRef.current) { try { additional.remove(e.splatId); } catch {} try { e.wrapper?.destroy(); } catch {} }
+    cleanupDoorsRef.current = [];
+    cleanupWallPunchRef.current = new Map();
+
+    const { serializePly } = await import('@/lib/ply');
+    const entries: CleanupDoorEntry[] = [];
+    for (const spec of specs) {
+      const res = await extractOneDoorForCleanup(base, spec.cornersRaw, spec.surfaceId);
+      if (!res) continue;
+      const bytes = serializePly(res.doorFullScene);
+      const blobUrl = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
+      const { id, ready } = additional.add(blobUrl, { name: `다듬기 ${spec.label}`, source: 'local' });
+      if (!id) { try { URL.revokeObjectURL(blobUrl); } catch {} continue; }
+      await ready;
+      const ent = additional.getEntity(id);
+      // 멀티도어 cleanup 전용 wrapper — 단일-문 'moduleDoor'/activeDoorWrapperRef 와 충돌하지 않게 별도 이름.
+      const wrapper = new pc.Entity(`cleanupDoor_${entries.length}`, app);
+      { const r = sd.splatEntity.getLocalRotation(); wrapper.setLocalRotation(r.x, r.y, r.z, r.w); }
+      app.root.addChild(wrapper);
+      if (ent) { ent.setLocalRotation(0, 0, 0, 1); ent.setLocalPosition(0, 0, 0); try { wrapper.addChild(ent); } catch {} }
+      entries.push({
+        doorIdx: spec.doorIdx, isAlign: spec.isAlign, label: spec.label, cornersRaw: spec.cornersRaw,
+        wallSurfaceId: spec.surfaceId, splatId: id, wrapper, origIndexOrder: res.origIndexOrder,
+        snapshot: res.snapshot, states: new Map(), blobUrl,
+      });
+      const prev = cleanupWallPunchRef.current.get(spec.surfaceId) ?? [];
+      cleanupWallPunchRef.current.set(spec.surfaceId, [...prev, { cornersA: spec.cornersRaw.map(c => rawToA(c, rotR)) }]);
+    }
+    if (entries.length === 0) return false;
+    cleanupDoorsRef.current = entries;
+    multiDoorCleanupActiveRef.current = true;
+    setMultiDoorCleanupActive(true);
+    setActiveCleanupDoorIdx(0);
+    // 멀티도어는 cleanupDoorsRef + activeCleanupDoorIdx 로만 동작 (단일-문 ref 미사용).
+    setDoorCleanupViewerUrl(entries[0].blobUrl ?? null);
+    setDoorCleanupOpenSynced(true);
+    return true;
+  }, [coreRef, planes, allPicked, picked, activeDoorIndex, nonAlignmentDoorCorners, nonAlignmentDoorLabels,
+      getCurrentEditorRotation, captureBaseSceneForCleanup, extractOneDoorForCleanup, additional, setDoorCleanupOpenSynced, onNDoorRefineFinalizedChange]);
+
+  // ③-4 per-door rebuild — 해당 문 splat 레이어만 states 반영해 재생성 (메인/타 문 미변경).
+  // 'included' 만 도어 splat 에 유지 (excluded/deleted 는 표시에서 제외; 최종 저장 시 구분은 ⑤).
+  const rebuildOneDoorCleanup = useCallback(async (entryIdx: number) => {
+    const entry = cleanupDoorsRef.current[entryIdx];
+    if (!entry) return;
+    setDoorCleanupBusy(true);
+    try {
+      const snap = entry.snapshot;
+      const states = entry.states;
+      const { filterScene, serializePly, concatScenes } = await import('@/lib/ply');
+      const { buildDoorSubScene } = await import('@/lib/gs/doorTrim');
+      const keepDoor = new Uint8Array(snap.scene.numSplats);
+      for (const i of snap.decomp.doorOriginalIndices) {
+        if (snap.alphaDeleted[i]) continue;
+        if ((states.get(i) ?? 'included') === 'included') keepDoor[i] = 1;
+      }
+      const filteredSubMeta = snap.decomp.doorSubMetadata.filter((m: any) =>
+        !snap.alphaDeleted[m.origIdx] && ((states.get(m.origIdx) ?? 'included') === 'included'));
+      const doorOrigScene = filterScene(snap.scene, keepDoor);
+      const doorSubsScene = (snap.boundarySplitEnabled && filteredSubMeta.length > 0)
+        ? buildDoorSubScene(snap.scene, filteredSubMeta) : null;
+      const doorFullScene = doorSubsScene ? concatScenes(doorOrigScene, doorSubsScene) : doorOrigScene;
+      const newOrder = snap.decomp.doorOriginalIndices
+        .filter(i => keepDoor[i] === 1)
+        .concat(filteredSubMeta.map((m: any) => m.origIdx));
+
+      // 기존 레이어 제거 후 새 레이어 추가 + 같은 wrapper 로 재부모.
+      try { additional.remove(entry.splatId); } catch {}
+      if (entry.blobUrl) { try { URL.revokeObjectURL(entry.blobUrl); } catch {} }
+      if (doorFullScene.numSplats === 0) {
+        entry.splatId = ''; entry.blobUrl = null; entry.origIndexOrder = [];
+        return;
+      }
+      const bytes = serializePly(doorFullScene);
+      const blobUrl = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
+      const { id, ready } = additional.add(blobUrl, { name: `다듬기 ${entry.label}`, source: 'local' });
+      if (!id) { entry.splatId = ''; entry.blobUrl = null; entry.origIndexOrder = []; return; }
+      await ready;
+      const ent = additional.getEntity(id);
+      if (ent) { ent.setLocalRotation(0, 0, 0, 1); ent.setLocalPosition(0, 0, 0); try { entry.wrapper.addChild(ent); } catch {} }
+      entry.splatId = id; entry.blobUrl = blobUrl; entry.origIndexOrder = newOrder;
+    } finally {
+      setDoorCleanupBusy(false);
+    }
+  }, [additional]);
+
   // 비정합 문 일괄 bake — applyDoorRefine(cornersOverride) 재사용으로 full punch+bake+splat.
   // bakeNonAlignDoorModeRef=true 구간에서 revertDoorRefine 은 오버레이만 제거(PLY 재로드 없음) →
   // 각 문 구멍이 직전 문 구멍 위에 순차 누적됨. canonical scene 도 매 문마다 갱신(onMainSplatReplaced).
@@ -2310,9 +2651,12 @@ export default function DoorAlignModal({
         const meshInput = lastDoorMeshInputRef.current;
         const splatBlobUrl = doorSubBlobUrlRef.current;
         const cornersAY = dc.map(c => Array.from(rawToAY(c as Vec3, bakeRot as FrameRotation)));
-        // suggested_hinge_edge 우선 사용 → 없으면 현재 정합 문 힌지 → 최후 fallback 3(왼쪽 변)
-        const doorHinge = nonAlignmentDoorHinges?.[i] ?? hingeEdgeRef.current ?? 3;
-        const entry: NonAlignmentDoorEntry = { id: `door_${i + 2}`, cornersAY, wallSurfaceId: bestId, hingeEdge: doorHinge, swing: 1 };
+        // hinge: 사용자 오버라이드/감지값(nonAlignmentDoorHinges) → 없으면 좌측 수직변(3) 기하 기본값.
+        //   정합 문 힌지를 복사하지 않는다 (문마다 벽/방향이 달라 좌우가 반대로 열릴 수 있음).
+        const doorHinge = nonAlignmentDoorHinges?.[i] ?? 3;
+        // swing: 사용자 오버라이드(nonAlignmentDoorSwings) → 없으면 방 안쪽(1).
+        const doorSwingVal = nonAlignmentDoorSwings?.[i] ?? 1;
+        const entry: NonAlignmentDoorEntry = { id: `door_${i + 2}`, cornersAY, wallSurfaceId: bestId, hingeEdge: doorHinge, swing: doorSwingVal };
 
         if (meshInput && meshInput.rgba.length > 0) {
           try {
@@ -2333,21 +2677,85 @@ export default function DoorAlignModal({
             }
           } catch (e) { console.warn('[NonAlignDoor] texture encode failed', i, e); }
         }
-        if (splatBlobUrl) entry.doorSplatBlobUrl = splatBlobUrl;
+        // ⑤ 저장 영속화: 다듬기에서 정리한 cleaned splat 이 있으면 그것을 저장 (없으면 fresh).
+        //   mesh 텍스처는 bake 의 fresh 결과를 쓰고, 가우시안(splat)만 cleaned 로 교체.
+        const cleanedUrl = cleanedNonAlignSplatsRef.current.get(entry.id);
+        if (cleanedUrl) entry.doorSplatBlobUrl = cleanedUrl;
+        else if (splatBlobUrl) entry.doorSplatBlobUrl = splatBlobUrl;
         lastDoorMeshInputRef.current = null;
         doorSubBlobUrlRef.current = null;
+
+        // 비정합 문 wrapper(mesh + splat)를 살려둔다 — 정합 단계에서 mesh 가 보이게.
+        //   wrapper 를 고유 이름('moduleDoorExtra_*')으로 바꾸고 단일-문 ref 를 분리해,
+        //   다음 iteration 의 applyDoorRefine revert 가 destroy 하지 못하게 한다.
+        //   enterAlignmentMode 가 'moduleDoorExtra_*' 를 정합 그룹에 포함(아래 SplatViewerCore 변경).
+        const extraWrapper = activeDoorWrapperRef.current;
+        if (extraWrapper) { try { extraWrapper.name = `moduleDoorExtra_${entry.id}`; } catch {} }
+        activeDoorWrapperRef.current = null;
+        doorSubGsplatIdRef.current = null;
+        doorMeshEntityRef.current = null;
+
         results.push(entry);
       }
 
-      // 마지막 문의 scene 오버레이(splat layer, mesh entity) 정리 — PLY는 유지.
-      // bakeNonAlignDoorMode 에서 revertDoorRefine 은 PLY 재로드를 건너뛰므로 안전하게 호출 가능.
+      // 모든 비정합 문 wrapper 는 위에서 분리(살려둠) → 최종 revert 는 destroy 할 대상이 없다.
+      // (PLY 재로드 없는 bake 모드이므로 상태 정리만.)
       try { await revertDoorRefine(); } catch (e) { console.warn('[NonAlignDoor] final cleanup failed', e); }
 
       return results;
     } finally {
       bakeNonAlignDoorModeRef.current = false;
     }
-  }, [nonAlignmentDoorCorners, nonAlignmentDoorHinges, planes, getCurrentEditorRotation, getRemainingRotationToAY, applyDoorRefine, revertDoorRefine]);
+  }, [nonAlignmentDoorCorners, nonAlignmentDoorHinges, nonAlignmentDoorSwings, planes, getCurrentEditorRotation, getRemainingRotationToAY, applyDoorRefine, revertDoorRefine]);
+  // closeMultiDoorCleanup(앞쪽 정의)이 TDZ 없이 호출하도록 ref 동기.
+  bakeNonAlignmentDoorsRef.current = bakeNonAlignmentDoors;
+
+  // ⑤ Part2: 비정합 문을 bake 해 wrapper 를 살려두고, 여닫기 애니메이션 입력(extraDoorWrappersRef)을 구성.
+  //   다듬기 종료 시 1회 호출. 완료 단계는 이 결과(finalizedNonAlignDoorsRef)를 재사용(재bake 안 함).
+  const finalizeNonAlignForSetup = useCallback(async () => {
+    if (!nonAlignmentDoorCorners?.length || !planes) return;
+    // 기준 문 refs 를 bake 의 tear-down 에서 보호 (Bug1 detach 패턴) — 5개 ref 모두 보존.
+    const savedW = activeDoorWrapperRef.current, savedS = doorSubGsplatIdRef.current, savedM = doorMeshEntityRef.current;
+    const savedBlob = doorSubBlobUrlRef.current, savedMesh = lastDoorMeshInputRef.current;
+    activeDoorWrapperRef.current = null; doorSubGsplatIdRef.current = null; doorMeshEntityRef.current = null;
+    doorSubBlobUrlRef.current = null; lastDoorMeshInputRef.current = null;
+    let naDoors: NonAlignmentDoorEntry[] = [];
+    try { naDoors = await (bakeNonAlignmentDoorsRef.current?.() ?? Promise.resolve([])); }
+    finally {
+      activeDoorWrapperRef.current = savedW; doorSubGsplatIdRef.current = savedS; doorMeshEntityRef.current = savedM;
+      doorSubBlobUrlRef.current = savedBlob; lastDoorMeshInputRef.current = savedMesh;
+    }
+    finalizedNonAlignDoorsRef.current = naDoors;
+    nDoorFinalizedRef.current = true;
+
+    // extraDoorWrappersRef 구성 — 각 비정합 문 wrapper('moduleDoorExtra_door_*') + hinge 입력.
+    const app = coreRef.current?.getApp?.();
+    const rotR = getCurrentEditorRotation();
+    const findWrapper = (name: string): any => {
+      const root = app?.root; if (!root) return null;
+      const stack = [...(root.children ?? [])];
+      while (stack.length) { const e = stack.pop(); if (e?.name === name) return e; if (e?.children) stack.push(...e.children); }
+      return null;
+    };
+    const extras: typeof extraDoorWrappersRef.current = [];
+    nonAlignmentDoorCorners.forEach((dc, i) => {
+      const id = `door_${i + 2}`;
+      const wrapper = findWrapper(`moduleDoorExtra_${id}`);
+      if (!wrapper) return;
+      // surfaceId — bake 와 동일하게 가장 가까운 평면.
+      const refA = rawToA(dc[0] as Vec3, rotR);
+      let bestId = '', bestDist = Infinity;
+      for (const p of (planes ?? [])) {
+        if (p.id === 'ceiling' || p.id === 'floor') continue;
+        const sdist = Math.abs(p.normal[0]*refA[0] + p.normal[1]*refA[1] + p.normal[2]*refA[2] - p.d);
+        if (sdist < bestDist) { bestDist = sdist; bestId = p.id; }
+      }
+      if (!bestId) return;
+      extras.push({ wrapper, cornersRaw: dc.map(c => c as Vec3), naIdx: i, surfaceId: bestId, curAngle: 0 });
+    });
+    extraDoorWrappersRef.current = extras;
+  }, [nonAlignmentDoorCorners, planes, coreRef, getCurrentEditorRotation]);
+  finalizeNonAlignForSetupRef.current = finalizeNonAlignForSetup;
 
   // 서버에서 corners 복원 후 1회 자동 문 추출 — 다시 들어와도 회전이 바로 활성.
   // 수동 픽 (사용자가 4점 직접 클릭) 일 때는 발동 안 함 (serverHydratedRef 게이트).
@@ -2612,43 +3020,104 @@ export default function DoorAlignModal({
     if (!core) return;
     return core.onUpdate(() => {
       const a = doorAnimRef.current;
-      if (!a) return;
+      const extras = extraDoorAnimsRef.current;
+      if (!a && extras.length === 0) return;
       const pc = core.getPC();
       if (!pc) return;
-      const tNorm = Math.min(1, (performance.now() - a.start) / a.duration);
-      const u = easeInOutCubic(tNorm);
-      const angle = a.fromAngleRad + (a.toAngleRad - a.fromAngleRad) * u;
-      const half = angle / 2;
-      const sH = Math.sin(half), cH = Math.cos(half);
-      const qR = new pc.Quat(a.hingeAxisA[0]*sH, a.hingeAxisA[1]*sH, a.hingeAxisA[2]*sH, cH);
-      // baseRot = splatEntity 의 현재 회전 (saveRefined 후 Z-180 만). 메인과 동일.
+      // baseRot = splatEntity 의 현재 회전 (Z-180). 기준 문/비정합 문 공통.
       const sd = core.getSplatData();
       const sr = sd?.splatEntity?.getLocalRotation();
       const baseRot = sr
         ? new pc.Quat(sr.x, sr.y, sr.z, sr.w)
         : (() => { const q = new pc.Quat(); q.setFromEulerAngles(0, 0, 180); return q; })();
-      const localRot = new pc.Quat();
-      localRot.copy(baseRot).mul(qR);
-      const hingeVec = new pc.Vec3(a.hingeOriginA[0], a.hingeOriginA[1], a.hingeOriginA[2]);
-      const rotatedHinge = new pc.Vec3();
-      qR.transformVector(hingeVec, rotatedHinge);
-      // A' 프레임에서 hinge 점이 회전 후에도 그 자리에 남도록 보정 → baseRot 으로 world 방향으로 옮김.
-      const offsetA = new pc.Vec3(a.hingeOriginA[0] - rotatedHinge.x, a.hingeOriginA[1] - rotatedHinge.y, a.hingeOriginA[2] - rotatedHinge.z);
-      const offsetWorld = new pc.Vec3();
-      baseRot.transformVector(offsetA, offsetWorld);
-
-      const wrapper = activeDoorWrapperRef.current;
-      if (wrapper) {
+      // 한 wrapper 를 hinge 기준 angle 로 회전 (회전축 고정 보정 포함).
+      const poseWrapper = (
+        wrapper: any, hingeAxisA: [number, number, number], hingeOriginA: [number, number, number], angle: number,
+      ) => {
+        if (!wrapper) return;
+        const half = angle / 2;
+        const sH = Math.sin(half), cH = Math.cos(half);
+        const qR = new pc.Quat(hingeAxisA[0]*sH, hingeAxisA[1]*sH, hingeAxisA[2]*sH, cH);
+        const localRot = new pc.Quat();
+        localRot.copy(baseRot).mul(qR);
+        const hingeVec = new pc.Vec3(hingeOriginA[0], hingeOriginA[1], hingeOriginA[2]);
+        const rotatedHinge = new pc.Vec3();
+        qR.transformVector(hingeVec, rotatedHinge);
+        const offsetA = new pc.Vec3(hingeOriginA[0] - rotatedHinge.x, hingeOriginA[1] - rotatedHinge.y, hingeOriginA[2] - rotatedHinge.z);
+        const offsetWorld = new pc.Vec3();
+        baseRot.transformVector(offsetA, offsetWorld);
         wrapper.setLocalRotation(localRot.x, localRot.y, localRot.z, localRot.w);
         wrapper.setLocalPosition(offsetWorld.x, offsetWorld.y, offsetWorld.z);
+      };
+
+      // 기준 문 (activeDoorWrapperRef).
+      if (a) {
+        const tNorm = Math.min(1, (performance.now() - a.start) / a.duration);
+        const angle = a.fromAngleRad + (a.toAngleRad - a.fromAngleRad) * easeInOutCubic(tNorm);
+        poseWrapper(activeDoorWrapperRef.current, a.hingeAxisA, a.hingeOriginA, angle);
+        if (tNorm >= 1) { doorCurrentAngleRef.current = a.toAngleRad; doorAnimRef.current = null; }
       }
 
-      if (tNorm >= 1) {
-        doorCurrentAngleRef.current = a.toAngleRad;
-        doorAnimRef.current = null;
+      // 비정합 문들 (extraDoorWrappersRef).
+      if (extras.length > 0) {
+        let anyActive = false;
+        for (const ea of extras) {
+          const entry = extraDoorWrappersRef.current[ea.entryIdx];
+          if (!entry) continue;
+          const tN = Math.min(1, (performance.now() - ea.start) / ea.duration);
+          const ang = ea.fromAngleRad + (ea.toAngleRad - ea.fromAngleRad) * easeInOutCubic(tN);
+          poseWrapper(entry.wrapper, ea.hingeAxisA, ea.hingeOriginA, ang);
+          if (tN >= 1) entry.curAngle = ea.toAngleRad; else anyActive = true;
+        }
+        if (!anyActive) extraDoorAnimsRef.current = [];
       }
     });
   }, [coreRef, additional]);
+
+  // ⑤ Part2: 한 문(corners + hingeEdge + swing + surfaceId)의 hinge 축/원점/열림각 계산.
+  //   applyDoorRotation 과 동일한 수식 (raw 프레임). 비정합 문 여닫기 애니메이션에 사용.
+  const computeDoorHinge = useCallback((
+    cornersRaw: Vec3[], hingeEdge: number, swing: 1 | -1, surfaceId: string,
+  ): { hingeAxisA: [number, number, number]; hingeOriginA: [number, number, number]; angleRad: number } | null => {
+    if (!planes || cornersRaw.length !== 4) return null;
+    const h1 = ((hingeEdge % 4) + 4) % 4;
+    const h2 = (h1 + 1) % 4;
+    const hs = cornersRaw[h1], he = cornersRaw[h2];
+    const hxv = he[0] - hs[0], hyv = he[1] - hs[1], hzv = he[2] - hs[2];
+    const hLen = Math.hypot(hxv, hyv, hzv) || 1;
+    const ax = hxv / hLen, ay = hyv / hLen, az = hzv / hLen;
+    const otherIdx = [0, 1, 2, 3].find(i => i !== h1 && i !== h2);
+    if (otherIdx === undefined) return null;
+    const P = cornersRaw[otherIdx];
+    const dxv = P[0] - hs[0], dyv = P[1] - hs[1], dzv = P[2] - hs[2];
+    const crossX = ay * dzv - az * dyv, crossY = az * dxv - ax * dzv, crossZ = ax * dyv - ay * dxv;
+    const wallPlane = planes.find(p => p.id === surfaceId);
+    if (!wallPlane) return null;
+    const wn = aToRaw(wallPlane.normal as Vec3, getCurrentEditorRotation());
+    const dotCN = crossX * wn[0] + crossY * wn[1] + crossZ * wn[2];
+    const insideSign = dotCN > 0 ? -1 : 1;
+    const angleRad = swing * insideSign * doorAngleDeg * Math.PI / 180;
+    return { hingeAxisA: [ax, ay, az], hingeOriginA: [hs[0], hs[1], hs[2]], angleRad };
+  }, [planes, getCurrentEditorRotation, doorAngleDeg]);
+
+  // ⑤ Part2: 비정합 문 전체 여닫기 (open=true 열기, false 닫기). extraDoorWrappersRef 의 각 문 애니 시작.
+  //   hinge/swing 은 현재 prop 에서 읽음 → 배너에서 변경한 회전축/방향 즉시 반영.
+  const setExtraDoorsOpen = useCallback((open: boolean) => {
+    const anims: typeof extraDoorAnimsRef.current = [];
+    extraDoorWrappersRef.current.forEach((w, idx) => {
+      if (!w.wrapper) return;
+      const hingeEdge = nonAlignmentDoorHinges?.[w.naIdx] ?? 3;
+      const swing = nonAlignmentDoorSwings?.[w.naIdx] ?? 1;
+      const h = computeDoorHinge(w.cornersRaw, hingeEdge, swing, w.surfaceId);
+      if (!h) return;
+      anims.push({
+        entryIdx: idx, hingeAxisA: h.hingeAxisA, hingeOriginA: h.hingeOriginA,
+        fromAngleRad: w.curAngle, toAngleRad: open ? h.angleRad : 0,
+        start: performance.now(), duration: 800,
+      });
+    });
+    extraDoorAnimsRef.current = anims;
+  }, [computeDoorHinge, nonAlignmentDoorHinges, nonAlignmentDoorSwings]);
 
   const applyDoorRotation = useCallback(() => {
     if (hingeIndices.length !== 2) {
@@ -2931,6 +3400,9 @@ export default function DoorAlignModal({
             >
               {doorInternalShow ? '문 영역 확인 OFF' : '문 영역 확인'}
             </button>
+            {/* 단일 문 흐름: 문 추출 버튼이 바로 다듬기로 진입. N-door 흐름에서는 숨김
+                (N-door 는 아래 "N개 문 모두 다듬기" 가 추출 역할 — 기준문 단일 추출/다듬기 진입 off). */}
+            {!(activeDoorIndex !== undefined && nonAlignmentDoorCorners && nonAlignmentDoorCorners.length > 0) && (
             <button
               onClick={async () => {
                 if (doorRefineActive) {
@@ -2949,11 +3421,33 @@ export default function DoorAlignModal({
                   : 'bg-blue-600 hover:bg-blue-500 text-[var(--ink)]'
               }`}
             >
-              {doorRefining ? '처리 중...' : (doorRefineActive ? '문 추출 취소' : (
-                activeDoorIndex !== undefined ? `문 ${activeDoorIndex + 1} 추출` : '문 추출'
-              ))}
+              {doorRefining ? '처리 중...' : (doorRefineActive ? '문 추출 취소' : '문 추출')}
             </button>
+            )}
           </div>
+          {/* N-door 흐름: 모든 문(기준+비정합) splat 동시 다듬기. 이 버튼이 추출 역할 —
+              다듬기 완료(닫기) 시 기준 문이 자동 추출되어 회전/완료 단계가 활성화된다. */}
+          {!basemapMode && activeDoorIndex !== undefined && nonAlignmentDoorCorners && nonAlignmentDoorCorners.length > 0 && (
+            <button
+              type="button"
+              onClick={async () => {
+                if (doorRefineActive) { await revertDoorRefine(); }
+                try {
+                  const ok = await extractAllDoorsForCleanup();
+                  if (!ok) setDoorRefineError('N개 문 동시 추출 실패 (검출 문/평면 확인)');
+                } catch (e: any) { setDoorRefineError(`N개 문 동시 다듬기 실패: ${e?.message ?? e}`); }
+              }}
+              disabled={!allPicked || doorRefining || doorCleanupBusy || nDoorRefineDone}
+              className="mt-1.5 w-full px-3 py-1.5 rounded cursor-pointer text-xs font-bold text-[var(--ink)] bg-fuchsia-700 hover:bg-fuchsia-600 disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)]"
+              title={nDoorRefineDone
+                ? '다듬기는 1회만 가능합니다. 다시 다듬으려면 문을 재검출하세요.'
+                : '검출된 모든 문(기준+비정합) splat 을 동시에 표시하고 chip 으로 전환하며 다듬기'}
+            >
+              {nDoorRefineDone
+                ? '✓ 문 다듬기 완료'
+                : `🚪×${(nonAlignmentDoorCorners.length ?? 0) + 1} 문 모두 다듬기`}
+            </button>
+          )}
         </div>
 
         {/* ── 문 회전 (힌지 + 각도 + 방향) — 모듈 등록에서만. ──
@@ -3029,7 +3523,10 @@ export default function DoorAlignModal({
           </div>
 
           <button
-            onClick={() => { if (doorRotated) resetDoorRotation(); else applyDoorRotation(); }}
+            onClick={() => {
+              if (doorRotated) { resetDoorRotation(); setExtraDoorsOpen(false); }
+              else { applyDoorRotation(); setExtraDoorsOpen(true); }
+            }}
             disabled={hingeIndices.length !== 2 || !doorRefineActive}
             title={!doorRefineActive ? '먼저 문 추출 을 누르세요.' : (hingeIndices.length !== 2 ? '회전축 변을 먼저 선택' : '')}
             className={`w-full px-3 py-1.5 rounded cursor-pointer text-xs font-bold disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] ${
@@ -3408,8 +3905,27 @@ export default function DoorAlignModal({
                       ...(doorSplat ? { doorSplat } : {}),
                     };
                   }
-                  // 비정합 문 door mesh bake (백그라운드)
-                  const nonAlignDoors = await bakeNonAlignmentDoors();
+                  // 비정합 문 door mesh bake.
+                  // ⑤ Part2: N-door 다듬기 종료 시 이미 bake 했으면(nDoorFinalizedRef) 그 결과 재사용 — 재bake 안 함.
+                  //   (재bake 하면 setup 에서 살려둔 wrapper 와 충돌.)
+                  let nonAlignDoors: NonAlignmentDoorEntry[];
+                  if (nDoorFinalizedRef.current && finalizedNonAlignDoorsRef.current) {
+                    nonAlignDoors = finalizedNonAlignDoorsRef.current;
+                  } else {
+                    // bakeNonAlignmentDoors 는 단일 activeDoorWrapperRef/doorSubGsplatIdRef 를 재사용하며
+                    // 정합 문의 live wrapper/mesh/splat 를 소모(destroy)한다. → bake 전에 정합 문 ref 를
+                    // 분리(detach)해 tear-down 대상에서 제외, bake 후 복원.
+                    const savedAlignWrapper = activeDoorWrapperRef.current;
+                    const savedAlignSplatId = doorSubGsplatIdRef.current;
+                    const savedAlignMeshEnt = doorMeshEntityRef.current;
+                    activeDoorWrapperRef.current = null;
+                    doorSubGsplatIdRef.current = null;
+                    doorMeshEntityRef.current = null;
+                    nonAlignDoors = await bakeNonAlignmentDoors();
+                    activeDoorWrapperRef.current = savedAlignWrapper;
+                    doorSubGsplatIdRef.current = savedAlignSplatId;
+                    doorMeshEntityRef.current = savedAlignMeshEnt;
+                  }
                   if (nonAlignDoors.length > 0) {
                     payload = payload ? { ...payload, nonAlignmentDoors: nonAlignDoors } : null;
                   }
@@ -3647,14 +4163,45 @@ export default function DoorAlignModal({
 
       {/* 현재 뷰어 위에서 문 후보 splat 을 정리하고 메인/도어 splat 으로 재분배한다. */}
       {doorCleanupOpen && doorCleanupViewerUrl && typeof document !== 'undefined' && createPortal((
+        (() => {
+          // ③ 멀티도어: 활성 문(activeCleanupDoorIdx) 엔트리로 모달 바인딩 + chip 전환.
+          const md = multiDoorCleanupActive ? cleanupDoorsRef.current : null;
+          const active = md?.[activeCleanupDoorIdx] ?? null;
+          const splatEnt = active
+            ? additional.getEntity(active.splatId)
+            : (doorSubGsplatIdRef.current ? additional.getEntity(doorSubGsplatIdRef.current) : null);
+          return (
         <DoorCleanupViewerModal
           coreRef={coreRef}
-          doorSplatEntity={doorSubGsplatIdRef.current ? additional.getEntity(doorSubGsplatIdRef.current) : null}
-          origIndexOrder={doorCleanupDoorOrigOrderRef.current}
-          initialStates={doorCleanupStateRef.current}
+          doorSplatEntity={splatEnt}
+          origIndexOrder={active ? active.origIndexOrder : doorCleanupDoorOrigOrderRef.current}
+          initialStates={active ? active.states : doorCleanupStateRef.current}
           busy={doorCleanupBusy}
-          doorLabel={activeDoorIndex !== undefined ? `문 ${activeDoorIndex + 1} 다듬기` : '문 다듬기'}
+          cleanupSessionKey={md ? activeCleanupDoorIdx : undefined}
+          doorLabel={
+            md ? `${active?.label ?? '문'} 다듬기 (${md.length}개 중)`
+              : (activeDoorIndex !== undefined ? `문 ${activeDoorIndex + 1} 다듬기` : '문 다듬기')
+          }
+          cleanupDoors={
+            md
+              ? md.map((e, i) => ({ label: e.label, isAlign: e.isAlign, active: i === activeCleanupDoorIdx }))
+              : (activeDoorIndex !== undefined && nonAlignmentDoorCorners && nonAlignmentDoorCorners.length > 0
+                  ? [
+                      { label: '기준 문', isAlign: true, active: true },
+                      ...nonAlignmentDoorCorners.map((_, i) => ({
+                        label: nonAlignmentDoorLabels?.[i] ?? `문 ${i + 2}`,
+                        isAlign: false,
+                        active: false,
+                      })),
+                    ]
+                  : undefined)
+          }
+          onSelectDoor={md ? (i) => {
+            if (!cleanupDoorsRef.current[i]) return;
+            setActiveCleanupDoorIdx(i); // 모달 바인딩은 active 엔트리(IIFE)로 자동 갱신.
+          } : undefined}
           onClose={() => {
+            if (md) { closeMultiDoorCleanup(); return; }
             if (basemapMode) {
               void finalizeBasemapDoorExtraction().catch((e) => {
                 console.error('[DoorRefine] basemap finalize failed:', e);
@@ -3665,11 +4212,21 @@ export default function DoorAlignModal({
             }
           }}
           onApply={async (nextStates) => {
+            if (md && active) {
+              // ③-4: 활성 문만 states 반영해 rebuild (메인/타 문/단일-문 ref 미변경).
+              active.states = new Map(nextStates);
+              await rebuildOneDoorCleanup(activeCleanupDoorIdx);
+              // 모달 re-render → IIFE 가 active.splatId(갱신됨) 로 재바인딩.
+              setDoorCleanupViewerUrl(cleanupDoorsRef.current[activeCleanupDoorIdx]?.blobUrl ?? null);
+              return;
+            }
             doorCleanupStateRef.current = new Map(nextStates);
             await rebuildDoorRefineFromCleanup();
             setDoorCleanupViewerUrl(doorSubBlobUrlRef.current);
           }}
         />
+          );
+        })()
       ), document.body)}
 
       {/* basemap 다중 도어 — 호수 휠 피커 모달 */}

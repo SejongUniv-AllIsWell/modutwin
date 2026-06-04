@@ -191,7 +191,7 @@ def _run_door_ml_pipeline(
             resp = client.post(
                 f"{settings.DOOR_ML_URL}/detect",
                 files={"file": ("scene.ply", ply_bytes, "application/octet-stream")},
-                params={"prompt": prompt or "door", "sam3_prob": 0.55},
+                params={"prompt": prompt or "door", "sam3_prob": 0.86},
             )
         if resp.status_code != 200:
             raise RuntimeError(f"door-ml HTTP {resp.status_code}: {resp.text[:300]}")

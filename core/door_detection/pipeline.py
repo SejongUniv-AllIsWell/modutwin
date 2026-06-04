@@ -8,7 +8,7 @@ Usage:
         --output_json path/to/door_corners.json \
         [--cache_dir path/to/cache] \
         [--n_coarse 32] [--n_fine 24] \
-        [--sam3_prob 0.8] [--ransac_ratio 0.005] \
+        [--sam3_prob 0.8] \
         [--debug]
 """
 
@@ -61,7 +61,7 @@ from .triangulation.ray import (
     save_rays_npz,
     stack_rays_by_corner,
 )
-from .triangulation.ransac import TriangulationResult, ransac_triangulate
+from .triangulation.ransac import TriangulationResult
 from .metrics.quality import compute_quality
 
 # load_ply는 utilities (sibling top-level package). 본 module이 root에서 실행되어
@@ -165,14 +165,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="local SAM3 checkpoint 경로 (없으면 HF에서 다운로드)",
-    )
-
-    # RANSAC
-    p.add_argument(
-        "--ransac_ratio",
-        type=float,
-        default=0.005,
-        help="RANSAC inlier threshold = robust_bbox_diagonal * ratio (D6 default 0.005)",
     )
 
     # Room interior gate (Phase 1)
@@ -299,8 +291,6 @@ def main(argv: list[str] | None = None) -> int:
         n_coarse=args.n_coarse,
         n_fine=args.n_fine,
         sam3_prob=args.sam3_prob,
-        ransac_ratio=args.ransac_ratio,
-        ransac_threshold_abs=0.0,  # Phase 1 완료 후 채워짐
         robust_bbox_diagonal=0.0,  # Phase 1 완료 후 채워짐
     )
 
@@ -313,7 +303,6 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  N coarse:   {args.n_coarse}", file=sys.stderr)
     print(f"  N fine:     {args.n_fine}", file=sys.stderr)
     print(f"  SAM3 prob:  {args.sam3_prob}", file=sys.stderr)
-    print(f"  RANSAC %:   {args.ransac_ratio}", file=sys.stderr)
     print("=" * 60, file=sys.stderr)
 
     result = empty_result(source_ply=args.ply)
@@ -378,7 +367,6 @@ def main(argv: list[str] | None = None) -> int:
         file=sys.stderr,
     )
     config.robust_bbox_diagonal = room_info.robust_bbox_diagonal
-    config.ransac_threshold_abs = room_info.robust_bbox_diagonal * config.ransac_ratio
     result.config = config
 
     # ------------------------------------------------------------------
@@ -828,29 +816,13 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
     else:
-        print("[Phase 10] RANSAC + LSQ triangulation per corner ...", file=sys.stderr)
-        threshold_abs = config.ransac_threshold_abs
-        for ck in CORNER_KEYS_TUPLE:
-            if ck not in by_corner:
-                raise RuntimeError(
-                    f"Phase 10: corner '{ck}' has no rays after Phase 8 ordering. (D10)"
-                )
-            d = by_corner[ck]
-            tri = ransac_triangulate(
-                origins=d["origins"],
-                directions=d["directions"],
-                view_idx=d["view_idx"],
-                threshold_abs=threshold_abs,
-                min_inliers=2,
-            )
-            tri_results[ck] = tri
-            print(
-                f"[Phase 10] {ck}: point={tuple(round(x,4) for x in tri.point)}, "
-                f"inliers={tri.n_inliers}, mean_perp={tri.mean_perp_dist:.4f}, "
-                f"cond={tri.condition_number:.2e}",
-                file=sys.stderr,
-            )
-        corners_3d_dict = {ck: tri_results[ck].point for ck in CORNER_KEYS_TUPLE}  # type: ignore[union-attr]
+        # RANSAC 삼각측량 경로 제거됨. 코너 확정은 known-room (wall_polygon) 기반
+        # ray∩벽평면 모드(4코너 single-view / top-2 다중뷰 평균)만 지원한다.
+        # wall_polygon 없이는 문 추출 실패로 처리한다.
+        raise RuntimeError(
+            "Phase 10: wall_polygon(known-room) 없이는 문 코너를 확정할 수 없습니다. "
+            "rot_x/rot_z/floor_y/ceiling_y/wall_polygon 을 제공하세요. (D10 fail-fast)"
+        )
 
     # ------------------------------------------------------------------
     # Phase 11 — Quality metrics + JSON output

@@ -104,6 +104,7 @@ def collect_door_candidates(
     """SAM3 검출 coarse 뷰 → DoorCandidate 리스트.
 
     요구③: 상단 2코너만 보이는 뷰는 ±adjacency_window 이웃에 4코너 뷰가 있으면 skip.
+    링 wrap-around 포함 (v0 ↔ v_last 인접 처리).
     """
     from ..view_selection.iterative_approach import analyze_mask_quad
 
@@ -139,18 +140,23 @@ def collect_door_candidates(
         )
         raw.append(cand)
 
-    # 요구③: 상단 2코너만 보이는 뷰 필터 — ±adjacency_window 이웃에 4코너 뷰 있으면 제외
-    all_view_idxs = {c.view_idx for c in raw}
+    n_total = len(coarse_cam_map)  # 링 크기 (전체 coarse view 수)
+
+    def _ring_dist(a: int, b: int) -> int:
+        d = abs(a - b)
+        return min(d, n_total - d) if n_total > 0 else d
+
+    # 요구③: 상단 2코너만 보이는 뷰 필터 — ring 거리 ≤ adjacency_window 인 4코너 뷰 있으면 제외
     four_corner_idxs = {c.view_idx for c in raw if c.all_corners_visible}
     filtered: list[DoorCandidate] = []
     for cand in raw:
         if cand.all_corners_visible:
             filtered.append(cand)
             continue
-        # 상단 2코너뿐 — 이웃에 4코너 뷰가 있는지 확인
-        neighbors = set(range(cand.view_idx - adjacency_window, cand.view_idx + adjacency_window + 1))
-        if neighbors & four_corner_idxs:
-            continue  # 이웃에 4코너 뷰 있음 → skip
+        # 상단 2코너뿐 — ring 이웃에 4코너 뷰가 있는지 확인
+        has_near_four = any(_ring_dist(cand.view_idx, fi) <= adjacency_window for fi in four_corner_idxs)
+        if has_near_four:
+            continue
         filtered.append(cand)
 
     return sorted(filtered, key=lambda c: c.view_idx)
@@ -163,26 +169,46 @@ def collect_door_candidates(
 def cluster_by_adjacency(
     candidates: list[DoorCandidate],
     gap: int = 2,
+    n_total: int = 0,
 ) -> list[list[DoorCandidate]]:
-    """같은 wall_idx + view_idx gap ≤ gap → 같은 클러스터.
+    """같은 wall_idx + ring view_idx gap ≤ gap → 같은 클러스터.
 
     계획 D3: 다른 wall_idx 는 항상 다른 문.
+    n_total: 전체 coarse view 수 (링 wrap-around 계산용). 0 이면 선형 거리 사용.
     """
     if not candidates:
         return []
+
+    def _ring_dist(a: int, b: int) -> int:
+        d = abs(a - b)
+        return min(d, n_total - d) if n_total > 0 else d
 
     clusters: list[list[DoorCandidate]] = []
     current: list[DoorCandidate] = [candidates[0]]
 
     for prev, cand in zip(candidates, candidates[1:]):
         same_wall = (prev.wall_idx == cand.wall_idx) or (prev.wall_idx == -1 and cand.wall_idx == -1)
-        close_idx = abs(cand.view_idx - prev.view_idx) <= gap
+        close_idx = _ring_dist(cand.view_idx, prev.view_idx) <= gap
         if same_wall and close_idx:
             current.append(cand)
         else:
             clusters.append(current)
             current = [cand]
     clusters.append(current)
+
+    # 링 wrap-around: 마지막 클러스터와 첫 번째 클러스터가 실제로 인접하면 병합.
+    if len(clusters) >= 2:
+        first, last = clusters[0], clusters[-1]
+        same_wall = (
+            (first[0].wall_idx == last[-1].wall_idx)
+            or (first[0].wall_idx == -1 and last[-1].wall_idx == -1)
+        )
+        close_idx = _ring_dist(first[0].view_idx, last[-1].view_idx) <= gap
+        if same_wall and close_idx:
+            clusters[-1] = last + first  # last 에 first 를 이어붙임
+            clusters = clusters[:-1] + [clusters[-1]]  # first 제거, last 확장
+            clusters.pop(0)
+
     return clusters
 
 
@@ -361,13 +387,15 @@ def extract_n_doors(
 
     DoorStructure 리스트(score 내림차순) 반환.
     """
+    n_total = len(coarse_cam_map)  # 링 크기
+
     # Step A
     candidates = collect_door_candidates(sam3_summary, coarse_cam_map, adjacency_window)
     if not candidates:
         return []
 
-    # Step B — 인접 클러스터링 (문 개수 자동)
-    clusters = cluster_by_adjacency(candidates, gap=gap)
+    # Step B — 인접 클러스터링 (문 개수 자동, 링 wrap-around 포함)
+    clusters = cluster_by_adjacency(candidates, gap=gap, n_total=n_total)
 
     # Step C
     structures = []
