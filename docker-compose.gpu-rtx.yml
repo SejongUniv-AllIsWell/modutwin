@@ -41,6 +41,10 @@ x-worker-environment: &worker-environment
   - GSPLAT_PYTHON=${GSPLAT_PYTHON:-/usr/bin/python3}
   - GSPLAT_TRAINER=${GSPLAT_TRAINER:-/opt/gsplat/examples/simple_trainer.py}
   - GSPLAT_MAX_STEPS=${GSPLAT_MAX_STEPS:-7000}
+  # COLMAP apt build can initialize Qt even for CLI feature extraction.
+  # Use offscreen + CPU SIFT by default for reliable headless worker execution.
+  - QT_QPA_PLATFORM=${QT_QPA_PLATFORM:-offscreen}
+  - COLMAP_USE_GPU=${COLMAP_USE_GPU:-0}
 
 x-worker-build: &worker-build
   context: ./worker_rtx

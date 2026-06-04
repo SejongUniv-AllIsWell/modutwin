@@ -10,6 +10,7 @@ from pipeline.base import PipelineModule, PipelineError
 logger = logging.getLogger(__name__)
 
 COLMAP_BIN = os.environ.get("COLMAP_BIN", "colmap")
+COLMAP_USE_GPU = os.environ.get("COLMAP_USE_GPU", "0")
 
 
 class ColmapModule(PipelineModule):
@@ -40,8 +41,10 @@ class ColmapModule(PipelineModule):
 
     def _run_cmd(self, cmd: list, step: str) -> str:
         logger.info(f"[{self.name}] {step}: {' '.join(cmd)}")
+        env = os.environ.copy()
+        env.setdefault("QT_QPA_PLATFORM", "offscreen")
         try:
-            result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+            result = subprocess.run(cmd, check=True, capture_output=True, text=True, env=env)
             return result.stdout + result.stderr
         except subprocess.CalledProcessError as e:
             raise PipelineError(self.name, f"{step} 실패:\n{(e.stderr or '')[-500:]}")
@@ -81,6 +84,7 @@ class ColmapModule(PipelineModule):
             "--image_path",    input_path,
             "--ImageReader.single_camera", "1",
             "--ImageReader.camera_model",  "OPENCV",
+            "--SiftExtraction.use_gpu", COLMAP_USE_GPU,
         ], "feature_extractor")
 
         # 2. Exhaustive matching
@@ -88,6 +92,7 @@ class ColmapModule(PipelineModule):
         self._run_cmd([
             COLMAP_BIN, "exhaustive_matcher",
             "--database_path", database_path,
+            "--SiftMatching.use_gpu", COLMAP_USE_GPU,
         ], "exhaustive_matcher")
 
         # 3. Mapper

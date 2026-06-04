@@ -60,6 +60,9 @@ x-worker-environment: &worker-environment
   - SOG_ITERATIONS=${SOG_ITERATIONS:-10}
   - SOG_TIMEOUT=${SOG_TIMEOUT:-3600}
   - SOG_DAWN_BACKEND=${SOG_DAWN_BACKEND:-vulkan}
+  # COLMAP CLI can still initialize Qt; offscreen + CPU SIFT is safer headless.
+  - QT_QPA_PLATFORM=${QT_QPA_PLATFORM:-offscreen}
+  - COLMAP_USE_GPU=${COLMAP_USE_GPU:-0}
   - SOG_PREFER_NVIDIA=${SOG_PREFER_NVIDIA:-1}
   # NVIDIA 드라이버의 compute + utility + graphics/Vulkan 부분까지 컨테이너에 마운트.
   - NVIDIA_VISIBLE_DEVICES=all

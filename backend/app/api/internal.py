@@ -75,6 +75,7 @@ async def upload_pipeline_callback(
             if body.status == "failed":
                 task.status = TaskStatus.failed
                 task.error_message = body.error_message
+                task.completed_at = now
             else:
                 task.status = TaskStatus.completed
                 task.progress = 100
