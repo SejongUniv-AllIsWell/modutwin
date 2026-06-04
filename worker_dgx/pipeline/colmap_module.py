@@ -5,15 +5,18 @@ import shutil
 import logging
 import subprocess
 import tempfile
+from typing import Callable, Optional
 
 from pipeline.base import PipelineModule, PipelineError
 
 logger = logging.getLogger(__name__)
 
 COLMAP_BIN = os.environ.get("COLMAP_BIN", "colmap")
+COLMAP_MATCHER = os.environ.get("COLMAP_MATCHER", "sequential").lower()
 COLMAP_USE_GPU = os.environ.get("COLMAP_USE_GPU", "0")
 COLMAP_NUM_THREADS = os.environ.get("COLMAP_NUM_THREADS", "2")
 COLMAP_MAX_IMAGE_SIZE = os.environ.get("COLMAP_MAX_IMAGE_SIZE", "1600")
+COLMAP_SEQUENTIAL_OVERLAP = os.environ.get("COLMAP_SEQUENTIAL_OVERLAP", "20")
 
 
 class ColmapModule(PipelineModule):
@@ -25,6 +28,9 @@ class ColmapModule(PipelineModule):
         └── sparse/
             └── 0/        ← cameras.bin, images.bin, points3D.bin
     """
+
+    def __init__(self, progress_callback: Optional[Callable[[int, str], None]] = None):
+        self.progress_callback = progress_callback
 
     @property
     def name(self) -> str:
@@ -75,6 +81,10 @@ class ColmapModule(PipelineModule):
         except Exception:
             return 0
 
+    def _progress(self, pct: int, module_name: str) -> None:
+        if self.progress_callback:
+            self.progress_callback(pct, module_name)
+
     def run(self, input_path: str) -> str:
         self.validate_input(input_path)
         total_images = self._total_images
@@ -89,6 +99,7 @@ class ColmapModule(PipelineModule):
 
         # 1. Feature extraction
         logger.info(f"[{self.name}] Feature extraction 시작: {input_path}")
+        self._progress(60, "COLMAP feature extraction")
         self._run_cmd([
             COLMAP_BIN, "feature_extractor",
             "--database_path", database_path,
@@ -101,16 +112,30 @@ class ColmapModule(PipelineModule):
         ], "feature_extractor")
 
         # 2. Exhaustive matching
-        logger.info(f"[{self.name}] Feature matching 시작")
-        self._run_cmd([
-            COLMAP_BIN, "exhaustive_matcher",
-            "--database_path", database_path,
-            "--SiftMatching.use_gpu", COLMAP_USE_GPU,
-            "--SiftMatching.num_threads", COLMAP_NUM_THREADS,
-        ], "exhaustive_matcher")
+        logger.info(f"[{self.name}] Feature matching 시작 ({COLMAP_MATCHER})")
+        self._progress(68, f"COLMAP {COLMAP_MATCHER} matching")
+        if COLMAP_MATCHER == "sequential":
+            matcher_cmd = [
+                COLMAP_BIN, "sequential_matcher",
+                "--database_path", database_path,
+                "--SiftMatching.use_gpu", COLMAP_USE_GPU,
+                "--SiftMatching.num_threads", COLMAP_NUM_THREADS,
+                "--SequentialMatching.overlap", COLMAP_SEQUENTIAL_OVERLAP,
+            ]
+        elif COLMAP_MATCHER == "exhaustive":
+            matcher_cmd = [
+                COLMAP_BIN, "exhaustive_matcher",
+                "--database_path", database_path,
+                "--SiftMatching.use_gpu", COLMAP_USE_GPU,
+                "--SiftMatching.num_threads", COLMAP_NUM_THREADS,
+            ]
+        else:
+            raise PipelineError(self.name, f"지원하지 않는 COLMAP_MATCHER 값입니다: {COLMAP_MATCHER}")
+        self._run_cmd(matcher_cmd, f"{COLMAP_MATCHER}_matcher")
 
         # 3. Mapper
         logger.info(f"[{self.name}] Incremental mapping 시작")
+        self._progress(76, "COLMAP mapping")
         self._run_cmd([
             COLMAP_BIN, "mapper",
             "--database_path", database_path,
@@ -167,6 +192,7 @@ class ColmapModule(PipelineModule):
 
         # 9. Image undistortion
         logger.info(f"[{self.name}] Image undistortion 시작")
+        self._progress(84, "COLMAP undistortion")
         os.makedirs(undistorted_dir, exist_ok=True)
         self._run_cmd([
             COLMAP_BIN, "image_undistorter",

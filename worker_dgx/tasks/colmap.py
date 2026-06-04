@@ -55,10 +55,13 @@ def run_colmap_preprocessing(self, upload_id: str, user_id: str, minio_input_key
             scaled = 5 + int(pct * 0.80)
             update_progress(task_id, scaled, module_name)
 
+        def _colmap_progress(pct: int, module_name: str):
+            update_progress(task_id, pct, module_name)
+
         modules = [
             FFmpegModule(fps=2),
             BlurDetectionModule(),
-            ColmapModule(),
+            ColmapModule(progress_callback=_colmap_progress),
         ]
         runner = PipelineRunner(modules)
         colmap_workspace = runner.run(local_input, _progress)
