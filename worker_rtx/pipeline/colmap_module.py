@@ -12,6 +12,8 @@ logger = logging.getLogger(__name__)
 
 COLMAP_BIN = os.environ.get("COLMAP_BIN", "colmap")
 COLMAP_USE_GPU = os.environ.get("COLMAP_USE_GPU", "0")
+COLMAP_NUM_THREADS = os.environ.get("COLMAP_NUM_THREADS", "2")
+COLMAP_MAX_IMAGE_SIZE = os.environ.get("COLMAP_MAX_IMAGE_SIZE", "1600")
 
 
 class ColmapModule(PipelineModule):
@@ -94,6 +96,8 @@ class ColmapModule(PipelineModule):
             "--ImageReader.single_camera", "1",
             "--ImageReader.camera_model",  "OPENCV",
             "--SiftExtraction.use_gpu", COLMAP_USE_GPU,
+            "--SiftExtraction.num_threads", COLMAP_NUM_THREADS,
+            "--SiftExtraction.max_image_size", COLMAP_MAX_IMAGE_SIZE,
         ], "feature_extractor")
 
         # 2. Exhaustive matching
@@ -102,6 +106,7 @@ class ColmapModule(PipelineModule):
             COLMAP_BIN, "exhaustive_matcher",
             "--database_path", database_path,
             "--SiftMatching.use_gpu", COLMAP_USE_GPU,
+            "--SiftMatching.num_threads", COLMAP_NUM_THREADS,
         ], "exhaustive_matcher")
 
         # 3. Mapper
@@ -111,6 +116,7 @@ class ColmapModule(PipelineModule):
             "--database_path", database_path,
             "--image_path",    input_path,
             "--output_path",   sparse_dir,
+            "--Mapper.num_threads", COLMAP_NUM_THREADS,
         ], "mapper")
 
         # 4. 생성된 subfolder 목록 수집

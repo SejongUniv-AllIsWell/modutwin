@@ -45,6 +45,8 @@ x-worker-environment: &worker-environment
   # Use offscreen + CPU SIFT by default for reliable headless worker execution.
   - QT_QPA_PLATFORM=${QT_QPA_PLATFORM:-offscreen}
   - COLMAP_USE_GPU=${COLMAP_USE_GPU:-0}
+  - COLMAP_NUM_THREADS=${COLMAP_NUM_THREADS:-2}
+  - COLMAP_MAX_IMAGE_SIZE=${COLMAP_MAX_IMAGE_SIZE:-1600}
 
 x-worker-build: &worker-build
   context: ./worker_rtx
