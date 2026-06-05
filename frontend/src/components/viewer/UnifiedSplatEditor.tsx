@@ -62,6 +62,41 @@ interface EnsureRegistrationContextResponse {
   module_name: string | null;
 }
 
+const SAM3_DIRECT_UPLOAD_LIMIT_BYTES = 90 * 1024 * 1024;
+
+async function uploadFileToStaging(file: File): Promise<string> {
+  const stagingInit = await api.post<{
+    key: string;
+    minio_upload_id: string;
+    presigned_urls: string[];
+    part_size: number;
+  }>('/uploads/staging-multipart-init', {
+    filename: file.name,
+    file_size: file.size,
+    content_type: file.type || 'application/octet-stream',
+  });
+  const parts: { part_number: number; etag: string }[] = [];
+  for (let i = 0; i < stagingInit.presigned_urls.length; i++) {
+    const start = i * stagingInit.part_size;
+    const end = Math.min(start + stagingInit.part_size, file.size);
+    const partResp = await fetch(stagingInit.presigned_urls[i], {
+      method: 'PUT',
+      body: file.slice(start, end),
+    });
+    if (!partResp.ok) throw new Error(`PLY 청크 ${i + 1} 업로드 실패: ${partResp.status}`);
+    parts.push({
+      part_number: i + 1,
+      etag: partResp.headers.get('etag')?.replace(/"/g, '') ?? '',
+    });
+  }
+  await api.post('/uploads/staging-multipart-complete', {
+    key: stagingInit.key,
+    minio_upload_id: stagingInit.minio_upload_id,
+    parts,
+  });
+  return stagingInit.key;
+}
+
 export default function UnifiedSplatEditor({
   initialSogUrl = null,
   initialUploadId,
@@ -98,6 +133,7 @@ export default function UnifiedSplatEditor({
   // 모듈 등록 흐름: 파일 선택 시 백그라운드로 PLY 를 백엔드 임시 보관소에 업로드 → 세션 ID 보관.
   // 자동 문 검출 시 이 세션 ID 만 보내면 됨. 30분 TTL.
   const sam3PrepareSessionIdRef = useRef<string | null>(null);
+  const sam3PrepareStagingKeyRef = useRef<string | null>(null);
   const sam3PrepareInFlightRef = useRef<Promise<void> | null>(null);
   // 문 설정 완료 시 DoorAlignModal 이 콜백으로 넘긴 최종 4 corners (A'+Y 프레임).
   // 자동 검출이든 수동 4점이든 동일 경로로 채워짐. 정합 완료 시 commit-final 의 doors.json 으로 직렬화.
@@ -623,14 +659,19 @@ export default function UnifiedSplatEditor({
       // 다듬기 도중 자동 문 검출 누르면 세션 ID 만 보내 즉시 검출 시작.
       if (!isBasemapPurpose) {
         sam3PrepareSessionIdRef.current = null;
-        const form = new FormData();
-        form.append('file', first);
+        sam3PrepareStagingKeyRef.current = null;
         sam3PrepareInFlightRef.current = (async () => {
           try {
-            const data = await api.postForm<{ session_id: string; size: number }>(
-              '/uploads/sam3/prepare', form,
-            );
-            sam3PrepareSessionIdRef.current = data.session_id;
+            if (first.size > SAM3_DIRECT_UPLOAD_LIMIT_BYTES) {
+              sam3PrepareStagingKeyRef.current = await uploadFileToStaging(first);
+            } else {
+              const form = new FormData();
+              form.append('file', first);
+              const data = await api.postForm<{ session_id: string; size: number }>(
+                '/uploads/sam3/prepare', form,
+              );
+              sam3PrepareSessionIdRef.current = data.session_id;
+            }
           } catch (e: any) {
             console.warn('[sam3-prepare] 백그라운드 업로드 실패 (자동 문 검출 비활성):', e?.message || e);
           }
@@ -644,7 +685,7 @@ export default function UnifiedSplatEditor({
       const blobUrl = URL.createObjectURL(f);
       additional.add(blobUrl, { name: f.name, source: 'local' }).ready.catch(() => {});
     }
-  }, [currentUrl, additional]);
+  }, [currentUrl, additional, isBasemapPurpose]);
 
   // ── 메인 제거 (레이어 패널 X 버튼) ──
   const handleRemoveMain = useCallback(() => {
@@ -1299,8 +1340,9 @@ export default function UnifiedSplatEditor({
                       await sam3PrepareInFlightRef.current;
                     }
                     const sid = sam3PrepareSessionIdRef.current;
-                    if (!sid) {
-                      console.warn('[Sam3] 임시 PLY 세션 미확보 — 자동 검출 불가, 수동 지정으로 진행');
+                    const stagingKey = sam3PrepareStagingKeyRef.current;
+                    if (!sid && !stagingKey) {
+                      console.warn('[Sam3] 임시 PLY 세션/staging 키 미확보 — 자동 검출 불가, 수동 지정으로 진행');
                       setAutoExtracting(false);
                       setSam3DispatchSent(false);
                       return;
@@ -1315,7 +1357,7 @@ export default function UnifiedSplatEditor({
                     }>(
                       '/uploads/sam3/detect-temp',
                       {
-                        session_id: sid,
+                        ...(stagingKey ? { staging_key: stagingKey } : { session_id: sid }),
                         prompt,
                         bake_rotation: bake,
                         interior_min_hits: opts.interiorMinHits,
@@ -1683,6 +1725,9 @@ export default function UnifiedSplatEditor({
                     }
                     if (sam3PrepareSessionIdRef.current) {
                       form.append('sam3_session_id', sam3PrepareSessionIdRef.current);
+                    }
+                    if (sam3PrepareStagingKeyRef.current) {
+                      form.append('sam3_staging_key', sam3PrepareStagingKeyRef.current);
                     }
 
                     const resp = await api.postForm<{ module_id: string; upload_id: string; scene_output_id: string; was_overwrite: boolean }>(

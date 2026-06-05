@@ -16,8 +16,10 @@ import json
 import logging
 import math
 import os
+import tempfile
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 from uuid import UUID, uuid4
 
@@ -99,7 +101,8 @@ class BakeRotation(BaseModel):
 
 
 class Sam3DetectTempRequest(BaseModel):
-    session_id: str
+    session_id: str | None = None
+    staging_key: str | None = None
     prompt: str = "door"
     bake_rotation: BakeRotation | None = None
     # Phase 1 interior gate 튜닝 (긴/비볼록 방에서 fail-fast 회피용). 미지정 시 파이프라인 기본값.
@@ -182,32 +185,62 @@ async def sam3_detect_temp(
 ):
     """임시 보관 PLY → door-ml 검출 → bake rotation 적용 → corners 반환.
 
-    DB 행 안 만듦, MinIO 안 건드림. 임시 PLY 파일은 호출 후 삭제하지 않음
-    (사용자가 다시 시도하거나 prompt 바꿔 재호출 가능. TTL 로 자동 청소.)
+    DB 행 안 만듦. session_id 경로의 임시 PLY 또는 staging_key 경로의 MinIO PLY 를
+    사용한다. 입력 파일은 호출 후 삭제하지 않음(사용자가 다시 시도하거나 prompt 바꿔
+    재호출 가능. 임시 PLY 는 TTL 로 자동 청소, staging PLY 는 commit-final 후 정리).
     """
-    p = temp_path(body.session_id)
-    if not p.exists() or is_expired(p):
-        raise HTTPException(
-            status_code=status.HTTP_410_GONE,
-            detail="임시 PLY 가 만료되었거나 없습니다. 파일을 다시 선택해 주세요.",
-        )
+    if bool(body.session_id) == bool(body.staging_key):
+        raise HTTPException(status_code=400, detail="session_id 또는 staging_key 중 하나만 필요합니다.")
 
-    # door-ml 으로 forward.
+    p = None
+    staging_tmp_path: str | None = None
+    if body.session_id:
+        p = temp_path(body.session_id)
+        if not p.exists() or is_expired(p):
+            raise HTTPException(
+                status_code=status.HTTP_410_GONE,
+                detail="임시 PLY 가 만료되었거나 없습니다. 파일을 다시 선택해 주세요.",
+            )
+    else:
+        try:
+            staging_key = normalize_minio_key(body.staging_key or "")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="유효하지 않은 staging_key 입니다.")
+        if not is_key_under_prefix(staging_key, f"staging/{user.id}/"):
+            raise HTTPException(status_code=400, detail="본인 staging 경로의 PLY 키가 아닙니다.")
+        minio = get_minio_service()
+        if not minio.object_exists(staging_key):
+            raise HTTPException(status_code=status.HTTP_410_GONE, detail="staging PLY 가 없습니다.")
+        fd, staging_tmp_path = tempfile.mkstemp(prefix="sam3_staging_", suffix=".ply")
+        os.close(fd)
+        try:
+            minio.download_to_file(staging_key, staging_tmp_path)
+        except Exception as e:
+            try:
+                os.unlink(staging_tmp_path)
+            except OSError:
+                pass
+            raise HTTPException(status_code=500, detail=f"staging PLY 다운로드 실패: {e}")
+        p = Path(staging_tmp_path)
+
     try:
         with open(p, "rb") as f:
-            ply_bytes = f.read()
-    except OSError as e:
-        raise HTTPException(status_code=500, detail=f"임시 PLY 읽기 실패: {e}")
-
-    try:
-        async with httpx.AsyncClient(timeout=600.0) as client:
-            resp = await client.post(
-                f"{settings.DOOR_ML_URL}/detect",
-                files={"file": ("scene.ply", ply_bytes, "application/octet-stream")},
-                params=_detect_params(body),
-            )
+            async with httpx.AsyncClient(timeout=600.0) as client:
+                resp = await client.post(
+                    f"{settings.DOOR_ML_URL}/detect",
+                    files={"file": ("scene.ply", f, "application/octet-stream")},
+                    params=_detect_params(body),
+                )
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"door-ml 통신 실패: {e}")
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"PLY 읽기 실패: {e}")
+    finally:
+        if staging_tmp_path:
+            try:
+                os.unlink(staging_tmp_path)
+            except OSError:
+                pass
 
     if resp.status_code != 200:
         raise HTTPException(
@@ -281,6 +314,7 @@ async def commit_final(
     mesh_json: UploadFile = File(...),
     doors_json: UploadFile = File(...),
     sam3_session_id: str | None = Form(None),
+    sam3_staging_key: str | None = Form(None),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -589,6 +623,13 @@ async def commit_final(
     if sam3_session_id:
         try:
             delete_temp(sam3_session_id)
+        except Exception:
+            pass
+    if sam3_staging_key:
+        try:
+            key = normalize_minio_key(sam3_staging_key)
+            if is_key_under_prefix(key, f"staging/{user.id}/"):
+                minio.delete_object(key)
         except Exception:
             pass
 
