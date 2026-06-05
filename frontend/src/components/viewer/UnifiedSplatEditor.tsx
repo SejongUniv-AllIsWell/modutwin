@@ -17,6 +17,19 @@ import { useRouter } from 'next/navigation';
 import { copyRefineState } from '@/lib/refine/persistence';
 import { rawToAY, ayToRaw, type FrameRotation } from '@/lib/refine/coordFrames';
 import type { ModuleDoorAssetPayload } from './tools/DoorAlignModal';
+import { buildDoorViewSet } from '@/lib/gs/doorViewSet';
+import { captureDoorViews, buildDetectImageFormData } from '@/lib/gs/doorRenderCapture';
+
+// 클라이언트 렌더 SAM3 (docs/client-render-sam3-plan.md): 다듬기 결과를 브라우저에서
+// 벽 정면 뷰셋으로 렌더 → 이미지셋만 서버로 보내 PLY 업로드 없이 문 검출.
+// 파리티(클라 렌더 ↔ 서버 검출 품질) 미검증 단계이므로 기본 OFF. 콘솔에서
+//   localStorage.setItem('CLIENT_RENDER_SAM3','1')  로 켠 뒤 새로고침해 검증.
+// 실패 시 기존 detect-temp(PLY forward) 경로로 자동 fallback.
+function clientRenderSam3Enabled(): boolean {
+  try {
+    return typeof window !== 'undefined' && window.localStorage?.getItem('CLIENT_RENDER_SAM3') === '1';
+  } catch { return false; }
+}
 
 const DoorAlignModal = lazy(() => import('./tools/DoorAlignModal'));
 const Sam3PromptModal = lazy(() => import('./tools/Sam3PromptModal'));
@@ -1351,26 +1364,65 @@ export default function UnifiedSplatEditor({
                     // 방법 B — 다듬기 확정 천장/바닥(A') + raw→A' 회전(bakedRotation) 전달.
                     // null 이면 known-room 비활성 → door-ml 기본 추정 fallback.
                     const roomFrame = refine.getRefinedRoomFrame?.() ?? null;
-                    const resp = await api.post<{
+
+                    type DetectResp = {
                       corners: { left_top: { x: number; y: number; z: number }; right_top: { x: number; y: number; z: number }; right_bottom: { x: number; y: number; z: number }; left_bottom: { x: number; y: number; z: number } };
                       all_doors?: Array<{ left_top: { x: number; y: number; z: number }; right_top: { x: number; y: number; z: number }; right_bottom: { x: number; y: number; z: number }; left_bottom: { x: number; y: number; z: number }; suggested_hinge_edge?: number | null }>;
-                    }>(
-                      '/uploads/sam3/detect-temp',
-                      {
-                        ...(stagingKey ? { staging_key: stagingKey } : { session_id: sid }),
-                        prompt,
-                        bake_rotation: bake,
-                        interior_min_hits: opts.interiorMinHits,
-                        interior_strict: opts.interiorStrict,
-                        ...(roomFrame ? {
-                          rot_x: roomFrame.rotX,
-                          rot_z: roomFrame.rotZ,
-                          floor_y: roomFrame.floorY,
-                          ceiling_y: roomFrame.ceilingY,
-                          ...(roomFrame.wallPolygon ? { wall_polygon: roomFrame.wallPolygon } : {}),
-                        } : {}),
-                      },
-                    );
+                    };
+
+                    let resp: DetectResp | null = null;
+
+                    // ── 클라이언트 렌더 경로 (known-room + 폴리곤 + core 필요). 실패 시 PLY 경로 fallback. ──
+                    if (clientRenderSam3Enabled() && roomFrame?.wallPolygon && coreRef.current) {
+                      try {
+                        const specs = buildDoorViewSet({
+                          wallPolygonAP: roomFrame.wallPolygon,
+                          floorY: roomFrame.floorY,
+                          ceilingY: roomFrame.ceilingY,
+                          rotX: roomFrame.rotX,
+                          rotZ: roomFrame.rotZ,
+                        });
+                        const captured = await captureDoorViews(coreRef.current, specs, { size: 256 });
+                        const fd = buildDetectImageFormData({
+                          captured,
+                          room: {
+                            rot_x: roomFrame.rotX,
+                            rot_z: roomFrame.rotZ,
+                            floor_y: roomFrame.floorY,
+                            ceiling_y: roomFrame.ceilingY,
+                            wall_polygon: roomFrame.wallPolygon,
+                          },
+                          wallAngleRad: bake.wallAngleRad,
+                          prompt,
+                        });
+                        resp = await api.postForm<DetectResp>('/uploads/sam3/detect-temp-image', fd);
+                        console.info('[Sam3] client-render 경로 성공 (PLY 업로드 없이 검출)');
+                      } catch (e: any) {
+                        console.warn('[Sam3] client-render 경로 실패 — PLY 경로로 fallback', e?.message || e);
+                        resp = null;
+                      }
+                    }
+
+                    // ── 기존 PLY forward 경로 (fallback / 기본) ──
+                    if (!resp) {
+                      resp = await api.post<DetectResp>(
+                        '/uploads/sam3/detect-temp',
+                        {
+                          ...(stagingKey ? { staging_key: stagingKey } : { session_id: sid }),
+                          prompt,
+                          bake_rotation: bake,
+                          interior_min_hits: opts.interiorMinHits,
+                          interior_strict: opts.interiorStrict,
+                          ...(roomFrame ? {
+                            rot_x: roomFrame.rotX,
+                            rot_z: roomFrame.rotZ,
+                            floor_y: roomFrame.floorY,
+                            ceiling_y: roomFrame.ceilingY,
+                            ...(roomFrame.wallPolygon ? { wall_polygon: roomFrame.wallPolygon } : {}),
+                          } : {}),
+                        },
+                      );
+                    }
 
                     // A'+Y 프레임 → raw 변환 헬퍼
                     const cornersAYtoRaw = (c: { left_top: {x:number;y:number;z:number}; right_top: {x:number;y:number;z:number}; right_bottom: {x:number;y:number;z:number}; left_bottom: {x:number;y:number;z:number} }): Array<[number,number,number]> => {

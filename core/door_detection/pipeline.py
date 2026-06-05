@@ -34,6 +34,7 @@ from .io.result_schema import (
 )
 from .io.writer import write_result
 from .render.camera_sampler import (
+    CameraView,
     sample_coarse_cameras,
     sample_walk_cameras,
     sample_wall_facing_cameras,
@@ -852,6 +853,152 @@ def main(argv: list[str] | None = None) -> int:
     write_result(result, args.output_json)
     _tock()
     print(f"[done] result written to {args.output_json}", file=sys.stderr)
+    return 0
+
+
+def _normalize_wall_polygon_ap(raw) -> np.ndarray:
+    """A' 폴리곤 입력(list[[x,z]] 또는 list[{x,z}])을 (N,2) ndarray 로."""
+    import numpy as np
+    if raw is None:
+        raise ValueError("wall_polygon (A') 가 필요합니다 (known-room).")
+    pts = []
+    for p in raw:
+        if isinstance(p, dict):
+            pts.append([float(p["x"]), float(p["z"])])
+        else:
+            pts.append([float(p[0]), float(p[1])])
+    arr = np.asarray(pts, dtype=np.float64).reshape(-1, 2)
+    if arr.shape[0] < 3:
+        raise ValueError(f"wall_polygon 점 수 부족: {arr.shape[0]}")
+    return arr
+
+
+def _identity_pixel(u: float, v: float, img_size: int = 0) -> tuple[float, float]:
+    """prerendered(클라 upright 캡처) 픽셀 매핑 — vflip 없이 항등.
+
+    서버 렌더 경로는 np.flipud 저장이라 pixel_rotate_cw_to_orig 가 필요하지만,
+    브라우저 canvas 캡처는 이미 OpenCV 픽셀 규약(top-left 원점, +v 아래)이므로 변환 없음.
+    """
+    return float(u), float(v)
+
+
+def run_from_prerendered(
+    renders_dir: str,
+    views_meta: list[dict],
+    rot_x: float,
+    rot_z: float,
+    floor_y: float,
+    ceiling_y: float,
+    wall_polygon,
+    output_json: str,
+    prompt: str = "white door",
+    sam3_prob: float = 0.55,
+    device: str = "cuda",
+    sam3_checkpoint: str | None = None,
+) -> int:
+    """클라이언트 렌더 PNG + 카메라 포즈(raw OpenCV c2w) + A' 방기하 → 문 코너.
+
+    서버 렌더(Phase 0~2)를 건너뛰고, known-room N-door 경로(Phase 3 SAM3 + extract_n_doors)
+    만 수행한다. 카메라/ray 는 raw→A' 로 변환해 A' 벽 평면과 교차한다.
+
+    views_meta: [{ "idx": int, "K": 3x3, "c2w": 4x4(raw OpenCV cam→world), "w": int, "h": int }]
+    wall_polygon: A' 프레임 footprint (list[[x,z]] 또는 list[{x,z}]).
+    """
+    import numpy as np
+    wall_poly_ap = _normalize_wall_polygon_ap(wall_polygon)
+
+    # raw→A' 회전 (translation 없음, 원점 기준 순수 회전).
+    rot_raw_to_ap = bake_rotation_matrix(float(rot_x), float(rot_z))  # 3x3
+    T_raw_to_ap = np.eye(4, dtype=np.float64)
+    T_raw_to_ap[:3, :3] = rot_raw_to_ap
+
+    # 클라 카메라(raw OpenCV c2w) → A' 프레임 CameraView.
+    cams: list[CameraView] = []
+    for vm in views_meta:
+        K = np.asarray(vm["K"], dtype=np.float64).reshape(3, 3)
+        c2w_raw = np.asarray(vm["c2w"], dtype=np.float64).reshape(4, 4)
+        c2w_ap = T_raw_to_ap @ c2w_raw
+        pos = c2w_ap[:3, 3]
+        fwd = c2w_ap[:3, 2]  # OpenCV forward = +z 열
+        look = pos + fwd
+        w = int(vm.get("w") or vm.get("width") or 256)
+        h = int(vm.get("h") or vm.get("height") or 256)
+        cams.append(CameraView(
+            view_idx=int(vm["idx"]),
+            K=K.tolist(),
+            c2w=c2w_ap.tolist(),
+            w=w,
+            h=h,
+            position=(float(pos[0]), float(pos[1]), float(pos[2])),
+            look_at=(float(look[0]), float(look[1]), float(look[2])),
+            source="coarse",
+            wall_idx=-1,
+        ))
+    if not cams:
+        raise RuntimeError("prerendered: 카메라/뷰가 없습니다.")
+    cams.sort(key=lambda c: c.view_idx)
+
+    # 시각 바닥/천장 (A' Z-180 Y 부호 보정: 큰 Y = 시각 바닥).
+    real_floor_y = max(float(floor_y), float(ceiling_y))
+
+    result = empty_result(source_ply=renders_dir)
+    result.config = PipelineConfig(
+        n_coarse=len(cams), n_fine=0, sam3_prob=float(sam3_prob),
+        robust_bbox_diagonal=0.0,
+    )
+
+    # Phase 3 — SAM3 (검증된 경로). renders_dir 의 PNG 들 입력.
+    image_paths = list_input_pngs(renders_dir)
+    if not image_paths:
+        raise RuntimeError(f"prerendered: 렌더 PNG 없음 ({renders_dir})")
+    sam3_out_dir = os.path.dirname(os.path.abspath(renders_dir.rstrip("/")))
+    sam3_summary = run_sam3(
+        image_paths=image_paths,
+        output_subdir=sam3_out_dir,
+        prompt=prompt,
+        confidence_threshold=float(sam3_prob),
+        device=device,
+        checkpoint_path=sam3_checkpoint,
+    )
+    print(
+        f"[prerendered] SAM3 {sam3_summary['n_views_with_detection']}/"
+        f"{sam3_summary['n_total_views']} views detected (prob ≥ {sam3_prob})",
+        file=sys.stderr,
+    )
+    if sam3_summary["n_views_with_detection"] == 0:
+        raise RuntimeError("prerendered: SAM3 검출 0건 (렌더 품질/프롬프트 확인). (D10)")
+
+    # known-room N-door 코너 추출 (Phase 4~11 대체). 픽셀 매핑은 항등(upright).
+    coarse_cam_map = {c.view_idx: c for c in cams}
+    cam_by_key = {("coarse", c.view_idx): c for c in cams}
+    walls = build_wall_planes(wall_poly_ap, float(floor_y), float(ceiling_y))
+
+    door_structures = extract_n_doors(
+        sam3_summary=sam3_summary,
+        coarse_cam_map=coarse_cam_map,
+        cam_by_key=cam_by_key,
+        walls=walls,
+        real_floor_y=float(real_floor_y),
+        pixel_rotate_fn=_identity_pixel,
+        pixel_to_ray_fn=pixel_to_world_ray,
+        ray_hit_fn=ray_wall_hit,
+    )
+    if not door_structures:
+        raise RuntimeError("prerendered: 문 클러스터 0개. (D10)")
+
+    primary = door_structures[0]
+    result.door_corners_3d = primary.corners  # type: ignore[assignment]
+    result.all_doors = [
+        {**d.corners, "suggested_hinge_edge": d.suggested_hinge_edge}
+        for d in door_structures
+    ]
+    result.warnings = []
+    print(
+        f"[prerendered] {len(door_structures)} door(s): "
+        + ", ".join(f"v{d.src_view_idx}({d.mode})" for d in door_structures),
+        file=sys.stderr,
+    )
+    write_result(result, output_json)
     return 0
 
 

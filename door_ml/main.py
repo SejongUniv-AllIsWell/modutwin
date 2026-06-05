@@ -54,6 +54,93 @@ def health():
     return {"status": "ok"}
 
 
+def _corners_json_to_response(data: dict) -> "DetectResponse":
+    """corners.json(파이프라인 출력) → DetectResponse."""
+    corners = data["door_corners_3d"]
+    raw_all = data.get("all_doors", [corners])
+    all_doors_resp = []
+    for door in raw_all:
+        entry: dict = {
+            k: {"x": float(v[0]), "y": float(v[1]), "z": float(v[2])}
+            for k, v in door.items()
+            if isinstance(v, (list, tuple))
+        }
+        entry["suggested_hinge_edge"] = door.get("suggested_hinge_edge")
+        all_doors_resp.append(entry)
+    return DetectResponse(
+        left_top=CornerPoint(x=corners["left_top"][0], y=corners["left_top"][1], z=corners["left_top"][2]),
+        right_top=CornerPoint(x=corners["right_top"][0], y=corners["right_top"][1], z=corners["right_top"][2]),
+        right_bottom=CornerPoint(x=corners["right_bottom"][0], y=corners["right_bottom"][1], z=corners["right_bottom"][2]),
+        left_bottom=CornerPoint(x=corners["left_bottom"][0], y=corners["left_bottom"][1], z=corners["left_bottom"][2]),
+        all_doors=all_doors_resp,
+    )
+
+
+@app.post("/detect_image", response_model=DetectResponse)
+async def detect_image(
+    views: list[UploadFile] = File(...),
+    meta: UploadFile = File(...),
+):
+    """클라이언트 렌더 PNG + 카메라 포즈(raw OpenCV c2w) + A' 방기하 → 문 코너.
+
+    서버 렌더 생략. multipart:
+      views: view_{idx:04d}.png 들 (256x256, upright)
+      meta:  JSON {
+        "prompt": "white door", "sam3_prob": 0.55,
+        "views": [{"idx":0,"K":[3x3],"c2w":[4x4 raw OpenCV],"w":256,"h":256}, ...],
+        "room":  {"rot_x":..,"rot_z":..,"floor_y":..,"ceiling_y":..,"wall_polygon":[[x,z],...]}
+      }
+    """
+    tmpdir = tempfile.mkdtemp(prefix="door_detect_img_")
+    renders_dir = os.path.join(tmpdir, "cache", "client", "renders")
+    os.makedirs(renders_dir, exist_ok=True)
+    output_path = os.path.join(tmpdir, "corners.json")
+    try:
+        meta_obj = json.loads((await meta.read()).decode("utf-8"))
+        views_meta = meta_obj["views"]
+        room = meta_obj["room"]
+
+        by_idx = {int(vm["idx"]): vm for vm in views_meta}
+        saved = 0
+        for uf in views:
+            name = os.path.basename(uf.filename or "")
+            if not name.lower().endswith(".png"):
+                continue
+            with open(os.path.join(renders_dir, name), "wb") as f:
+                shutil.copyfileobj(uf.file, f)
+            saved += 1
+        if saved == 0:
+            raise HTTPException(status_code=400, detail="view PNG 가 없습니다.")
+
+        from core.door_detection.pipeline import run_from_prerendered
+
+        rc = run_from_prerendered(
+            renders_dir=renders_dir,
+            views_meta=list(by_idx.values()),
+            rot_x=float(room["rot_x"]),
+            rot_z=float(room["rot_z"]),
+            floor_y=float(room["floor_y"]),
+            ceiling_y=float(room["ceiling_y"]),
+            wall_polygon=room["wall_polygon"],
+            output_json=output_path,
+            prompt=meta_obj.get("prompt", "white door"),
+            sam3_prob=float(meta_obj.get("sam3_prob", 0.55)),
+            device="cuda",
+        )
+        if rc != 0:
+            raise RuntimeError("run_from_prerendered non-zero")
+        with open(output_path, encoding="utf-8") as f:
+            return _corners_json_to_response(json.load(f))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"prerendered 검출 실패: {exc}") from exc
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 @app.post("/detect", response_model=DetectResponse)
 async def detect(
     file: UploadFile = File(...),

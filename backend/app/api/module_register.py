@@ -297,6 +297,72 @@ async def sam3_detect_temp(
     return Sam3DetectTempResponse(corners=corners, all_doors=all_doors_transformed)
 
 
+# ── 2-b. 클라이언트 렌더 자동검출 (PLY 업로드 없이 이미지셋 relay) ──────────────
+
+@router.post("/sam3/detect-temp-image", response_model=Sam3DetectTempResponse)
+async def sam3_detect_temp_image(
+    views: list[UploadFile] = File(...),
+    meta: UploadFile = File(...),
+    user: User = Depends(get_current_user),
+):
+    """클라 렌더 이미지셋 → door-ml `/detect_image` relay → wallAngle 적용 → corners.
+
+    PLY 업로드 불필요(병목 제거). meta JSON:
+      { "prompt": "white door", "sam3_prob": 0.55, "wall_angle_rad": <float>,
+        "views": [{"idx","K"(3x3),"c2w"(4x4 raw OpenCV),"w","h"}, ...],
+        "room":  {"rot_x","rot_z","floor_y","ceiling_y","wall_polygon"(A')} }
+    이미지 경로는 항상 known-room(A') 이므로 door-ml 의 A' 코너에 wallAngle 만 적용한다.
+    """
+    meta_bytes = await meta.read()
+    try:
+        meta_obj = json.loads(meta_bytes.decode("utf-8"))
+        room = meta_obj["room"]
+        for k in ("rot_x", "rot_z", "floor_y", "ceiling_y", "wall_polygon"):
+            if room.get(k) is None:
+                raise ValueError(f"room.{k} 누락 (known-room 필수)")
+        wall_angle_rad = float(meta_obj.get("wall_angle_rad", 0.0))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"meta 파싱 실패: {e}")
+
+    # door-ml relay (multipart 재구성). meta 는 그대로 전달, door-ml 은 room/views/prompt 만 사용.
+    files: list = [("meta", ("meta.json", meta_bytes, "application/json"))]
+    n_views = 0
+    for uf in views:
+        name = os.path.basename(uf.filename or "")
+        if not name.lower().endswith(".png"):
+            continue
+        files.append(("views", (name, await uf.read(), "image/png")))
+        n_views += 1
+    if n_views == 0:
+        raise HTTPException(status_code=400, detail="view PNG 가 없습니다.")
+
+    try:
+        async with httpx.AsyncClient(timeout=600.0) as client:
+            resp = await client.post(f"{settings.DOOR_ML_URL}/detect_image", files=files)
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"door-ml 통신 실패: {e}")
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"door-ml HTTP {resp.status_code}: {resp.text[:300]}")
+
+    resp_json = resp.json()
+    required = ("left_top", "right_top", "right_bottom", "left_bottom")
+    if not all(k in resp_json for k in required):
+        raise HTTPException(status_code=502, detail=f"door-ml 응답 형식 오류: keys={list(resp_json.keys())}")
+
+    def _tf(c: dict) -> dict:
+        return {k: _apply_wall_angle_to_corner(c[k], wall_angle_rad) for k in required}
+
+    corners = _tf({k: resp_json[k] for k in required})
+    all_doors = []
+    for d in resp_json.get("all_doors", [{k: resp_json[k] for k in required}]):
+        t = _tf(d)
+        t["suggested_hinge_edge"] = d.get("suggested_hinge_edge")
+        all_doors.append(t)
+    return Sam3DetectTempResponse(corners=corners, all_doors=all_doors)
+
+
 # ── 3. 정합 완료 — 일괄 영속화 ────────────────────────────────────────────────
 
 class AlignmentTransformDTO(BaseModel):
