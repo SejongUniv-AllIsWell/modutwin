@@ -177,6 +177,18 @@ def _detect_params(body: "Sam3DetectTempRequest") -> dict:
     return params
 
 
+async def _post_door_ml_detect(p: Path, body: "Sam3DetectTempRequest", params_override: dict | None = None) -> httpx.Response:
+    params = _detect_params(body)
+    if params_override:
+        params.update(params_override)
+    with open(p, "rb") as f:
+        async with httpx.AsyncClient(timeout=600.0) as client:
+            return await client.post(
+                f"{settings.DOOR_ML_URL}/detect",
+                files={"file": ("scene.ply", f, "application/octet-stream")},
+                params=params,
+            )
+
 
 @router.post("/sam3/detect-temp", response_model=Sam3DetectTempResponse)
 async def sam3_detect_temp(
@@ -192,7 +204,7 @@ async def sam3_detect_temp(
     if bool(body.session_id) == bool(body.staging_key):
         raise HTTPException(status_code=400, detail="session_id 또는 staging_key 중 하나만 필요합니다.")
 
-    p = None
+    p: Path | None = None
     staging_tmp_path: str | None = None
     if body.session_id:
         p = temp_path(body.session_id)
@@ -224,13 +236,22 @@ async def sam3_detect_temp(
         p = Path(staging_tmp_path)
 
     try:
-        with open(p, "rb") as f:
-            async with httpx.AsyncClient(timeout=600.0) as client:
-                resp = await client.post(
-                    f"{settings.DOOR_ML_URL}/detect",
-                    files={"file": ("scene.ply", f, "application/octet-stream")},
-                    params=_detect_params(body),
-                )
+        if p is None:
+            raise OSError("PLY path is not available")
+        resp = await _post_door_ml_detect(p, body)
+        if resp.status_code != 200 and body.interior_strict and "Room center not interior" in resp.text:
+            relaxed_min_hits = max(0, min(body.interior_min_hits, 20))
+            logger.warning(
+                "[sam3_detect_temp] interior strict gate failed; retrying relaxed "
+                "interior check (min_hits=%s): %s",
+                relaxed_min_hits,
+                resp.text[:300],
+            )
+            resp = await _post_door_ml_detect(
+                p,
+                body,
+                {"interior_strict": False, "interior_min_hits": relaxed_min_hits},
+            )
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"door-ml 통신 실패: {e}")
     except OSError as e:
