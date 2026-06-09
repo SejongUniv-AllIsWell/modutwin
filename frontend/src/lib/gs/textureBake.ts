@@ -147,8 +147,9 @@ export async function bakeTextureForPlane(
   const vH = input.vMax - input.vMin;
   if (uW <= 0 || vH <= 0) throw new Error('bakeTextureForPlane: empty bounds');
 
-  const width = Math.max(1, Math.ceil(uW * opts.texelsPerMeter));
-  const height = Math.max(1, Math.ceil(vH * opts.texelsPerMeter));
+  const tpm = opts.texelsPerMeter;
+  const width = Math.max(1, Math.ceil(uW * tpm));
+  const height = Math.max(1, Math.ceil(vH * tpm));
 
   const px = scene.attrs.get('x');
   const py = scene.attrs.get('y');
@@ -172,7 +173,6 @@ export async function bakeTextureForPlane(
   const [ux, uy, uz] = input.uAxis;
   const [vx, vy, vz] = input.vAxis;
   const [nx, ny, nz] = input.normal;
-  const tpm = opts.texelsPerMeter;
   const tpm2 = tpm * tpm;
   const maxBB = opts.maxFootprintPx;
   const N = scene.numSplats;

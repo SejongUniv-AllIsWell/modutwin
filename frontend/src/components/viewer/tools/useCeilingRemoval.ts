@@ -60,22 +60,22 @@ export function useCeilingRemoval<T extends CeilingMaskRecord>({
     const core = coreRef.current;
     if (!core) return;
     const sd = core.getSplatData();
-    if (!sd?.colorTexture || !sd?.origColorData || !sd?.posY) return;
+    const origAlpha = sd?.origAlphaData ?? core.ensureMainAlphaSnapshot();
+    if (!sd?.colorTexture || !origAlpha || !sd?.posY) return;
     const data = sd.colorTexture.lock();
     if (!data) return;
 
     const threshold = visualCeilingY + cutoffMeters;
     const zeroH = core.float2Half(0);
-    const orig = sd.origColorData;
     const posY = sd.posY;
     const count = sd.numSplats;
 
     if (hide) {
       for (let i = 0; i < count; i++) {
-        data[i * 4 + 3] = posY[i] < threshold ? zeroH : orig[i * 4 + 3];
+        data[i * 4 + 3] = posY[i] < threshold ? zeroH : origAlpha[i];
       }
     } else {
-      for (let i = 0; i < count; i++) data[i * 4 + 3] = orig[i * 4 + 3];
+      for (let i = 0; i < count; i++) data[i * 4 + 3] = origAlpha[i];
     }
 
     sd.colorTexture.unlock();

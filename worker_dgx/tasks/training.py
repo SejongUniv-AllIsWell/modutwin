@@ -23,6 +23,7 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+COLMAP_FRAME_FPS = float(os.environ.get("COLMAP_FRAME_FPS", "1"))
 PLY_EXT = {".ply"}
 VIDEO_EXT = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 
@@ -153,7 +154,7 @@ def run_3dgs_training(self, upload_id: str, user_id: str, minio_input_key: str,
             update_progress(task_id, scaled, module_nm)
 
         modules = [
-            FFmpegModule(fps=2),
+            FFmpegModule(fps=COLMAP_FRAME_FPS),
             BlurDetectionModule(),
             ColmapModule(),
             GsplatModule(),
@@ -247,7 +248,7 @@ def run_gs_training_from_colmap(self, upload_id: str, user_id: str, zip_minio_ke
         local_zip = os.path.join(work_dir, f"input{ext}")
         download_file(zip_minio_key, local_zip)
 
-        ffmpeg = FFmpegModule(fps=2)
+        ffmpeg = FFmpegModule(fps=COLMAP_FRAME_FPS)
         image_dir = ffmpeg.run(local_zip)
         logger.info(f"[Task {task_id}] 이미지 추출 완료: {image_dir}")
 

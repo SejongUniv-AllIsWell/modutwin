@@ -7,6 +7,7 @@ import type { SplatData, SplatViewerCoreRef } from '../SplatViewerCore';
 import { loadRefineState } from '@/lib/refine/persistence';
 import { getEditorRotation, rawToA, aToRaw, rawToAY, type FrameRotation } from '@/lib/refine/coordFrames';
 import { surfacePlanesFromPolygon, type SurfacePlane } from '@/lib/gs/planes';
+import { encodeRgbaTexture } from '@/lib/upload/textureEncoding';
 import { useAdditionalGsplats, type AdditionalGsplatsApi } from './useAdditionalGsplats';
 import { useDoorLabels } from './useDoorLabels';
 import type { GaussianScene } from '@/lib/ply/types';
@@ -158,7 +159,7 @@ interface Props {
   ) => Promise<void> | void;
   /** "문 설정 완료" 누른 직후 호출 — uploadId 가 없으면 부모가 모달 + register-local 처리하고 새 uploadId 반환. */
   ensureUploadId?: () => Promise<string>;
-  /** 도어 설정 영속화 직전 호출 — refined PLY + mesh.json + tex_*.png 일괄 업로드.
+  /** 도어 설정 영속화 직전 호출 — refined PLY + mesh.json + tex_* 이미지 일괄 업로드.
    *  반환: PLY 에 베이크된 회전값. 신규 도어 자산도 같은 final frame 으로 변환해야 일관 유지. */
   onCommitRefined?: (uploadId: string) => Promise<{ rotX: number; rotZ: number; wallAngleRad: number; plyKey: string }>;
   /** 다듬기 단계의 현재 keep mask (boundaryCull/floater/brush 모두 반영). 문 추출이 cachedScene 에 적용해
@@ -428,21 +429,18 @@ export default function DoorAlignModal({
         swing: d.swing,
       };
       if (d.doorMeshInput.rgba.length > 0) {
-        const canvas = document.createElement('canvas');
-        canvas.width = d.doorMeshInput.width;
-        canvas.height = d.doorMeshInput.height;
-        const ctx = canvas.getContext('2d');
-        if (!ctx) throw new Error('canvas 2d ctx failed');
-        ctx.putImageData(new ImageData(new Uint8ClampedArray(d.doorMeshInput.rgba), d.doorMeshInput.width, d.doorMeshInput.height), 0, 0);
-        const pngBlob = await new Promise<Blob>((res, rej) => {
-          canvas.toBlob(b => b ? res(b) : rej(new Error('toBlob null')), 'image/png');
-        });
+        const encoded = await encodeRgbaTexture(
+          d.doorMeshInput.rgba,
+          d.doorMeshInput.width,
+          d.doorMeshInput.height,
+          `tex_${d.doorId}`,
+        );
         const texUrl = await api.post<{ put_url: string; key: string }>(
           '/refine/refined-upload-url',
-          { upload_id: activeUploadId, filename: `tex_${d.doorId}.png` },
+          { upload_id: activeUploadId, filename: encoded.filename },
         );
         const texResp = await fetch(texUrl.put_url, {
-          method: 'PUT', body: pngBlob, headers: { 'Content-Type': 'image/png' },
+          method: 'PUT', body: encoded.blob, headers: { 'Content-Type': encoded.contentType },
         });
         if (!texResp.ok) throw new Error(`도어 ${d.doorId} 텍스처 업로드 실패: ${texResp.status}`);
         entry.doorMesh = {
@@ -2729,21 +2727,13 @@ export default function DoorAlignModal({
 
         if (meshInput && meshInput.rgba.length > 0) {
           try {
-            const canvas = document.createElement('canvas');
-            canvas.width = meshInput.width; canvas.height = meshInput.height;
-            const ctx = canvas.getContext('2d');
-            if (ctx) {
-              ctx.putImageData(new ImageData(new Uint8ClampedArray(meshInput.rgba), meshInput.width, meshInput.height), 0, 0);
-              const blob = await new Promise<Blob | null>(res => canvas.toBlob(b => res(b), 'image/png'));
-              if (blob) {
-                entry.doorMesh = {
-                  corners: meshInput.corners.map(c => [c[0], c[1], c[2]]),
-                  uvs: meshInput.uvs.map(u => [u[0], u[1]]),
-                  normalInward: [meshInput.normalInward[0], meshInput.normalInward[1], meshInput.normalInward[2]],
-                  textureWidth: meshInput.width, textureHeight: meshInput.height, textureBlob: blob,
-                };
-              }
-            }
+            const encoded = await encodeRgbaTexture(meshInput.rgba, meshInput.width, meshInput.height, `tex_${entry.id}`);
+            entry.doorMesh = {
+              corners: meshInput.corners.map(c => [c[0], c[1], c[2]]),
+              uvs: meshInput.uvs.map(u => [u[0], u[1]]),
+              normalInward: [meshInput.normalInward[0], meshInput.normalInward[1], meshInput.normalInward[2]],
+              textureWidth: meshInput.width, textureHeight: meshInput.height, textureBlob: encoded.blob,
+            };
           } catch (e) { console.warn('[NonAlignDoor] texture encode failed', i, e); }
         }
         // ⑤ 저장 영속화: 다듬기에서 정리한 cleaned splat 이 있으면 그것을 저장 (없으면 fresh).
@@ -3901,23 +3891,12 @@ export default function DoorAlignModal({
                   if (sourceDoor) {
                     let doorMesh: ModuleDoorAssetPayload['doorMesh'];
                     if (sourceDoor.doorMeshInput.rgba.length > 0) {
-                      const canvas = document.createElement('canvas');
-                      canvas.width = sourceDoor.doorMeshInput.width;
-                      canvas.height = sourceDoor.doorMeshInput.height;
-                      const ctx = canvas.getContext('2d');
-                      if (!ctx) throw new Error('canvas 2d ctx failed');
-                      ctx.putImageData(
-                        new ImageData(
-                          new Uint8ClampedArray(sourceDoor.doorMeshInput.rgba),
-                          sourceDoor.doorMeshInput.width,
-                          sourceDoor.doorMeshInput.height,
-                        ),
-                        0,
-                        0,
+                      const encoded = await encodeRgbaTexture(
+                        sourceDoor.doorMeshInput.rgba,
+                        sourceDoor.doorMeshInput.width,
+                        sourceDoor.doorMeshInput.height,
+                        'door_1',
                       );
-                      const textureBlob = await new Promise<Blob>((res, rej) => {
-                        canvas.toBlob(b => b ? res(b) : rej(new Error('toBlob null')), 'image/png');
-                      });
                       doorMesh = {
                         corners: sourceDoor.doorMeshInput.corners.map(c => [c[0], c[1], c[2]]),
                         uvs: sourceDoor.doorMeshInput.uvs.map(u => [u[0], u[1]]),
@@ -3928,7 +3907,7 @@ export default function DoorAlignModal({
                         ],
                         textureWidth: sourceDoor.doorMeshInput.width,
                         textureHeight: sourceDoor.doorMeshInput.height,
-                        textureBlob,
+                        textureBlob: encoded.blob,
                       };
                     }
                     let doorSplat: ModuleDoorAssetPayload['doorSplat'];
@@ -4088,7 +4067,7 @@ export default function DoorAlignModal({
                     }
                     if (!activeUploadId) throw new Error('uploadId 확보 실패');
 
-                    // 2) basemap PLY + mesh.json + tex_*.png 업로드 (onCommitRefined 가 처리)
+                    // 2) basemap PLY + mesh.json + tex_* 이미지 업로드 (onCommitRefined 가 처리)
                     if (onCommitRefined) {
                       await onCommitRefined(activeUploadId);
                     }
@@ -4118,25 +4097,20 @@ export default function DoorAlignModal({
                         hingeEdge: d.hingeEdge,
                         swing: d.swing,
                       };
-                      // 도어 mesh 텍스처 PNG 업로드
+                      // 도어 mesh 텍스처 업로드
                       if (d.doorMeshInput.rgba.length > 0) {
-                        const rgbaToPng = async (rgba: Uint8ClampedArray, w: number, h: number): Promise<Blob> => {
-                          const canvas = document.createElement('canvas');
-                          canvas.width = w; canvas.height = h;
-                          const ctx = canvas.getContext('2d');
-                          if (!ctx) throw new Error('canvas 2d ctx failed');
-                          ctx.putImageData(new ImageData(new Uint8ClampedArray(rgba), w, h), 0, 0);
-                          return await new Promise<Blob>((res, rej) => {
-                            canvas.toBlob(b => b ? res(b) : rej(new Error('toBlob null')), 'image/png');
-                          });
-                        };
-                        const pngBlob = await rgbaToPng(d.doorMeshInput.rgba, d.doorMeshInput.width, d.doorMeshInput.height);
+                        const encoded = await encodeRgbaTexture(
+                          d.doorMeshInput.rgba,
+                          d.doorMeshInput.width,
+                          d.doorMeshInput.height,
+                          `tex_${d.doorId}`,
+                        );
                         const texUrl = await api.post<{ put_url: string; key: string }>(
                           '/refine/refined-upload-url',
-                          { upload_id: activeUploadId, filename: `tex_${d.doorId}.png` },
+                          { upload_id: activeUploadId, filename: encoded.filename },
                         );
                         const texResp = await fetch(texUrl.put_url, {
-                          method: 'PUT', body: pngBlob, headers: { 'Content-Type': 'image/png' },
+                          method: 'PUT', body: encoded.blob, headers: { 'Content-Type': encoded.contentType },
                         });
                         if (!texResp.ok) throw new Error(`도어 ${d.doorId} 텍스처 업로드 실패: ${texResp.status}`);
                         entry.doorMesh = {

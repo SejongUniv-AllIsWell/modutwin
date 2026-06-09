@@ -22,10 +22,8 @@ from app.services.metadata_options import (
 from app.services.storage_access import (
     add_storage_key,
     delete_storage_best_effort,
-    safe_object_exists,
     safe_presigned_download_url,
 )
-from app.services.scene_assets import pick_scene_viewer_key
 from app.services.storage_paths import module_base_path
 
 router = APIRouter(tags=["buildings"])
@@ -281,8 +279,10 @@ class AdminDeleteResponse(BaseModel):
     counts: dict[str, int]
 
 
-def _pick_scene_output_path(minio, scene: SceneOutput | None) -> str | None:
-    return pick_scene_viewer_key(minio, scene)
+def _pick_scene_output_path(scene: SceneOutput | None) -> str | None:
+    if scene is None:
+        return None
+    return scene.sog_path or scene.ply_path
 
 
 async def _collect_delete_scope(
@@ -1114,9 +1114,7 @@ async def get_floor_detail_manifest(
             .limit(1)
         )
         basemap_scene = basemap_scene_result.scalar_one_or_none()
-        basemap_serve_key = pick_scene_viewer_key(minio, basemap_scene)
-        if basemap_serve_key is None and safe_object_exists(minio, basemap.minio_path):
-            basemap_serve_key = basemap.minio_path
+        basemap_serve_key = _pick_scene_output_path(basemap_scene) or basemap.minio_path
     basemap_url = safe_presigned_download_url(minio, basemap_serve_key) if basemap_serve_key else None
     basemap_entry = (
         DetailBasemapEntry(
@@ -1181,7 +1179,7 @@ async def get_floor_detail_manifest(
     module_entries: list[DetailModuleEntry] = []
     for module, uploader_name in module_rows:
         latest_scene = latest_scene_by_module.get(module.id)
-        path = _pick_scene_output_path(minio, latest_scene)
+        path = _pick_scene_output_path(latest_scene)
         module_entries.append(
             DetailModuleEntry(
                 id=module.id,

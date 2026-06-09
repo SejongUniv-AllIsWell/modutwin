@@ -60,10 +60,11 @@ x-worker-environment: &worker-environment
   - SOG_ITERATIONS=${SOG_ITERATIONS:-10}
   - SOG_TIMEOUT=${SOG_TIMEOUT:-3600}
   - SOG_DAWN_BACKEND=${SOG_DAWN_BACKEND:-vulkan}
-  # COLMAP CLI can still initialize Qt; offscreen + CPU SIFT is safer headless.
+  # COLMAP CLI can still initialize Qt; use offscreen and try GPU SIFT by default.
   - QT_QPA_PLATFORM=${QT_QPA_PLATFORM:-offscreen}
   - COLMAP_MATCHER=${COLMAP_MATCHER:-sequential}
-  - COLMAP_USE_GPU=${COLMAP_USE_GPU:-0}
+  - COLMAP_FRAME_FPS=${COLMAP_FRAME_FPS:-1}
+  - COLMAP_USE_GPU=${COLMAP_USE_GPU:-1}
   - COLMAP_NUM_THREADS=${COLMAP_NUM_THREADS:-2}
   - COLMAP_MAX_IMAGE_SIZE=${COLMAP_MAX_IMAGE_SIZE:-1600}
   - COLMAP_SEQUENTIAL_OVERLAP=${COLMAP_SEQUENTIAL_OVERLAP:-20}

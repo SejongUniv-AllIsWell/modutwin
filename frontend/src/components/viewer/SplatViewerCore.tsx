@@ -21,6 +21,7 @@ export interface SplatData {
   posZ: Float32Array;
   colorTexture: any;
   origColorData: Uint16Array | null;   // half-float RGBA
+  origAlphaData: Uint16Array | null;   // half-float alpha only, used by read-only masks/minimap
   splatEntity: any;
   /** transformA 텍스처 (위치+회전xy GPU 데이터) */
   transformATexture: any;
@@ -71,6 +72,10 @@ export interface SplatViewerCoreRef {
   setCameraPose: (pose: CameraPose) => void;
   /** 메인 splat 엔티티 visibility 토글 */
   setMainVisible: (visible: boolean) => void;
+  /** color texture 원본 snapshot 을 필요 시 생성해 반환. 보기 전용 초기 로드에서는 지연 생성에 사용. */
+  ensureMainColorSnapshot: () => Uint16Array | null;
+  /** alpha 채널만 필요할 때 RGBA 전체 복사 없이 원본 alpha snapshot 을 생성해 반환. */
+  ensureMainAlphaSnapshot: () => Uint16Array | null;
   /** 정합 모드: 모듈 entity 들 (splat + wall mesh + door mesh + module 추가 splat) 을
    *  공통 부모 alignmentGroup 아래로 이동. basemap 으로 표시된 추가 splat 은 제외.
    *  반환: alignmentGroup entity (transform 적용 대상). 이미 진입 상태면 기존 group 반환.
@@ -111,6 +116,8 @@ interface SplatViewerCoreProps {
   sogUrl?: string | null;
   /** blob URL 처럼 URL 만으로 확장자를 알 수 없을 때 PlayCanvas parser 선택에 쓰는 파일명 힌트. */
   assetFilename?: string | null;
+  /** 편집/마스킹용 color texture 원본을 로드 직후 복사할지 여부. */
+  captureColorSnapshot?: boolean;
   onSplatLoaded?: (data: SplatData) => void;
   children?: React.ReactNode;
 }
@@ -120,7 +127,7 @@ const hasEditableGsplatProps = (gsplatData: any): boolean => (
 );
 
 const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
-  ({ sogUrl, assetFilename, onSplatLoaded, children }, ref) => {
+  ({ sogUrl, assetFilename, captureColorSnapshot = true, onSplatLoaded, children }, ref) => {
     const containerRef = useRef<HTMLDivElement>(null);
     const rootRef = useRef<HTMLDivElement>(null);
     const [loading, setLoading] = useState(true);
@@ -159,6 +166,56 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
     // 콜백 identity가 매 렌더마다 바뀌어도 effect가 재실행되지 않도록 ref로 보관
     const onSplatLoadedRef = useRef(onSplatLoaded);
     useEffect(() => { onSplatLoadedRef.current = onSplatLoaded; }, [onSplatLoaded]);
+    const captureColorSnapshotRef = useRef(captureColorSnapshot);
+    useEffect(() => { captureColorSnapshotRef.current = captureColorSnapshot; }, [captureColorSnapshot]);
+
+    const ensureColorSnapshotForData = useCallback((target?: SplatData | null): Uint16Array | null => {
+      const data = target ?? splatDataRef.current;
+      if (!data?.colorTexture) return null;
+      if (data.origColorData) return data.origColorData;
+      let locked: Uint16Array | null = null;
+      try {
+        locked = data.colorTexture.lock?.() ?? null;
+        if (!locked) return null;
+        const snapshot = new Uint16Array(locked.length);
+        snapshot.set(locked);
+        data.origColorData = snapshot;
+        if (!data.origAlphaData) {
+          const alpha = new Uint16Array(data.numSplats);
+          for (let i = 0; i < data.numSplats; i++) alpha[i] = snapshot[i * 4 + 3];
+          data.origAlphaData = alpha;
+        }
+        return snapshot;
+      } finally {
+        if (locked) {
+          try { data.colorTexture.unlock(); } catch {}
+        }
+      }
+    }, []);
+
+    const ensureAlphaSnapshotForData = useCallback((target?: SplatData | null): Uint16Array | null => {
+      const data = target ?? splatDataRef.current;
+      if (!data?.colorTexture) return null;
+      if (data.origAlphaData) return data.origAlphaData;
+      const alpha = new Uint16Array(data.numSplats);
+      if (data.origColorData) {
+        for (let i = 0; i < data.numSplats; i++) alpha[i] = data.origColorData[i * 4 + 3];
+        data.origAlphaData = alpha;
+        return alpha;
+      }
+      let locked: Uint16Array | null = null;
+      try {
+        locked = data.colorTexture.lock?.() ?? null;
+        if (!locked) return null;
+        for (let i = 0; i < data.numSplats; i++) alpha[i] = locked[i * 4 + 3];
+        data.origAlphaData = alpha;
+        return alpha;
+      } finally {
+        if (locked) {
+          try { data.colorTexture.unlock(); } catch {}
+        }
+      }
+    }, []);
 
     // ── 외부 노출 API ──
     useImperativeHandle(ref, () => ({
@@ -192,6 +249,8 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
         const ent = splatEntityRef.current;
         if (ent) ent.enabled = visible;
       },
+      ensureMainColorSnapshot: () => ensureColorSnapshotForData(),
+      ensureMainAlphaSnapshot: () => ensureAlphaSnapshotForData(),
       enterAlignmentMode: () => {
         const app = appRef.current;
         const pc = pcRef.current;
@@ -250,7 +309,7 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
         alignmentGroupRef.current = null;
       },
       getAlignmentGroup: () => alignmentGroupRef.current,
-      reloadSplatFromUrl: (url: string, opts?: { preserveCamera?: boolean }) => {
+      reloadSplatFromUrl: (url: string, opts?: { preserveCamera?: boolean; filename?: string | null }) => {
         const fn = loadSplatRef.current;
         if (!fn) return Promise.reject(new Error('splat loader not ready'));
         return fn(url, opts);
@@ -766,8 +825,7 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
                   }
                 }
 
-                // PlayCanvas 2.x: PLY/compatible resources expose gsplatData.getProp().
-                // SOG is loaded with asset.data.decompress=true above so registration flows can edit it.
+                // PlayCanvas 2.x: PLY/decompressed SOG resources expose gsplatData.getProp().
                 const resource = asset.resource as any;
                 const gsplatData = resource?.gsplatData;
                 if (hasEditableGsplatProps(gsplatData)) {
@@ -776,16 +834,6 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
                   const posY = gsplatData.getProp('y') as Float32Array;
                   const posZ = gsplatData.getProp('z') as Float32Array;
                   const colorTex = resource?.streams?.textures?.get('splatColor') ?? null;
-                  let origColorData: Uint16Array | null = null;
-                  if (colorTex) {
-                    const td = colorTex.lock();
-                    if (td) {
-                      origColorData = new Uint16Array(td.length);
-                      origColorData.set(td);
-                      colorTex.unlock();
-                    }
-                  }
-
                   const transformATex = resource?.streams?.textures?.get('transformA') ?? null;
                   const transformBTex = resource?.streams?.textures?.get('transformB') ?? null;
 
@@ -793,13 +841,15 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
                     numSplats: n,
                     posX, posY, posZ,
                     colorTexture: colorTex,
-                    origColorData,
+                    origColorData: null,
+                    origAlphaData: null,
                     splatEntity,
                     transformATexture: transformATex,
                     transformBTexture: transformBTex,
                     resource,
                     gsplatData,
                   };
+                  if (captureColorSnapshotRef.current) ensureColorSnapshotForData(data);
                   splatDataRef.current = data;
                   onSplatLoadedRef.current?.(data);
                 }

@@ -16,6 +16,8 @@ import { ActiveBasemapResponse } from '@/types';
 import { useRouter } from 'next/navigation';
 import { copyRefineState } from '@/lib/refine/persistence';
 import { rawToAY, ayToRaw, type FrameRotation } from '@/lib/refine/coordFrames';
+import { uploadMultipartParts } from '@/lib/upload/multipart';
+import { textureUploadFilename } from '@/lib/upload/textureEncoding';
 import type { ModuleDoorAssetPayload } from './tools/DoorAlignModal';
 import { buildDoorViewSet } from '@/lib/gs/doorViewSet';
 import { captureDoorViews, buildDetectImageFormData } from '@/lib/gs/doorRenderCapture';
@@ -88,20 +90,13 @@ async function uploadFileToStaging(file: File): Promise<string> {
     file_size: file.size,
     content_type: file.type || 'application/octet-stream',
   });
-  const parts: { part_number: number; etag: string }[] = [];
-  for (let i = 0; i < stagingInit.presigned_urls.length; i++) {
-    const start = i * stagingInit.part_size;
-    const end = Math.min(start + stagingInit.part_size, file.size);
-    const partResp = await fetch(stagingInit.presigned_urls[i], {
-      method: 'PUT',
-      body: file.slice(start, end),
-    });
-    if (!partResp.ok) throw new Error(`PLY 청크 ${i + 1} 업로드 실패: ${partResp.status}`);
-    parts.push({
-      part_number: i + 1,
-      etag: partResp.headers.get('etag')?.replace(/"/g, '') ?? '',
-    });
-  }
+  const parts = await uploadMultipartParts({
+    presignedUrls: stagingInit.presigned_urls,
+    partSize: stagingInit.part_size,
+    totalSize: file.size,
+    getChunk: (start, end) => file.slice(start, end),
+    errorLabel: 'PLY 청크',
+  });
   await api.post('/uploads/staging-multipart-complete', {
     key: stagingInit.key,
     minio_upload_id: stagingInit.minio_upload_id,
@@ -605,7 +600,7 @@ export default function UnifiedSplatEditor({
     onRequestMetadata: requestSaveMetadata,
   });
 
-  // 정제된 wall mesh + 텍스처 자동 로드 (저장된 mesh.json + tex_*.png).
+  // 정제된 wall mesh + 텍스처 자동 로드 (저장된 mesh.json + tex_* 이미지).
   // 비활성 조건 두 가지:
   //   - door 단계: 문 설정이 끝나기 전이라 서버 refined bundle 이 아직 없을 수 있음.
   //   - meshIsFreshInMemory: 문 설정 완료 직후 정합 진입 시 메모리에 이미 punch 된 텍스처 + 메시가 있어 서버 fetch 가 덮어쓰면 안 됨.
@@ -617,7 +612,7 @@ export default function UnifiedSplatEditor({
     Boolean(uploadId) && (mode !== 'door' || isBasemapEditMode) && !meshIsFreshInMemory,
     undefined,
     null,
-    true,
+    isBasemapEditMode,
     isBasemapEditMode ? refine.registerPersistedBake : undefined,
   );
   // basemap 의 wall mesh + 텍스처 + 도어 (다중) 자산 로드. source_upload_id 가 채워졌을 때만 동작.
@@ -630,6 +625,7 @@ export default function UnifiedSplatEditor({
     !!basemapSourceUploadId,
     additional,
     null,
+    false,
   );
 
   const handleSplatLoaded = useCallback((data: SplatData) => {
@@ -1281,7 +1277,7 @@ export default function UnifiedSplatEditor({
                 return newId;
               }}
               onCommitRefined={async (id) => {
-                // refined PLY + mesh.json + tex_*.png 일괄 업로드. 베이크된 회전값 그대로 반환.
+                // refined PLY + mesh.json + tex_* 이미지 일괄 업로드. 베이크된 회전값 그대로 반환.
                 return await refine.commitRefinedToServer(id);
               }}
               getCurrentKeepMask={() => refine.getCurrentKeepMask?.() ?? null}
@@ -1713,19 +1709,13 @@ export default function UnifiedSplatEditor({
                       file_size: plyView.byteLength,
                       content_type: 'application/octet-stream',
                     });
-                    const plyParts: { part_number: number; etag: string }[] = [];
-                    for (let i = 0; i < stagingInit.presigned_urls.length; i++) {
-                      const start = i * stagingInit.part_size;
-                      const end = Math.min(start + stagingInit.part_size, plyView.byteLength);
-                      const partResp = await fetch(stagingInit.presigned_urls[i], {
-                        method: 'PUT', body: plyView.subarray(start, end) as unknown as BodyInit,
-                      });
-                      if (!partResp.ok) throw new Error(`PLY 청크 ${i + 1} 업로드 실패: ${partResp.status}`);
-                      plyParts.push({
-                        part_number: i + 1,
-                        etag: partResp.headers.get('etag')?.replace(/"/g, '') ?? '',
-                      });
-                    }
+                    const plyParts = await uploadMultipartParts({
+                      presignedUrls: stagingInit.presigned_urls,
+                      partSize: stagingInit.part_size,
+                      totalSize: plyView.byteLength,
+                      getChunk: (start, end) => plyView.subarray(start, end),
+                      errorLabel: 'PLY 청크',
+                    });
                     await api.post('/uploads/staging-multipart-complete', {
                       key: stagingInit.key,
                       minio_upload_id: stagingInit.minio_upload_id,
@@ -1754,7 +1744,7 @@ export default function UnifiedSplatEditor({
                     form.append('mesh_json', new Blob([assets.meshJson], { type: 'application/json' }), 'mesh.json');
                     form.append('doors_json', new Blob([doorsJson], { type: 'application/json' }), 'doors.json');
                     if (doorAssets?.doorMesh) {
-                      form.append(doorTextureField, doorAssets.doorMesh.textureBlob, 'door_1.png');
+                      form.append(doorTextureField, doorAssets.doorMesh.textureBlob, textureUploadFilename('door_1', doorAssets.doorMesh.textureBlob));
                     }
                     if (doorAssets?.doorSplat) {
                       form.append(doorSplatField, doorAssets.doorSplat.plyBlob, 'door_1.ply');
@@ -1763,12 +1753,12 @@ export default function UnifiedSplatEditor({
                     for (const sid of Array.from(assets.textures.keys())) {
                       const tex = assets.textures.get(sid);
                       if (!tex) throw new Error(`텍스처 누락: ${sid} (다듬기 단계에서 모든 면 베이크 필요)`);
-                      form.append(`tex_${sid}`, tex, `tex_${sid}.png`);
+                      form.append(`tex_${sid}`, tex, textureUploadFilename(`tex_${sid}`, tex));
                     }
                     // 비정합 문 texture / splat blob — splat 은 위에서 직렬화 성공한 것만 (doorsJson ref 와 일치).
                     for (const d of _nonAlignDoors) {
                       if (d.doorMesh?.textureBlob) {
-                        form.append(`door_tex_${d.id}`, d.doorMesh.textureBlob, `${d.id}.png`);
+                        form.append(`door_tex_${d.id}`, d.doorMesh.textureBlob, textureUploadFilename(d.id, d.doorMesh.textureBlob));
                       }
                       const splatBlob = nonAlignSplatBlobs.get(d.id);
                       if (splatBlob) {

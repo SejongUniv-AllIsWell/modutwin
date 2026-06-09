@@ -5,6 +5,7 @@ import os
 from typing import Any
 from uuid import UUID, uuid4
 
+import redis.asyncio as aioredis
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
@@ -30,6 +31,7 @@ from app.schemas.uploads import (
 )
 from app.services.minio_service import get_minio_service, PART_SIZE
 from app.services.celery_service import (
+    celery_app,
     dispatch_training_task,
     dispatch_sam3_door_detection_task,
     dispatch_colmap_task,
@@ -551,6 +553,31 @@ async def get_upload(
 VIEWABLE_EXTENSIONS = {".ply", ".splat", ".sog"}
 
 
+def _task_progress_key(celery_task_id: str) -> str:
+    return f"task:progress:{celery_task_id}"
+
+
+def _revoke_celery_tasks(celery_task_ids: list[str]) -> None:
+    for celery_task_id in celery_task_ids:
+        try:
+            celery_app.control.revoke(celery_task_id, terminate=True, signal="SIGTERM")
+        except Exception:
+            logger.exception("[delete_upload] celery revoke failed: task_id=%s", celery_task_id)
+
+
+async def _clear_worker_progress(celery_task_ids: list[str]) -> None:
+    if not celery_task_ids:
+        return
+
+    client = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+    try:
+        await client.delete(*[_task_progress_key(task_id) for task_id in celery_task_ids])
+    except Exception:
+        logger.exception("[delete_upload] redis progress cleanup failed")
+    finally:
+        await client.aclose()
+
+
 @router.delete("/{upload_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_upload(
     upload_id: UUID,
@@ -564,6 +591,7 @@ async def delete_upload(
 
     함께 정리:
       - SceneOutput row + MinIO 파일 (ply/sog/metadata)
+      - 진행 중 worker task revoke/terminate + progress key 삭제
       - 관련 Task row + Notification.related_task_id null 처리
       - Upload 자신의 MinIO 파일 (원본/refined/doors.json + refined prefix)
     """
@@ -595,8 +623,14 @@ async def delete_upload(
     if upload.minio_path:
         prefixes.add(refined_prefix(upload.minio_path))
 
-    task_ids_rows = await db.execute(select(Task.id).where(Task.upload_id == upload.id))
-    task_ids = [tid for (tid,) in task_ids_rows.all()]
+    task_rows = await db.execute(
+        select(Task.id, Task.celery_task_id).where(Task.upload_id == upload.id)
+    )
+    task_pairs = task_rows.all()
+    task_ids = [tid for (tid, _) in task_pairs]
+    celery_task_ids = [ctid for (_, ctid) in task_pairs if ctid]
+    _revoke_celery_tasks(celery_task_ids)
+    await _clear_worker_progress(celery_task_ids)
 
     scene_rows = await db.execute(
         select(SceneOutput.id, SceneOutput.ply_path, SceneOutput.sog_path, SceneOutput.metadata_path)
@@ -1123,7 +1157,7 @@ class DoorMeshMeta(BaseModel):
     corners: list[list[float]]  # 4 × [x, y, z] — A'+Y 프레임 mesh 코너
     uvs: list[list[float]]      # 4 × [u, v]   — 텍스처 매핑
     normalInward: list[float]   # [x, y, z]    — 방 안쪽 normal
-    textureFilename: str        # MinIO 키: "tex_door_<doorId>.png"
+    textureFilename: str        # MinIO texture key
     textureWidth: int
     textureHeight: int
 

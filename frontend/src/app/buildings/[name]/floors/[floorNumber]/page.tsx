@@ -8,11 +8,12 @@ import type { FloorDetailManifest, FloorDetailModuleEntry } from '@/types';
 import SplatViewerCore, { type SplatViewerCoreRef } from '@/components/viewer/SplatViewerCore';
 import { useAdditionalGsplats } from '@/components/viewer/tools/useAdditionalGsplats';
 import { useCeilingRemoval, type CeilingMaskRecord } from '@/components/viewer/tools/useCeilingRemoval';
-import { useRefinedMeshLoader } from '@/components/viewer/tools/useRefinedMeshLoader';
+import { loadTextureSource, useRefinedMeshLoader } from '@/components/viewer/tools/useRefinedMeshLoader';
 import { useToast } from '@/components/ui/Toast';
 import RoomWheelPicker, { roomNumberLabel } from '@/components/ui/RoomWheelPicker';
 import type { FloorplanResult } from '@/lib/gs/floorplan';
 import { createDoorInteraction, type DoorInteractionController, type DoorHandle } from '@/lib/gs/doorInteraction';
+import type { TextureImageSource } from '@/lib/gs/wallMesh';
 
 const Minimap = lazy(() => import('@/components/viewer/tools/Minimap'));
 const CeilingCutPanel = lazy(() => import('@/components/viewer/tools/CeilingCutPanel'));
@@ -116,19 +117,17 @@ function parseAlignmentTransform(raw: Record<string, unknown> | null): { positio
   return { position, rotation, scale };
 }
 
-function loadHtmlImage(url: string): Promise<HTMLImageElement | null> {
-  return new Promise((resolve) => {
-    const img = new Image();
-    img.crossOrigin = 'anonymous';
-    img.onload = () => resolve(img);
-    img.onerror = () => resolve(null);
-    img.src = url;
-  });
+function textureSourceWidth(source: TextureImageSource): number {
+  return source instanceof HTMLImageElement ? source.naturalWidth : source.width;
 }
 
-function averageImageColor(image: HTMLImageElement): [number, number, number] | null {
-  const sourceWidth = image.naturalWidth || image.width;
-  const sourceHeight = image.naturalHeight || image.height;
+function textureSourceHeight(source: TextureImageSource): number {
+  return source instanceof HTMLImageElement ? source.naturalHeight : source.height;
+}
+
+function averageImageColor(image: TextureImageSource): [number, number, number] | null {
+  const sourceWidth = textureSourceWidth(image);
+  const sourceHeight = textureSourceHeight(image);
   if (!sourceWidth || !sourceHeight) return null;
   const width = Math.max(1, Math.min(64, sourceWidth));
   const height = Math.max(1, Math.min(64, sourceHeight));
@@ -429,7 +428,8 @@ function FloorCompositeViewer({
             posY: sd.posY,
             posZ: sd.posZ,
             numSplats: sd.numSplats,
-            origColorData: sd.origColorData ?? null,
+            origColorData: sd.origColorData,
+            origAlphaData: sd.origAlphaData ?? core.ensureMainAlphaSnapshot(),
             splatEntity: sd.splatEntity,
           },
           core.half2Float,
@@ -585,6 +585,7 @@ function FloorCompositeViewer({
           name: module.name,
           source: 'server',
           visible: true,
+          lazyColorSnapshot: true,
         });
         record.splatLayerIds.push(splat.id);
         record.mainSplatLayerId = splat.id;   // 천장제거 마스크 대상 (도어 splat 제외)
@@ -643,12 +644,21 @@ function FloorCompositeViewer({
             if (metaResp.ok) {
               const meta = await metaResp.json();
               const surfaces = meta.surfaces ?? [];
-              const images = await Promise.all(
-                surfaces.map((surface: any) => {
+              const images: Array<TextureImageSource | null> = new Array(surfaces.length).fill(null);
+              const concurrency = Math.min(3, surfaces.length);
+              let nextSurfaceIndex = 0;
+              const loadNextSurfaceImage = async () => {
+                while (!record.cancelled && nextSurfaceIndex < surfaces.length) {
+                  const index = nextSurfaceIndex;
+                  nextSurfaceIndex += 1;
+                  const surface = surfaces[index];
                   const url = bundle.textures[surface.surfaceId];
-                  return url ? loadHtmlImage(url) : Promise.resolve(null);
-                }),
-              );
+                  images[index] = url ? await loadTextureSource(`module ${module.name} ${surface.surfaceId}`, url) : null;
+                }
+              };
+              if (concurrency > 0) {
+                await Promise.all(Array.from({ length: concurrency }, loadNextSurfaceImage));
+              }
               if (record.cancelled || !record.group) return;
               for (let i = 0; i < surfaces.length; i++) {
                 const surface = surfaces[i];
@@ -701,10 +711,10 @@ function FloorCompositeViewer({
               });
             }
 
-            let doorMeshImage: HTMLImageElement | null = null;
+            let doorMeshImage: TextureImageSource | null = null;
             let doorMeshAverageColor: [number, number, number] | null = null;
             if (door.door_mesh) {
-              doorMeshImage = await loadHtmlImage(door.door_mesh.textureUrl);
+              doorMeshImage = await loadTextureSource(`module door ${module.name} ${door.id}`, door.door_mesh.textureUrl);
               if (record.cancelled || !record.group) return;
               if (doorMeshImage) {
                 doorMeshAverageColor = averageImageColor(doorMeshImage);
@@ -831,7 +841,12 @@ function FloorCompositeViewer({
   }, [handlePrimarySplatLoaded]);
 
   return (
-    <SplatViewerCore ref={setCoreRef} sogUrl={primaryUrl} onSplatLoaded={onSplatLoaded}>
+    <SplatViewerCore
+      ref={setCoreRef}
+      sogUrl={primaryUrl}
+      captureColorSnapshot={false}
+      onSplatLoaded={onSplatLoaded}
+    >
       {/* 우측 컬럼 — 미니맵(자동 베이크) 위, 천장 컷 패널 아래. 각자 독립 슬라이드 숨김. */}
       <div className="absolute top-3 right-3 z-30 flex flex-col items-end gap-2">
         {floorplan && (

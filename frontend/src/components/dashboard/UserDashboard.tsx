@@ -5,8 +5,14 @@ import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { api } from '@/lib/api';
 import { wsClient } from '@/lib/ws';
-import { Upload, Notification, WsMessage } from '@/types';
+import { Upload, Notification, Task, TaskProgress, WsMessage } from '@/types';
 import { useToast } from '@/components/ui/Toast';
+import {
+  clearLocalUploadProgress,
+  isActiveLocalUploadProgress,
+  type LocalUploadProgress,
+  useLocalUploadProgress,
+} from '@/lib/upload/localUploadProgress';
 
 const VIEWABLE_EXTENSIONS = new Set(['.ply', '.splat', '.sog']);
 
@@ -68,19 +74,85 @@ function progressStage(u: { status: string; has_refined?: boolean; has_doors_jso
   return 'uploaded_only';
 }
 
-const SAM3_LABEL: Record<string, string> = {
-  pending: '대기',
-  running: 'SAM3 작동 중',
-  done: '완료',
-  failed: '실패',
-};
+const WORKER_PROGRESS_POLL_MS = 5000;
 
-const SAM3_COLOR: Record<string, string> = {
-  pending: 'text-[var(--muted)]',
-  running: 'text-yellow-400',
-  done: 'text-green-400',
-  failed: 'text-red-400',
-};
+function uploadPercentLabel(progress: LocalUploadProgress | undefined): string | null {
+  if (!progress || progress.phase === 'failed' || progress.phase === 'processing') return null;
+  return `${Math.round(progress.percent)}%`;
+}
+
+function latestTaskByUpload(tasks: Task[]): Record<string, Task> {
+  return tasks.reduce<Record<string, Task>>((acc, task) => {
+    const current = acc[task.upload_id];
+    if (!current || Date.parse(task.created_at) > Date.parse(current.created_at)) {
+      acc[task.upload_id] = task;
+    }
+    return acc;
+  }, {});
+}
+
+function workerModuleLabel(module: string): string {
+  const value = module.trim();
+  if (!value) return '';
+
+  const lower = value.toLowerCase();
+  if (lower.includes('matching') || lower.includes('matcher')) return 'COLMAP 매칭';
+  if (lower.includes('mapping') || lower.includes('mapper')) return 'COLMAP 매핑';
+  if (lower.includes('feature')) return 'COLMAP 특징 추출';
+  if (lower.includes('undistort')) return 'COLMAP 보정';
+  if (lower.includes('upload')) return '결과 업로드';
+
+  return value;
+}
+
+function workerProgressLabel(progress: TaskProgress | undefined): string | null {
+  if (!progress || progress.progress < 0) return null;
+  const percent = Math.max(0, Math.min(100, Math.round(progress.progress)));
+  const module = workerModuleLabel(progress.module);
+  return module ? `${percent}% / ${module}` : `${percent}%`;
+}
+
+function colmapStatusLabel(
+  upload: Upload,
+  progress: LocalUploadProgress | undefined,
+  workerProgress: TaskProgress | undefined,
+): string {
+  const activeProgress = progress ? isActiveLocalUploadProgress(progress) : false;
+  const percent = uploadPercentLabel(progress);
+  const workerLabel = workerProgressLabel(workerProgress);
+
+  if (upload.status === 'failed' || progress?.phase === 'failed') return '업로드 실패';
+  if (upload.status === 'completed' && upload.has_gsplat_ply) return '학습 완료';
+  if (upload.status === 'processing' || progress?.phase === 'processing') return workerLabel ?? 'COLMAP 처리 중';
+  if (upload.status === 'uploaded') {
+    if (progress?.phase === 'completing' && activeProgress) return '업로드 완료 처리 중';
+    if (progress?.phase === 'uploading' && !activeProgress) return '업로드 중단';
+    return percent ? `업로드 중 ${percent}` : '업로드 중';
+  }
+  return '업로드 중';
+}
+
+function colmapStatusColor(
+  upload: Upload,
+  progress: LocalUploadProgress | undefined,
+  workerProgress: TaskProgress | undefined,
+): string {
+  if (upload.status === 'failed' || progress?.phase === 'failed') return 'text-red-400';
+  if (workerProgress && workerProgress.progress < 0) return 'text-red-400';
+  if (upload.status === 'completed' && upload.has_gsplat_ply) return 'text-cyan-300';
+  if (upload.status === 'processing' || progress?.phase === 'processing') return 'text-yellow-400';
+  if (upload.status === 'uploaded' && progress?.phase === 'uploading' && !isActiveLocalUploadProgress(progress)) {
+    return 'text-red-300';
+  }
+  return 'text-emerald-400';
+}
+
+function colmapPendingActionLabel(progress: LocalUploadProgress | undefined): string {
+  if (progress?.phase === 'failed') return '확인 필요';
+  if (progress?.phase === 'completing') return '완료 처리 중...';
+  const percent = uploadPercentLabel(progress);
+  return percent ? `${percent}` : '업로드 중...';
+}
 
 interface Props {
   showHeader?: boolean;
@@ -91,11 +163,14 @@ export default function UserDashboard({ showHeader = true }: Props) {
   const { show: showToast } = useToast();
   const [uploads, setUploads] = useState<Upload[]>([]);
   const [notifications, setNotifications] = useState<Notification[]>([]);
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [workerProgress, setWorkerProgress] = useState<Record<string, TaskProgress>>({});
   const [deleteTarget, setDeleteTarget] = useState<Upload | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   // COLMAP 결과 PLY 를 PC 로 다운로드 + viewer 이동 처리 중인 업로드 id (중복 클릭 방지).
   const [fetchingColmapId, setFetchingColmapId] = useState<string | null>(null);
+  const localUploadProgress = useLocalUploadProgress();
 
   // 사용자 PC 에 다운로드 트리거 후 같은 upload_id 로 /viewer 이동 (refine 모드 자동 시작).
   // presigned URL 을 받아 <a download> 로 저장 → router.push 로 viewer 진입.
@@ -125,40 +200,115 @@ export default function UserDashboard({ showHeader = true }: Props) {
   useEffect(() => {
     api.get<Upload[]>('/uploads').then(setUploads).catch(() => {});
     api.get<Notification[]>('/notifications').then(setNotifications).catch(() => {});
+    api.get<Task[]>('/tasks').then(setTasks).catch(() => {});
 
     const unsub = wsClient.subscribe((msg: WsMessage) => {
       if (msg.type === 'task_complete' || msg.type === 'task_failed') {
         api.get<Upload[]>('/uploads').then(setUploads).catch(() => {});
         api.get<Notification[]>('/notifications').then(setNotifications).catch(() => {});
+        api.get<Task[]>('/tasks').then(setTasks).catch(() => {});
       }
     });
 
     return () => { unsub(); };
   }, []);
 
+  useEffect(() => {
+    for (const upload of uploads) {
+      if (upload.ply_target === 'colmap' && upload.status !== 'uploaded') {
+        clearLocalUploadProgress(upload.id);
+      }
+    }
+  }, [uploads]);
+
+  useEffect(() => {
+    const taskByUpload = latestTaskByUpload(tasks);
+    const taskIds = uploads
+      .filter(upload => upload.ply_target === 'colmap' && upload.status === 'processing')
+      .map(upload => taskByUpload[upload.id]?.id)
+      .filter((taskId): taskId is string => !!taskId);
+
+    if (taskIds.length === 0) {
+      setWorkerProgress({});
+      return;
+    }
+
+    let cancelled = false;
+    const refreshProgress = async () => {
+      const results = await Promise.all(
+        taskIds.map(taskId =>
+          api.get<TaskProgress>(`/tasks/${taskId}/progress`)
+            .then(progress => [taskId, progress] as const)
+            .catch(() => null),
+        ),
+      );
+      if (cancelled) return;
+
+      setWorkerProgress(() => {
+        const next: Record<string, TaskProgress> = {};
+        for (const result of results) {
+          if (result) {
+            const [taskId, progress] = result;
+            next[taskId] = progress;
+          }
+        }
+        return next;
+      });
+    };
+
+    refreshProgress();
+    const interval = window.setInterval(refreshProgress, WORKER_PROGRESS_POLL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [uploads, tasks]);
+
+  const taskByUpload = latestTaskByUpload(tasks);
+
   const markAllRead = async () => {
     await api.post('/notifications/read-all');
     setNotifications([]);
   };
 
-  const handleDelete = async () => {
-    if (!deleteTarget) return;
-    const isHide = !!deleteTarget.is_basemap_source;
+  const deleteUpload = async (target: Upload) => {
+    const isHide = !!target.is_basemap_source;
+    const targetTaskIds = tasks
+      .filter(task => task.upload_id === target.id)
+      .map(task => task.id);
+
     setDeleting(true);
     setDeleteError(null);
     try {
       if (isHide) {
-        await api.post(`/uploads/${deleteTarget.id}/hide`);
+        await api.post(`/uploads/${target.id}/hide`);
       } else {
-        await api.delete(`/uploads/${deleteTarget.id}`);
+        await api.delete(`/uploads/${target.id}`);
       }
-      setUploads(prev => prev.filter(u => u.id !== deleteTarget.id));
+      clearLocalUploadProgress(target.id);
+      setUploads(prev => prev.filter(u => u.id !== target.id));
+      setTasks(prev => prev.filter(task => task.upload_id !== target.id));
+      setWorkerProgress(prev => {
+        const next = { ...prev };
+        for (const taskId of targetTaskIds) delete next[taskId];
+        return next;
+      });
       setDeleteTarget(null);
     } catch (e: any) {
-      setDeleteError(e?.message || (isHide ? '업로드 숨김 실패' : '업로드 삭제 실패'));
+      const message = e?.message || (isHide ? '업로드 숨김 실패' : '업로드 삭제 실패');
+      if (deleteTarget?.id === target.id) {
+        setDeleteError(message);
+      } else {
+        showToast(message, 'error');
+      }
     } finally {
       setDeleting(false);
     }
+  };
+
+  const handleDelete = async () => {
+    if (!deleteTarget) return;
+    await deleteUpload(deleteTarget);
   };
 
   return (
@@ -202,7 +352,6 @@ export default function UserDashboard({ showHeader = true }: Props) {
                 <tr className="text-[var(--muted)] text-left border-b border-[var(--rule)]">
                   <th className="py-2 pr-4">파일명</th>
                   <th className="py-2 pr-4">상태</th>
-                  <th className="py-2 pr-4">SAM3</th>
                   <th className="py-2 pr-4">날짜</th>
                   <th className="py-2 pr-4 text-right">삭제</th>
                 </tr>
@@ -214,12 +363,17 @@ export default function UserDashboard({ showHeader = true }: Props) {
                   const isColmap = u.ply_target === 'colmap';
                   const colmapDone = isColmap && u.status === 'completed' && !!u.has_gsplat_ply;
                   const colmapProcessing = isColmap && u.status === 'processing';
-                  const colmapFailed = isColmap && u.status === 'failed';
+                  const localColmapProgress = isColmap ? localUploadProgress[u.id] : undefined;
+                  const colmapTask = isColmap ? taskByUpload[u.id] : undefined;
+                  const colmapTaskProgress = colmapTask ? workerProgress[colmapTask.id] : undefined;
+                  const colmapLocalFailed = localColmapProgress?.phase === 'failed';
+                  const colmapUploadPending = isColmap && u.status === 'uploaded' && !colmapLocalFailed;
+                  const colmapPipelineStarted = colmapProcessing || localColmapProgress?.phase === 'processing';
                   const filenameClickable = isViewable(u.original_filename) || colmapDone;
                   const isBasemap = !!u.is_basemap_source;
                   const isBasemapUpload = !!u.is_basemap_upload;
-                  // basemap 목적 업로드는 정합 대상이 아니므로 어떤 경우에도 '정합하기' 노출 안 함.
-                  const canAlign = !isColmap && !isBasemapUpload && (!!u.has_refined || !!u.has_doors_json);
+                  // basemap 목적 업로드와 이미 정합 완료된 업로드는 '정합하기' 노출 안 함.
+                  const canAlign = !isColmap && !isBasemapUpload && !u.has_alignment && (!!u.has_refined || !!u.has_doors_json);
                   return (
                     <tr key={u.id} className="border-b border-[var(--rule)]/50">
                       <td className="py-3 pr-4">
@@ -247,21 +401,12 @@ export default function UserDashboard({ showHeader = true }: Props) {
                       </td>
                       <td className={`py-3 pr-4 ${
                         isColmap
-                          ? (colmapFailed ? 'text-red-400' : (colmapDone ? 'text-cyan-300' : 'text-emerald-400'))
+                          ? colmapStatusColor(u, localColmapProgress, colmapTaskProgress)
                           : STAGE_COLOR[stage]
                       }`}>
                         {isColmap
-                          ? (colmapFailed
-                              ? 'COLMAP 실패'
-                              : colmapDone
-                                ? '학습 완료'
-                                : colmapProcessing
-                                  ? 'COLMAP 처리 중'
-                                  : 'COLMAP 대기')
+                          ? colmapStatusLabel(u, localColmapProgress, colmapTaskProgress)
                           : STAGE_LABEL[stage]}
-                      </td>
-                      <td className={`py-3 pr-4 ${sam ? SAM3_COLOR[sam] : 'text-[var(--muted-2)]'}`}>
-                        {isColmap ? '—' : (sam ? SAM3_LABEL[sam] : '—')}
                       </td>
                       <td className="py-3 pr-4 text-[var(--muted)]">{new Date(u.uploaded_at).toLocaleDateString('ko-KR')}</td>
                       <td className="py-3 pr-4 text-right">
@@ -276,12 +421,31 @@ export default function UserDashboard({ showHeader = true }: Props) {
                             >
                               {fetchingColmapId === u.id ? '준비 중...' : '파일 선택'}
                             </button>
+                          ) : colmapUploadPending || colmapLocalFailed ? (
+                            <button
+                              type="button"
+                              disabled
+                              className="inline-block px-3 py-1 rounded bg-[var(--bg-soft)] text-[var(--muted)] text-xs font-bold cursor-not-allowed"
+                              title={localColmapProgress?.error ?? '브라우저에서 MinIO multipart 업로드 중'}
+                            >
+                              {colmapPendingActionLabel(localColmapProgress)}
+                            </button>
+                          ) : colmapPipelineStarted ? (
+                            <button
+                              type="button"
+                              disabled={deleting}
+                              onClick={() => { void deleteUpload(u); }}
+                              className="inline-block px-3 py-1 rounded bg-[var(--paper)] hover:bg-red-600/20 border border-[var(--rule)] text-[var(--ink)] text-xs font-bold disabled:opacity-50"
+                              title="GPU worker 작업을 취소하고 업로드 파일과 DB 정보를 삭제"
+                            >
+                              {deleting ? '삭제중' : '처리중'}
+                            </button>
                           ) : (
                             <Link
                               href={`/colmap-viewer?upload_id=${u.id}`}
                               className="inline-block px-3 py-1 rounded bg-[var(--paper)] hover:bg-sky-400/10 border border-[var(--rule)] text-[var(--ink)] text-xs font-bold"
                             >
-                              처리 중...
+                              업로드 중...
                             </Link>
                           )
                         ) : (
@@ -326,6 +490,7 @@ export default function UserDashboard({ showHeader = true }: Props) {
 
       {deleteTarget && (() => {
         const isHide = !!deleteTarget.is_basemap_source;
+        const isProcessing = deleteTarget.status === 'processing';
         return (
           <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4">
             <div className="w-full max-w-md rounded-lg border border-[var(--rule)] bg-[var(--paper)] p-5 shadow-xl">
@@ -335,7 +500,9 @@ export default function UserDashboard({ showHeader = true }: Props) {
               <p className={`mt-3 text-sm ${isHide ? 'text-[var(--ink-2)]' : 'text-red-300'}`}>
                 {isHide
                   ? 'basemap 원본 파일과 DB 는 그대로 보존되며, 내 업로드 내역에서만 숨김 처리됩니다.'
-                  : '삭제 시 업로드한 파일과 관련된 모든 데이터가 삭제됩니다.'}
+                  : isProcessing
+                    ? '처리 중인 GPU worker 작업을 취소하고, 업로드한 파일과 관련된 모든 데이터가 삭제됩니다.'
+                    : '삭제 시 업로드한 파일과 관련된 모든 데이터가 삭제됩니다.'}
               </p>
               <p className="mt-2 text-sm text-[var(--ink-2)] truncate">
                 대상: {deleteTarget.original_filename}

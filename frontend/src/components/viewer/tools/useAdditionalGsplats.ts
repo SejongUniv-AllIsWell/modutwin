@@ -23,6 +23,8 @@ export interface AddOptions {
   source?: AdditionalGsplatSource;
   meta?: Record<string, any>;
   visible?: boolean;
+  /** false 면 로드 직후 천장컷용 alpha snapshot 을 만든다. 기본값은 초기 로드 비용을 줄이기 위해 true. */
+  lazyColorSnapshot?: boolean;
 }
 
 export interface DetachedLayer {
@@ -107,15 +109,15 @@ export function useAdditionalGsplats(
   // id → ready Promise resolver/rejector (asset.ready / asset.error 시 호출).
   const readyMapRef = useRef<Map<string, { resolve: () => void; reject: (e: Error) => void }>>(new Map());
 
-  // 천장제거 마스킹용 snapshot — asset.ready 직후 1회 캡처. 외부에서 applyCeilingMask 로 alpha 변경 시
-  // origColor 의 alpha 채널을 복원 기준으로 사용. posY 는 baked frame 좌표 (PLY 원본).
-  type ColorSnapshot = {
-    origColor: Uint16Array;     // RGBA half-float (rgb + alpha 모두 원본 보존)
+  // 천장제거 마스킹용 snapshot. 외부에서 applyCeilingMask 로 alpha 변경 시 원본 alpha 를 복원 기준으로 사용.
+  // posY 는 baked frame 좌표 (PLY 원본).
+  type AlphaSnapshot = {
+    origAlpha: Uint16Array;     // half-float alpha only
     posY: Float32Array;         // baked frame Y
     colorTexture: any;          // PlayCanvas texture (lock/unlock 대상)
     numSplats: number;
   };
-  const colorSnapshotMapRef = useRef<Map<string, ColorSnapshot>>(new Map());
+  const colorSnapshotMapRef = useRef<Map<string, AlphaSnapshot>>(new Map());
 
   const revokeIfBlob = (url: string) => {
     if (url.startsWith('blob:')) {
@@ -123,8 +125,48 @@ export function useAdditionalGsplats(
     }
   };
 
+  const captureAlphaSnapshot = useCallback((id: string): AlphaSnapshot | null => {
+    const existing = colorSnapshotMapRef.current.get(id);
+    if (existing) return existing;
+    const asset = assetMapRef.current.get(id) as any;
+    try {
+      const resource = asset?.resource;
+      const gsplatData = resource?.gsplatData;
+      const colorTex = resource?.streams?.textures?.get('splatColor') ?? null;
+      if (!gsplatData || !colorTex) return null;
+      const posY = gsplatData.getProp?.('y') as Float32Array | undefined;
+      if (!posY) return null;
+      const td = colorTex.lock();
+      if (!td) return null;
+      try {
+        const origAlpha = new Uint16Array(gsplatData.numSplats);
+        for (let i = 0; i < gsplatData.numSplats; i++) origAlpha[i] = td[i * 4 + 3];
+        const snapshot = {
+          origAlpha,
+          posY,
+          colorTexture: colorTex,
+          numSplats: gsplatData.numSplats,
+        };
+        colorSnapshotMapRef.current.set(id, snapshot);
+        return snapshot;
+      } finally {
+        colorTex.unlock();
+      }
+    } catch (e) {
+      console.warn('[useAdditionalGsplats] alpha snapshot failed for', id, e);
+      return null;
+    }
+  }, []);
+
   /** 단일 항목을 현재 PlayCanvas app에 로드. app 준비 전이면 50ms 간격으로 재시도. */
-  const loadEntity = useCallback((id: string, url: string, source: AdditionalGsplatSource, visible: boolean, filenameHint?: string | null) => {
+  const loadEntity = useCallback((
+    id: string,
+    url: string,
+    source: AdditionalGsplatSource,
+    visible: boolean,
+    filenameHint?: string | null,
+    lazyColorSnapshot = true,
+  ) => {
     let cancelled = false;
     cancelMapRef.current.set(id, () => { cancelled = true; });
 
@@ -139,7 +181,11 @@ export function useAdditionalGsplats(
       }
 
       const { filename, extension: ext } = getPlayCanvasGsplatAssetHint(url, filenameHint);
-      const asset = new pc.Asset(`add_splat_${id}`, 'gsplat', { url, filename }, { reorder: false } as any);
+      const assetData = {
+        reorder: false,
+        ...(ext === 'sog' ? { decompress: true } : {}),
+      };
+      const asset = new pc.Asset(`add_splat_${id}`, 'gsplat', { url, filename }, assetData as any);
       app.assets.add(asset);
       assetMapRef.current.set(id, asset);
 
@@ -172,27 +218,8 @@ export function useAdditionalGsplats(
         parent.addChild(ent);
         entityMapRef.current.set(id, ent);
 
-        // 천장제거 마스킹용 snapshot — posY (baked) + colorTexture + 원본 alpha (half-float) 캡처.
-        // 실패해도 (예: streams 구조 변경) 다른 기능에는 영향 없음. 마스킹만 no-op.
-        try {
-          const resource = (asset as any).resource;
-          const gsplatData = resource?.gsplatData;
-          const colorTex = resource?.streams?.textures?.get('splatColor') ?? null;
-          if (gsplatData && colorTex) {
-            const posY = gsplatData.getProp('y') as Float32Array;
-            const td = colorTex.lock();
-            if (td) {
-              const origColor = new Uint16Array(td.length);
-              origColor.set(td);
-              colorTex.unlock();
-              colorSnapshotMapRef.current.set(id, {
-                origColor, posY, colorTexture: colorTex, numSplats: gsplatData.numSplats,
-              });
-            }
-          }
-        } catch (e) {
-          console.warn('[useAdditionalGsplats] color snapshot failed for', id, e);
-        }
+        // 천장제거 마스킹용 snapshot. 층 상세 overlay 는 초기 로드 비용을 줄이기 위해 lazy 생성 가능.
+        if (!lazyColorSnapshot) captureAlphaSnapshot(id);
 
         setItems(prev => prev.map(it => it.id === id ? { ...it, loaded: true, error: null } : it));
         const r = readyMapRef.current.get(id);
@@ -202,7 +229,7 @@ export function useAdditionalGsplats(
       app.assets.load(asset);
     };
     tryLoad();
-  }, [coreRef]);
+  }, [coreRef, captureAlphaSnapshot]);
 
   const remove = useCallback((id: string) => {
     const cancel = cancelMapRef.current.get(id);
@@ -226,7 +253,7 @@ export function useAdditionalGsplats(
   const applyCeilingMask = useCallback((
     id: string, visualCeilingY: number, cutoff: number, mode: 'remove' | 'restore',
   ) => {
-    const snap = colorSnapshotMapRef.current.get(id);
+    const snap = colorSnapshotMapRef.current.get(id) ?? captureAlphaSnapshot(id);
     if (!snap) return;  // asset.ready 전에는 호출자가 ready 직후 다시 적용한다.
     const core = coreRef.current;
     if (!core) return;
@@ -236,20 +263,20 @@ export function useAdditionalGsplats(
     // visual ceiling 의 baked Y + 방 내부 방향(+baked Y) 안쪽 cutoff 까지 hide.
     const threshold = visualCeilingY + cutoff;
     const zeroH = f2h(0);
-    const orig = snap.origColor;
+    const orig = snap.origAlpha;
     const posY = snap.posY;
     const N = snap.numSplats;
     if (mode === 'remove') {
       for (let i = 0; i < N; i++) {
         const aboveVisualCeiling = posY[i] < threshold;
-        data[i*4+3] = aboveVisualCeiling ? zeroH : orig[i*4+3];
+        data[i*4+3] = aboveVisualCeiling ? zeroH : orig[i];
       }
     } else {
       // restore: alpha 만 원본으로 복원 (RGB 는 다른 기능이 건드릴 수 있어 건드리지 않음).
-      for (let i = 0; i < N; i++) data[i*4+3] = orig[i*4+3];
+      for (let i = 0; i < N; i++) data[i*4+3] = orig[i];
     }
     snap.colorTexture.unlock();
-  }, [coreRef]);
+  }, [coreRef, captureAlphaSnapshot]);
 
   const add = useCallback((url: string, opts?: AddOptions): AddResult => {
     const id = (typeof crypto !== 'undefined' && (crypto as any).randomUUID)
@@ -274,7 +301,7 @@ export function useAdditionalGsplats(
     ]);
     urlMapRef.current.set(id, url);
 
-    loadEntity(id, url, source, visible, name);
+    loadEntity(id, url, source, visible, name, opts?.lazyColorSnapshot ?? true);
 
     return { id, ready };
   }, [loadEntity]);

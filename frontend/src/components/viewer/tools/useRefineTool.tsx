@@ -7,6 +7,8 @@ import { surfacePlanesFromPolygon, signedDistance, type SurfacePlane, type Polyg
 import { loadRefineState, saveRefineState, clearRefineState } from '@/lib/refine/persistence';
 import type { GaussianScene } from '@/lib/ply/types';
 import { gsplatVisibleSigmaRadius, sigmoidOpacity } from '@/lib/gs/playcanvasGsplat';
+import { uploadMultipartParts } from '@/lib/upload/multipart';
+import { encodeRgbaTexture } from '@/lib/upload/textureEncoding';
 import { getPlayCanvasGsplatAssetHint } from './gsplatAssetHints';
 import {
   AXIS_COLORS,
@@ -1584,32 +1586,40 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     return keep;
   }, []);
 
-  const rebuildCanonicalPlyFromMemory = useCallback(async () => {
+  const finalizeCanonicalPlyFromMemory = useCallback(async () => {
     const data = splatDataRef.current;
     const core = coreRef.current;
     if (!data?.gsplatData || !core) return;
-    const { filterScene, serializePly } = await import('@/lib/ply');
+    const { filterScene } = await import('@/lib/ply');
     const scene = buildSceneFromSplatData(data);
     const keep = buildKeepMaskFromCurrentState(data, core);
     const canonical = filterScene(scene, keep);
     refinedCanonicalSceneRef.current = canonical;
     canonicalNeedsLiveRebuildRef.current = false;
 
-    const bytes = serializePly(canonical);
-    const blobUrl = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
-    skipNextSplatRebakeRef.current = true;
-    try {
-      await core.reloadSplatFromUrl(blobUrl, { preserveCamera: true });
-    } catch (e) {
-      skipNextSplatRebakeRef.current = false;
-      throw e;
+    // PLY 재직렬화 + PlayCanvas 재로드는 큰 씬에서 가장 오래 걸리는 단계다.
+    // live splat 은 그대로 두고, 삭제 대상은 alpha=0 을 origColorData/GPU color texture 에 확정한다.
+    // 저장은 위 canonical scene 을 사용하므로 최종 PLY 에서는 실제로 compact 된다.
+    if (data.origColorData && data.colorTexture) {
+      const zeroH = core.float2Half(0);
+      for (let i = 0; i < data.numSplats; i++) {
+        if (keep[i]) continue;
+        data.origColorData[i * 4 + 3] = zeroH;
+      }
+      const td = data.colorTexture.lock();
+      if (td) {
+        td.set(data.origColorData);
+        data.colorTexture.unlock();
+      }
     }
 
-    // 삭제는 canonical PLY geometry 에 반영됐으므로 이후 단계에서는 별도 mask 를 더 들고 가지 않는다.
+    // 삭제는 origColorData alpha 와 canonical scene 에 반영됐으므로 이후 단계에서는 별도 mask 를 더 들고 가지 않는다.
     boundaryCullMaskRef.current = null;
     boundaryCullSurfaceIdsRef.current = null;
     boundaryCullActiveRef.current = false;
+    boundaryCullVisibleRef.current = true;
     setBoundaryCullActive(false);
+    setBoundaryCullVisible(true);
     floaterMaskRef.current = null;
     floaterActiveRef.current = false;
     setFloaterActive(false);
@@ -1629,10 +1639,10 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     boundaryCullPreviewActiveRef.current = false;
     // pendingRotation 을 splatData 에 in-place 베이크 → 이후 코드는 단일 frame (A') 가정.
     await bakeSplatRotation();
-    await rebuildCanonicalPlyFromMemory();
+    await finalizeCanonicalPlyFromMemory();
     setSaved(true);
     options?.onSwitchToAlign?.();
-  }, [options, bakeSplatRotation, rebuildCanonicalPlyFromMemory]);
+  }, [options, bakeSplatRotation, finalizeCanonicalPlyFromMemory]);
 
   const buildFinalPlyScene = useCallback(async (): Promise<{
     baked: GaussianScene;
@@ -1722,7 +1732,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     };
   }, [ensureOriginalScene]);
 
-  // 다듬기 결과 자산(PLY + mesh.json + tex_*.png) 을 메모리에서 빌드해 반환. 업로드 안 함.
+  // 다듬기 결과 자산(PLY + mesh.json + tex_* 이미지) 을 메모리에서 빌드해 반환. 업로드 안 함.
   // 새 흐름(정합 완료 시 일괄 영속화) 의 commit-final 페이로드 작성용.
   const gatherRefinedAssets = useCallback(async (): Promise<{
     plyBytes: ArrayBuffer | Uint8Array;
@@ -1762,26 +1772,14 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     }> = [];
 
     if (lastBakesRef.current.size > 0) {
-      const rgbaToPng = async (rgba: Uint8ClampedArray, w: number, h: number): Promise<Blob> => {
-        const canvas = document.createElement('canvas');
-        canvas.width = w; canvas.height = h;
-        const ctx = canvas.getContext('2d');
-        if (!ctx) throw new Error('canvas 2d ctx failed');
-        ctx.putImageData(new ImageData(new Uint8ClampedArray(rgba), w, h), 0, 0);
-        return await new Promise<Blob>((res, rej) => {
-          canvas.toBlob(b => b ? res(b) : rej(new Error('toBlob null')), 'image/png');
-        });
-      };
-
       const cy = Math.cos(wallAngleRad), sy = Math.sin(wallAngleRad);
       const rotateY = (v: [number, number, number]): [number, number, number] => [
         cy * v[0] + sy * v[2], v[1], -sy * v[0] + cy * v[2],
       ];
 
       for (const [surfaceId, bake] of Array.from(lastBakesRef.current.entries())) {
-        const texFilename = `tex_${surfaceId}.png`;
-        const pngBlob = await rgbaToPng(bake.rgba, bake.width, bake.height);
-        textures.set(surfaceId, pngBlob);
+        const encoded = await encodeRgbaTexture(bake.rgba, bake.width, bake.height, `tex_${surfaceId}`);
+        textures.set(surfaceId, encoded.blob);
         const inwardRaw: [number, number, number] = [
           -bake.input.normal[0], -bake.input.normal[1], -bake.input.normal[2],
         ];
@@ -1792,7 +1790,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
           corners: cornersOut,
           uvs: bake.uvs.map(u => [u[0], u[1]]),
           normalInward: inward,
-          textureFilename: texFilename,
+          textureFilename: encoded.filename,
           textureWidth: bake.width,
           textureHeight: bake.height,
         });
@@ -1809,7 +1807,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     return { plyBytes, meshJson, textures, rotX, rotZ, wallAngleRad, plyFilename };
   }, [buildFinalPlyScene, options?.originalFilename]);
 
-  // 베이스맵 등록 흐름의 문 설정 완료 시점에 호출됨 — refined PLY + mesh.json + tex_*.png 일괄 업로드 + SceneOutput 등록.
+  // 베이스맵 등록 흐름의 문 설정 완료 시점에 호출됨 — refined PLY + mesh.json + tex_* 이미지 일괄 업로드 + SceneOutput 등록.
   // 모듈 등록 흐름은 이 함수 안 부르고, 정합 완료 시 `gatherRefinedAssets` 결과를 `commit-final` 로 일괄 전송.
   // 반환값:
   //   rotX/rotZ/wallAngleRad — PLY 에 베이크된 회전값. 호출자가 doors corners 등 다른 좌표를
@@ -1830,7 +1828,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
 
       const bytes = serializePly(baked);
 
-      // session_id: 한 번의 저장에서 PLY + mesh.json + tex_*.png 가 같은 디렉토리로 가도록.
+      // session_id: 한 번의 저장에서 PLY + mesh.json + tex_* 이미지가 같은 디렉토리로 가도록.
       const sessionId = `s${Date.now()}`;
 
       // 저장 PLY 파일명: refined_<원본basename>.ply.
@@ -1858,18 +1856,17 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         content_type: 'application/octet-stream',
         session_id: sessionId,
       });
-      const plyParts: { part_number: number; etag: string }[] = [];
       const plyView = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
-      for (let i = 0; i < plyInit.presigned_urls.length; i++) {
-        const start = i * plyInit.part_size;
-        const end = Math.min(start + plyInit.part_size, plyView.byteLength);
-        const chunk = plyView.subarray(start, end);
-        const partResp = await fetch(plyInit.presigned_urls[i], { method: 'PUT', body: chunk });
-        if (!partResp.ok) throw new Error(`PLY part ${i + 1} PUT failed: ${partResp.status}`);
-        const etag = partResp.headers.get('etag')?.replace(/"/g, '') ?? '';
-        plyParts.push({ part_number: i + 1, etag });
-        setUploadProgressMessage(`파일 업로드 중... ${i + 1}/${plyInit.presigned_urls.length}`);
-      }
+      const plyParts = await uploadMultipartParts({
+        presignedUrls: plyInit.presigned_urls,
+        partSize: plyInit.part_size,
+        totalSize: plyView.byteLength,
+        getChunk: (start, end) => plyView.subarray(start, end),
+        errorLabel: 'PLY part',
+        onPartUploaded: (completed, total) => {
+          setUploadProgressMessage(`파일 업로드 중... ${completed}/${total}`);
+        },
+      });
       const plyUrl = await api.post<{ key: string; get_url: string }>(
         '/refine/refined-multipart-complete',
         {
@@ -1892,27 +1889,14 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
       }> = [];
 
       if (lastBakesRef.current.size > 0) {
-        // RGBA → PNG Blob (Canvas 거쳐서 toBlob)
-        const rgbaToPng = async (rgba: Uint8ClampedArray, w: number, h: number): Promise<Blob> => {
-          const canvas = document.createElement('canvas');
-          canvas.width = w; canvas.height = h;
-          const ctx = canvas.getContext('2d');
-          if (!ctx) throw new Error('canvas 2d ctx failed');
-          ctx.putImageData(new ImageData(new Uint8ClampedArray(rgba), w, h), 0, 0);
-          return await new Promise<Blob>((res, rej) => {
-            canvas.toBlob(b => b ? res(b) : rej(new Error('toBlob null')), 'image/png');
-          });
-        };
-
         for (const [surfaceId, bake] of Array.from(lastBakesRef.current.entries())) {
-          const texFilename = `tex_${surfaceId}.png`;
+          const encoded = await encodeRgbaTexture(bake.rgba, bake.width, bake.height, `tex_${surfaceId}`);
           const texUrl = await api.post<{ put_url: string; key: string }>(
             '/refine/refined-upload-url',
-            { upload_id: activeUploadId, filename: texFilename, session_id: sessionId },
+            { upload_id: activeUploadId, filename: encoded.filename, session_id: sessionId },
           );
-          const pngBlob = await rgbaToPng(bake.rgba, bake.width, bake.height);
           const texResp = await fetch(texUrl.put_url, {
-            method: 'PUT', body: pngBlob, headers: { 'Content-Type': 'image/png' },
+            method: 'PUT', body: encoded.blob, headers: { 'Content-Type': encoded.contentType },
           });
           if (!texResp.ok) throw new Error(`tex PUT failed (${surfaceId}): ${texResp.status}`);
 
@@ -1938,7 +1922,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
             corners: cornersOut,
             uvs: bake.uvs.map(u => [u[0], u[1]]),
             normalInward: inward,
-            textureFilename: texFilename,
+            textureFilename: encoded.filename,
             textureWidth: bake.width,
             textureHeight: bake.height,
           });

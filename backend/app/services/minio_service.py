@@ -7,7 +7,7 @@ from app.core.config import get_settings
 
 settings = get_settings()
 
-PART_SIZE = 10 * 1024 * 1024  # 10MB per part
+PART_SIZE = 20 * 1024 * 1024  # 20MB per part
 
 
 def get_minio_client() -> Minio:

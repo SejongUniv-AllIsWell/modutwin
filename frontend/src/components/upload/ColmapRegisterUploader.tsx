@@ -4,6 +4,14 @@ import { useState, useRef, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
 import { api } from '@/lib/api';
 import { Building, Floor, Module, UploadInitResponse } from '@/types';
+import { uploadMultipartParts } from '@/lib/upload/multipart';
+import {
+  markLocalUploadCompleting,
+  markLocalUploadFailed,
+  markLocalUploadProcessing,
+  setLocalUploadPartProgress,
+  startLocalUploadProgress,
+} from '@/lib/upload/localUploadProgress';
 import { Button } from '@/components/ui/Button';
 import type { UploaderFixedContext } from './MultipartUploader';
 
@@ -164,11 +172,16 @@ export default function ColmapRegisterUploader({
         ply_target: 'colmap',
       });
 
-      const { upload_id, minio_upload_id, presigned_urls, part_size } = initRes;
+      const { upload_id, minio_upload_id, presigned_urls, part_size, part_count } = initRes;
+      startLocalUploadProgress({
+        uploadId: upload_id,
+        filename: file.name,
+        totalParts: part_count || presigned_urls.length,
+      });
 
       // 백그라운드 업로드 — router.push 직후에도 fetch promise 는 살아남는다.
       runColmapUpload({ file, upload_id, minio_upload_id, presigned_urls, part_size }).catch(() => {
-        // dashboard 에서 status='failed' 로 표시됨.
+        // dashboard 에서 local progress 상태로 실패 표시됨.
       });
 
       router.push('/dashboard');
@@ -240,15 +253,21 @@ async function runColmapUpload(params: {
   part_size: number;
 }) {
   const { file, presigned_urls, part_size, upload_id, minio_upload_id } = params;
-  const parts: { part_number: number; etag: string }[] = [];
-  for (let i = 0; i < presigned_urls.length; i++) {
-    const start = i * part_size;
-    const end = Math.min(start + part_size, file.size);
-    const chunk = file.slice(start, end);
-    const res = await fetch(presigned_urls[i], { method: 'PUT', body: chunk });
-    if (!res.ok) throw new Error(`part ${i + 1} upload failed`);
-    const etag = res.headers.get('etag')?.replace(/"/g, '') || '';
-    parts.push({ part_number: i + 1, etag });
+  try {
+    const parts = await uploadMultipartParts({
+      presignedUrls: presigned_urls,
+      partSize: part_size,
+      totalSize: file.size,
+      getChunk: (start, end) => file.slice(start, end),
+      onPartUploaded: (completed, total) => {
+        setLocalUploadPartProgress(upload_id, completed, total);
+      },
+    });
+    markLocalUploadCompleting(upload_id);
+    await api.post('/uploads/complete', { upload_id, minio_upload_id, parts });
+    markLocalUploadProcessing(upload_id);
+  } catch (e) {
+    markLocalUploadFailed(upload_id, e);
+    throw e;
   }
-  await api.post('/uploads/complete', { upload_id, minio_upload_id, parts });
 }

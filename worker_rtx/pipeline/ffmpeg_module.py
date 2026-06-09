@@ -21,7 +21,7 @@ class FFmpegModule(PipelineModule):
     - 단일 이미지: images/ 에 복사 (테스트용)
     """
 
-    def __init__(self, fps: int = 2):
+    def __init__(self, fps: float = 1.0):
         self.fps = fps
 
     @property

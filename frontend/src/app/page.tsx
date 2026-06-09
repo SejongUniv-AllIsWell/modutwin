@@ -612,8 +612,8 @@ export default function LandingPage() {
             className="flex justify-between gap-5 flex-wrap mono text-[14px] uppercase"
             style={{ color: 'var(--ink)', letterSpacing: 0 }}
           >
-            <span>© 2024–2026 ModuTwin</span>
-            <span>public beta · build {process.env.NEXT_PUBLIC_BUILD_TAG ?? '2026.05.21'}</span>
+            <span>© 2026 ModuTwin</span>
+            <span>public beta · build {process.env.NEXT_PUBLIC_BUILD_TAG ?? '2026.06.05'}</span>
           </div>
         </div>
       </footer>

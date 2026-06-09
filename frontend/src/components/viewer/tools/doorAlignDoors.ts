@@ -27,7 +27,7 @@ export interface DoorMeshMeta {
   corners: number[][];      // 4 × 3 (final PLY 좌표계, z-fight 오프셋 적용)
   uvs: number[][];          // 4 × 2
   normalInward: number[];   // [x, y, z]
-  textureFilename: string;  // "tex_door_<doorId>.png"
+  textureFilename: string;  // MinIO texture key
   textureWidth: number;
   textureHeight: number;
 }

@@ -387,6 +387,23 @@ import re as _re
 
 REQUIRED_TEXTURE_KEYS = ("ceiling", "floor")
 _WALL_KEY_RE = _re.compile(r"^w\d+$")
+_TEXTURE_EXT_BY_CONTENT_TYPE = {
+    "image/webp": ".webp",
+    "image/png": ".png",
+}
+
+
+def _texture_ext(upload: UploadFile) -> str:
+    content_type = (upload.content_type or "").split(";", 1)[0].strip().lower()
+    if content_type in _TEXTURE_EXT_BY_CONTENT_TYPE:
+        return _TEXTURE_EXT_BY_CONTENT_TYPE[content_type]
+    ext = os.path.splitext(upload.filename or "")[1].lower()
+    return ext if ext in {".webp", ".png"} else ".png"
+
+
+def _texture_content_type(upload: UploadFile) -> str:
+    content_type = (upload.content_type or "").split(";", 1)[0].strip().lower()
+    return content_type if content_type in _TEXTURE_EXT_BY_CONTENT_TYPE else "image/png"
 
 
 @router.post("/commit-final", response_model=CommitFinalResponse)
@@ -409,7 +426,7 @@ async def commit_final(
 
     - 같은 사용자가 같은 호수 재등록 시: 기존 module 재사용 + 기존 자산 삭제(덮어쓰기).
     - 다른 사용자가 같은 호수: 별개 module 신규 생성.
-    - 영속 자산: final.ply + mesh.json + tex_*.png 6장 + doors.json + alignment_transform.
+    - 영속 자산: final.ply + mesh.json + tex_* 텍스처 + doors.json + alignment_transform.
     - 'aligned.ply' 는 저장 안 함 (final.ply + alignment_transform 로 재계산 가능).
     """
     module_name = (module_name or "").strip()
@@ -542,10 +559,10 @@ async def commit_final(
     final_ply_key = f"{refined_dir}/final.ply"
     mesh_key = f"{refined_dir}/mesh.json"
     doors_key = f"{refined_dir}/doors.json"
-    tex_keys = {tid: f"{refined_dir}/tex_{tid}.png" for tid in tex_uploads.keys()}
-    tex_variant_keys = {tid: f"{refined_dir}/tex_{tid}.png" for tid in tex_variant_uploads.keys()}
+    tex_keys = {tid: f"{refined_dir}/tex_{tid}{_texture_ext(f)}" for tid, f in tex_uploads.items()}
+    tex_variant_keys = {tid: f"{refined_dir}/tex_{tid}{_texture_ext(f)}" for tid, f in tex_variant_uploads.items()}
     door_asset_dir = f"{refined_dir}/door_assets"
-    door_tex_keys = {field: f"{door_asset_dir}/{field}.png" for field in door_tex_uploads.keys()}
+    door_tex_keys = {field: f"{door_asset_dir}/{field}{_texture_ext(f)}" for field, f in door_tex_uploads.items()}
     door_splat_keys = {field: f"{door_asset_dir}/{field}.ply" for field in door_splat_uploads.keys()}
 
     # ── Upload 행 생성 ──
@@ -595,7 +612,7 @@ async def commit_final(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"doors_json 형식 오류: {e}")
 
-    # ── MinIO 업로드 (final.ply + mesh.json + tex_*.png + doors.json + door assets) ──
+    # ── MinIO 업로드 (final.ply + mesh.json + tex_* + doors.json + door assets) ──
     uploaded_keys: list[str] = []
     try:
         # 대용량 PLY: staging → 최종 키로 MinIO 서버사이드 복사 (데이터가 백엔드/Cloudflare 미경유).
@@ -611,15 +628,15 @@ async def commit_final(
 
         for tid, f in tex_uploads.items():
             data = await f.read()
-            minio.put_object_bytes(tex_keys[tid], data, "image/png")
+            minio.put_object_bytes(tex_keys[tid], data, _texture_content_type(f))
             uploaded_keys.append(tex_keys[tid])
         for tid, f in tex_variant_uploads.items():
             data = await f.read()
-            minio.put_object_bytes(tex_variant_keys[tid], data, "image/png")
+            minio.put_object_bytes(tex_variant_keys[tid], data, _texture_content_type(f))
             uploaded_keys.append(tex_variant_keys[tid])
         for field, f in door_tex_uploads.items():
             data = await f.read()
-            minio.put_object_bytes(door_tex_keys[field], data, "image/png")
+            minio.put_object_bytes(door_tex_keys[field], data, _texture_content_type(f))
             uploaded_keys.append(door_tex_keys[field])
         for field, f in door_splat_uploads.items():
             data = await f.read()
