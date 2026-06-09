@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 
 from pipeline.base import PipelineModule, PipelineError
+from pipeline.subprocess_utils import run_capture
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +87,7 @@ class FFmpegModule(PipelineModule):
             "-y",
         ]
         try:
-            subprocess.run(cmd, check=True, capture_output=True)
+            run_capture(cmd, text=False)
         except FileNotFoundError:
             raise PipelineError(self.name, "ffmpeg이 설치되어 있지 않습니다.")
         except subprocess.CalledProcessError as e:

@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 
 from pipeline.base import PipelineModule, PipelineError
+from pipeline.subprocess_utils import run_capture
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +42,7 @@ class ColmapModule(PipelineModule):
     def _run_cmd(self, cmd: list, step: str) -> str:
         logger.info(f"[{self.name}] {step}: {' '.join(cmd)}")
         try:
-            result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+            result = run_capture(cmd, text=True)
             return result.stdout + result.stderr
         except subprocess.CalledProcessError as e:
             raise PipelineError(self.name, f"{step} 실패:\n{(e.stderr or '')[-500:]}")
@@ -51,9 +52,9 @@ class ColmapModule(PipelineModule):
     def _get_registered_images(self, folder_path: str) -> int:
         """colmap model_analyzer로 registered images 수 반환."""
         try:
-            result = subprocess.run(
+            result = run_capture(
                 [COLMAP_BIN, "model_analyzer", "--path", folder_path],
-                check=True, capture_output=True, text=True,
+                text=True,
             )
             output = result.stdout + result.stderr
             match = re.search(r"Registered images:\s*(\d+)", output)

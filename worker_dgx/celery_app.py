@@ -1,10 +1,13 @@
 import os
 import sys
 from celery import Celery
+from celery.signals import worker_ready
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 if APP_DIR not in sys.path:
     sys.path.insert(0, APP_DIR)
+
+from worker_tmp_cleanup import cleanup_stale_tmp_dirs
 
 app = Celery('worker')
 app.config_from_object({
@@ -29,6 +32,12 @@ app.config_from_object({
         'tasks.sog',
     ),
 })
+
+
+@worker_ready.connect
+def cleanup_worker_tmp_on_ready(**kwargs):
+    cleanup_stale_tmp_dirs()
+
 
 import tasks.colmap   # noqa: F401
 import tasks.training  # noqa: F401

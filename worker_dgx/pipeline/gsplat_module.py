@@ -3,6 +3,7 @@ import subprocess
 import logging
 
 from pipeline.base import PipelineModule, PipelineError
+from pipeline.subprocess_utils import run_capture
 
 logger = logging.getLogger(__name__)
 
@@ -75,9 +76,7 @@ class GsplatModule(PipelineModule):
         ]
 
         try:
-            result = subprocess.run(
-                cmd, check=True, capture_output=True, text=True, cwd=GSPLAT_CWD,
-            )
+            result = run_capture(cmd, text=True, cwd=GSPLAT_CWD)
             logger.info(f"[{self.name}] 학습 완료\n{result.stdout[-500:]}")
         except subprocess.CalledProcessError as e:
             tail = (e.stderr or e.stdout or "")[-1000:]

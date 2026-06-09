@@ -36,6 +36,7 @@ from app.services.celery_service import (
     dispatch_sam3_door_detection_task,
     dispatch_colmap_task,
 )
+from app.services.celery_broker_cleanup import drop_ready_celery_messages
 from app.services.sam3_service import (
     SAM3_DISABLED_DETAIL,
     mark_sam3_disabled,
@@ -565,6 +566,13 @@ def _revoke_celery_tasks(celery_task_ids: list[str]) -> None:
             logger.exception("[delete_upload] celery revoke failed: task_id=%s", celery_task_id)
 
 
+def _drop_ready_celery_messages(celery_task_ids: list[str]) -> None:
+    try:
+        drop_ready_celery_messages(celery_task_ids)
+    except Exception:
+        logger.exception("[delete_upload] broker ready-message cleanup failed")
+
+
 async def _clear_worker_progress(celery_task_ids: list[str]) -> None:
     if not celery_task_ids:
         return
@@ -617,11 +625,19 @@ async def delete_upload(
     # 정리 대상 키 / prefix 수집.
     keys: set[str] = set()
     prefixes: set[str] = set()
-    for k in (upload.minio_path, upload.refined_ply_path, upload.door_corners_json_path):
+    for k in (
+        upload.minio_path,
+        upload.gsplat_ply_path,
+        upload.refined_ply_path,
+        upload.door_corners_json_path,
+    ):
         if k:
             keys.add(k)
     if upload.minio_path:
         prefixes.add(refined_prefix(upload.minio_path))
+    if upload.ply_target == PlyTarget.colmap:
+        prefixes.add(f"users/{upload.user_id}/colmap/{upload.id}")
+        prefixes.add(f"users/{upload.user_id}/gsplat/{upload.id}")
 
     task_rows = await db.execute(
         select(Task.id, Task.celery_task_id).where(Task.upload_id == upload.id)
@@ -630,6 +646,7 @@ async def delete_upload(
     task_ids = [tid for (tid, _) in task_pairs]
     celery_task_ids = [ctid for (_, ctid) in task_pairs if ctid]
     _revoke_celery_tasks(celery_task_ids)
+    _drop_ready_celery_messages(celery_task_ids)
     await _clear_worker_progress(celery_task_ids)
 
     scene_rows = await db.execute(

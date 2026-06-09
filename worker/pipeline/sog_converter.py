@@ -3,6 +3,7 @@ import subprocess
 import logging
 
 from pipeline.base import PipelineModule, PipelineError
+from pipeline.subprocess_utils import run_capture
 
 logger = logging.getLogger(__name__)
 
@@ -108,9 +109,7 @@ def convert_to_sog(input_path: str, output_path: str | None = None,
     logger.debug(f"[SOGConverter] cmd: {' '.join(cmd)}")
 
     try:
-        result = subprocess.run(
-            cmd, check=True, capture_output=True, text=True, timeout=SOG_TIMEOUT,
-        )
+        result = run_capture(cmd, text=True, timeout=SOG_TIMEOUT)
         if result.stderr:
             logger.debug(f"[SOGConverter] {result.stderr.strip()[-500:]}")
     except FileNotFoundError:

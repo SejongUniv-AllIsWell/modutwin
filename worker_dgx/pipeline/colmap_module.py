@@ -8,6 +8,7 @@ import tempfile
 from typing import Callable, Optional
 
 from pipeline.base import PipelineModule, PipelineError
+from pipeline.subprocess_utils import run_capture
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +56,7 @@ class ColmapModule(PipelineModule):
         env.setdefault("QT_QPA_PLATFORM", "offscreen")
         env.setdefault("GLOG_logtostderr", "1")
         try:
-            result = subprocess.run(cmd, check=True, capture_output=True, text=True, env=env)
+            result = run_capture(cmd, text=True, env=env)
             return result.stdout + result.stderr
         except subprocess.CalledProcessError as e:
             output = "\n".join(part for part in [e.stdout, e.stderr] if part)
@@ -71,9 +72,9 @@ class ColmapModule(PipelineModule):
     def _get_registered_images(self, folder_path: str) -> int:
         """colmap model_analyzer로 registered images 수 반환."""
         try:
-            result = subprocess.run(
+            result = run_capture(
                 [COLMAP_BIN, "model_analyzer", "--path", folder_path],
-                check=True, capture_output=True, text=True,
+                text=True,
             )
             output = result.stdout + result.stderr
             match = re.search(r"Registered images:\s*(\d+)", output)

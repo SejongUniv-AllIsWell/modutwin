@@ -114,9 +114,9 @@ services:
     environment:
       - RABBITMQ_DEFAULT_USER=${RABBITMQ_DEFAULT_USER}
       - RABBITMQ_DEFAULT_PASS=${RABBITMQ_DEFAULT_PASS}
-      # Long COLMAP / gsplat tasks use late ack; RabbitMQ's default 30m
-      # consumer_timeout can close the channel while a valid task is still running.
-      - RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS=-rabbit consumer_timeout ${RABBITMQ_CONSUMER_TIMEOUT_MS:-21600000}
+      # Long COLMAP / gsplat tasks use late ack; keep consumer_timeout above
+      # worst-case reconstruction time so RabbitMQ does not orphan a valid task.
+      - RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS=-rabbit consumer_timeout ${RABBITMQ_CONSUMER_TIMEOUT_MS:-86400000}
     healthcheck:
       test: [ "CMD", "rabbitmq-diagnostics", "-q", "ping" ]
       interval: 15s
