@@ -5,6 +5,7 @@ import { useSearchParams } from 'next/navigation';
 import { api } from '@/lib/api';
 import dynamic from 'next/dynamic';
 import type { EditorMode, RegistrationContext, RegistrationPurpose } from '@/components/viewer/UnifiedSplatEditor';
+import type { Upload } from '@/types';
 import { clearPendingLocalPly, readPendingLocalPly, type PendingLocalPlyPayload } from '@/lib/upload/pendingLocalPly';
 
 const UnifiedSplatEditor = dynamic(
@@ -32,6 +33,21 @@ function buildRegistrationContextFromPayload(p: PendingLocalPlyPayload): Registr
   };
 }
 
+function buildRegistrationContextFromUpload(upload: Upload | null): RegistrationContext | null {
+  if (!upload) return null;
+  if (!upload.building_id || !upload.floor_id || typeof upload.floor_number !== 'number') return null;
+  const moduleName = upload.module_name?.trim();
+  if (!moduleName || moduleName === '__basemap__') return null;
+  return {
+    purpose: 'module',
+    building_id: upload.building_id,
+    building_name: upload.building_name ?? '',
+    floor_id: upload.floor_id,
+    floor_number: upload.floor_number,
+    module_name: moduleName,
+  };
+}
+
 function ViewerContent() {
   const searchParams = useSearchParams();
 
@@ -46,10 +62,12 @@ function ViewerContent() {
   const uploadId = searchParams.get('upload_id') ?? undefined;
   const basemapEditMode = searchParams.get('basemap_edit') === '1';
   const basemapId = searchParams.get('basemap_id') ?? undefined;
+  const [serverRegistrationContext, setServerRegistrationContext] = useState<RegistrationContext | null>(null);
 
   // 등록 컨텍스트: 로컬 핸드오프가 있으면 그것을 우선, 없으면 URL 쿼리 파라미터 (서버 진입용) 사용.
   const initialRegistrationContext: RegistrationContext | null = useMemo(() => {
     if (pendingLocal) return buildRegistrationContextFromPayload(pendingLocal);
+    if (serverRegistrationContext) return serverRegistrationContext;
     const purposeParam = searchParams.get('purpose');
     const purpose: RegistrationPurpose | null =
       purposeParam === 'basemap' || purposeParam === 'module' ? purposeParam : null;
@@ -71,7 +89,7 @@ function ViewerContent() {
       latitude: Number.isFinite(lat) ? lat : undefined,
       longitude: Number.isFinite(lng) ? lng : undefined,
     };
-  }, [pendingLocal, searchParams]);
+  }, [pendingLocal, searchParams, serverRegistrationContext]);
 
   // 초기 모드:
   //  - 로컬 핸드오프 진입 → refine
@@ -103,8 +121,12 @@ function ViewerContent() {
     setResolveError(null);
     const variant = initialMode === 'align' || initialMode === 'door' ? 'refined' : '';
     const qs = variant ? `?variant=${variant}` : '';
-    api.get<{ url: string; filename: string; variant?: string }>(`/uploads/${uploadId}/presigned-url${qs}`)
-      .then(data => {
+    Promise.all([
+      api.get<{ url: string; filename: string; variant?: string }>(`/uploads/${uploadId}/presigned-url${qs}`),
+      api.get<Upload>(`/uploads/${uploadId}`),
+    ])
+      .then(([data, upload]) => {
+        setServerRegistrationContext(buildRegistrationContextFromUpload(upload));
         setFileUrl(data.url);
         const name = data.filename ?? '';
         const servedVariant = data.variant ?? '';
@@ -120,6 +142,7 @@ function ViewerContent() {
       })
       .catch((e: any) => {
         setFileUrl(null);
+        setServerRegistrationContext(null);
         setResolveError(e?.message || '파일 URL 을 가져오지 못했습니다.');
       })
       .finally(() => setResolving(false));

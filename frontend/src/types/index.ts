@@ -160,6 +160,11 @@ export type Sam3Status = 'pending' | 'running' | 'done' | 'failed';
 export interface Upload {
   id: string;
   module_id: string;
+  module_name?: string | null;
+  floor_id?: string | null;
+  floor_number?: number | null;
+  building_id?: string | null;
+  building_name?: string | null;
   original_filename: string;
   file_size: number;
   status: 'uploaded' | 'processing' | 'completed' | 'failed';

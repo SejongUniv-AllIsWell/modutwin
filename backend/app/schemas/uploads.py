@@ -153,6 +153,11 @@ class UploadCompleteResponse(BaseModel):
 class UploadResponse(BaseModel):
     id: UUID
     module_id: UUID
+    module_name: Optional[str] = None
+    floor_id: Optional[UUID] = None
+    floor_number: Optional[int] = None
+    building_id: Optional[UUID] = None
+    building_name: Optional[str] = None
     original_filename: str
     file_size: int
     status: str

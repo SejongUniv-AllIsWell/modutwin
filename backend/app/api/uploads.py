@@ -476,6 +476,11 @@ def _upload_to_response(
     has_alignment: bool = False,
     is_basemap_upload: bool = False,
     is_basemap_active: bool = False,
+    module_name: str | None = None,
+    floor_id: UUID | None = None,
+    floor_number: int | None = None,
+    building_id: UUID | None = None,
+    building_name: str | None = None,
 ) -> UploadResponse:
     """Upload ORM → UploadResponse (SAM3 파이프라인 파생 플래그 포함).
 
@@ -490,6 +495,11 @@ def _upload_to_response(
     return UploadResponse(
         id=upload.id,
         module_id=upload.module_id,
+        module_name=module_name,
+        floor_id=floor_id,
+        floor_number=floor_number,
+        building_id=building_id,
+        building_name=building_name,
         original_filename=upload.original_filename,
         file_size=upload.file_size,
         status=upload.status.value if upload.status else "uploaded",
@@ -505,6 +515,35 @@ def _upload_to_response(
         is_basemap_upload=is_basemap_upload,
         is_basemap_active=is_basemap_active,
     )
+
+
+async def _upload_context_by_id(db: AsyncSession, upload_ids: list[UUID]) -> dict[UUID, dict[str, Any]]:
+    if not upload_ids:
+        return {}
+    rows = await db.execute(
+        select(
+            Upload.id,
+            Module.name.label("module_name"),
+            Floor.id.label("floor_id"),
+            Floor.floor_number,
+            Building.id.label("building_id"),
+            Building.name.label("building_name"),
+        )
+        .join(Module, Upload.module_id == Module.id)
+        .join(Floor, Module.floor_id == Floor.id)
+        .join(Building, Floor.building_id == Building.id)
+        .where(Upload.id.in_(upload_ids))
+    )
+    return {
+        row.id: {
+            "module_name": row.module_name,
+            "floor_id": row.floor_id,
+            "floor_number": row.floor_number,
+            "building_id": row.building_id,
+            "building_name": row.building_name,
+        }
+        for row in rows.all()
+    }
 
 
 @router.get("", response_model=list[UploadResponse])
@@ -523,6 +562,7 @@ async def list_uploads(
         return []
     # 다듬기 저장 (SceneOutput 생성) 여부를 한 번에 조회 — has_refined 보강용.
     upload_ids = [u.id for u in uploads]
+    context_by_upload = await _upload_context_by_id(db, upload_ids)
     scene_rows = await db.execute(
         select(Task.upload_id)
         .join(SceneOutput, SceneOutput.task_id == Task.id)
@@ -564,6 +604,7 @@ async def list_uploads(
             has_alignment=(u.module_id in aligned_module_ids),
             is_basemap_upload=(u.module_id in basemap_module_ids),
             is_basemap_active=(u.id in active_basemap_source_ids),
+            **context_by_upload.get(u.id, {}),
         )
         for u in uploads
     ]
@@ -610,6 +651,7 @@ async def get_upload(
     module_row = module_check.first()
     has_alignment = module_row is not None and module_row[0] is not None
     is_basemap_upload = module_row is not None and module_row[1] == "__basemap__"
+    context_by_upload = await _upload_context_by_id(db, [upload.id])
     return _upload_to_response(
         upload,
         has_scene_output=has_scene,
@@ -617,6 +659,7 @@ async def get_upload(
         has_alignment=has_alignment,
         is_basemap_upload=is_basemap_upload,
         is_basemap_active=is_basemap_active,
+        **context_by_upload.get(upload.id, {}),
     )
 
 
