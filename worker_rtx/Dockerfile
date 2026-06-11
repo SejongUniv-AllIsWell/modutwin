@@ -40,6 +40,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libcurl4-openssl-dev \
     libeigen3-dev \
     libflann-dev \
+    libfreeimage-dev \
     libgflags-dev \
     libglew-dev \
     libglib2.0-0 \
