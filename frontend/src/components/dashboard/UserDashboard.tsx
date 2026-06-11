@@ -395,7 +395,7 @@ export default function UserDashboard({ showHeader = true }: Props) {
                   <th className="py-2 pr-4">파일명</th>
                   <th className="py-2 pr-4">상태</th>
                   <th className="py-2 pr-4">날짜</th>
-                  <th className="py-2 pr-4 text-right">삭제</th>
+                  <th className="py-2 pr-4 text-right">작업</th>
                 </tr>
               </thead>
               <tbody>
@@ -455,14 +455,26 @@ export default function UserDashboard({ showHeader = true }: Props) {
                       <td className="py-3 pr-4 text-right">
                         {isColmap ? (
                           colmapDone ? (
-                            <button
-                              type="button"
-                              onClick={() => handleColmapSelect(u.id)}
-                              className="inline-block px-3 py-1 rounded bg-[var(--accent)] hover:brightness-110 text-[#04131f] text-xs font-bold"
-                              title="서버 결과를 다듬기 단계에서 열기"
-                            >
-                              뷰어 열기
-                            </button>
+                            <div className="inline-flex items-center justify-end gap-2">
+                              <button
+                                type="button"
+                                onClick={() => handleColmapSelect(u.id)}
+                                className="inline-block px-3 py-1 rounded bg-[var(--accent)] hover:brightness-110 text-[#04131f] text-xs font-bold"
+                                title="서버 결과를 다듬기 단계에서 열기"
+                              >
+                                뷰어 열기
+                              </button>
+                              <button
+                                type="button"
+                                disabled={deleting}
+                                onClick={() => setDeleteTarget(u)}
+                                aria-label={`${u.original_filename} 업로드와 처리 결과 삭제`}
+                                className="w-6 h-6 inline-flex items-center justify-center text-[var(--muted)] hover:text-[var(--ink)] hover:bg-red-600 rounded text-xs font-bold disabled:opacity-50"
+                                title="업로드 파일, COLMAP/3DGS 결과, 관련 DB 데이터 삭제"
+                              >
+                                X
+                              </button>
+                            </div>
                           ) : colmapFailed ? (
                             <div className="inline-flex items-center justify-end gap-2">
                               <button
