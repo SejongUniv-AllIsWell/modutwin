@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { api } from '@/lib/api';
@@ -76,6 +76,7 @@ function progressStage(u: { status: string; has_refined?: boolean; has_doors_jso
 }
 
 const WORKER_PROGRESS_POLL_MS = 5000;
+const LOCAL_UPLOAD_REFRESH_MS = 3000;
 
 function uploadPercentLabel(progress: LocalUploadProgress | undefined): string | null {
   if (!progress || progress.phase === 'failed' || progress.phase === 'processing') return null;
@@ -157,7 +158,7 @@ function colmapStatusLabel(
     return `${stage}(${workerLabel ?? taskPercent})`;
   }
   if (upload.status === 'uploaded') {
-    if (progress?.phase === 'completing') return activeProgress ? '업로드 완료' : '업로드 실패';
+    if (progress?.phase === 'completing') return activeProgress ? '업로드 완료 처리 중' : '업로드 완료 확인 실패';
     if (progress?.phase === 'uploading') return activeProgress ? `업로드(${percent ?? '0%'})` : '업로드 실패';
     return '업로드 실패';
   }
@@ -182,7 +183,7 @@ function colmapStatusColor(
   if (latestTask?.status === 'completed') return 'text-cyan-300';
   if (upload.status === 'processing' || progress?.phase === 'processing') return 'text-yellow-400';
   if (upload.status === 'uploaded' && progress?.phase === 'completing' && isActiveLocalUploadProgress(progress)) {
-    return 'text-emerald-400';
+    return 'text-yellow-400';
   }
   if (upload.status === 'uploaded' && progress?.phase === 'uploading' && isActiveLocalUploadProgress(progress)) {
     return 'text-emerald-400';
@@ -208,26 +209,62 @@ export default function UserDashboard({ showHeader = true }: Props) {
   const [retryingUploadId, setRetryingUploadId] = useState<string | null>(null);
   const localUploadProgress = useLocalUploadProgress();
 
+  const refreshDashboardData = useCallback(async () => {
+    const [nextUploads, nextNotifications, nextTasks] = await Promise.all([
+      api.get<Upload[]>('/uploads'),
+      api.get<Notification[]>('/notifications'),
+      api.get<Task[]>('/tasks'),
+    ]);
+    setUploads(nextUploads);
+    setNotifications(nextNotifications);
+    setTasks(nextTasks);
+  }, []);
+
   // COLMAP/3DGS 결과는 사용자 PC로 다운로드하지 않고, upload_id만 넘겨 viewer가 서버 URL을 로드한다.
   const handleColmapSelect = (uploadId: string) => {
     router.push(`/viewer?upload_id=${uploadId}`);
   };
 
   useEffect(() => {
-    api.get<Upload[]>('/uploads').then(setUploads).catch(() => {});
-    api.get<Notification[]>('/notifications').then(setNotifications).catch(() => {});
-    api.get<Task[]>('/tasks').then(setTasks).catch(() => {});
+    refreshDashboardData().catch(() => {});
 
     const unsub = wsClient.subscribe((msg: WsMessage) => {
       if (msg.type === 'task_complete' || msg.type === 'task_failed') {
-        api.get<Upload[]>('/uploads').then(setUploads).catch(() => {});
-        api.get<Notification[]>('/notifications').then(setNotifications).catch(() => {});
-        api.get<Task[]>('/tasks').then(setTasks).catch(() => {});
+        refreshDashboardData().catch(() => {});
       }
     });
 
     return () => { unsub(); };
-  }, []);
+  }, [refreshDashboardData]);
+
+  useEffect(() => {
+    const shouldPoll = Object.values(localUploadProgress).some(progress => (
+      progress.phase === 'completing' || progress.phase === 'processing'
+    ));
+    if (!shouldPoll) return;
+
+    let cancelled = false;
+    const refresh = async () => {
+      try {
+        const [nextUploads, nextTasks] = await Promise.all([
+          api.get<Upload[]>('/uploads'),
+          api.get<Task[]>('/tasks'),
+        ]);
+        if (cancelled) return;
+        setUploads(nextUploads);
+        setTasks(nextTasks);
+      } catch {
+        // 다음 tick 에 다시 시도.
+      }
+    };
+
+    refresh();
+    const interval = window.setInterval(refresh, LOCAL_UPLOAD_REFRESH_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [localUploadProgress]);
 
   useEffect(() => {
     for (const upload of uploads) {
