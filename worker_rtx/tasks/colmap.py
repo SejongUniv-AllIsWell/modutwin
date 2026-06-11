@@ -11,6 +11,11 @@ from backend_callback import notify_upload_progress
 logger = logging.getLogger(__name__)
 
 COLMAP_FRAME_FPS = float(os.environ.get("COLMAP_FRAME_FPS", "1"))
+WORKER_ERROR_CALLBACK_MAX = int(os.environ.get("WORKER_ERROR_CALLBACK_MAX", "4000"))
+
+
+def _callback_error_message(error: Exception) -> str:
+    return str(error)[:WORKER_ERROR_CALLBACK_MAX]
 
 
 @app.task(
@@ -114,7 +119,7 @@ def run_colmap_preprocessing(self, upload_id: str, user_id: str, minio_input_key
             delete_prefix(result_base)
         notify_upload_progress(
             upload_id, "colmap", status="failed",
-            celery_task_id=task_id, error_message=str(e)[:500],
+            celery_task_id=task_id, error_message=_callback_error_message(e),
         )
         raise
 

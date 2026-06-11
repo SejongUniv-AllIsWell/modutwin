@@ -26,6 +26,11 @@ logger = logging.getLogger(__name__)
 COLMAP_FRAME_FPS = float(os.environ.get("COLMAP_FRAME_FPS", "1"))
 PLY_EXT = {".ply"}
 VIDEO_EXT = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+WORKER_ERROR_CALLBACK_MAX = int(os.environ.get("WORKER_ERROR_CALLBACK_MAX", "4000"))
+
+
+def _callback_error_message(error: Exception) -> str:
+    return str(error)[:WORKER_ERROR_CALLBACK_MAX]
 
 
 def _check_magic_bytes(file_path: str, ext: str) -> bool:
@@ -339,7 +344,7 @@ def run_gs_training_from_colmap(self, upload_id: str, user_id: str, zip_minio_ke
             delete_prefix(result_base)
         notify_upload_progress(
             upload_id, "gsplat", status="failed",
-            celery_task_id=task_id, error_message=str(e)[:500],
+            celery_task_id=task_id, error_message=_callback_error_message(e),
         )
         raise
 

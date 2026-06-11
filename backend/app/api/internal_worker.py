@@ -84,7 +84,7 @@ def _normalize_path(value: str | None, field_name: str) -> str | None:
         ) from exc
 
 
-def _summarize_error_message(error_message: str | None, max_len: int = 500) -> str:
+def _summarize_error_message(error_message: str | None, max_len: int = 4000) -> str:
     message = (error_message or "Worker task failed.").strip()
     if len(message) <= max_len:
         return message
