@@ -117,7 +117,9 @@ RUN python3 -m pip install --no-cache-dir --ignore-installed "setuptools<81" whe
     && git submodule update --init --recursive \
     && python3 -m pip install --no-cache-dir ninja numpy jaxtyping rich \
     && python3 -m pip install --no-cache-dir --no-build-isolation -e "${GSPLAT_REPO}" \
-    && python3 -m pip install --no-cache-dir --no-build-isolation -r "${GSPLAT_REPO}/examples/requirements.txt"
+    && python3 -m pip install --no-cache-dir --no-build-isolation -r "${GSPLAT_REPO}/examples/requirements.txt" \
+    && python3 -m pip install --no-cache-dir --no-build-isolation -e "${GSPLAT_REPO}/libs/scene" -e "${GSPLAT_REPO}/libs/stage" \
+    && python3 -c "import gsplat, gsplat_scene, gsplat_stage; print('gsplat imports ok')"
 
 COPY . .
 
