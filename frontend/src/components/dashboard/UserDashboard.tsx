@@ -92,59 +92,102 @@ function latestTaskByUpload(tasks: Task[]): Record<string, Task> {
   }, {});
 }
 
-function workerModuleLabel(module: string): string {
-  const value = module.trim();
-  if (!value) return '';
-
-  const lower = value.toLowerCase();
-  if (lower.includes('matching') || lower.includes('matcher')) return 'COLMAP 매칭';
-  if (lower.includes('mapping') || lower.includes('mapper')) return 'COLMAP 매핑';
-  if (lower.includes('feature')) return 'COLMAP 특징 추출';
-  if (lower.includes('undistort')) return 'COLMAP 보정';
-  if (lower.includes('upload')) return '결과 업로드';
-
-  return value;
+function latestFailedTaskByUpload(tasks: Task[]): Record<string, Task> {
+  return tasks.reduce<Record<string, Task>>((acc, task) => {
+    if (task.status !== 'failed') return acc;
+    const current = acc[task.upload_id];
+    if (!current || Date.parse(task.created_at) > Date.parse(current.created_at)) {
+      acc[task.upload_id] = task;
+    }
+    return acc;
+  }, {});
 }
 
 function workerProgressLabel(progress: TaskProgress | undefined): string | null {
   if (!progress || progress.progress < 0) return null;
   const percent = Math.max(0, Math.min(100, Math.round(progress.progress)));
-  const module = workerModuleLabel(progress.module);
-  return module ? `${percent}% / ${module}` : `${percent}%`;
+  return `${percent}%`;
+}
+
+function taskStageName(task: Task | undefined): 'COLMAP' | '3DGS' | '정합' | 'SAM3' | null {
+  if (!task) return null;
+  if (task.task_type === 'colmap_preprocessing') return 'COLMAP';
+  if (task.task_type === '3dgs_training') return '3DGS';
+  if (task.task_type === 'door_alignment') return '정합';
+  if (task.task_type === 'sam3_door_detection') return 'SAM3';
+  return null;
+}
+
+function failedTaskLabel(task: Task | undefined): string | null {
+  const stage = taskStageName(task);
+  return stage ? `${stage} 실패` : null;
+}
+
+function completedTaskLabel(task: Task | undefined): string | null {
+  const stage = taskStageName(task);
+  return stage ? `${stage} 완료` : null;
 }
 
 function colmapStatusLabel(
   upload: Upload,
   progress: LocalUploadProgress | undefined,
   workerProgress: TaskProgress | undefined,
+  latestTask: Task | undefined,
+  latestFailedTask: Task | undefined,
 ): string {
   const activeProgress = progress ? isActiveLocalUploadProgress(progress) : false;
   const percent = uploadPercentLabel(progress);
   const workerLabel = workerProgressLabel(workerProgress);
+  const failedTask = latestTask?.status === 'failed'
+    ? latestTask
+    : upload.status === 'failed'
+      ? latestFailedTask
+      : undefined;
+  const failedLabel = failedTaskLabel(failedTask);
+  const latestCompletedLabel = completedTaskLabel(latestTask);
 
-  if (upload.status === 'failed' || progress?.phase === 'failed') return '업로드 실패';
-  if (upload.status === 'completed' && upload.has_gsplat_ply) return '학습 완료';
-  if (upload.status === 'processing' || progress?.phase === 'processing') return workerLabel ?? 'COLMAP 처리 중';
-  if (upload.status === 'uploaded') {
-    if (progress?.phase === 'completing' && activeProgress) return '업로드 완료 처리 중';
-    if (progress?.phase === 'uploading' && !activeProgress) return '업로드 중단';
-    return percent ? `업로드 중(${percent})` : '업로드 중';
+  if (failedTask) return failedLabel ?? '업로드 실패';
+  if (progress?.phase === 'failed') return '업로드 실패';
+  if (upload.status === 'failed') return failedLabel ?? '업로드 실패';
+  if (upload.status === 'completed' && upload.has_gsplat_ply) return '3DGS 완료';
+  if (latestTask?.status === 'completed') return latestCompletedLabel ?? '업로드 완료';
+  if (upload.status === 'processing' || progress?.phase === 'processing') {
+    const stage = taskStageName(latestTask) ?? 'COLMAP';
+    const taskPercent = latestTask ? `${Math.max(0, Math.min(100, Math.round(latestTask.progress)))}%` : '0%';
+    return `${stage}(${workerLabel ?? taskPercent})`;
   }
-  return '업로드 중';
+  if (upload.status === 'uploaded') {
+    if (progress?.phase === 'completing') return activeProgress ? '업로드 완료' : '업로드 실패';
+    if (progress?.phase === 'uploading') return activeProgress ? `업로드(${percent ?? '0%'})` : '업로드 실패';
+    return '업로드 실패';
+  }
+  return '업로드 완료';
 }
 
 function colmapStatusColor(
   upload: Upload,
   progress: LocalUploadProgress | undefined,
   workerProgress: TaskProgress | undefined,
+  latestTask: Task | undefined,
+  latestFailedTask: Task | undefined,
 ): string {
-  if (upload.status === 'failed' || progress?.phase === 'failed') return 'text-red-400';
+  const failedTask = latestTask?.status === 'failed'
+    ? latestTask
+    : upload.status === 'failed'
+      ? latestFailedTask
+      : undefined;
+  if (failedTask || upload.status === 'failed' || progress?.phase === 'failed') return 'text-red-400';
   if (workerProgress && workerProgress.progress < 0) return 'text-red-400';
   if (upload.status === 'completed' && upload.has_gsplat_ply) return 'text-cyan-300';
+  if (latestTask?.status === 'completed') return 'text-cyan-300';
   if (upload.status === 'processing' || progress?.phase === 'processing') return 'text-yellow-400';
-  if (upload.status === 'uploaded' && progress?.phase === 'uploading' && !isActiveLocalUploadProgress(progress)) {
-    return 'text-red-300';
+  if (upload.status === 'uploaded' && progress?.phase === 'completing' && isActiveLocalUploadProgress(progress)) {
+    return 'text-emerald-400';
   }
+  if (upload.status === 'uploaded' && progress?.phase === 'uploading' && isActiveLocalUploadProgress(progress)) {
+    return 'text-emerald-400';
+  }
+  if (upload.status === 'uploaded') return 'text-red-400';
   return 'text-emerald-400';
 }
 
@@ -260,6 +303,7 @@ export default function UserDashboard({ showHeader = true }: Props) {
   }, [uploads, tasks]);
 
   const taskByUpload = latestTaskByUpload(tasks);
+  const failedTaskByUpload = latestFailedTaskByUpload(tasks);
 
   const markAllRead = async () => {
     await api.post('/notifications/read-all');
@@ -385,6 +429,7 @@ export default function UserDashboard({ showHeader = true }: Props) {
                   const colmapProcessing = isColmap && u.status === 'processing';
                   const localColmapProgress = isColmap ? localUploadProgress[u.id] : undefined;
                   const colmapTask = isColmap ? taskByUpload[u.id] : undefined;
+                  const colmapFailedTask = isColmap ? failedTaskByUpload[u.id] : undefined;
                   const colmapTaskProgress = colmapTask ? workerProgress[colmapTask.id] : undefined;
                   const colmapLocalFailed = localColmapProgress?.phase === 'failed';
                   const colmapUploadPending = isColmap && u.status === 'uploaded' && !colmapLocalFailed;
@@ -422,11 +467,11 @@ export default function UserDashboard({ showHeader = true }: Props) {
                       </td>
                       <td className={`py-3 pr-4 ${
                         isColmap
-                          ? colmapStatusColor(u, localColmapProgress, colmapTaskProgress)
+                          ? colmapStatusColor(u, localColmapProgress, colmapTaskProgress, colmapTask, colmapFailedTask)
                           : STAGE_COLOR[stage]
                       }`}>
                         {isColmap
-                          ? colmapStatusLabel(u, localColmapProgress, colmapTaskProgress)
+                          ? colmapStatusLabel(u, localColmapProgress, colmapTaskProgress, colmapTask, colmapFailedTask)
                           : STAGE_LABEL[stage]}
                       </td>
                       <td className="py-3 pr-4 text-[var(--muted)]">{new Date(u.uploaded_at).toLocaleDateString('ko-KR')}</td>
