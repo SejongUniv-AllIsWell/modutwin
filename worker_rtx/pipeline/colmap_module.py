@@ -69,6 +69,36 @@ class ColmapModule(PipelineModule):
         except FileNotFoundError:
             raise PipelineError(self.name, f"colmap 바이너리를 찾을 수 없습니다: {COLMAP_BIN}")
 
+    def _gpu_enabled(self) -> bool:
+        return str(COLMAP_USE_GPU).strip().lower() not in {"0", "false", "no", "off"}
+
+    def _cmd_with_cpu_sift(self, cmd: list) -> list:
+        cpu_cmd = list(cmd)
+        for option in ("--SiftExtraction.use_gpu", "--SiftMatching.use_gpu"):
+            if option in cpu_cmd:
+                value_index = cpu_cmd.index(option) + 1
+                if value_index < len(cpu_cmd):
+                    cpu_cmd[value_index] = "0"
+        return cpu_cmd
+
+    def _run_cmd_with_cpu_fallback(self, cmd: list, step: str, cleanup_before_retry=None) -> str:
+        try:
+            return self._run_cmd(cmd, step)
+        except PipelineError as exc:
+            if not self._gpu_enabled():
+                raise
+            if "--SiftExtraction.use_gpu" not in cmd and "--SiftMatching.use_gpu" not in cmd:
+                raise
+            logger.warning(
+                "[%s] %s GPU SIFT 실패, CPU SIFT로 재시도합니다: %s",
+                self.name,
+                step,
+                exc,
+            )
+            if cleanup_before_retry:
+                cleanup_before_retry()
+            return self._run_cmd(self._cmd_with_cpu_sift(cmd), f"{step} (CPU fallback)")
+
     def _get_registered_images(self, folder_path: str) -> int:
         """colmap model_analyzer로 registered images 수 반환."""
         try:
@@ -101,7 +131,7 @@ class ColmapModule(PipelineModule):
         # 1. Feature extraction
         logger.info(f"[{self.name}] Feature extraction 시작: {input_path}")
         self._progress(60, "COLMAP feature extraction")
-        self._run_cmd([
+        feature_cmd = [
             COLMAP_BIN, "feature_extractor",
             "--database_path", database_path,
             "--image_path",    input_path,
@@ -110,7 +140,12 @@ class ColmapModule(PipelineModule):
             "--SiftExtraction.use_gpu", COLMAP_USE_GPU,
             "--SiftExtraction.num_threads", COLMAP_NUM_THREADS,
             "--SiftExtraction.max_image_size", COLMAP_MAX_IMAGE_SIZE,
-        ], "feature_extractor")
+        ]
+        self._run_cmd_with_cpu_fallback(
+            feature_cmd,
+            "feature_extractor",
+            cleanup_before_retry=lambda: os.path.exists(database_path) and os.remove(database_path),
+        )
 
         # 2. Exhaustive matching
         logger.info(f"[{self.name}] Feature matching 시작 ({COLMAP_MATCHER})")
@@ -132,7 +167,7 @@ class ColmapModule(PipelineModule):
             ]
         else:
             raise PipelineError(self.name, f"지원하지 않는 COLMAP_MATCHER 값입니다: {COLMAP_MATCHER}")
-        self._run_cmd(matcher_cmd, f"{COLMAP_MATCHER}_matcher")
+        self._run_cmd_with_cpu_fallback(matcher_cmd, f"{COLMAP_MATCHER}_matcher")
 
         # 3. Mapper
         logger.info(f"[{self.name}] Incremental mapping 시작")

@@ -5,7 +5,7 @@ import logging
 import tempfile
 
 from celery_app import app
-from minio_helper import download_file, upload_file
+from minio_helper import delete_file, download_file, upload_file
 from redis_helper import update_progress, clear_progress
 from callback_client import notify_task_failure, notify_task_success
 from pipeline.sog_converter import convert_to_sog
@@ -40,6 +40,11 @@ def run_door_alignment(self, upload_id: str, user_id: str,
     logger.info(f"[Task {task_id}] 정합 시작: upload_id={upload_id}")
     processing_completed = False
     success_callback_failed = False
+    uploaded_keys: list[str] = []
+
+    def upload_output(local_path: str, key: str, content_type: str = "application/octet-stream") -> None:
+        upload_file(local_path, key, content_type=content_type)
+        uploaded_keys.append(key)
 
     try:
         # 1. 다운로드
@@ -77,8 +82,8 @@ def run_door_alignment(self, upload_id: str, user_id: str,
         output_sog_key = f"{module_base}/alignment/{module_name}.sog"
         metadata_key = f"{module_base}/alignment/metadata.json"
 
-        upload_file(aligned_ply, output_ply_key)
-        upload_file(aligned_sog, output_sog_key)
+        upload_output(aligned_ply, output_ply_key)
+        upload_output(aligned_sog, output_sog_key)
 
         metadata = {
             "upload_id": upload_id,
@@ -92,17 +97,18 @@ def run_door_alignment(self, upload_id: str, user_id: str,
         metadata_path = os.path.join(work_dir, "metadata.json")
         with open(metadata_path, "w") as f:
             json.dump(metadata, f, indent=2)
-        upload_file(metadata_path, metadata_key, content_type="application/json")
+        upload_output(metadata_path, metadata_key, content_type="application/json")
 
         # 5. web_output/ 에도 복사 (웹 뷰어용)
         web_sog_key = f"{module_base}/web_output/{module_name}.sog"
-        upload_file(aligned_sog, web_sog_key)
+        upload_output(aligned_sog, web_sog_key)
 
         update_progress(task_id, 100, "완료")
 
         result = {
             "status": "completed",
             "upload_id": upload_id,
+            "task_type": "door_alignment",
             "ply_key": output_ply_key,
             "sog_key": output_sog_key,
             "web_sog_key": web_sog_key,
@@ -118,10 +124,30 @@ def run_door_alignment(self, upload_id: str, user_id: str,
         return result
 
     except Exception as e:
-        if not processing_completed and not success_callback_failed:
+        if uploaded_keys and not processing_completed:
+            for key in uploaded_keys:
+                delete_file(key)
+        if success_callback_failed:
+            logger.error(f"[Task {task_id}] 성공 콜백 실패로 정합 태스크를 실패 처리: {e}")
+            failure_status = None
+            try:
+                failure_response = notify_task_failure(
+                    task_id,
+                    upload_id,
+                    f"성공 콜백 실패: {e}",
+                    "door_alignment",
+                )
+                failure_status = failure_response.get("status")
+            except Exception as callback_err:
+                logger.error(f"[Task {task_id}] 실패 콜백 전송 실패: {callback_err}")
+            if uploaded_keys and failure_status and failure_status != "completed":
+                for key in uploaded_keys:
+                    delete_file(key)
+            update_progress(task_id, -1, f"성공 콜백 실패: {str(e)[:180]}")
+        elif not processing_completed:
             logger.error(f"[Task {task_id}] 정합 실패: {e}")
             try:
-                notify_task_failure(task_id, upload_id, str(e))
+                notify_task_failure(task_id, upload_id, str(e), "door_alignment")
             except Exception as callback_err:
                 logger.error(f"[Task {task_id}] 실패 콜백 전송 실패: {callback_err}")
             update_progress(task_id, -1, f"실패: {str(e)[:200]}")
@@ -147,9 +173,9 @@ def _align_module(ply_path: str, basemap_path: str,
     import numpy as np
 
     # Docker 컨테이너: core/, utilities/가 /app 아래에 볼륨 마운트됨
-    # 로컬 실행: worker_rtx/ 상위(프로젝트 루트)를 path에 추가
+    # 로컬 실행: worker/ 상위(프로젝트 루트)를 path에 추가
     project_root = os.path.join(os.path.dirname(__file__), "..", "..")
-    app_root = os.path.dirname(os.path.dirname(__file__))  # worker_rtx/ → /app
+    app_root = os.path.dirname(os.path.dirname(__file__))  # worker/ → /app
     for p in (app_root, project_root):
         if p not in sys.path:
             sys.path.insert(0, p)
