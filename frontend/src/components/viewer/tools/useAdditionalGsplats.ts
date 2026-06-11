@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { SplatViewerCoreRef } from '../SplatViewerCore';
 import { getPlayCanvasGsplatAssetHint } from './gsplatAssetHints';
+import { stabilizeGsplatRendering } from './gsplatRenderStability';
 
 export type AdditionalGsplatSource = 'local' | 'server' | 'basemap';
 
@@ -206,7 +207,9 @@ export function useAdditionalGsplats(
           // PLY 컨벤션: Z축 180° 회전 (SuperSplat과 동일)
           ent.setLocalEulerAngles(0, 0, 180);
         }
-        ent.addComponent('gsplat', { asset });
+        // LOD는 PlayCanvas unified/octree 경로에서 동작하므로 일반 GSplatInstance 로 고정한다.
+        ent.addComponent('gsplat', { asset, unified: false });
+        stabilizeGsplatRendering(ent);
         ent.enabled = visible;
         // 정합 모드 reparent 시 module-side 와 basemap 을 구분하기 위한 태그.
         // SplatViewerCore.enterAlignmentMode 가 'basemap' 태그가 없는 추가 splat 만 alignmentGroup 으로 옮긴다.

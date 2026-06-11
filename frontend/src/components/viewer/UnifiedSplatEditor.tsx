@@ -60,6 +60,8 @@ interface Props {
   initialDisplayName?: string;
   initialMode?: EditorMode;
   initialRegistrationContext?: RegistrationContext | null;
+  /** /refine/refined-bundle 을 바로 조회해도 되는 서버 SceneOutput 존재 여부. */
+  initialHasRefinedBundle?: boolean;
   /** /upload 페이지에서 blob URL 핸드오프로 들어온 로컬 파일의 원본 크기.
    *  blob URL 자체로는 size 를 알 수 없어 register-local 의 quota 계산에 필요. */
   initialLocalFileSize?: number;
@@ -135,6 +137,7 @@ export default function UnifiedSplatEditor({
   initialDisplayName,
   initialMode = null,
   initialRegistrationContext = null,
+  initialHasRefinedBundle = false,
   initialLocalFileSize = 0,
   initialBasemapEditMode = false,
   initialBasemapId,
@@ -153,6 +156,7 @@ export default function UnifiedSplatEditor({
   const [displayName, setDisplayName] = useState<string | null>(initialDisplayName ?? null);
   const [source, setSource] = useState<'local' | 'server'>(initialUploadId ? 'server' : 'local');
   const [mainVisible, setMainVisible] = useState(true);
+  const [refinedBundleAvailable, setRefinedBundleAvailable] = useState(Boolean(initialHasRefinedBundle));
 
   // 로컬 파일 → Object URL 추적 (revoke 위해). /upload 페이지에서 blob URL 핸드오프로 들어왔으면 그대로 보관.
   const localObjectUrlRef = useRef<string | null>(
@@ -249,6 +253,10 @@ export default function UnifiedSplatEditor({
   // 서버 진입 — initialSogUrl 변화 시 동기화
   const lastInitialUrlRef = useRef(initialSogUrl);
   useEffect(() => {
+    setRefinedBundleAvailable(Boolean(initialHasRefinedBundle));
+  }, [initialHasRefinedBundle, initialUploadId]);
+
+  useEffect(() => {
     if (lastInitialUrlRef.current === initialSogUrl) return;
     lastInitialUrlRef.current = initialSogUrl ?? null;
     if (initialSogUrl) {
@@ -332,6 +340,7 @@ export default function UnifiedSplatEditor({
     copyRefineState('', reg.upload_id);
     setUploadId(reg.upload_id);
     setSource('server');
+    setRefinedBundleAvailable(false);
     return reg.upload_id;
   }, [uploadId, isBasemapPurpose, displayName]);
 
@@ -401,6 +410,7 @@ export default function UnifiedSplatEditor({
         copyRefineState('', reg.upload_id);
         setUploadId(reg.upload_id);
         setSource('server');
+        setRefinedBundleAvailable(false);
         enriched = { ...result, upload_id: reg.upload_id };
       } catch (e: any) {
         alert(`업로드 등록 실패: ${e?.message || e}`);
@@ -625,7 +635,8 @@ export default function UnifiedSplatEditor({
   });
 
   // 정제된 wall mesh + 텍스처 자동 로드 (저장된 mesh.json + tex_* 이미지).
-  // 비활성 조건 두 가지:
+  // 비활성 조건 세 가지:
+  //   - refinedBundleAvailable=false: 서버에 SceneOutput 이 없어 /refine/refined-bundle 이 404 인 업로드.
   //   - door 단계: 문 설정이 끝나기 전이라 서버 refined bundle 이 아직 없을 수 있음.
   //   - meshIsFreshInMemory: 문 설정 완료 직후 정합 진입 시 메모리에 이미 punch 된 텍스처 + 메시가 있어 서버 fetch 가 덮어쓰면 안 됨.
   // basemap 수정 모드는 등록된 도어 splat 을 별도 레이어로 올리지 않는다. 여러 gsplat entity 가 겹치면
@@ -633,7 +644,7 @@ export default function UnifiedSplatEditor({
   useRefinedMeshLoader(
     coreRef,
     uploadId,
-    Boolean(uploadId) && (mode !== 'door' || isBasemapEditMode) && !meshIsFreshInMemory,
+    Boolean(uploadId) && refinedBundleAvailable && (mode !== 'door' || isBasemapEditMode) && !meshIsFreshInMemory,
     undefined,
     null,
     isBasemapEditMode,
@@ -681,6 +692,7 @@ export default function UnifiedSplatEditor({
 
       setCurrentUrl(url);
       setUploadId(undefined);
+      setRefinedBundleAvailable(false);
       setDisplayName(first.name);
       setSource('local');
       setMainVisible(true);
@@ -734,6 +746,7 @@ export default function UnifiedSplatEditor({
     }
     setCurrentUrl(null);
     setUploadId(undefined);
+    setRefinedBundleAvailable(false);
     setDisplayName(null);
     setSource('local');
     setMainVisible(true);
@@ -757,18 +770,20 @@ export default function UnifiedSplatEditor({
     const prevMainName = displayName ?? '파일';
     const prevMainSource = source;
     const prevMainVisible = mainVisible;
-    const prevMainMeta = { uploadId, metadata };
+    const prevMainMeta = { uploadId, metadata, refinedBundleAvailable };
 
     // 3) 새 메인 상태 적용 (URL 소유권은 메인의 localObjectUrlRef 가 인수 — blob일 때만)
     const newSource: 'local' | 'server' =
       detached.source === 'server' ? 'server' : 'local';
     const newUploadId = detached.meta?.uploadId as string | undefined;
     const newMetadata = (detached.meta?.metadata ?? null) as MetadataResult | null;
+    const newHasRefinedBundle = Boolean(detached.meta?.refinedBundleAvailable);
 
     setCurrentUrl(detached.url);
     setDisplayName(detached.name);
     setSource(newSource);
     setUploadId(newUploadId);
+    setRefinedBundleAvailable(newHasRefinedBundle);
     setMetadata(newMetadata);
     setMainVisible(detached.visible);
     setMode('refine');
@@ -786,7 +801,7 @@ export default function UnifiedSplatEditor({
         meta: prevMainMeta,
       }).ready.catch(() => {});
     }
-  }, [additional, currentUrl, displayName, source, mainVisible, uploadId, metadata]);
+  }, [additional, currentUrl, displayName, source, mainVisible, uploadId, metadata, refinedBundleAvailable]);
 
   // 언마운트 시 로컬 Object URL 정리
   useEffect(() => {
@@ -1256,6 +1271,7 @@ export default function UnifiedSplatEditor({
                     newId = reg.upload_id;
                     setUploadId(reg.upload_id);
                     setSource('server');
+                    setRefinedBundleAvailable(false);
                   }
                   if (!newId) throw new Error('register failed');
                   return newId;
@@ -1290,6 +1306,7 @@ export default function UnifiedSplatEditor({
                     newId = reg.upload_id;
                     setUploadId(reg.upload_id);
                     setSource('server');
+                    setRefinedBundleAvailable(false);
                   }
                   if (!newId) throw new Error('register failed');
                   return newId;
@@ -1302,7 +1319,9 @@ export default function UnifiedSplatEditor({
               }}
               onCommitRefined={async (id) => {
                 // refined PLY + mesh.json + tex_* 이미지 일괄 업로드. 베이크된 회전값 그대로 반환.
-                return await refine.commitRefinedToServer(id);
+                const result = await refine.commitRefinedToServer(id);
+                setRefinedBundleAvailable(true);
+                return result;
               }}
               getCurrentKeepMask={() => refine.getCurrentKeepMask?.() ?? null}
               getBakeRgba={(sid) => refine.getBakeRgba?.(sid) ?? null}
@@ -1344,6 +1363,7 @@ export default function UnifiedSplatEditor({
                 } else {
                   // basemap 등록 흐름 — 즉시 영속화 후 대시보드 이동.
                   await refine.commitRefinedToServer(activeUploadId);
+                  setRefinedBundleAvailable(true);
                   await api.post('/basemaps/register', { upload_id: activeUploadId });
                   setBasemapDone(true);
                   setTimeout(() => router.push('/dashboard'), 1400);

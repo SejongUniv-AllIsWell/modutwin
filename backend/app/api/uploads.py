@@ -508,6 +508,7 @@ def _upload_to_response(
         sam3_status=upload.sam3_status.value if upload.sam3_status else None,
         sam3_prompt=upload.sam3_prompt,
         has_refined=bool(upload.refined_ply_path) or has_scene_output,
+        has_refined_bundle=has_scene_output,
         has_doors_json=bool(upload.door_corners_json_path),
         has_alignment=has_alignment,
         has_gsplat_ply=bool(upload.gsplat_ply_path),

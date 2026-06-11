@@ -10,6 +10,7 @@ import {
   getLookDir,
   getRightDir,
 } from './tools/cameraMath';
+import { stabilizeGsplatRendering } from './tools/gsplatRenderStability';
 import { getPlayCanvasGsplatAssetHint } from './tools/gsplatAssetHints';
 
 // ── 외부 노출 타입 ──
@@ -802,7 +803,9 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
                 if (extension !== 'spz') {
                   splatEntity.setLocalEulerAngles(0, 0, 180);
                 }
-                splatEntity.addComponent('gsplat', { asset });
+                // LOD는 PlayCanvas unified/octree 경로에서 동작하므로 일반 GSplatInstance 로 고정한다.
+                splatEntity.addComponent('gsplat', { asset, unified: false });
+                stabilizeGsplatRendering(splatEntity);
                 app.root.addChild(splatEntity);
                 splatEntityRef.current = splatEntity;
 

@@ -103,6 +103,7 @@ function ViewerContent() {
 
   const [fileUrl, setFileUrl] = useState<string | null>(pendingLocal?.blobUrl ?? null);
   const [filename, setFilename] = useState<string | undefined>(pendingLocal?.filename);
+  const [serverHasRefinedBundle, setServerHasRefinedBundle] = useState(false);
   const [resolving, setResolving] = useState(!pendingLocal && !!uploadId);
   const [resolveError, setResolveError] = useState<string | null>(null);
 
@@ -111,10 +112,12 @@ function ViewerContent() {
   useEffect(() => {
     if (pendingLocal) {
       setResolving(false);
+      setServerHasRefinedBundle(false);
       return;
     }
     if (!uploadId) {
       setResolving(false);
+      setServerHasRefinedBundle(false);
       return;
     }
     setResolving(true);
@@ -127,6 +130,11 @@ function ViewerContent() {
     ])
       .then(([data, upload]) => {
         setServerRegistrationContext(buildRegistrationContextFromUpload(upload));
+        setServerHasRefinedBundle(
+          typeof upload.has_refined_bundle === 'boolean'
+            ? upload.has_refined_bundle
+            : Boolean(upload.has_refined && !upload.has_gsplat_ply),
+        );
         setFileUrl(data.url);
         const name = data.filename ?? '';
         const servedVariant = data.variant ?? '';
@@ -143,6 +151,7 @@ function ViewerContent() {
       .catch((e: any) => {
         setFileUrl(null);
         setServerRegistrationContext(null);
+        setServerHasRefinedBundle(false);
         setResolveError(e?.message || '파일 URL 을 가져오지 못했습니다.');
       })
       .finally(() => setResolving(false));
@@ -178,6 +187,7 @@ function ViewerContent() {
         initialDisplayName={filename}
         initialMode={initialMode}
         initialRegistrationContext={initialRegistrationContext}
+        initialHasRefinedBundle={serverHasRefinedBundle}
         initialLocalFileSize={pendingLocal?.fileSize ?? 0}
         initialBasemapEditMode={basemapEditMode}
         initialBasemapId={basemapId}

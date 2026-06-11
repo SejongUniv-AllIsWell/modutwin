@@ -16,7 +16,7 @@ COLMAP_BIN = os.environ.get("COLMAP_BIN", "colmap")
 COLMAP_MATCHER = os.environ.get("COLMAP_MATCHER", "sequential").lower()
 COLMAP_USE_GPU = os.environ.get("COLMAP_USE_GPU", "0")
 COLMAP_NUM_THREADS = os.environ.get("COLMAP_NUM_THREADS", "2")
-COLMAP_MAX_IMAGE_SIZE = os.environ.get("COLMAP_MAX_IMAGE_SIZE", "1600")
+COLMAP_MAX_IMAGE_SIZE = os.environ.get("COLMAP_MAX_IMAGE_SIZE", "3840")
 COLMAP_SEQUENTIAL_OVERLAP = os.environ.get("COLMAP_SEQUENTIAL_OVERLAP", "20")
 
 

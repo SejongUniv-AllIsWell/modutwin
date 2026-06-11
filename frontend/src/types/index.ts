@@ -174,6 +174,7 @@ export interface Upload {
   sam3_status?: Sam3Status | null;
   sam3_prompt?: string | null;
   has_refined?: boolean;
+  has_refined_bundle?: boolean;
   has_doors_json?: boolean;
   has_alignment?: boolean;
   has_gsplat_ply?: boolean;

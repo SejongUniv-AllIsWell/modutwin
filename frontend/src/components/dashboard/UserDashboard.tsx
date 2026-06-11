@@ -206,33 +206,11 @@ export default function UserDashboard({ showHeader = true }: Props) {
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [retryingUploadId, setRetryingUploadId] = useState<string | null>(null);
-  // COLMAP 결과 PLY 를 PC 로 다운로드 + viewer 이동 처리 중인 업로드 id (중복 클릭 방지).
-  const [fetchingColmapId, setFetchingColmapId] = useState<string | null>(null);
   const localUploadProgress = useLocalUploadProgress();
 
-  // 사용자 PC 에 다운로드 트리거 후 같은 upload_id 로 /viewer 이동 (refine 모드 자동 시작).
-  // presigned URL 을 받아 <a download> 로 저장 → router.push 로 viewer 진입.
-  const handleColmapSelect = async (uploadId: string) => {
-    if (fetchingColmapId) return;
-    setFetchingColmapId(uploadId);
-    try {
-      const data = await api.get<{ url: string; filename: string }>(
-        `/uploads/${uploadId}/presigned-url`,
-      );
-      const a = document.createElement('a');
-      a.href = data.url;
-      const fname = data.filename || 'gsplat.ply';
-      a.download = fname.endsWith('.ply') ? fname : `${fname}.ply`;
-      a.rel = 'noopener';
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      router.push(`/viewer?upload_id=${uploadId}`);
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : String(e);
-      showToast(`파일을 가져오지 못했습니다: ${msg}`, 'error');
-      setFetchingColmapId(null);
-    }
+  // COLMAP/3DGS 결과는 사용자 PC로 다운로드하지 않고, upload_id만 넘겨 viewer가 서버 URL을 로드한다.
+  const handleColmapSelect = (uploadId: string) => {
+    router.push(`/viewer?upload_id=${uploadId}`);
   };
 
   useEffect(() => {
@@ -446,9 +424,8 @@ export default function UserDashboard({ showHeader = true }: Props) {
                         {isColmap && colmapDone ? (
                           <button
                             type="button"
-                            disabled={fetchingColmapId === u.id}
                             onClick={() => handleColmapSelect(u.id)}
-                            className="text-cyan-300 hover:underline disabled:opacity-60 disabled:cursor-wait"
+                            className="text-cyan-300 hover:underline"
                           >
                             {u.original_filename}
                           </button>
@@ -480,12 +457,11 @@ export default function UserDashboard({ showHeader = true }: Props) {
                           colmapDone ? (
                             <button
                               type="button"
-                              disabled={fetchingColmapId === u.id}
                               onClick={() => handleColmapSelect(u.id)}
-                              className="inline-block px-3 py-1 rounded bg-[var(--accent)] hover:brightness-110 disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] text-[#04131f] text-xs font-bold"
-                              title="PLY를 PC에 저장하고 다듬기 단계로 이동"
+                              className="inline-block px-3 py-1 rounded bg-[var(--accent)] hover:brightness-110 text-[#04131f] text-xs font-bold"
+                              title="서버 결과를 다듬기 단계에서 열기"
                             >
-                              {fetchingColmapId === u.id ? '준비 중...' : '파일 선택'}
+                              뷰어 열기
                             </button>
                           ) : colmapFailed ? (
                             <div className="inline-flex items-center justify-end gap-2">

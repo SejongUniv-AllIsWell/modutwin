@@ -168,6 +168,8 @@ class UploadResponse(BaseModel):
     sam3_status: Optional[str] = None
     sam3_prompt: Optional[str] = None
     has_refined: bool = False
+    # /refine/refined-bundle 이 실제로 200을 반환할 수 있는 SceneOutput 존재 여부.
+    has_refined_bundle: bool = False
     has_doors_json: bool = False
     has_alignment: bool = False
     has_gsplat_ply: bool = False  # COLMAP→GS 결과 PLY 존재 여부

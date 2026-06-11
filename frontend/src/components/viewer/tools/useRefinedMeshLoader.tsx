@@ -399,7 +399,7 @@ export function useRefinedMeshLoader(
         }
       } catch (e: any) {
         // 404 는 정상 (정제된 결과 없음). 그 외 에러만 로그.
-        if (!String(e?.message ?? '').includes('404')) {
+        if (e?.status !== 404 && !String(e?.message ?? '').includes('404')) {
           console.warn('[useRefinedMeshLoader] failed:', e);
         }
       }
