@@ -1820,6 +1820,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
     setSaving(true);
     setUploadProgressOpen(true);
     setUploadProgressMessage('정제된 PLY 준비 중...');
+    let refinedCleanup: { key: string; minio_upload_id: string } | null = null;
     try {
       const { serializePly } = await import('@/lib/ply');
       const { api } = await import('@/lib/api');
@@ -1856,6 +1857,7 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         content_type: 'application/octet-stream',
         session_id: sessionId,
       });
+      refinedCleanup = { key: plyInit.key, minio_upload_id: plyInit.minio_upload_id };
       const plyView = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
       const plyParts = await uploadMultipartParts({
         presignedUrls: plyInit.presigned_urls,
@@ -1952,11 +1954,26 @@ export function useRefineTool(coreRef: RefObject<SplatViewerCoreRef | null>, opt
         upload_id: activeUploadId,
         source_key: plyUrl.key,
       });
+      refinedCleanup = null;
 
       // commit 완료 — 호출자(문 설정 완료) 가 다음 단계 (정합) 진입을 처리함.
       // 호출자가 doors corners 등을 같은 프레임으로 변환할 수 있도록 베이크된 회전값 + plyKey 반환.
       return { rotX, rotZ, wallAngleRad, plyKey: plyUrl.key };
     } catch (e: any) {
+      if (refinedCleanup) {
+        try {
+          const { api } = await import('@/lib/api');
+          await api.post('/refine/refined-multipart-abort', {
+            upload_id: activeUploadId,
+            key: refinedCleanup.key,
+            minio_upload_id: refinedCleanup.minio_upload_id,
+            delete_object: true,
+            delete_session: true,
+          });
+        } catch {
+          // cleanup failure must not mask the original save error.
+        }
+      }
       alert(`서버 저장 실패: ${e.message || e}`);
       throw e;
     } finally {

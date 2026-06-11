@@ -4,7 +4,7 @@ import logging
 import tempfile
 
 from celery_app import app
-from minio_helper import download_file, upload_file
+from minio_helper import delete_file, download_file, upload_file
 from callback_client import notify_sog_ready
 from pipeline.sog_converter import convert_to_sog
 
@@ -25,6 +25,7 @@ def convert_scene_to_sog(self, scene_id: str, ply_key: str):
     """
     task_id = self.request.id
     work_dir = tempfile.mkdtemp(prefix=f"sog_{scene_id}_")
+    uploaded_sog_key: str | None = None
     try:
         local_ply = os.path.join(work_dir, "input.ply")
         download_file(ply_key, local_ply)
@@ -48,12 +49,15 @@ def convert_scene_to_sog(self, scene_id: str, ply_key: str):
 
         sog_key = os.path.splitext(ply_key)[0] + ".sog"
         upload_file(local_sog, sog_key)
+        uploaded_sog_key = sog_key
 
         notify_sog_ready(scene_id, sog_key)
         logger.info(f"[Task {task_id}] SOG 변환 완료: scene={scene_id} → {sog_key}")
         return {"status": "completed", "scene_id": scene_id, "sog_key": sog_key}
 
     except Exception as e:
+        if uploaded_sog_key:
+            delete_file(uploaded_sog_key)
         # PipelineError 등 일부 예외는 Celery result backend(Redis) pickle 이 불가해
         # UnpickleableExceptionWrapper 를 유발한다 → 평문 RuntimeError 로 변환해 raise.
         logger.error(f"[Task {task_id}] SOG 변환 실패 (scene={scene_id}): {e}")

@@ -233,6 +233,40 @@ class Task(Base):
     upload: Mapped["Upload"] = relationship(back_populates="tasks")
     user: Mapped["User"] = relationship(back_populates="tasks")
     scene_outputs: Mapped[list["SceneOutput"]] = relationship(back_populates="task", cascade="all, delete-orphan")
+    dispatch_outbox: Mapped[list["TaskDispatchOutbox"]] = relationship(back_populates="task", cascade="all, delete-orphan")
+
+
+class TaskDispatchOutbox(Base):
+    __tablename__ = "task_dispatch_outbox"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    task_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tasks.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    upload_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("uploads.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    celery_task_id: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    task_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    queue: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    args: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    kwargs: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=20)
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    task: Mapped["Task | None"] = relationship(back_populates="dispatch_outbox")
 
 
 class SceneOutput(Base):

@@ -4,7 +4,7 @@ import logging
 import tempfile
 
 from celery_app import app
-from minio_helper import download_file, upload_file
+from minio_helper import delete_prefix, download_file, upload_file
 from redis_helper import update_progress, clear_progress
 from backend_callback import notify_upload_progress
 
@@ -45,6 +45,7 @@ def run_colmap_preprocessing(self, upload_id: str, user_id: str, minio_input_key
 
     try:
         # 1. MinIO에서 zip 다운로드
+        completion_callback_failed = False
         update_progress(task_id, 5, "다운로드")
         ext = os.path.splitext(minio_input_key)[1].lower()
         local_input = os.path.join(work_dir, f"input{ext}")
@@ -88,16 +89,15 @@ def run_colmap_preprocessing(self, upload_id: str, user_id: str, minio_input_key
             logger.info(f"[Task {task_id}] undistorted images 업로드 완료")
 
         update_progress(task_id, 100, "완료")
-        logger.info(f"[Task {task_id}] COLMAP 전처리 완료 → GS 학습 자동 시작")
+        logger.info(f"[Task {task_id}] COLMAP 전처리 완료 → 백엔드가 GS 학습을 발행합니다")
 
         # 백엔드에 COLMAP 단계 완료 통지 (Task row 갱신; Upload 는 GS 단계까지 processing 유지)
-        notify_upload_progress(
+        callback_ok = notify_upload_progress(
             upload_id, "colmap", status="completed", celery_task_id=task_id,
         )
-
-        # GS 학습 태스크 자동 체이닝 (바운딩박스 없이 전체 범위 학습)
-        from tasks.training import run_gs_training_from_colmap
-        run_gs_training_from_colmap.delay(upload_id, user_id, minio_input_key, {})
+        if not callback_ok:
+            completion_callback_failed = True
+            raise RuntimeError("백엔드 COLMAP 완료 콜백 실패")
 
         return {
             "status": "completed",
@@ -107,6 +107,8 @@ def run_colmap_preprocessing(self, upload_id: str, user_id: str, minio_input_key
     except Exception as e:
         logger.error(f"[Task {task_id}] 실패: {e}")
         update_progress(task_id, -1, f"실패: {str(e)[:200]}")
+        if not completion_callback_failed:
+            delete_prefix(result_base)
         notify_upload_progress(
             upload_id, "colmap", status="failed",
             celery_task_id=task_id, error_message=str(e)[:500],

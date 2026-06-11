@@ -35,14 +35,15 @@ from app.core.security import get_current_user
 from app.core.storage_keys import is_key_under_prefix, normalize_minio_key
 from app.models import (
     Building, Floor, Module, SceneOutput, Task, Upload, User, UserRole,
-    PlyTarget, UploadStatus, TaskType, TaskStatus,
+    PlyTarget, UploadStatus, TaskType, TaskStatus, Notification,
 )
-from app.services.celery_service import dispatch_sog_conversion_task
+from app.services.celery_service import SOG_CONVERSION_TASK_NAME, SOG_QUEUE
 from app.services.minio_service import get_minio_service
 from app.services.sam3_temp_storage import (
     delete_temp, is_expired, new_session_id, temp_path,
 )
 from app.services.storage_paths import module_base_path, object_dir
+from app.services.task_dispatch_outbox import dispatch_outbox_by_id, enqueue_task_dispatch
 
 router = APIRouter(prefix="/uploads", tags=["module-register"])
 settings = get_settings()
@@ -523,6 +524,7 @@ async def commit_final(
 
     old_upload_ids: list = []
     old_cleanup_prefixes: list[str] = []
+    old_cleanup_keys: list[str] = []
     # ── 덮어쓰기 준비: 교체 대상은 새 commit 이 성공한 뒤 정리 ──
     if existing_module is not None:
         if user.role != UserRole.admin and existing_module.user_id != user.id:
@@ -531,13 +533,28 @@ async def commit_final(
             select(Upload).where(Upload.module_id == existing_module.id)
         )).scalars().all()
         old_upload_ids = [u.id for u in old_uploads]
+        for old_upload in old_uploads:
+            for key in (
+                old_upload.minio_path,
+                old_upload.gsplat_ply_path,
+                old_upload.refined_ply_path,
+                old_upload.door_corners_json_path,
+            ):
+                if key:
+                    old_cleanup_keys.append(key)
         old_base = module_base_path(
             str(building_id), str(floor_id), str(existing_module.id), existing_module.name,
         )
-        old_scene_paths = (await db.execute(
-            select(SceneOutput.ply_path).where(SceneOutput.module_id == existing_module.id)
-        )).scalars().all()
-        old_cleanup_prefixes = [object_dir(path) for path in old_scene_paths if path]
+        old_scene_rows = (await db.execute(
+            select(SceneOutput.ply_path, SceneOutput.sog_path, SceneOutput.metadata_path)
+            .where(SceneOutput.module_id == existing_module.id)
+        )).all()
+        old_scene_paths = [row[0] for row in old_scene_rows if row[0]]
+        old_cleanup_prefixes = [object_dir(path) for path in old_scene_paths]
+        for ply_path, sog_path, metadata_path in old_scene_rows:
+            for key in (ply_path, sog_path, metadata_path):
+                if key:
+                    old_cleanup_keys.append(key)
         old_cleanup_prefixes.extend([
             f"{old_base}/alignment/refined/door_assets",
         ])
@@ -677,6 +694,17 @@ async def commit_final(
     db.add(scene_output)
     await db.flush()
 
+    sog_outbox = await enqueue_task_dispatch(
+        db,
+        task_id=None,
+        upload_id=upload.id,
+        celery_task_id=str(uuid4()),
+        task_name=SOG_CONVERSION_TASK_NAME,
+        queue=SOG_QUEUE,
+        args=[str(scene_output.id), final_ply_key],
+    )
+    sog_outbox_id = sog_outbox.id
+
     # ── Module 정합 정보 갱신 ──
     module.alignment_transform = {
         "transform": {
@@ -696,7 +724,16 @@ async def commit_final(
         sa_update(Floor).where(Floor.id == floor_id).values(overview_dirty=True)
     )
 
-    await db.commit()
+    try:
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        for key in [*uploaded_keys, staging_key]:
+            try:
+                minio.delete_object(key)
+            except Exception:
+                pass
+        raise
 
     # staging PLY 정리 — 최종 키로 복사 완료됐으니 임시본 삭제 (실패해도 무시, 누수만 됨).
     try:
@@ -706,22 +743,30 @@ async def commit_final(
 
     if old_upload_ids:
         try:
+            old_task_ids = (await db.execute(
+                select(Task.id).where(Task.upload_id.in_(old_upload_ids))
+            )).scalars().all()
+            if old_task_ids:
+                await db.execute(
+                    sa_update(Notification)
+                    .where(Notification.related_task_id.in_(old_task_ids))
+                    .values(related_task_id=None)
+                )
             await db.execute(sa_delete(SceneOutput).where(SceneOutput.module_id == module.id, SceneOutput.id != scene_output.id))
             await db.execute(sa_delete(Task).where(Task.upload_id.in_(old_upload_ids)))
             await db.execute(sa_delete(Upload).where(Upload.id.in_(old_upload_ids)))
             await db.commit()
             for prefix in old_cleanup_prefixes:
                 minio.delete_prefix(prefix)
+            for key in old_cleanup_keys:
+                minio.delete_object(key)
         except Exception as e:
             await db.rollback()
             logger.exception(f"[commit-final] 교체 대상 정리 실패: {e}")
 
     # refined(정합 완료) PLY → SOG 변환 비동기 발행. 뷰어용 경량 파생물이라 브로커
     # 미가용 등으로 실패해도 무시 — sog_path 는 None 으로 남고 표시는 PLY 로 폴백된다.
-    try:
-        dispatch_sog_conversion_task(str(scene_output.id), final_ply_key)
-    except Exception as e:
-        logger.warning(f"[commit_final] SOG 변환 발행 실패 (무시): {e}")
+    await dispatch_outbox_by_id(sog_outbox_id)
 
     # SAM3 임시 PLY 삭제 (있으면)
     if sam3_session_id:

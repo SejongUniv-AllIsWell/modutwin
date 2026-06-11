@@ -44,6 +44,25 @@ def test_require_worker_token_accepts_matching_header(required_env, monkeypatch)
     assert internal_worker._require_worker_token("secret") is None
 
 
+def test_missing_callback_storage_fields_reports_missing_objects(required_env) -> None:
+    internal_worker = _load_internal_worker()
+
+    class FakeMinio:
+        def object_exists(self, key: str) -> bool:
+            return key == "ok.ply"
+
+    missing = internal_worker._missing_callback_storage_fields(
+        FakeMinio(),
+        {
+            "ply_key": "ok.ply",
+            "sog_key": "missing.sog",
+            "metadata_key": None,
+        },
+    )
+
+    assert missing == ["sog_key"]
+
+
 @pytest.mark.asyncio
 async def test_worker_scene_sog_ready_sets_scene_sog_path(required_env, monkeypatch) -> None:
     internal_worker = _load_internal_worker()
@@ -52,24 +71,31 @@ async def test_worker_scene_sog_ready_sets_scene_sog_path(required_env, monkeypa
     scene = SimpleNamespace(id=scene_id, task_id=task_id, sog_path=None)
 
     class FakeDb:
+        committed = False
+
         async def get(self, model, requested_id):
             assert model is internal_worker.SceneOutput
             assert requested_id == scene_id
             return scene
+
+        async def commit(self):
+            self.committed = True
 
     class FakeMinio:
         def object_exists(self, key: str) -> bool:
             return key == "scenes/final.sog"
 
     monkeypatch.setattr(internal_worker, "get_minio_service", lambda: FakeMinio())
+    db = FakeDb()
 
     response = await internal_worker.worker_scene_sog_ready(
         internal_worker.WorkerSogReadyRequest(scene_id=scene_id, sog_key="scenes/final.sog"),
         _auth=None,
-        db=FakeDb(),
+        db=db,
     )
 
     assert scene.sog_path == "scenes/final.sog"
+    assert db.committed is True
     assert response.task_id == task_id
     assert response.scene_id == scene_id
     assert response.status == "completed"

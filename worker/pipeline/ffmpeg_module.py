@@ -41,7 +41,8 @@ class FFmpegModule(PipelineModule):
     def run(self, input_path: str) -> str:
         self.validate_input(input_path)
         ext = os.path.splitext(input_path)[1].lower()
-        work_dir = os.path.join(tempfile.gettempdir(), f"ffmpeg_{os.getpid()}")
+        parent_dir = os.path.dirname(os.path.abspath(input_path)) or tempfile.gettempdir()
+        work_dir = tempfile.mkdtemp(prefix="ffmpeg_", dir=parent_dir)
         output_dir = os.path.join(work_dir, "images")
         os.makedirs(output_dir, exist_ok=True)
 

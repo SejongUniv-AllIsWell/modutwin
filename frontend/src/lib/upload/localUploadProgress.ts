@@ -11,6 +11,7 @@ export type LocalUploadPhase = 'uploading' | 'completing' | 'processing' | 'fail
 export interface LocalUploadProgress {
   uploadId: string;
   filename: string;
+  minioUploadId?: string;
   completedParts: number;
   totalParts: number;
   percent: number;
@@ -22,6 +23,7 @@ export interface LocalUploadProgress {
 type ProgressMap = Record<string, LocalUploadProgress>;
 
 let beforeUnloadGuardInstalled = false;
+const activeUploadControllers = new Map<string, AbortController>();
 
 function canUseLocalStorage(): boolean {
   return typeof window !== 'undefined' && typeof window.localStorage !== 'undefined';
@@ -46,6 +48,7 @@ function normalizeProgress(raw: unknown): LocalUploadProgress | null {
   return {
     uploadId: item.uploadId,
     filename: item.filename,
+    ...(item.minioUploadId ? { minioUploadId: String(item.minioUploadId) } : {}),
     completedParts,
     totalParts,
     percent: clampPercent(Number(item.percent) || (completedParts / totalParts) * 100),
@@ -118,6 +121,7 @@ export function installLocalUploadBeforeUnloadGuard(): void {
 export function startLocalUploadProgress(params: {
   uploadId: string;
   filename: string;
+  minioUploadId?: string;
   totalParts: number;
 }): void {
   installLocalUploadBeforeUnloadGuard();
@@ -125,6 +129,7 @@ export function startLocalUploadProgress(params: {
   updateLocalUploadProgress(params.uploadId, () => ({
     uploadId: params.uploadId,
     filename: params.filename,
+    ...(params.minioUploadId ? { minioUploadId: params.minioUploadId } : {}),
     completedParts: 0,
     totalParts,
     percent: 0,
@@ -182,6 +187,27 @@ export function markLocalUploadFailed(uploadId: string, error: unknown): void {
 
 export function clearLocalUploadProgress(uploadId: string): void {
   updateLocalUploadProgress(uploadId, () => null);
+}
+
+export function createLocalUploadAbortController(uploadId: string): AbortController {
+  abortLocalUpload(uploadId);
+  const controller = new AbortController();
+  activeUploadControllers.set(uploadId, controller);
+  return controller;
+}
+
+export function releaseLocalUploadAbortController(uploadId: string, controller: AbortController): void {
+  if (activeUploadControllers.get(uploadId) === controller) {
+    activeUploadControllers.delete(uploadId);
+  }
+}
+
+export function abortLocalUpload(uploadId: string): boolean {
+  const controller = activeUploadControllers.get(uploadId);
+  if (!controller) return false;
+  controller.abort();
+  activeUploadControllers.delete(uploadId);
+  return true;
 }
 
 export function useLocalUploadProgress(): ProgressMap {

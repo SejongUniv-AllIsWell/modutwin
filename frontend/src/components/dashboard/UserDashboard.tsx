@@ -8,6 +8,7 @@ import { wsClient } from '@/lib/ws';
 import { Upload, Notification, Task, TaskProgress, WsMessage } from '@/types';
 import { useToast } from '@/components/ui/Toast';
 import {
+  abortLocalUpload,
   clearLocalUploadProgress,
   isActiveLocalUploadProgress,
   type LocalUploadProgress,
@@ -127,7 +128,7 @@ function colmapStatusLabel(
   if (upload.status === 'uploaded') {
     if (progress?.phase === 'completing' && activeProgress) return '업로드 완료 처리 중';
     if (progress?.phase === 'uploading' && !activeProgress) return '업로드 중단';
-    return percent ? `업로드 중 ${percent}` : '업로드 중';
+    return percent ? `업로드 중(${percent})` : '업로드 중';
   }
   return '업로드 중';
 }
@@ -147,13 +148,6 @@ function colmapStatusColor(
   return 'text-emerald-400';
 }
 
-function colmapPendingActionLabel(progress: LocalUploadProgress | undefined): string {
-  if (progress?.phase === 'failed') return '확인 필요';
-  if (progress?.phase === 'completing') return '완료 처리 중...';
-  const percent = uploadPercentLabel(progress);
-  return percent ? `${percent}` : '업로드 중...';
-}
-
 interface Props {
   showHeader?: boolean;
 }
@@ -168,6 +162,7 @@ export default function UserDashboard({ showHeader = true }: Props) {
   const [deleteTarget, setDeleteTarget] = useState<Upload | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [retryingUploadId, setRetryingUploadId] = useState<string | null>(null);
   // COLMAP 결과 PLY 를 PC 로 다운로드 + viewer 이동 처리 중인 업로드 id (중복 클릭 방지).
   const [fetchingColmapId, setFetchingColmapId] = useState<string | null>(null);
   const localUploadProgress = useLocalUploadProgress();
@@ -283,7 +278,10 @@ export default function UserDashboard({ showHeader = true }: Props) {
       if (isHide) {
         await api.post(`/uploads/${target.id}/hide`);
       } else {
-        await api.delete(`/uploads/${target.id}`);
+        abortLocalUpload(target.id);
+        const minioUploadId = localUploadProgress[target.id]?.minioUploadId;
+        const query = minioUploadId ? `?minio_upload_id=${encodeURIComponent(minioUploadId)}` : '';
+        await api.delete(`/uploads/${target.id}${query}`);
       }
       clearLocalUploadProgress(target.id);
       setUploads(prev => prev.filter(u => u.id !== target.id));
@@ -309,6 +307,28 @@ export default function UserDashboard({ showHeader = true }: Props) {
   const handleDelete = async () => {
     if (!deleteTarget) return;
     await deleteUpload(deleteTarget);
+  };
+
+  const retryUpload = async (target: Upload) => {
+    if (retryingUploadId) return;
+    setRetryingUploadId(target.id);
+    try {
+      await api.post(`/uploads/${target.id}/retry`);
+      clearLocalUploadProgress(target.id);
+      const [nextUploads, nextTasks] = await Promise.all([
+        api.get<Upload[]>('/uploads'),
+        api.get<Task[]>('/tasks'),
+      ]);
+      setUploads(nextUploads);
+      setTasks(nextTasks);
+      setWorkerProgress({});
+      showToast('재시도를 시작했습니다.');
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      showToast(`재시도 실패: ${msg}`, 'error');
+    } finally {
+      setRetryingUploadId(null);
+    }
   };
 
   return (
@@ -369,6 +389,7 @@ export default function UserDashboard({ showHeader = true }: Props) {
                   const colmapLocalFailed = localColmapProgress?.phase === 'failed';
                   const colmapUploadPending = isColmap && u.status === 'uploaded' && !colmapLocalFailed;
                   const colmapPipelineStarted = colmapProcessing || localColmapProgress?.phase === 'processing';
+                  const colmapFailed = isColmap && u.status === 'failed';
                   const filenameClickable = isViewable(u.original_filename) || colmapDone;
                   const isBasemap = !!u.is_basemap_source;
                   const isBasemapUpload = !!u.is_basemap_upload;
@@ -421,32 +442,61 @@ export default function UserDashboard({ showHeader = true }: Props) {
                             >
                               {fetchingColmapId === u.id ? '준비 중...' : '파일 선택'}
                             </button>
+                          ) : colmapFailed ? (
+                            <div className="inline-flex items-center justify-end gap-2">
+                              <button
+                                type="button"
+                                disabled={retryingUploadId === u.id || deleting}
+                                onClick={() => { void retryUpload(u); }}
+                                className="inline-block px-3 py-1 rounded bg-[var(--accent)] hover:brightness-110 disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] text-[#04131f] text-xs font-bold"
+                                title="업로드된 원본 파일로 실패한 단계부터 다시 시도"
+                              >
+                                {retryingUploadId === u.id ? '시작 중...' : '재시도'}
+                              </button>
+                              <button
+                                type="button"
+                                disabled={deleting || retryingUploadId === u.id}
+                                onClick={() => { void deleteUpload(u); }}
+                                aria-label={`${u.original_filename} 업로드 내역 삭제`}
+                                className="w-6 h-6 inline-flex items-center justify-center text-[var(--muted)] hover:text-[var(--ink)] hover:bg-red-600 rounded text-xs font-bold disabled:opacity-50"
+                                title="업로드 내역 삭제"
+                              >
+                                X
+                              </button>
+                            </div>
                           ) : colmapUploadPending || colmapLocalFailed ? (
                             <button
                               type="button"
-                              disabled
-                              className="inline-block px-3 py-1 rounded bg-[var(--bg-soft)] text-[var(--muted)] text-xs font-bold cursor-not-allowed"
-                              title={localColmapProgress?.error ?? '브라우저에서 MinIO multipart 업로드 중'}
+                              disabled={deleting}
+                              onClick={() => { void deleteUpload(u); }}
+                              aria-label={colmapLocalFailed ? `${u.original_filename} 업로드 내역 삭제` : `${u.original_filename} 업로드 취소`}
+                              className="w-6 h-6 inline-flex items-center justify-center text-[var(--muted)] hover:text-[var(--ink)] hover:bg-red-600 rounded text-xs font-bold disabled:opacity-50"
+                              title={colmapLocalFailed ? '업로드 내역 삭제' : '업로드 취소'}
                             >
-                              {colmapPendingActionLabel(localColmapProgress)}
+                              X
                             </button>
                           ) : colmapPipelineStarted ? (
                             <button
                               type="button"
                               disabled={deleting}
                               onClick={() => { void deleteUpload(u); }}
-                              className="inline-block px-3 py-1 rounded bg-[var(--paper)] hover:bg-red-600/20 border border-[var(--rule)] text-[var(--ink)] text-xs font-bold disabled:opacity-50"
+                              aria-label={`${u.original_filename} 처리 취소 및 삭제`}
+                              className="w-6 h-6 inline-flex items-center justify-center text-[var(--muted)] hover:text-[var(--ink)] hover:bg-red-600 rounded text-xs font-bold disabled:opacity-50"
                               title="GPU worker 작업을 취소하고 업로드 파일과 DB 정보를 삭제"
                             >
-                              {deleting ? '삭제중' : '처리중'}
+                              X
                             </button>
                           ) : (
-                            <Link
-                              href={`/colmap-viewer?upload_id=${u.id}`}
-                              className="inline-block px-3 py-1 rounded bg-[var(--paper)] hover:bg-sky-400/10 border border-[var(--rule)] text-[var(--ink)] text-xs font-bold"
+                            <button
+                              type="button"
+                              disabled={deleting}
+                              onClick={() => { void deleteUpload(u); }}
+                              aria-label={`${u.original_filename} 업로드 내역 삭제`}
+                              className="w-6 h-6 inline-flex items-center justify-center text-[var(--muted)] hover:text-[var(--ink)] hover:bg-red-600 rounded text-xs font-bold disabled:opacity-50"
+                              title="업로드 내역 삭제"
                             >
-                              업로드 중...
-                            </Link>
+                              X
+                            </button>
                           )
                         ) : (
                           <div className="inline-flex items-center justify-end gap-2">
@@ -474,7 +524,7 @@ export default function UserDashboard({ showHeader = true }: Props) {
                               }
                               className="w-6 h-6 inline-flex items-center justify-center text-[var(--muted)] hover:text-[var(--ink)] hover:bg-red-600 rounded"
                             >
-                              ×
+                              X
                             </button>
                           </div>
                         )}

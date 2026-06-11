@@ -13,7 +13,7 @@ import logging
 import math
 import os
 from typing import List, Optional
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
@@ -27,8 +27,9 @@ from app.models import (
     User, UserRole, Upload, Task, SceneOutput, TaskType, TaskStatus,
     Module, Floor, Building, Basemap,
 )
-from app.services.celery_service import dispatch_sog_conversion_task
+from app.services.celery_service import SOG_CONVERSION_TASK_NAME, SOG_QUEUE
 from app.services.minio_service import get_minio_service, PART_SIZE
+from app.services.storage_access import delete_storage_best_effort
 from app.services.storage_paths import (
     build_refined_object_key,
     mesh_meta_key,
@@ -36,6 +37,7 @@ from app.services.storage_paths import (
     session_dir_from_scene_key,
     session_file_key,
 )
+from app.services.task_dispatch_outbox import dispatch_outbox_by_id, enqueue_task_dispatch
 
 router = APIRouter(prefix="/refine", tags=["refine"])
 logger = logging.getLogger(__name__)
@@ -123,6 +125,31 @@ class RefinedMultipartCompleteResponse(BaseModel):
     key: str
 
 
+class RefinedMultipartAbortRequest(BaseModel):
+    upload_id: UUID
+    key: str
+    minio_upload_id: str | None = None
+    delete_object: bool = True
+    delete_session: bool = False
+
+
+def _refined_cleanup_targets(
+    upload_minio_path: str,
+    scene_key: str,
+    *,
+    delete_session: bool,
+    delete_object: bool = True,
+) -> tuple[set[str], set[str]]:
+    """Return safe refined cleanup targets for a single uploaded scene key."""
+    refined_root = refined_prefix(upload_minio_path).rstrip("/")
+    session_dir = session_dir_from_scene_key(scene_key).rstrip("/")
+    if delete_session and session_dir != refined_root and is_key_under_prefix(session_dir, refined_root):
+        return {session_dir}, set()
+    if delete_object:
+        return set(), {scene_key}
+    return set(), set()
+
+
 @router.post("/refined-multipart-init", response_model=RefinedMultipartInitResponse)
 async def refined_multipart_init(
     body: RefinedMultipartInitRequest,
@@ -195,6 +222,7 @@ async def refined_multipart_complete(
         parts = [{"part_number": p.part_number, "etag": p.etag} for p in body.parts]
         minio.complete_multipart_upload(normalized_key, body.minio_upload_id, parts)
     except Exception as e:
+        minio.abort_multipart_upload(normalized_key, body.minio_upload_id)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"MinIO multipart 완료 실패: {str(e)}",
@@ -204,6 +232,41 @@ async def refined_multipart_complete(
         get_url=minio.get_presigned_download_url(normalized_key, expires=3600),
         key=normalized_key,
     )
+
+
+@router.post("/refined-multipart-abort", status_code=status.HTTP_204_NO_CONTENT)
+async def refined_multipart_abort(
+    body: RefinedMultipartAbortRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """refined multipart 업로드 실패/취소 시 uploaded part 또는 완료 객체를 정리한다."""
+    result = await db.execute(
+        select(Upload).where(Upload.id == body.upload_id, Upload.user_id == user.id)
+    )
+    upload = result.scalar_one_or_none()
+    if not upload:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="업로드를 찾을 수 없습니다.")
+
+    refined_root = refined_prefix(upload.minio_path)
+    try:
+        normalized_key = normalize_minio_key(body.key)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="유효하지 않은 key 입니다.")
+    if not is_key_under_prefix(normalized_key, refined_root):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="이 업로드의 refined 경로가 아닙니다.")
+
+    minio = get_minio_service()
+    if body.minio_upload_id:
+        minio.abort_multipart_upload(normalized_key, body.minio_upload_id)
+    prefixes, keys = _refined_cleanup_targets(
+        upload.minio_path,
+        normalized_key,
+        delete_session=body.delete_session,
+        delete_object=body.delete_object,
+    )
+    delete_storage_best_effort(minio, prefixes, keys)
+    return None
 
 
 class SaveRequest(BaseModel):
@@ -277,6 +340,18 @@ async def save_refined(
         is_aligned=False,
     )
     db.add(scene)
+    await db.flush()
+
+    outbox = await enqueue_task_dispatch(
+        db,
+        task_id=None,
+        upload_id=upload.id,
+        celery_task_id=str(uuid4()),
+        task_name=SOG_CONVERSION_TASK_NAME,
+        queue=SOG_QUEUE,
+        args=[str(scene.id), source_key],
+    )
+    outbox_id = outbox.id
 
     floor_id_result = await db.execute(
         select(Module.floor_id).where(Module.id == upload.module_id)
@@ -289,14 +364,20 @@ async def save_refined(
             .values(overview_dirty=True)
         )
 
-    await db.commit()
+    try:
+        await db.commit()
+    except Exception:
+        prefixes, keys = _refined_cleanup_targets(
+            upload.minio_path,
+            source_key,
+            delete_session=True,
+        )
+        delete_storage_best_effort(minio, prefixes, keys)
+        raise
 
     # refined PLY → SOG 변환 비동기 발행 (basemap 등 다듬기 확정 경로). 뷰어용 경량
     # 파생물이라 발행 실패해도 무시 — sog_path 는 None 으로 남고 표시는 PLY 로 폴백.
-    try:
-        dispatch_sog_conversion_task(str(scene.id), source_key)
-    except Exception as e:
-        logger.warning(f"[refine save] SOG 변환 발행 실패 (무시): {e}")
+    await dispatch_outbox_by_id(outbox_id)
 
     return SaveResponse(scene_id=scene.id, message="정제 결과가 저장되었습니다.")
 

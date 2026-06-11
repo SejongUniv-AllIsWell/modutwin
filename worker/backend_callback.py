@@ -39,11 +39,15 @@ def notify_upload_progress(
     ply_key: Optional[str] = None,
     celery_task_id: Optional[str] = None,
     error_message: Optional[str] = None,
-) -> None:
-    """파이프라인 단계 완료 / 실패 시 백엔드에 통지. 실패해도 워커 작업 자체는 성공으로 둔다."""
+) -> bool:
+    """파이프라인 단계 완료 / 실패 시 백엔드에 통지.
+
+    Returns:
+        백엔드가 콜백을 정상 수락했으면 True, 설정 누락/HTTP 실패면 False.
+    """
     if not INTERNAL_TOKEN:
         logger.warning("[backend_callback] INTERNAL_API_TOKEN 미설정 — 콜백 스킵")
-        return
+        return False
 
     url = f"{BACKEND_URL}/api/internal/uploads/{upload_id}/complete"
     payload = {"stage": stage, "status": status}
@@ -64,8 +68,10 @@ def notify_upload_progress(
             timeout=10,
         )
         logger.info(f"[backend_callback] {stage} {status} 통지 완료 (upload_id={upload_id})")
+        return True
     except RuntimeError as e:
         status_code, response_body = _parse_http_error(str(e))
         logger.error(f"[backend_callback] {url} -> {status_code} {response_body}")
     except requests.RequestException as e:
         logger.error(f"[backend_callback] {url} 요청 실패: {e}")
+    return False

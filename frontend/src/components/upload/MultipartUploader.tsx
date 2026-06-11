@@ -7,9 +7,11 @@ import { Building, Floor, Module, UploadInitResponse } from '@/types';
 import { PENDING_LOCAL_PLY_KEY, type PendingLocalPlyPayload } from '@/lib/upload/pendingLocalPly';
 import { uploadMultipartParts } from '@/lib/upload/multipart';
 import {
+  createLocalUploadAbortController,
   markLocalUploadCompleting,
   markLocalUploadFailed,
   markLocalUploadProcessing,
+  releaseLocalUploadAbortController,
   setLocalUploadPartProgress,
   startLocalUploadProgress,
 } from '@/lib/upload/localUploadProgress';
@@ -206,6 +208,7 @@ export default function MultipartUploader({
         startLocalUploadProgress({
           uploadId: upload_id,
           filename: file.name,
+          minioUploadId: minio_upload_id,
           totalParts: part_count || presigned_urls.length,
         });
 
@@ -302,21 +305,32 @@ async function runColmapUpload(params: {
   part_size: number;
 }) {
   const { file, upload_id, minio_upload_id, presigned_urls, part_size } = params;
+  const controller = createLocalUploadAbortController(upload_id);
   try {
     const parts = await uploadMultipartParts({
       presignedUrls: presigned_urls,
       partSize: part_size,
       totalSize: file.size,
       getChunk: (start, end) => file.slice(start, end),
+      signal: controller.signal,
       onPartUploaded: (completed, total) => {
         setLocalUploadPartProgress(upload_id, completed, total);
       },
     });
+    if (controller.signal.aborted) return;
     markLocalUploadCompleting(upload_id);
-    await api.post('/uploads/complete', { upload_id, minio_upload_id, parts });
+    await api.fetch('/uploads/complete', {
+      method: 'POST',
+      body: JSON.stringify({ upload_id, minio_upload_id, parts }),
+      signal: controller.signal,
+    });
+    if (controller.signal.aborted) return;
     markLocalUploadProcessing(upload_id);
   } catch (e) {
+    if (controller.signal.aborted) return;
     markLocalUploadFailed(upload_id, e);
     throw e;
+  } finally {
+    releaseLocalUploadAbortController(upload_id, controller);
   }
 }

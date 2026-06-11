@@ -30,3 +30,37 @@ def upload_file(local_path: str, minio_key: str, content_type: str = "applicatio
     """MinIO에 파일 업로드"""
     client = get_minio_client()
     client.fput_object(MINIO_BUCKET, minio_key, local_path, content_type=content_type)
+
+
+def delete_file(minio_key: str) -> bool:
+    """MinIO 파일을 best-effort 로 삭제."""
+    if not minio_key:
+        return False
+    client = get_minio_client()
+    try:
+        client.remove_object(MINIO_BUCKET, minio_key)
+        return True
+    except Exception:
+        return False
+
+
+def delete_prefix(prefix: str) -> int:
+    """MinIO prefix 하위 파일을 best-effort 로 삭제."""
+    normalized = prefix.strip("/")
+    if not normalized:
+        return 0
+    if not normalized.endswith("/"):
+        normalized += "/"
+
+    client = get_minio_client()
+    deleted = 0
+    try:
+        objects = list(client.list_objects(MINIO_BUCKET, prefix=normalized, recursive=True))
+    except Exception:
+        return 0
+
+    for obj in objects:
+        name = getattr(obj, "object_name", None)
+        if name and delete_file(name):
+            deleted += 1
+    return deleted

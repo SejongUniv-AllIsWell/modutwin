@@ -1,5 +1,5 @@
 import json
-from uuid import UUID
+from uuid import UUID, uuid4
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -17,8 +17,9 @@ from app.models import (
 from app.schemas.uploads import SceneResponse, SceneDownloadResponse
 from app.services.storage_paths import door_position_key
 from app.services.minio_service import get_minio_service
-from app.services.celery_service import dispatch_alignment_task
+from app.services.celery_service import ALIGNMENT_QUEUE, ALIGNMENT_TASK_NAME
 from app.services.scene_assets import pick_scene_viewer_key
+from app.services.task_dispatch_outbox import dispatch_outbox_by_id, enqueue_task_dispatch
 
 router = APIRouter(prefix="/scenes", tags=["scenes"])
 
@@ -182,20 +183,8 @@ async def set_door_position(
     task_result = await db.execute(select(Task).where(Task.id == scene.task_id))
     parent_task = task_result.scalar_one()
 
-    # 정합 태스크 발행
-    celery_task_id = dispatch_alignment_task(
-        upload_id=str(parent_task.upload_id),
-        user_id=str(user.id),
-        ply_key=scene.ply_path,
-        door_position_key=door_key,
-        basemap_key=basemap.minio_path,
-        building_id=str(floor.building_id),
-        floor_id=str(floor.id),
-        module_id=str(module.id),
-        module_name=module.name,
-    )
-
-    # Task 레코드 생성
+    # Task row 를 먼저 저장한 뒤 같은 celery_task_id 로 worker 에 발행한다.
+    celery_task_id = str(uuid4())
     alignment_task = Task(
         upload_id=parent_task.upload_id,
         user_id=user.id,
@@ -204,6 +193,33 @@ async def set_door_position(
         status=TaskStatus.pending,
     )
     db.add(alignment_task)
-    await db.commit()
+    await db.flush()
+    outbox = await enqueue_task_dispatch(
+        db,
+        task_id=alignment_task.id,
+        upload_id=parent_task.upload_id,
+        celery_task_id=celery_task_id,
+        task_name=ALIGNMENT_TASK_NAME,
+        queue=ALIGNMENT_QUEUE,
+        args=[
+            str(parent_task.upload_id),
+            str(user.id),
+            scene.ply_path,
+            door_key,
+            basemap.minio_path,
+            str(floor.building_id),
+            str(floor.id),
+            str(module.id),
+            module.name,
+        ],
+    )
+    outbox_id = outbox.id
+    try:
+        await db.commit()
+    except Exception:
+        minio.delete_object(door_key)
+        raise
+
+    await dispatch_outbox_by_id(outbox_id)
 
     return {"message": "문 위치가 저장되었습니다. 정합 작업이 시작됩니다.", "task_id": str(alignment_task.id)}

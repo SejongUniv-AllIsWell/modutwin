@@ -66,8 +66,8 @@ class ColmapModule(PipelineModule):
         self.validate_input(input_path)
         total_images = self._total_images
 
-        work_dir = os.path.join(tempfile.gettempdir(), f"colmap_{os.getpid()}")
-        os.makedirs(work_dir, exist_ok=True)
+        parent_dir = os.path.dirname(os.path.abspath(input_path)) or tempfile.gettempdir()
+        work_dir = tempfile.mkdtemp(prefix="colmap_", dir=parent_dir)
 
         database_path = os.path.join(work_dir, "database.db")
         sparse_dir    = os.path.join(work_dir, "sparse")

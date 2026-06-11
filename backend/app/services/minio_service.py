@@ -48,9 +48,17 @@ class MinioService:
             pass  # 설정된 정책이 없으면 무시 (기본 private)
 
     def init_multipart_upload(self, key: str, content_type: str) -> str:
-        return self.client._create_multipart_upload(
-            self.bucket, key, {"Content-Type": content_type}
-        )
+        headers = {"Content-Type": content_type}
+        try:
+            response = self.client._create_multipart_upload(
+                bucket_name=self.bucket,
+                object_name=key,
+                headers=headers,
+            )
+        except TypeError:
+            response = self.client._create_multipart_upload(self.bucket, key, headers)
+        upload_id = getattr(getattr(response, "result", None), "upload_id", response)
+        return str(upload_id)
 
     def get_presigned_upload_url(
         self, key: str, upload_id: str, part_number: int, expires: int = 3600
@@ -81,9 +89,32 @@ class MinioService:
             Part(p["part_number"], p["etag"])
             for p in sorted(parts, key=lambda x: x["part_number"])
         ]
-        self.client._complete_multipart_upload(
-            self.bucket, key, upload_id, minio_parts
-        )
+        try:
+            self.client._complete_multipart_upload(
+                bucket_name=self.bucket,
+                object_name=key,
+                upload_id=upload_id,
+                parts=minio_parts,
+            )
+        except TypeError:
+            self.client._complete_multipart_upload(self.bucket, key, upload_id, minio_parts)
+
+    def abort_multipart_upload(self, key: str, upload_id: str) -> bool:
+        """Abort an unfinished multipart upload and remove uploaded parts best-effort."""
+        if not key or not upload_id:
+            return False
+        try:
+            try:
+                self.client._abort_multipart_upload(
+                    bucket_name=self.bucket,
+                    object_name=key,
+                    upload_id=upload_id,
+                )
+            except TypeError:
+                self.client._abort_multipart_upload(self.bucket, key, upload_id)
+            return True
+        except Exception:
+            return False
 
     def get_presigned_download_url(self, key: str, expires: int = 3600) -> str:
         return self.public_client.presigned_get_object(

@@ -14,6 +14,7 @@ export async function uploadMultipartParts(params: {
   getChunk: (start: number, end: number) => MultipartChunk;
   concurrency?: number;
   errorLabel?: string;
+  signal?: AbortSignal;
   onPartUploaded?: (completed: number, total: number) => void;
 }): Promise<MultipartUploadedPart[]> {
   const {
@@ -23,6 +24,7 @@ export async function uploadMultipartParts(params: {
     getChunk,
     concurrency = MULTIPART_UPLOAD_CONCURRENCY,
     errorLabel = 'part',
+    signal,
     onPartUploaded,
   } = params;
 
@@ -35,6 +37,10 @@ export async function uploadMultipartParts(params: {
 
   async function uploadNextPart() {
     while (nextIndex < presignedUrls.length) {
+      if (signal?.aborted) {
+        throw new Error('upload aborted');
+      }
+
       const index = nextIndex;
       nextIndex += 1;
 
@@ -43,6 +49,7 @@ export async function uploadMultipartParts(params: {
       const response = await fetch(presignedUrls[index], {
         method: 'PUT',
         body: getChunk(start, end) as BodyInit,
+        signal,
       });
       if (!response.ok) {
         throw new Error(`${errorLabel} ${index + 1} upload failed: ${response.status}`);

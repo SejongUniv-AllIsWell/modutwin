@@ -79,30 +79,54 @@ interface EnsureRegistrationContextResponse {
 
 const SAM3_DIRECT_UPLOAD_LIMIT_BYTES = 90 * 1024 * 1024;
 
+async function cleanupStagingUpload(key: string | null | undefined, minioUploadId?: string | null): Promise<void> {
+  if (!key) return;
+  try {
+    await api.post('/uploads/staging-multipart-abort', {
+      key,
+      minio_upload_id: minioUploadId || null,
+      delete_object: true,
+    });
+  } catch {
+    // cleanup failure must not mask the original upload/commit error.
+  }
+}
+
 async function uploadFileToStaging(file: File): Promise<string> {
-  const stagingInit = await api.post<{
+  let stagingInit: {
     key: string;
     minio_upload_id: string;
     presigned_urls: string[];
     part_size: number;
-  }>('/uploads/staging-multipart-init', {
-    filename: file.name,
-    file_size: file.size,
-    content_type: file.type || 'application/octet-stream',
-  });
-  const parts = await uploadMultipartParts({
-    presignedUrls: stagingInit.presigned_urls,
-    partSize: stagingInit.part_size,
-    totalSize: file.size,
-    getChunk: (start, end) => file.slice(start, end),
-    errorLabel: 'PLY 청크',
-  });
-  await api.post('/uploads/staging-multipart-complete', {
-    key: stagingInit.key,
-    minio_upload_id: stagingInit.minio_upload_id,
-    parts,
-  });
-  return stagingInit.key;
+  } | null = null;
+  try {
+    stagingInit = await api.post<{
+      key: string;
+      minio_upload_id: string;
+      presigned_urls: string[];
+      part_size: number;
+    }>('/uploads/staging-multipart-init', {
+      filename: file.name,
+      file_size: file.size,
+      content_type: file.type || 'application/octet-stream',
+    });
+    const parts = await uploadMultipartParts({
+      presignedUrls: stagingInit.presigned_urls,
+      partSize: stagingInit.part_size,
+      totalSize: file.size,
+      getChunk: (start, end) => file.slice(start, end),
+      errorLabel: 'PLY 청크',
+    });
+    await api.post('/uploads/staging-multipart-complete', {
+      key: stagingInit.key,
+      minio_upload_id: stagingInit.minio_upload_id,
+      parts,
+    });
+    return stagingInit.key;
+  } catch (error) {
+    await cleanupStagingUpload(stagingInit?.key, stagingInit?.minio_upload_id);
+    throw error;
+  }
 }
 
 export default function UnifiedSplatEditor({
@@ -1702,81 +1726,89 @@ export default function UnifiedSplatEditor({
                     const plyView = assets.plyBytes instanceof Uint8Array
                       ? assets.plyBytes
                       : new Uint8Array(assets.plyBytes);
-                    const stagingInit = await api.post<{
-                      key: string; minio_upload_id: string; presigned_urls: string[]; part_size: number;
-                    }>('/uploads/staging-multipart-init', {
-                      filename: assets.plyFilename,
-                      file_size: plyView.byteLength,
-                      content_type: 'application/octet-stream',
-                    });
-                    const plyParts = await uploadMultipartParts({
-                      presignedUrls: stagingInit.presigned_urls,
-                      partSize: stagingInit.part_size,
-                      totalSize: plyView.byteLength,
-                      getChunk: (start, end) => plyView.subarray(start, end),
-                      errorLabel: 'PLY 청크',
-                    });
-                    await api.post('/uploads/staging-multipart-complete', {
-                      key: stagingInit.key,
-                      minio_upload_id: stagingInit.minio_upload_id,
-                      parts: plyParts,
-                    });
+                    let stagingCleanup: { key: string; minio_upload_id: string } | null = null;
+                    try {
+                      const stagingInit = await api.post<{
+                        key: string; minio_upload_id: string; presigned_urls: string[]; part_size: number;
+                      }>('/uploads/staging-multipart-init', {
+                        filename: assets.plyFilename,
+                        file_size: plyView.byteLength,
+                        content_type: 'application/octet-stream',
+                      });
+                      stagingCleanup = { key: stagingInit.key, minio_upload_id: stagingInit.minio_upload_id };
+                      const plyParts = await uploadMultipartParts({
+                        presignedUrls: stagingInit.presigned_urls,
+                        partSize: stagingInit.part_size,
+                        totalSize: plyView.byteLength,
+                        getChunk: (start, end) => plyView.subarray(start, end),
+                        errorLabel: 'PLY 청크',
+                      });
+                      await api.post('/uploads/staging-multipart-complete', {
+                        key: stagingInit.key,
+                        minio_upload_id: stagingInit.minio_upload_id,
+                        parts: plyParts,
+                      });
 
-                    // 5) 나머지 작은 자산(mesh/doors/텍스처/도어) + PLY staging 키를 멀티파트 POST.
-                    const form = new FormData();
-                    form.append('building_id', initialRegistrationContext.building_id);
-                    form.append('floor_id', initialRegistrationContext.floor_id);
-                    form.append('module_name', initialRegistrationContext.module_name.trim());
-                    form.append('original_filename', displayName ?? 'local.ply');
-                    form.append('alignment_transform_json', JSON.stringify({
-                      position: transformPosition,
-                      rotation: transformRotation,
-                      scale: transformScale,
-                      rmsd,
-                      matches: [{ module_door_id: 'door_1', basemap_id: 'auto' }],
-                      bake_rotation: {
-                        rotX: assets.rotX,
-                        rotZ: assets.rotZ,
-                        wallAngleRad: assets.wallAngleRad,
-                      },
-                    }));
-                    form.append('final_ply_staging_key', stagingInit.key);
-                    form.append('mesh_json', new Blob([assets.meshJson], { type: 'application/json' }), 'mesh.json');
-                    form.append('doors_json', new Blob([doorsJson], { type: 'application/json' }), 'doors.json');
-                    if (doorAssets?.doorMesh) {
-                      form.append(doorTextureField, doorAssets.doorMesh.textureBlob, textureUploadFilename('door_1', doorAssets.doorMesh.textureBlob));
-                    }
-                    if (doorAssets?.doorSplat) {
-                      form.append(doorSplatField, doorAssets.doorSplat.plyBlob, 'door_1.ply');
-                    }
-                    // ceiling/floor + 폴리곤 변 수만큼의 wN. assets.textures 에 들어있는 모든 surfaceId 전송.
-                    for (const sid of Array.from(assets.textures.keys())) {
-                      const tex = assets.textures.get(sid);
-                      if (!tex) throw new Error(`텍스처 누락: ${sid} (다듬기 단계에서 모든 면 베이크 필요)`);
-                      form.append(`tex_${sid}`, tex, textureUploadFilename(`tex_${sid}`, tex));
-                    }
-                    // 비정합 문 texture / splat blob — splat 은 위에서 직렬화 성공한 것만 (doorsJson ref 와 일치).
-                    for (const d of _nonAlignDoors) {
-                      if (d.doorMesh?.textureBlob) {
-                        form.append(`door_tex_${d.id}`, d.doorMesh.textureBlob, textureUploadFilename(d.id, d.doorMesh.textureBlob));
+                      // 5) 나머지 작은 자산(mesh/doors/텍스처/도어) + PLY staging 키를 멀티파트 POST.
+                      const form = new FormData();
+                      form.append('building_id', initialRegistrationContext.building_id);
+                      form.append('floor_id', initialRegistrationContext.floor_id);
+                      form.append('module_name', initialRegistrationContext.module_name.trim());
+                      form.append('original_filename', displayName ?? 'local.ply');
+                      form.append('alignment_transform_json', JSON.stringify({
+                        position: transformPosition,
+                        rotation: transformRotation,
+                        scale: transformScale,
+                        rmsd,
+                        matches: [{ module_door_id: 'door_1', basemap_id: 'auto' }],
+                        bake_rotation: {
+                          rotX: assets.rotX,
+                          rotZ: assets.rotZ,
+                          wallAngleRad: assets.wallAngleRad,
+                        },
+                      }));
+                      form.append('final_ply_staging_key', stagingInit.key);
+                      form.append('mesh_json', new Blob([assets.meshJson], { type: 'application/json' }), 'mesh.json');
+                      form.append('doors_json', new Blob([doorsJson], { type: 'application/json' }), 'doors.json');
+                      if (doorAssets?.doorMesh) {
+                        form.append(doorTextureField, doorAssets.doorMesh.textureBlob, textureUploadFilename('door_1', doorAssets.doorMesh.textureBlob));
                       }
-                      const splatBlob = nonAlignSplatBlobs.get(d.id);
-                      if (splatBlob) {
-                        form.append(`door_splat_${d.id}`, splatBlob, `${d.id}.ply`);
+                      if (doorAssets?.doorSplat) {
+                        form.append(doorSplatField, doorAssets.doorSplat.plyBlob, 'door_1.ply');
                       }
-                    }
-                    if (sam3PrepareSessionIdRef.current) {
-                      form.append('sam3_session_id', sam3PrepareSessionIdRef.current);
-                    }
-                    if (sam3PrepareStagingKeyRef.current) {
-                      form.append('sam3_staging_key', sam3PrepareStagingKeyRef.current);
-                    }
+                      // ceiling/floor + 폴리곤 변 수만큼의 wN. assets.textures 에 들어있는 모든 surfaceId 전송.
+                      for (const sid of Array.from(assets.textures.keys())) {
+                        const tex = assets.textures.get(sid);
+                        if (!tex) throw new Error(`텍스처 누락: ${sid} (다듬기 단계에서 모든 면 베이크 필요)`);
+                        form.append(`tex_${sid}`, tex, textureUploadFilename(`tex_${sid}`, tex));
+                      }
+                      // 비정합 문 texture / splat blob — splat 은 위에서 직렬화 성공한 것만 (doorsJson ref 와 일치).
+                      for (const d of _nonAlignDoors) {
+                        if (d.doorMesh?.textureBlob) {
+                          form.append(`door_tex_${d.id}`, d.doorMesh.textureBlob, textureUploadFilename(d.id, d.doorMesh.textureBlob));
+                        }
+                        const splatBlob = nonAlignSplatBlobs.get(d.id);
+                        if (splatBlob) {
+                          form.append(`door_splat_${d.id}`, splatBlob, `${d.id}.ply`);
+                        }
+                      }
+                      if (sam3PrepareSessionIdRef.current) {
+                        form.append('sam3_session_id', sam3PrepareSessionIdRef.current);
+                      }
+                      if (sam3PrepareStagingKeyRef.current) {
+                        form.append('sam3_staging_key', sam3PrepareStagingKeyRef.current);
+                      }
 
-                    const resp = await api.postForm<{ module_id: string; upload_id: string; scene_output_id: string; was_overwrite: boolean }>(
-                      '/uploads/commit-final', form,
-                    );
-                    if (resp.was_overwrite) {
-                      alert('기존 등록을 덮어쓰고 새 작업물을 저장했습니다.');
+                      const resp = await api.postForm<{ module_id: string; upload_id: string; scene_output_id: string; was_overwrite: boolean }>(
+                        '/uploads/commit-final', form,
+                      );
+                      stagingCleanup = null;
+                      if (resp.was_overwrite) {
+                        alert('기존 등록을 덮어쓰고 새 작업물을 저장했습니다.');
+                      }
+                    } catch (error) {
+                      await cleanupStagingUpload(stagingCleanup?.key, stagingCleanup?.minio_upload_id);
+                      throw error;
                     }
                     // 새로 만들어진 module 의 building 페이지로 이동
                     setTimeout(() => {
