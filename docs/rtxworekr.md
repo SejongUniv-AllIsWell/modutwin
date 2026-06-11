@@ -3,7 +3,7 @@
 Ubuntu 22.04 + RTX 5090 PC를 기준으로 원격 Celery worker를 실행하는 절차다.
 이 RTX worker는 `worker_rtx/` 이미지를 사용하고, PC 웹 서버의 RabbitMQ/Redis/MinIO/backend에 붙어서 `training`, `alignment`, `sog` 큐를 소비한다. 같은 RTX compose에서 `door_ml_rtx/` 기반 `door-ml`도 함께 실행한다.
 
-기본 설정은 RTX 5090(Blackwell)을 우선 지원하도록 CUDA 12.8 / PyTorch cu128을 사용한다. `TORCH_CUDA_ARCH_LIST=8.6 8.9 12.0+PTX`로 두어 RTX 30(Ampere), RTX 40(Ada), RTX 50(Blackwell) 계열을 같은 이미지에서 지원한다.
+기본 설정은 CUDA 12.8 / PyTorch cu128을 사용한다. `TORCH_CUDA_ARCH_LIST=8.6 8.9 12.0+PTX`로 두어 gsplat 빌드는 RTX 30(Ampere), RTX 40(Ada), RTX 50(Blackwell) 계열을 같은 이미지에서 지원한다. COLMAP은 apt 패키지 대신 CUDA 지원 source build로 설치하며, `COLMAP_CUDA_ARCHITECTURES` 기본값은 RTX 3070/RTX 30용 `86`이다.
 
 SAM3 자동 문 검출을 쓰려면 RTX PC의 `door-ml` 포트(`8100`)를 PC backend에서 접근할 수 있어야 한다.
 
@@ -21,7 +21,7 @@ SAM3 자동 문 검출을 쓰려면 RTX PC의 `door-ml` 포트(`8100`)를 PC bac
 | Worker CUDA image | `nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04` |
 | Door ML CUDA image | `nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04` |
 | PyTorch wheel index | `https://download.pytorch.org/whl/cu128` |
-| Default arch list | `TORCH_CUDA_ARCH_LIST=8.6 8.9 12.0+PTX` |
+| Default arch list | `TORCH_CUDA_ARCH_LIST=8.6 8.9 12.0+PTX`, `COLMAP_CUDA_ARCHITECTURES=86` |
 | RTX 5090 arch | Blackwell, `12.0` |
 | RTX 30 arch | Ampere, `8.6` |
 
@@ -173,6 +173,11 @@ GSPLAT_REF=main
 GSPLAT_MAX_STEPS=7000
 WORKER_SHM_SIZE=12gb
 
+# COLMAP CUDA source build
+# RTX 30=86, RTX 40=89, RTX 50=120
+COLMAP_REF=3.12.6
+COLMAP_CUDA_ARCHITECTURES=86
+
 SOG_DEVICE=auto
 SOG_DAWN_BACKEND=vulkan
 SOG_PREFER_NVIDIA=1
@@ -217,7 +222,8 @@ worker import/CUDA 확인:
 docker exec 3dgs-rtx-worker nvidia-smi
 docker exec 3dgs-rtx-worker python -c "import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0))"
 docker exec 3dgs-rtx-worker python -c "import celery_app, tasks.training, tasks.colmap, tasks.alignment, tasks.sog; print('imports ok')"
-docker exec 3dgs-rtx-worker bash -lc 'which colmap && test -f "$GSPLAT_TRAINER" && node --version'
+docker exec 3dgs-rtx-worker bash -lc 'colmap -h | tee /tmp/colmap-help.txt && ! grep -qi "without CUDA" /tmp/colmap-help.txt'
+docker exec 3dgs-rtx-worker bash -lc 'test -f "$GSPLAT_TRAINER" && node --version'
 ```
 
 door-ml 확인:
@@ -335,6 +341,7 @@ DOOR_ML_URL=http://<RTX_PC_IP>:8100
 
 ```env
 TORCH_CUDA_ARCH_LIST=8.6 8.9 12.0+PTX
+COLMAP_CUDA_ARCHITECTURES=86
 PYTORCH_INDEX_URL=https://download.pytorch.org/whl/cu128
 ```
 
@@ -342,6 +349,7 @@ PYTORCH_INDEX_URL=https://download.pytorch.org/whl/cu128
 
 ```env
 TORCH_CUDA_ARCH_LIST=8.6
+COLMAP_CUDA_ARCHITECTURES=86
 ```
 
 이 경우 해당 이미지가 RTX 5090에서는 Blackwell용 CUDA extension을 다시 빌드해야 할 수 있으므로, 여러 RTX 세대에서 이미지를 재사용하려면 기본값을 유지한다.

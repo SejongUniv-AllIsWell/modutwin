@@ -122,7 +122,8 @@ GPU/CUDA smoke check:
 docker exec 3dgs-rtx-worker nvidia-smi
 docker exec 3dgs-rtx-worker python -c "import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0))"
 docker exec 3dgs-rtx-worker python -c "import celery_app, tasks.training, tasks.colmap, tasks.alignment, tasks.sog; print('imports ok')"
-docker exec 3dgs-rtx-worker bash -lc 'which colmap && test -f "$GSPLAT_TRAINER" && node --version'
+docker exec 3dgs-rtx-worker bash -lc 'colmap -h | tee /tmp/colmap-help.txt && ! grep -qi "without CUDA" /tmp/colmap-help.txt'
+docker exec 3dgs-rtx-worker bash -lc 'test -f "$GSPLAT_TRAINER" && node --version'
 docker exec 3dgs-rtx-sog-worker vulkaninfo --summary
 curl -i http://127.0.0.1:8100/health
 ```

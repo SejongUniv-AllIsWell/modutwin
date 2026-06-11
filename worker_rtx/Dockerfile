@@ -11,38 +11,89 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONPATH=/app \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    QT_XCB_GL_INTEGRATION=xcb_egl \
     TORCH_CUDA_ARCH_LIST="8.6 8.9 12.0+PTX" \
     GSPLAT_REPO=/opt/gsplat \
     GSPLAT_PYTHON=/usr/bin/python3 \
     GSPLAT_TRAINER=/opt/gsplat/examples/simple_trainer.py
 
-# ffmpeg + COLMAP + Python build/runtime libraries + Node.js install tools.
+# ffmpeg + COLMAP source-build deps + Python build/runtime libraries + Node.js install tools.
 # libvulkan1: Vulkan loader for splat-transform WebGPU/Dawn on NVIDIA GPUs.
 #   NVIDIA Vulkan ICD/driver libraries are mounted by NVIDIA Container Toolkit at runtime
 #   (compose must expose the graphics driver capability). vulkan-tools is for vulkaninfo checks.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    ccache \
     cmake \
     ffmpeg \
+    g++-10 \
+    gcc-10 \
     git \
+    ninja-build \
+    libboost-filesystem-dev \
+    libboost-graph-dev \
+    libboost-program-options-dev \
+    libboost-regex-dev \
+    libboost-system-dev \
+    libceres-dev \
+    libcgal-dev \
+    libcurl4-openssl-dev \
+    libeigen3-dev \
+    libflann-dev \
+    libgflags-dev \
+    libglew-dev \
+    libglib2.0-0 \
+    libgl1 \
+    libgomp1 \
+    libgoogle-glog-dev \
+    libgmock-dev \
+    libgtest-dev \
+    liblz4-dev \
+    libmetis-dev \
+    libopenblas-openmp-dev \
+    libopenimageio-dev \
+    libqt5opengl5-dev \
+    libqt5svg5-dev \
+    libsm6 \
+    libsqlite3-dev \
+    libssl-dev \
+    libsuitesparse-dev \
+    libvulkan1 \
+    libxext6 \
+    libxrender1 \
+    openimageio-tools \
     python3 \
     python3-dev \
     python3-pip \
     python3-venv \
     python-is-python3 \
-    colmap \
-    libglib2.0-0 \
-    libsm6 \
-    libxext6 \
-    libxrender1 \
-    libgl1 \
-    libgomp1 \
-    libvulkan1 \
-    vulkan-tools \
+    qtbase5-dev \
     curl \
     ca-certificates \
     gnupg \
+    vulkan-tools \
     && rm -rf /var/lib/apt/lists/*
+
+ARG COLMAP_REF=3.12.6
+ARG COLMAP_CUDA_ARCHITECTURES=86
+
+# Ubuntu/Debian COLMAP packages are CPU-only. Build COLMAP from source so
+# SIFT feature extraction/matching can use CUDA in the RTX worker.
+RUN git clone --depth=1 --branch "${COLMAP_REF}" https://github.com/colmap/colmap.git /opt/colmap-src \
+    && mkdir -p /opt/colmap-src/build \
+    && cd /opt/colmap-src/build \
+    && CC=/usr/bin/gcc-10 \
+       CXX=/usr/bin/g++-10 \
+       CUDAHOSTCXX=/usr/bin/g++-10 \
+       cmake .. -GNinja \
+         -DCMAKE_BUILD_TYPE=Release \
+         -DCMAKE_CUDA_ARCHITECTURES="${COLMAP_CUDA_ARCHITECTURES}" \
+         -DBLA_VENDOR=OpenBLAS \
+         -DGUI_ENABLED=OFF \
+    && ninja install \
+    && colmap -h | tee /tmp/colmap-help.txt \
+    && ! grep -qi "without CUDA" /tmp/colmap-help.txt \
+    && rm -rf /opt/colmap-src /tmp/colmap-help.txt
 
 # Node.js 20 (SOG 변환기 splat-transform 빌드/실행용)
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \

@@ -41,7 +41,7 @@ x-worker-environment: &worker-environment
   - GSPLAT_PYTHON=${GSPLAT_PYTHON:-/usr/bin/python3}
   - GSPLAT_TRAINER=${GSPLAT_TRAINER:-/opt/gsplat/examples/simple_trainer.py}
   - GSPLAT_MAX_STEPS=${GSPLAT_MAX_STEPS:-7000}
-  # COLMAP apt build can initialize Qt even for CLI feature extraction.
+  # RTX worker builds COLMAP from source with CUDA support.
   # Use offscreen and try GPU SIFT by default; set COLMAP_USE_GPU=0 to force CPU.
   - QT_QPA_PLATFORM=${QT_QPA_PLATFORM:-offscreen}
   - COLMAP_MATCHER=${COLMAP_MATCHER:-sequential}
@@ -56,6 +56,8 @@ x-worker-build: &worker-build
   args:
     PYTORCH_INDEX_URL: ${PYTORCH_INDEX_URL:-https://download.pytorch.org/whl/cu128}
     GSPLAT_REF: ${GSPLAT_REF:-main}
+    COLMAP_REF: ${COLMAP_REF:-3.12.6}
+    COLMAP_CUDA_ARCHITECTURES: ${COLMAP_CUDA_ARCHITECTURES:-86}
 
 x-door-ml-build: &door-ml-build
   context: ./door_ml_rtx
