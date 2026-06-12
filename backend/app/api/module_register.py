@@ -90,6 +90,12 @@ async def sam3_prepare(
         except Exception:
             pass
         raise HTTPException(status_code=400, detail="빈 파일")
+    if not _looks_like_ply(path):
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise HTTPException(status_code=400, detail="SAM3 자동 문검출은 PLY 파일만 지원합니다.")
     return Sam3PrepareResponse(session_id=sid, size=size)
 
 
@@ -123,6 +129,15 @@ class Sam3DetectTempRequest(BaseModel):
 class Sam3DetectTempResponse(BaseModel):
     corners: dict           # 첫 번째(주) 문 코너 (backward compat)
     all_doors: list[dict] = []  # N-door: 모든 문 코너 목록
+
+
+def _looks_like_ply(path: Path) -> bool:
+    try:
+        with open(path, "rb") as f:
+            head = f.read(4)
+    except OSError:
+        return False
+    return head.startswith(b"ply\n") or head.startswith(b"ply\r")
 
 
 def _apply_bake_rotation_to_corner(c: dict, rot_x: float, rot_z: float, wall_angle_rad: float) -> dict:
@@ -239,6 +254,8 @@ async def sam3_detect_temp(
     try:
         if p is None:
             raise OSError("PLY path is not available")
+        if not _looks_like_ply(p):
+            raise HTTPException(status_code=400, detail="SAM3 자동 문검출은 PLY 파일만 지원합니다.")
         resp = await _post_door_ml_detect(p, body)
         if resp.status_code != 200 and body.interior_strict and "Room center not interior" in resp.text:
             relaxed_min_hits = max(0, min(body.interior_min_hits, 20))

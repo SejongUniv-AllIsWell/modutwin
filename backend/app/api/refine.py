@@ -21,7 +21,7 @@ from sqlalchemy import select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.core.security import get_current_user
+from app.core.security import get_current_user, get_current_user_optional
 from app.core.storage_keys import is_key_under_prefix, normalize_minio_key
 from app.models import (
     User, UserRole, Upload, Task, SceneOutput, TaskType, TaskStatus,
@@ -421,7 +421,7 @@ class RefinedBundleResponse(BaseModel):
 @router.get("/refined-bundle", response_model=RefinedBundleResponse)
 async def get_refined_bundle(
     upload_id: UUID,
-    user: User = Depends(get_current_user),
+    user: User | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ):
     """upload_id 의 가장 최근 정제 결과 (PLY + mesh.json + 텍스처 PNG들) presigned URL 일괄 반환.
@@ -445,7 +445,7 @@ async def get_refined_bundle(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="정제 결과가 없습니다.")
     scene, module, floor, building = row
 
-    can_read = (
+    can_read = user is not None and (
         user.role == UserRole.admin
         or scene.user_id == user.id
         or module.user_id == user.id

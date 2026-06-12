@@ -87,6 +87,7 @@ export interface FloorDetailModuleEntry {
   is_visible: boolean;
   version: string | null;
   url: string | null;
+  filename?: string | null;
   source_upload_id: string | null;
 }
 

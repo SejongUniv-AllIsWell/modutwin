@@ -17,6 +17,7 @@ export interface AdditionalGsplat {
   error: string | null;
   /** caller-defined per-layer metadata (e.g. uploadId, MetadataResult) — preserved through detach/refresh */
   meta?: Record<string, any>;
+  filenameHint?: string | null;
 }
 
 export interface AddOptions {
@@ -26,6 +27,8 @@ export interface AddOptions {
   visible?: boolean;
   /** false 면 로드 직후 천장컷용 alpha snapshot 을 만든다. 기본값은 초기 로드 비용을 줄이기 위해 true. */
   lazyColorSnapshot?: boolean;
+  /** presigned/blob URL 에서 확장자를 안정적으로 알 수 없을 때 PlayCanvas parser 선택에 쓰는 파일명 힌트. */
+  filenameHint?: string | null;
 }
 
 export interface DetachedLayer {
@@ -34,6 +37,7 @@ export interface DetachedLayer {
   source: AdditionalGsplatSource;
   visible: boolean;
   meta?: Record<string, any>;
+  filenameHint?: string | null;
 }
 
 export interface AddResult {
@@ -300,11 +304,11 @@ export function useAdditionalGsplats(
 
     setItems(prev => [
       ...prev,
-      { id, url, name, source, visible, loaded: false, error: null, meta: opts?.meta },
+      { id, url, name, source, visible, loaded: false, error: null, meta: opts?.meta, filenameHint: opts?.filenameHint ?? null },
     ]);
     urlMapRef.current.set(id, url);
 
-    loadEntity(id, url, source, visible, name, opts?.lazyColorSnapshot ?? true);
+    loadEntity(id, url, source, visible, opts?.filenameHint ?? name, opts?.lazyColorSnapshot ?? true);
 
     return { id, ready };
   }, [loadEntity]);
@@ -362,6 +366,7 @@ export function useAdditionalGsplats(
       source: item.source,
       visible: item.visible,
       meta: item.meta,
+      filenameHint: item.filenameHint,
     };
   }, [coreRef]);
 
@@ -377,7 +382,7 @@ export function useAdditionalGsplats(
     // 3) 모든 항목을 unloaded 로 표시 후 현재 app 에 재로드
     const list = itemsRef.current;
     setItems(prev => prev.map(it => ({ ...it, loaded: false, error: null })));
-    list.forEach(item => loadEntity(item.id, item.url, item.source, item.visible, item.name));
+    list.forEach(item => loadEntity(item.id, item.url, item.source, item.visible, item.filenameHint ?? item.name));
   }, [loadEntity]);
 
   // 언마운트 시 모두 정리

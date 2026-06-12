@@ -10,7 +10,7 @@ import { useRefineTool } from './tools/useRefineTool';
 import { useRefinedMeshLoader } from './tools/useRefinedMeshLoader';
 import { useDoorLabels, type DoorLabelEntry } from './tools/useDoorLabels';
 import { useAdditionalGsplats, AdditionalGsplatSource } from './tools/useAdditionalGsplats';
-import { destroyMainDerivedMeshes, splitSceneFilesByExtension } from './tools/sourceManager';
+import { destroyMainDerivedMeshes, splitSceneFileExtension, splitSceneFilesByExtension } from './tools/sourceManager';
 import { api } from '@/lib/api';
 import { ActiveBasemapResponse } from '@/types';
 import { useRouter } from 'next/navigation';
@@ -80,6 +80,9 @@ interface EnsureRegistrationContextResponse {
 }
 
 const SAM3_DIRECT_UPLOAD_LIMIT_BYTES = 90 * 1024 * 1024;
+const isPlyFilename = (filename: string | null | undefined): boolean => (
+  splitSceneFileExtension(filename ?? '') === 'ply'
+);
 
 async function cleanupStagingUpload(key: string | null | undefined, minioUploadId?: string | null): Promise<void> {
   if (!key) return;
@@ -154,6 +157,7 @@ export default function UnifiedSplatEditor({
   const [currentUrl, setCurrentUrl] = useState<string | null>(initialSogUrl ?? null);
   const [uploadId, setUploadId] = useState<string | undefined>(initialUploadId);
   const [displayName, setDisplayName] = useState<string | null>(initialDisplayName ?? null);
+  const [assetFilenameHint, setAssetFilenameHint] = useState<string | null>(initialDisplayName ?? null);
   const [source, setSource] = useState<'local' | 'server'>(initialUploadId ? 'server' : 'local');
   const [mainVisible, setMainVisible] = useState(true);
   const [refinedBundleAvailable, setRefinedBundleAvailable] = useState(Boolean(initialHasRefinedBundle));
@@ -246,7 +250,14 @@ export default function UnifiedSplatEditor({
   // 모듈측 도어의 선택된 힌지 변. 정합 단계 doorPivotGroup 회전축 계산에 사용.
   const [moduleDoorHingeEdge, setModuleDoorHingeEdge] = useState<number | null>(null);
 
-  const reloadWithUrl = useCallback((newUrl: string) => {
+  const reloadWithUrl = useCallback((newUrl: string, opts?: { filename?: string | null }) => {
+    if (localObjectUrlRef.current && localObjectUrlRef.current !== newUrl) {
+      try { URL.revokeObjectURL(localObjectUrlRef.current); } catch {}
+    }
+    localObjectUrlRef.current = newUrl.startsWith('blob:') ? newUrl : null;
+    if (opts && 'filename' in opts) {
+      setAssetFilenameHint(opts.filename ?? null);
+    }
     setCurrentUrl(newUrl);
   }, []);
 
@@ -261,8 +272,9 @@ export default function UnifiedSplatEditor({
     lastInitialUrlRef.current = initialSogUrl ?? null;
     if (initialSogUrl) {
       setCurrentUrl(initialSogUrl);
+      setAssetFilenameHint(initialDisplayName ?? null);
     }
-  }, [initialSogUrl]);
+  }, [initialSogUrl, initialDisplayName]);
 
   // 추가 레이어 (basemap 등)
   const additional = useAdditionalGsplats(coreRef);
@@ -694,6 +706,7 @@ export default function UnifiedSplatEditor({
       setUploadId(undefined);
       setRefinedBundleAvailable(false);
       setDisplayName(first.name);
+      setAssetFilenameHint(first.name);
       setSource('local');
       setMainVisible(true);
       setMetadata(null);
@@ -705,22 +718,26 @@ export default function UnifiedSplatEditor({
       if (!isBasemapPurpose) {
         sam3PrepareSessionIdRef.current = null;
         sam3PrepareStagingKeyRef.current = null;
-        sam3PrepareInFlightRef.current = (async () => {
-          try {
-            if (first.size > SAM3_DIRECT_UPLOAD_LIMIT_BYTES) {
-              sam3PrepareStagingKeyRef.current = await uploadFileToStaging(first);
-            } else {
-              const form = new FormData();
-              form.append('file', first);
-              const data = await api.postForm<{ session_id: string; size: number }>(
-                '/uploads/sam3/prepare', form,
-              );
-              sam3PrepareSessionIdRef.current = data.session_id;
+        if (isPlyFilename(first.name)) {
+          sam3PrepareInFlightRef.current = (async () => {
+            try {
+              if (first.size > SAM3_DIRECT_UPLOAD_LIMIT_BYTES) {
+                sam3PrepareStagingKeyRef.current = await uploadFileToStaging(first);
+              } else {
+                const form = new FormData();
+                form.append('file', first);
+                const data = await api.postForm<{ session_id: string; size: number }>(
+                  '/uploads/sam3/prepare', form,
+                );
+                sam3PrepareSessionIdRef.current = data.session_id;
+              }
+            } catch (e: any) {
+              console.warn('[sam3-prepare] 백그라운드 업로드 실패 (자동 문 검출 비활성):', e?.message || e);
             }
-          } catch (e: any) {
-            console.warn('[sam3-prepare] 백그라운드 업로드 실패 (자동 문 검출 비활성):', e?.message || e);
-          }
-        })();
+          })();
+        } else {
+          sam3PrepareInFlightRef.current = null;
+        }
       }
     }
 
@@ -1098,7 +1115,7 @@ export default function UnifiedSplatEditor({
     <SplatViewerCore
       ref={coreRef}
       sogUrl={currentUrl}
-      assetFilename={displayName}
+      assetFilename={assetFilenameHint ?? displayName}
       onSplatLoaded={handleSplatLoaded}
     >
       {/* 패널 숨김 시: 좌측 가장자리에 펼치기 핸들 노출 */}
@@ -1392,13 +1409,18 @@ export default function UnifiedSplatEditor({
                     if (sam3PrepareInFlightRef.current) {
                       await sam3PrepareInFlightRef.current;
                     }
-                    const sid = sam3PrepareSessionIdRef.current;
+                    let sid = sam3PrepareSessionIdRef.current;
                     const stagingKey = sam3PrepareStagingKeyRef.current;
                     if (!sid && !stagingKey) {
-                      console.warn('[Sam3] 임시 PLY 세션/staging 키 미확보 — 자동 검출 불가, 수동 지정으로 진행');
-                      setAutoExtracting(false);
-                      setSam3DispatchSent(false);
-                      return;
+                      const prepared = await refine.prepareSam3TempPly?.();
+                      sid = prepared?.session_id ?? null;
+                      sam3PrepareSessionIdRef.current = sid;
+                      if (!sid) {
+                        console.warn('[Sam3] 임시 PLY 세션/staging 키 미확보 — 자동 검출 불가, 수동 지정으로 진행');
+                        setAutoExtracting(false);
+                        setSam3DispatchSent(false);
+                        return;
+                      }
                     }
                     const bake = refine.getRemainingRotationToAY?.() ?? { rotX: 0, rotZ: 0, wallAngleRad: 0 };
                     // 방법 B — 다듬기 확정 천장/바닥(A') + raw→A' 회전(bakedRotation) 전달.

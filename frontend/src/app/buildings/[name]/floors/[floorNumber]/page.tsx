@@ -278,6 +278,7 @@ function sceneWorldBounds(app: any): { mnX: number; mxX: number; mnY: number; mx
 
 function FloorCompositeViewer({
   primaryUrl,
+  primaryFilename,
   basemapSourceUploadId,
   primarySourceUploadId,
   primaryIsModule,
@@ -289,6 +290,7 @@ function FloorCompositeViewer({
   onCoreReady,
 }: {
   primaryUrl: string;
+  primaryFilename: string | null;
   basemapSourceUploadId: string | null;
   primarySourceUploadId: string | null;   // 천장제거: primary 자산의 mesh.json fetch 대상
   primaryIsModule: boolean;               // 베이스맵 없이 모듈이 primary 인 경우
@@ -586,6 +588,7 @@ function FloorCompositeViewer({
           source: 'server',
           visible: true,
           lazyColorSnapshot: true,
+          filenameHint: module.filename ?? null,
         });
         record.splatLayerIds.push(splat.id);
         record.mainSplatLayerId = splat.id;   // 천장제거 마스크 대상 (도어 splat 제외)
@@ -844,6 +847,7 @@ function FloorCompositeViewer({
     <SplatViewerCore
       ref={setCoreRef}
       sogUrl={primaryUrl}
+      assetFilename={primaryFilename}
       captureColorSnapshot={false}
       onSplatLoaded={onSplatLoaded}
     >
@@ -1010,6 +1014,12 @@ export default function FloorDetailPage() {
     if (manifest?.basemap?.url === primaryUrl) return manifest?.basemap?.source_upload_id ?? null;
     const primaryModule = renderableModules.find((m) => m.url === primaryUrl);
     return primaryModule?.source_upload_id ?? null;
+  }, [manifest, primaryUrl, renderableModules]);
+  const primaryFilename = useMemo<string | null>(() => {
+    if (!primaryUrl) return null;
+    if (manifest?.basemap?.url === primaryUrl) return manifest?.basemap?.filename ?? null;
+    const primaryModule = renderableModules.find((m) => m.url === primaryUrl);
+    return primaryModule?.filename ?? null;
   }, [manifest, primaryUrl, renderableModules]);
   const primaryIsModule = !!primaryUrl && manifest?.basemap?.url !== primaryUrl;
 
@@ -1375,6 +1385,7 @@ export default function FloorDetailPage() {
           <>
             <FloorCompositeViewer
               primaryUrl={primaryUrl}
+              primaryFilename={primaryFilename}
               basemapSourceUploadId={manifest?.basemap?.source_upload_id ?? null}
               primarySourceUploadId={primarySourceUploadId}
               primaryIsModule={primaryIsModule}

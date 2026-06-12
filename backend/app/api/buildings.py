@@ -242,6 +242,7 @@ class DetailModuleEntry(BaseModel):
     is_visible: bool
     version: datetime | None
     url: str | None
+    filename: str | None = None
     source_upload_id: UUID | None = None
 
 
@@ -1190,6 +1191,7 @@ async def get_floor_detail_manifest(
                 is_visible=module.is_visible,
                 version=latest_scene.created_at if latest_scene else None,
                 url=minio.get_presigned_download_url(path) if path else None,
+                filename=path.rsplit("/", 1)[-1] if path else None,
                 source_upload_id=upload_id_by_task.get(latest_scene.task_id) if latest_scene else None,
             )
         )

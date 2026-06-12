@@ -28,7 +28,7 @@ export interface RefineToolOptions {
   // 다듬기가 베이스로 삼는 원본 PLY URL — ensureOriginalScene 에서 fetch&parse.
   currentUrl?: string;
   // resetAll 에서 새 URL로 SplatViewerCore in-place reload.
-  reloadWithUrl?: (url: string) => void;
+  reloadWithUrl?: (url: string, opts?: { filename?: string | null }) => void;
   // 사용자에게 보여주는 파일명 (이미 'refined_' prefix 가 붙어있을 수도 있음 — 이중 prefix 방지용으로 strip).
   // 저장 시 MinIO key 의 파일명에 사용: `refined_<원본>.ply`.
   originalFilename?: string;
