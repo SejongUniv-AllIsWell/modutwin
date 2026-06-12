@@ -21,7 +21,7 @@ GSPLAT_TRAINER = os.environ.get(
 # simple_trainer.py 가 examples/ 내부에서 `from datasets.colmap import ...` 처럼
 # 상대 import 를 쓰므로 examples 디렉토리에서 실행해야 한다.
 GSPLAT_CWD = os.path.dirname(GSPLAT_TRAINER)
-GSPLAT_MAX_STEPS = int(os.environ.get("GSPLAT_MAX_STEPS", "7000"))
+GSPLAT_MAX_STEPS = int(os.environ.get("GSPLAT_MAX_STEPS", "30000"))
 
 
 class GsplatModule(PipelineModule):

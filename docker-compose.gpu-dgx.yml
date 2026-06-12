@@ -75,7 +75,7 @@ x-worker-environment: &worker-environment
   # gsplat 경로/스텝 (기본값은 DGX(imlabdgx1) 기준; 필요시 .env 로 오버라이드).
   - GSPLAT_PYTHON=${GSPLAT_PYTHON:-/home/imlabdgx1/miniforge3/envs/gsplat/bin/python}
   - GSPLAT_TRAINER=${GSPLAT_TRAINER:-/home/imlabdgx1/Development/gsplat/examples/simple_trainer.py}
-  - GSPLAT_MAX_STEPS=${GSPLAT_MAX_STEPS:-7000}
+  - GSPLAT_MAX_STEPS=${GSPLAT_MAX_STEPS:-30000}
 
 x-worker-volumes: &worker-volumes
   - ./core:/app/core:ro

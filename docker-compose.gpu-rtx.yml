@@ -40,7 +40,7 @@ x-worker-environment: &worker-environment
   # worker_rtx/Dockerfile 이 컨테이너 내부에 설치한 gsplat 경로.
   - GSPLAT_PYTHON=${GSPLAT_PYTHON:-/usr/bin/python3}
   - GSPLAT_TRAINER=${GSPLAT_TRAINER:-/opt/gsplat/examples/simple_trainer.py}
-  - GSPLAT_MAX_STEPS=${GSPLAT_MAX_STEPS:-7000}
+  - GSPLAT_MAX_STEPS=${GSPLAT_MAX_STEPS:-30000}
   # RTX worker builds COLMAP from source with CUDA support.
   # Use offscreen and try GPU SIFT by default; set COLMAP_USE_GPU=0 to force CPU.
   - QT_QPA_PLATFORM=${QT_QPA_PLATFORM:-offscreen}
