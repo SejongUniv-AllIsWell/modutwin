@@ -11,7 +11,9 @@ plans were removed or merged.
 | Document | Purpose |
 | --- | --- |
 | `CODEBASE_REFERENCE.md` | Current architecture, runtime identity, main modules, data flows, and remaining risks. |
-| `DEVELOPMENT.md` | Local/prod-like startup, environment setup, migrations, validation, and GPU notes. |
+| `DEVELOPMENT.md` | Local/prod-like startup, environment setup, migrations, and validation. |
+| `GPU_WORKER.md` | Remote GPU worker variants, SOG Vulkan checks, and operational troubleshooting. |
+| `rtxworekr.md` | RTX worker setup after pulling the repo on an Ubuntu 22.04 RTX PC. |
 | `validation_and_qa.md` | Repeatable checks, smoke tests, manual QA matrix, and rollback notes. |
 | `frontend_pages.md` | Current frontend App Router pages and shared shell components. |
 | `ROADMAP.md` | Current product, cleanup, and refactoring work that has not been completed. |

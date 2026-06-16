@@ -1,0 +1,124 @@
+# 원격 RTX GPU 머신 전용 worker compose.
+# ===========================================================================
+# PC 웹 스택(RabbitMQ/Redis/MinIO/backend)은 docker-compose.yml 로 별도 머신에서
+# 실행하고, 이 파일은 RTX NVIDIA GPU 머신에서 Celery worker + door-ml 을 띄운다.
+#
+# 사용법 (RTX GPU 머신에서):
+#   cp .env.rtx-worker.example .env.rtx-worker
+#   docker compose --env-file .env.rtx-worker -f docker-compose.gpu-rtx.yml up -d --build
+#
+# door-ml 은 RTX용 door_ml_rtx/Dockerfile 을 사용한다. 기존 door_ml/Dockerfile 은
+# DGX Spark/GB10 CUDA 13 경로를 유지한다.
+# ===========================================================================
+
+x-worker-environment: &worker-environment
+  # 브로커/스토리지는 PC 를 PC_HOST_IP 로 가리킨다 (도커 서비스 이름 사용 X).
+  - RABBITMQ_URL=amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@${PC_HOST_IP}:5673//
+  - REDIS_URL=redis://:${REDIS_PASSWORD}@${PC_HOST_IP}:6379/0
+  - MINIO_ENDPOINT=${PC_HOST_IP}:9000
+  - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY}
+  - MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
+  - MINIO_BUCKET=${MINIO_BUCKET}
+  - MINIO_SECURE=false
+  # 백엔드 콜백도 PC 로. nginx 경유면 http://${PC_HOST_IP}, 8000 직노출이면 :8000.
+  - BACKEND_CALLBACK_URL=${BACKEND_CALLBACK_URL}
+  - WORKER_CALLBACK_TOKEN=${WORKER_CALLBACK_TOKEN}
+  # notify_upload_progress 용 (backend_callback.py). 미설정 시 BACKEND_CALLBACK_URL 재사용.
+  - BACKEND_INTERNAL_URL=${BACKEND_INTERNAL_URL:-${BACKEND_CALLBACK_URL}}
+  - INTERNAL_API_TOKEN=${INTERNAL_API_TOKEN:-}
+  # SOG 변환 디바이스: auto = WebGPU(Dawn)에서 NVIDIA/Vulkan 어댑터 우선, 실패 시 CPU 폴백.
+  - SOG_DEVICE=${SOG_DEVICE:-auto}
+  - SOG_ITERATIONS=${SOG_ITERATIONS:-10}
+  - SOG_TIMEOUT=${SOG_TIMEOUT:-3600}
+  - SOG_DAWN_BACKEND=${SOG_DAWN_BACKEND:-vulkan}
+  - SOG_PREFER_NVIDIA=${SOG_PREFER_NVIDIA:-1}
+  # NVIDIA 드라이버의 compute + utility + graphics/Vulkan 부분까지 컨테이너에 마운트.
+  - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
+  - NVIDIA_DRIVER_CAPABILITIES=${NVIDIA_DRIVER_CAPABILITIES:-compute,utility,graphics}
+  # RTX 30(Ampere)=8.6, RTX 40(Ada)=8.9, RTX 50/Blackwell=12.0.
+  - TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST:-8.6 8.9 12.0+PTX}
+  # worker_rtx/Dockerfile 이 컨테이너 내부에 설치한 gsplat 경로.
+  - GSPLAT_PYTHON=${GSPLAT_PYTHON:-/usr/bin/python3}
+  - GSPLAT_TRAINER=${GSPLAT_TRAINER:-/opt/gsplat/examples/simple_trainer.py}
+  - GSPLAT_MAX_STEPS=${GSPLAT_MAX_STEPS:-30000}
+  # RTX worker builds COLMAP from source with CUDA support.
+  # Use offscreen and try GPU SIFT by default; set COLMAP_USE_GPU=0 to force CPU.
+  - QT_QPA_PLATFORM=${QT_QPA_PLATFORM:-offscreen}
+  - COLMAP_MATCHER=${COLMAP_MATCHER:-sequential}
+  - COLMAP_FRAME_FPS=${COLMAP_FRAME_FPS:-1}
+  - COLMAP_USE_GPU=${COLMAP_USE_GPU:-1}
+  - COLMAP_NUM_THREADS=${COLMAP_NUM_THREADS:-16}
+  - COLMAP_MAX_IMAGE_SIZE=${COLMAP_MAX_IMAGE_SIZE:-3840}
+  - COLMAP_SEQUENTIAL_OVERLAP=${COLMAP_SEQUENTIAL_OVERLAP:-20}
+
+x-worker-build: &worker-build
+  context: ./worker_rtx
+  args:
+    PYTORCH_INDEX_URL: ${PYTORCH_INDEX_URL:-https://download.pytorch.org/whl/cu128}
+    GSPLAT_REF: ${GSPLAT_REF:-main}
+    COLMAP_REF: ${COLMAP_REF:-3.12.6}
+    COLMAP_CUDA_ARCHITECTURES: ${COLMAP_CUDA_ARCHITECTURES:-86}
+
+x-door-ml-build: &door-ml-build
+  context: ./door_ml_rtx
+  args:
+    PYTORCH_INDEX_URL: ${PYTORCH_INDEX_URL:-https://download.pytorch.org/whl/cu128}
+
+x-worker-volumes: &worker-volumes
+  - ./core:/app/core:ro
+  - ./utilities:/app/utilities:ro
+
+x-gpu-deploy: &gpu-deploy
+  resources:
+    reservations:
+      devices:
+        - driver: nvidia
+          count: all
+          capabilities: [gpu]
+
+services:
+  # training + alignment 전용 워커 (Dockerfile CMD: -Q training,alignment -c 1).
+  worker:
+    build: *worker-build
+    image: modutwin-worker-rtx
+    container_name: 3dgs-rtx-worker
+    environment: *worker-environment
+    volumes: *worker-volumes
+    shm_size: ${WORKER_SHM_SIZE:-12gb}
+    deploy: *gpu-deploy
+    restart: unless-stopped
+
+  # SOG 변환 전용 워커 — 'sog' 큐만 소비. 긴 SOG 변환이 training/alignment 를 막지 않도록 분리.
+  sog-worker:
+    build: *worker-build
+    image: modutwin-worker-rtx
+    container_name: 3dgs-rtx-sog-worker
+    command: ["celery", "-A", "celery_app", "worker", "-Q", "sog", "-c", "1", "--loglevel=info"]
+    environment: *worker-environment
+    volumes: *worker-volumes
+    shm_size: ${WORKER_SHM_SIZE:-12gb}
+    deploy: *gpu-deploy
+    restart: unless-stopped
+
+  # SAM3 문검출 HTTP 서버. PC 백엔드가 POST /detect 로 호출한다(celery 미사용).
+  door-ml:
+    build: *door-ml-build
+    image: modutwin-door-ml-rtx
+    container_name: 3dgs-rtx-door-ml
+    ports:
+      - "${DOOR_ML_PORT:-8100}:8000"
+    volumes:
+      - ./core:/app/core:ro
+      - ./utilities:/app/utilities:ro
+      - hf_cache:/root/.cache/huggingface
+    environment:
+      - TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST:-8.6 8.9 12.0+PTX}
+      - HF_TOKEN=${HF_TOKEN}
+      - HF_HUB_DISABLE_PROGRESS_BARS=1
+      - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
+      - NVIDIA_DRIVER_CAPABILITIES=${NVIDIA_DRIVER_CAPABILITIES:-compute,utility,graphics}
+    deploy: *gpu-deploy
+    restart: unless-stopped
+
+volumes:
+  hf_cache:

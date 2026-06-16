@@ -56,3 +56,34 @@ def test_sam3_dispatch_alias_controls_enable_sam3(required_env: dict[str, str]) 
     )
 
     assert settings.ENABLE_SAM3 is True
+
+
+def test_worker_callback_token_is_loaded_from_worker_env_name(required_env: dict[str, str]) -> None:
+    settings = Settings(
+        POSTGRES_PASSWORD=required_env["POSTGRES_PASSWORD"],
+        REDIS_PASSWORD=required_env["REDIS_PASSWORD"],
+        RABBITMQ_DEFAULT_PASS=required_env["RABBITMQ_DEFAULT_PASS"],
+        MINIO_SECRET_KEY=required_env["MINIO_SECRET_KEY"],
+        JWT_SECRET_KEY=required_env["JWT_SECRET_KEY"],
+        WORKER_CALLBACK_TOKEN="worker-secret",
+    )
+
+    assert settings.WORKER_CALLBACK_TOKEN == "worker-secret"
+
+
+def test_worker_callback_token_falls_back_to_internal_token(
+    required_env: dict[str, str],
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("WORKER_CALLBACK_TOKEN", raising=False)
+    settings = Settings(
+        POSTGRES_PASSWORD=required_env["POSTGRES_PASSWORD"],
+        REDIS_PASSWORD=required_env["REDIS_PASSWORD"],
+        RABBITMQ_DEFAULT_PASS=required_env["RABBITMQ_DEFAULT_PASS"],
+        MINIO_SECRET_KEY=required_env["MINIO_SECRET_KEY"],
+        JWT_SECRET_KEY=required_env["JWT_SECRET_KEY"],
+        INTERNAL_API_TOKEN="legacy-internal-secret",
+        WORKER_CALLBACK_TOKEN="",
+    )
+
+    assert settings.WORKER_CALLBACK_TOKEN == "legacy-internal-secret"

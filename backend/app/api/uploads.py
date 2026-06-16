@@ -5,6 +5,7 @@ import os
 from typing import Any
 from uuid import UUID, uuid4
 
+import redis.asyncio as aioredis
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
@@ -16,7 +17,7 @@ from app.core.security import get_current_user
 from app.core.storage_keys import is_key_under_prefix, normalize_minio_key
 from app.models import (
     User, UserRole, Upload, Task, Module, Floor, Building, SceneOutput,
-    UploadStatus, TaskType, TaskStatus, PlyTarget, Sam3Status,
+    UploadStatus, TaskType, TaskStatus, PlyTarget,
     Basemap, Notification,
 )
 from sqlalchemy import delete as sa_delete, update as sa_update
@@ -30,10 +31,14 @@ from app.schemas.uploads import (
 )
 from app.services.minio_service import get_minio_service, PART_SIZE
 from app.services.celery_service import (
-    dispatch_training_task,
-    dispatch_sam3_door_detection_task,
-    dispatch_colmap_task,
+    COLMAP_TASK_NAME,
+    GS_FROM_COLMAP_TASK_NAME,
+    SAM3_DOOR_ML_TASK_NAME,
+    TRAINING_QUEUE,
+    TRAINING_TASK_NAME,
+    celery_app,
 )
+from app.services.celery_broker_cleanup import drop_ready_celery_messages
 from app.services.sam3_service import (
     SAM3_DISABLED_DETAIL,
     mark_sam3_disabled,
@@ -41,6 +46,7 @@ from app.services.sam3_service import (
 )
 from app.services.storage_access import delete_storage_best_effort
 from app.services.storage_paths import doors_json_key, module_base_path, refined_prefix
+from app.services.task_dispatch_outbox import dispatch_outbox_by_id, enqueue_task_dispatch
 
 router = APIRouter(prefix="/uploads", tags=["uploads"])
 settings = get_settings()
@@ -49,6 +55,123 @@ logger = logging.getLogger(__name__)
 # 사용자당 업로드 제한 (개수 / 총 용량)
 MAX_UPLOADS_PER_USER = 100
 MAX_STORAGE_PER_USER = 200 * 1024 * 1024 * 1024  # 200 GB
+
+# ── Staging multipart 업로드 ───────────────────────────────────────────────
+# Cloudflare 요청 본문 100MB 한도를 피하기 위한 범용 청크 업로드. 대용량 자산
+# (예: commit-final 의 refined PLY ~130MB)을 module/Upload 행 없이도 MinIO 에
+# 직접 청크 PUT 으로 올린 뒤, 이어지는 핸들러(commit-final)가 그 키를 받아
+# 서버사이드 copy 로 최종 위치에 옮긴다. 키는 사용자 격리: staging/{user}/{uuid}.
+STAGING_PREFIX = "staging"
+
+
+def _user_staging_prefix(user_id) -> str:
+    return f"{STAGING_PREFIX}/{user_id}/"
+
+
+class StagingMultipartInitRequest(BaseModel):
+    filename: str
+    file_size: int
+    content_type: str = "application/octet-stream"
+
+
+class StagingMultipartInitResponse(BaseModel):
+    key: str
+    minio_upload_id: str
+    presigned_urls: list[str]
+    part_size: int
+    part_count: int
+
+
+class StagingMultipartPart(BaseModel):
+    part_number: int
+    etag: str
+
+
+class StagingMultipartCompleteRequest(BaseModel):
+    key: str
+    minio_upload_id: str
+    parts: list[StagingMultipartPart]
+
+
+class StagingMultipartCompleteResponse(BaseModel):
+    key: str
+
+
+class StagingMultipartAbortRequest(BaseModel):
+    key: str
+    minio_upload_id: str | None = None
+    delete_object: bool = True
+
+
+@router.post("/staging-multipart-init", response_model=StagingMultipartInitResponse)
+async def staging_multipart_init(
+    body: StagingMultipartInitRequest,
+    user: User = Depends(get_current_user),
+):
+    """대용량 자산을 staging 키로 청크 presigned PUT 하기 위한 multipart 초기화."""
+    if body.file_size <= 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="file_size는 양수여야 합니다.")
+    ext = os.path.splitext(body.filename)[1].lower() or ".ply"
+    key = f"{STAGING_PREFIX}/{user.id}/{uuid4()}{ext}"
+    part_count = max(1, math.ceil(body.file_size / PART_SIZE))
+    minio = get_minio_service()
+    minio_upload_id = minio.init_multipart_upload(key, body.content_type)
+    presigned_urls = minio.get_presigned_upload_urls(key, minio_upload_id, part_count)
+    return StagingMultipartInitResponse(
+        key=key,
+        minio_upload_id=minio_upload_id,
+        presigned_urls=presigned_urls,
+        part_size=PART_SIZE,
+        part_count=part_count,
+    )
+
+
+@router.post("/staging-multipart-complete", response_model=StagingMultipartCompleteResponse)
+async def staging_multipart_complete(
+    body: StagingMultipartCompleteRequest,
+    user: User = Depends(get_current_user),
+):
+    """모든 청크 PUT 후 호출. 본인 staging 경로의 키만 완료 처리한다."""
+    try:
+        key = normalize_minio_key(body.key)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="유효하지 않은 key 입니다.")
+    if not is_key_under_prefix(key, _user_staging_prefix(user.id)):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="본인 staging 경로의 키가 아닙니다.")
+    minio = get_minio_service()
+    try:
+        parts = [{"part_number": p.part_number, "etag": p.etag} for p in body.parts]
+        minio.complete_multipart_upload(key, body.minio_upload_id, parts)
+    except Exception as e:
+        minio.abort_multipart_upload(key, body.minio_upload_id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"MinIO staging multipart 완료 실패: {str(e)}",
+        )
+    return StagingMultipartCompleteResponse(key=key)
+
+
+@router.post("/staging-multipart-abort", status_code=status.HTTP_204_NO_CONTENT)
+async def staging_multipart_abort(
+    body: StagingMultipartAbortRequest,
+    user: User = Depends(get_current_user),
+):
+    """본인 staging multipart/object 를 best-effort 로 정리한다."""
+    try:
+        key = normalize_minio_key(body.key)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="유효하지 않은 key 입니다.")
+    if not is_key_under_prefix(key, _user_staging_prefix(user.id)):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="본인 staging 경로의 키가 아닙니다.")
+
+    minio = get_minio_service()
+    if body.minio_upload_id:
+        minio.abort_multipart_upload(key, body.minio_upload_id)
+    if body.delete_object:
+        minio.delete_object(key)
+    return None
+
+
 @router.post("/init", response_model=UploadInitResponse)
 async def init_upload(
     body: UploadInitRequest,
@@ -164,6 +287,21 @@ async def complete_upload(
 
     minio = get_minio_service()
 
+    async def _fail_upload_complete(
+        status_code: int,
+        detail: str,
+        *,
+        abort_multipart: bool = False,
+        delete_object: bool = False,
+    ) -> None:
+        upload.status = UploadStatus.failed
+        await db.commit()
+        if abort_multipart:
+            minio.abort_multipart_upload(upload.minio_path, body.minio_upload_id)
+        if delete_object:
+            delete_storage_best_effort(minio, set(), {upload.minio_path})
+        raise HTTPException(status_code=status_code, detail=detail)
+
     try:
         parts = [
             {"part_number": p.part_number, "etag": p.etag}
@@ -171,22 +309,20 @@ async def complete_upload(
         ]
         minio.complete_multipart_upload(upload.minio_path, body.minio_upload_id, parts)
     except Exception as e:
-        upload.status = UploadStatus.failed
-        await db.commit()
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"MinIO 업로드 완료 실패: {str(e)}",
+        await _fail_upload_complete(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            f"MinIO 업로드 완료 실패: {str(e)}",
+            abort_multipart=True,
         )
 
     # 완성된 객체의 실제 크기를 MinIO stat으로 검증한다.
     try:
         actual_size = minio.get_object_size(upload.minio_path)
     except Exception as e:
-        upload.status = UploadStatus.failed
-        await db.commit()
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"업로드 파일 검증 실패: {str(e)}",
+        await _fail_upload_complete(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            f"업로드 파일 검증 실패: {str(e)}",
+            delete_object=True,
         )
 
     max_size = max(1, int(settings.UPLOAD_MAX_FILE_SIZE_BYTES))
@@ -194,25 +330,22 @@ async def complete_upload(
     declared_size = int(upload.file_size or 0)
 
     if actual_size <= 0:
-        upload.status = UploadStatus.failed
-        await db.commit()
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="업로드 파일 크기가 0이어서 완료할 수 없습니다.",
+        await _fail_upload_complete(
+            status.HTTP_400_BAD_REQUEST,
+            "업로드 파일 크기가 0이어서 완료할 수 없습니다.",
+            delete_object=True,
         )
     if actual_size > max_size:
-        upload.status = UploadStatus.failed
-        await db.commit()
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="업로드 파일이 허용된 최대 크기를 초과했습니다.",
+        await _fail_upload_complete(
+            status.HTTP_400_BAD_REQUEST,
+            "업로드 파일이 허용된 최대 크기를 초과했습니다.",
+            delete_object=True,
         )
     if declared_size > 0 and actual_size > declared_size + tolerance:
-        upload.status = UploadStatus.failed
-        await db.commit()
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="업로드 파일의 실제 크기가 선언된 크기 허용 오차를 초과했습니다.",
+        await _fail_upload_complete(
+            status.HTTP_400_BAD_REQUEST,
+            "업로드 파일의 실제 크기가 선언된 크기 허용 오차를 초과했습니다.",
+            delete_object=True,
         )
 
     # quota 계산 일관성을 위해 실제 저장 크기로 보정.
@@ -243,16 +376,14 @@ async def complete_upload(
     floor_result = await db.execute(select(Floor).where(Floor.id == module.floor_id))
     floor = floor_result.scalar_one()
 
-    celery_task_id = None
+    celery_task_id: str | None = None
+    dispatch_stage: str | None = None
 
     if is_colmap_input:
-        # COLMAP 전처리 태스크 발행
+        # Task row 를 먼저 저장한 뒤 같은 celery_task_id 로 발행한다.
         upload.status = UploadStatus.processing
-        celery_task_id = dispatch_colmap_task(
-            upload_id=str(upload.id),
-            user_id=str(user.id),
-            minio_input_key=upload.minio_path,
-        )
+        celery_task_id = str(uuid4())
+        dispatch_stage = "colmap"
         task = Task(
             upload_id=upload.id,
             user_id=user.id,
@@ -261,16 +392,8 @@ async def complete_upload(
             status=TaskStatus.pending,
         )
     elif not skip_training:
-        celery_task_id = dispatch_training_task(
-            upload_id=str(upload.id),
-            user_id=str(user.id),
-            minio_input_key=upload.minio_path,
-            building_id=str(floor.building_id),
-            floor_id=str(floor.id),
-            module_id=str(module.id),
-            module_name=module.name,
-            ply_target=upload.ply_target.value if upload.ply_target else "gsplat",
-        )
+        celery_task_id = str(uuid4())
+        dispatch_stage = "training"
         task = Task(
             upload_id=upload.id,
             user_id=user.id,
@@ -288,7 +411,45 @@ async def complete_upload(
         )
 
     db.add(task)
+    await db.flush()
+
+    outbox_id: UUID | None = None
+    if dispatch_stage and celery_task_id:
+        if dispatch_stage == "colmap":
+            outbox = await enqueue_task_dispatch(
+                db,
+                task_id=task.id,
+                upload_id=upload.id,
+                celery_task_id=celery_task_id,
+                task_name=COLMAP_TASK_NAME,
+                queue=TRAINING_QUEUE,
+                args=[str(upload.id), str(user.id), upload.minio_path],
+            )
+        else:
+            outbox = await enqueue_task_dispatch(
+                db,
+                task_id=task.id,
+                upload_id=upload.id,
+                celery_task_id=celery_task_id,
+                task_name=TRAINING_TASK_NAME,
+                queue=TRAINING_QUEUE,
+                args=[
+                    str(upload.id),
+                    str(user.id),
+                    upload.minio_path,
+                    str(floor.building_id),
+                    str(floor.id),
+                    str(module.id),
+                    module.name,
+                    upload.ply_target.value if upload.ply_target else "gsplat",
+                ],
+            )
+        outbox_id = outbox.id
+
     await db.commit()
+
+    if outbox_id:
+        await dispatch_outbox_by_id(outbox_id)
 
     if is_colmap_input:
         msg = "업로드 완료. COLMAP 전처리가 시작됩니다."
@@ -313,15 +474,32 @@ def _upload_to_response(
     has_scene_output: bool = False,
     is_basemap_source: bool = False,
     has_alignment: bool = False,
+    is_basemap_upload: bool = False,
+    is_basemap_active: bool = False,
+    module_name: str | None = None,
+    floor_id: UUID | None = None,
+    floor_number: int | None = None,
+    building_id: UUID | None = None,
+    building_name: str | None = None,
 ) -> UploadResponse:
     """Upload ORM → UploadResponse (SAM3 파이프라인 파생 플래그 포함).
 
     has_refined: SAM3 정식 경로 (refined_ply_path) 또는 다듬기 저장으로 생성된 SceneOutput 중 하나라도 있으면 true.
     is_basemap_source: 이 업로드가 어떤 basemap의 원본 PLY 인지 — 삭제 비활성화 판단용.
+    is_basemap_upload: basemap 목적으로 올라온 업로드인지 (register-local-basemap 가 생성하는 '__basemap__' 모듈 소속).
+        등록 전이라도 모듈 업로드와 구분 가능 — 대시보드 상태/정합 버튼 분기용.
+    is_basemap_active: 이 업로드를 원본으로 하는 basemap 이 활성(관리자 승인/등록 완료)인지.
+        pending(제출만 됨) 단계에서도 Basemap row(source_upload) 는 생기므로, '업로드 완료' vs 'Basemap'
+        구분은 is_basemap_source 가 아니라 이 플래그로 한다.
     """
     return UploadResponse(
         id=upload.id,
         module_id=upload.module_id,
+        module_name=module_name,
+        floor_id=floor_id,
+        floor_number=floor_number,
+        building_id=building_id,
+        building_name=building_name,
         original_filename=upload.original_filename,
         file_size=upload.file_size,
         status=upload.status.value if upload.status else "uploaded",
@@ -330,11 +508,43 @@ def _upload_to_response(
         sam3_status=upload.sam3_status.value if upload.sam3_status else None,
         sam3_prompt=upload.sam3_prompt,
         has_refined=bool(upload.refined_ply_path) or has_scene_output,
+        has_refined_bundle=has_scene_output,
         has_doors_json=bool(upload.door_corners_json_path),
         has_alignment=has_alignment,
         has_gsplat_ply=bool(upload.gsplat_ply_path),
         is_basemap_source=is_basemap_source,
+        is_basemap_upload=is_basemap_upload,
+        is_basemap_active=is_basemap_active,
     )
+
+
+async def _upload_context_by_id(db: AsyncSession, upload_ids: list[UUID]) -> dict[UUID, dict[str, Any]]:
+    if not upload_ids:
+        return {}
+    rows = await db.execute(
+        select(
+            Upload.id,
+            Module.name.label("module_name"),
+            Floor.id.label("floor_id"),
+            Floor.floor_number,
+            Building.id.label("building_id"),
+            Building.name.label("building_name"),
+        )
+        .join(Module, Upload.module_id == Module.id)
+        .join(Floor, Module.floor_id == Floor.id)
+        .join(Building, Floor.building_id == Building.id)
+        .where(Upload.id.in_(upload_ids))
+    )
+    return {
+        row.id: {
+            "module_name": row.module_name,
+            "floor_id": row.floor_id,
+            "floor_number": row.floor_number,
+            "building_id": row.building_id,
+            "building_name": row.building_name,
+        }
+        for row in rows.all()
+    }
 
 
 @router.get("", response_model=list[UploadResponse])
@@ -353,6 +563,7 @@ async def list_uploads(
         return []
     # 다듬기 저장 (SceneOutput 생성) 여부를 한 번에 조회 — has_refined 보강용.
     upload_ids = [u.id for u in uploads]
+    context_by_upload = await _upload_context_by_id(db, upload_ids)
     scene_rows = await db.execute(
         select(Task.upload_id)
         .join(SceneOutput, SceneOutput.task_id == Task.id)
@@ -367,18 +578,34 @@ async def list_uploads(
         .distinct()
     )
     basemap_source_ids = {row[0] for row in basemap_rows.all() if row[0] is not None}
+    # 활성(관리자 승인/등록 완료) basemap 의 원본 업로드 — 상태 'Basemap' 표시 판단용.
+    active_basemap_rows = await db.execute(
+        select(Basemap.source_upload_id)
+        .where(Basemap.source_upload_id.in_(upload_ids), Basemap.is_active == True)
+        .distinct()
+    )
+    active_basemap_source_ids = {row[0] for row in active_basemap_rows.all() if row[0] is not None}
     module_ids = {u.module_id for u in uploads}
     aligned_module_rows = await db.execute(
         select(Module.id)
         .where(Module.id.in_(module_ids), Module.alignment_transform.is_not(None))
     )
     aligned_module_ids = {row[0] for row in aligned_module_rows.all()}
+    # basemap 목적 업로드 — register-local-basemap 가 만드는 '__basemap__' 모듈 소속.
+    basemap_module_rows = await db.execute(
+        select(Module.id)
+        .where(Module.id.in_(module_ids), Module.name == "__basemap__")
+    )
+    basemap_module_ids = {row[0] for row in basemap_module_rows.all()}
     return [
         _upload_to_response(
             u,
             has_scene_output=(u.id in has_scene),
             is_basemap_source=(u.id in basemap_source_ids),
             has_alignment=(u.module_id in aligned_module_ids),
+            is_basemap_upload=(u.module_id in basemap_module_ids),
+            is_basemap_active=(u.id in active_basemap_source_ids),
+            **context_by_upload.get(u.id, {}),
         )
         for u in uploads
     ]
@@ -413,24 +640,217 @@ async def get_upload(
         select(Basemap.id).where(Basemap.source_upload_id == upload_id).limit(1)
     )
     is_basemap_source = basemap_check.scalar_one_or_none() is not None
-    module_check = await db.execute(
-        select(Module.alignment_transform).where(Module.id == upload.module_id).limit(1)
+    active_basemap_check = await db.execute(
+        select(Basemap.id)
+        .where(Basemap.source_upload_id == upload_id, Basemap.is_active == True)
+        .limit(1)
     )
-    has_alignment = module_check.scalar_one_or_none() is not None
+    is_basemap_active = active_basemap_check.scalar_one_or_none() is not None
+    module_check = await db.execute(
+        select(Module.alignment_transform, Module.name).where(Module.id == upload.module_id).limit(1)
+    )
+    module_row = module_check.first()
+    has_alignment = module_row is not None and module_row[0] is not None
+    is_basemap_upload = module_row is not None and module_row[1] == "__basemap__"
+    context_by_upload = await _upload_context_by_id(db, [upload.id])
     return _upload_to_response(
         upload,
         has_scene_output=has_scene,
         is_basemap_source=is_basemap_source,
         has_alignment=has_alignment,
+        is_basemap_upload=is_basemap_upload,
+        is_basemap_active=is_basemap_active,
+        **context_by_upload.get(upload.id, {}),
     )
 
 
 VIEWABLE_EXTENSIONS = {".ply", ".splat", ".sog"}
 
 
+def _task_progress_key(celery_task_id: str) -> str:
+    return f"task:progress:{celery_task_id}"
+
+
+def _revoke_celery_tasks(celery_task_ids: list[str]) -> None:
+    for celery_task_id in celery_task_ids:
+        try:
+            celery_app.control.revoke(celery_task_id, terminate=True, signal="SIGTERM")
+        except Exception:
+            logger.exception("[delete_upload] celery revoke failed: task_id=%s", celery_task_id)
+
+
+def _drop_ready_celery_messages(celery_task_ids: list[str]) -> None:
+    try:
+        drop_ready_celery_messages(celery_task_ids)
+    except Exception:
+        logger.exception("[delete_upload] broker ready-message cleanup failed")
+
+
+async def _clear_worker_progress(celery_task_ids: list[str]) -> None:
+    if not celery_task_ids:
+        return
+
+    client = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+    try:
+        await client.delete(*[_task_progress_key(task_id) for task_id in celery_task_ids])
+    except Exception:
+        logger.exception("[delete_upload] redis progress cleanup failed")
+    finally:
+        await client.aclose()
+
+
+class UploadRetryResponse(BaseModel):
+    upload_id: UUID
+    task_id: UUID
+    celery_task_id: str
+    retry_stage: str
+    status: str
+
+
+def _colmap_retry_stage(upload: Upload, tasks: list[Task]) -> str:
+    """Return the failed COLMAP pipeline stage to resume from."""
+    latest_task = tasks[0] if tasks else None
+    if latest_task and latest_task.status == TaskStatus.failed:
+        if latest_task.task_type == TaskType.colmap_preprocessing:
+            return "colmap"
+        if latest_task.task_type == TaskType.training_3dgs:
+            return "gsplat"
+
+    colmap_completed = any(
+        task.task_type == TaskType.colmap_preprocessing
+        and task.status == TaskStatus.completed
+        for task in tasks
+    )
+    if upload.status == UploadStatus.failed and colmap_completed and not upload.gsplat_ply_path:
+        return "gsplat"
+    return "colmap"
+
+
+def _has_colmap_sparse_outputs(minio, upload: Upload) -> bool:
+    colmap_base = f"users/{upload.user_id}/colmap/{upload.id}/sparse/0"
+    try:
+        return all(
+            minio.object_exists(f"{colmap_base}/{filename}")
+            for filename in ("cameras.bin", "images.bin", "points3D.bin")
+        )
+    except Exception:
+        return False
+
+
+@router.post("/{upload_id}/retry", response_model=UploadRetryResponse)
+async def retry_upload_pipeline(
+    upload_id: UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """실패한 COLMAP/GS 파이프라인을 기존 업로드 파일로 재시도.
+
+    원본 multipart 업로드는 다시 요구하지 않는다. 실패 지점이 COLMAP이면 COLMAP부터,
+    COLMAP 산출물이 이미 있고 GS 단계에서 실패한 것으로 판단되면 GS부터 재발행한다.
+    """
+    stmt = select(Upload).where(Upload.id == upload_id)
+    if user.role != UserRole.admin:
+        stmt = stmt.where(Upload.user_id == user.id)
+    upload = (await db.execute(stmt)).scalar_one_or_none()
+    if upload is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="업로드를 찾을 수 없습니다.")
+    if upload.ply_target != PlyTarget.colmap:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="COLMAP 업로드만 재시도할 수 있습니다.")
+    if upload.status != UploadStatus.failed:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="실패 상태인 업로드만 재시도할 수 있습니다.")
+
+    task_rows = await db.execute(
+        select(Task)
+        .where(Task.upload_id == upload.id)
+        .order_by(Task.created_at.desc())
+    )
+    tasks = list(task_rows.scalars().all())
+    retry_stage = _colmap_retry_stage(upload, tasks)
+
+    minio = get_minio_service()
+    if not minio.object_exists(upload.minio_path):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="원본 업로드 파일이 없어 재시도할 수 없습니다.",
+        )
+    if retry_stage == "gsplat" and not _has_colmap_sparse_outputs(minio, upload):
+        retry_stage = "colmap"
+
+    old_celery_ids = [task.celery_task_id for task in tasks if task.celery_task_id]
+    _revoke_celery_tasks(old_celery_ids)
+    _drop_ready_celery_messages(old_celery_ids)
+    await _clear_worker_progress(old_celery_ids)
+
+    cleanup_prefixes: set[str] = set()
+    cleanup_keys: set[str] = set()
+    if retry_stage == "colmap":
+        cleanup_prefixes.add(f"users/{upload.user_id}/colmap/{upload.id}")
+        cleanup_prefixes.add(f"users/{upload.user_id}/gsplat/{upload.id}")
+        if upload.gsplat_ply_path:
+            cleanup_keys.add(upload.gsplat_ply_path)
+        upload.gsplat_ply_path = None
+        task_type = TaskType.colmap_preprocessing
+    else:
+        cleanup_prefixes.add(f"users/{upload.user_id}/gsplat/{upload.id}")
+        if upload.gsplat_ply_path:
+            cleanup_keys.add(upload.gsplat_ply_path)
+        upload.gsplat_ply_path = None
+        task_type = TaskType.training_3dgs
+
+    celery_task_id = str(uuid4())
+    retry_task = Task(
+        upload_id=upload.id,
+        user_id=upload.user_id,
+        task_type=task_type,
+        celery_task_id=celery_task_id,
+        status=TaskStatus.pending,
+        progress=0,
+        error_message=None,
+    )
+    upload.status = UploadStatus.processing
+    db.add(retry_task)
+    await db.flush()
+
+    if retry_stage == "colmap":
+        outbox = await enqueue_task_dispatch(
+            db,
+            task_id=retry_task.id,
+            upload_id=upload.id,
+            celery_task_id=celery_task_id,
+            task_name=COLMAP_TASK_NAME,
+            queue=TRAINING_QUEUE,
+            args=[str(upload.id), str(upload.user_id), upload.minio_path],
+        )
+    else:
+        outbox = await enqueue_task_dispatch(
+            db,
+            task_id=retry_task.id,
+            upload_id=upload.id,
+            celery_task_id=celery_task_id,
+            task_name=GS_FROM_COLMAP_TASK_NAME,
+            queue=TRAINING_QUEUE,
+            args=[str(upload.id), str(upload.user_id), upload.minio_path, {}],
+        )
+    outbox_id = outbox.id
+
+    await db.commit()
+
+    delete_storage_best_effort(minio, cleanup_prefixes, cleanup_keys)
+    await dispatch_outbox_by_id(outbox_id)
+
+    return UploadRetryResponse(
+        upload_id=upload.id,
+        task_id=retry_task.id,
+        celery_task_id=celery_task_id,
+        retry_stage=retry_stage,
+        status=upload.status.value,
+    )
+
+
 @router.delete("/{upload_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_upload(
     upload_id: UUID,
+    minio_upload_id: str | None = None,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -441,8 +861,10 @@ async def delete_upload(
 
     함께 정리:
       - SceneOutput row + MinIO 파일 (ply/sog/metadata)
+      - 진행 중 worker task revoke/terminate + progress key 삭제
       - 관련 Task row + Notification.related_task_id null 처리
       - Upload 자신의 MinIO 파일 (원본/refined/doors.json + refined prefix)
+      - 완료 전 multipart 업로드가 있으면 MinIO abort 로 uploaded part 정리
     """
     stmt = select(Upload).where(Upload.id == upload_id)
     if user.role != UserRole.admin:
@@ -463,17 +885,42 @@ async def delete_upload(
             detail="basemap에 등록된 업로드는 삭제할 수 없습니다. 관리자에게 문의하세요.",
         )
 
+    minio = get_minio_service()
+    if minio_upload_id and upload.minio_path:
+        aborted = minio.abort_multipart_upload(upload.minio_path, minio_upload_id.strip())
+        if not aborted:
+            logger.info(
+                "[delete_upload] multipart abort skipped/failed: upload_id=%s minio_key=%s",
+                upload.id,
+                upload.minio_path,
+            )
+
     # 정리 대상 키 / prefix 수집.
     keys: set[str] = set()
     prefixes: set[str] = set()
-    for k in (upload.minio_path, upload.refined_ply_path, upload.door_corners_json_path):
+    for k in (
+        upload.minio_path,
+        upload.gsplat_ply_path,
+        upload.refined_ply_path,
+        upload.door_corners_json_path,
+    ):
         if k:
             keys.add(k)
     if upload.minio_path:
         prefixes.add(refined_prefix(upload.minio_path))
+    if upload.ply_target == PlyTarget.colmap:
+        prefixes.add(f"users/{upload.user_id}/colmap/{upload.id}")
+        prefixes.add(f"users/{upload.user_id}/gsplat/{upload.id}")
 
-    task_ids_rows = await db.execute(select(Task.id).where(Task.upload_id == upload.id))
-    task_ids = [tid for (tid,) in task_ids_rows.all()]
+    task_rows = await db.execute(
+        select(Task.id, Task.celery_task_id).where(Task.upload_id == upload.id)
+    )
+    task_pairs = task_rows.all()
+    task_ids = [tid for (tid, _) in task_pairs]
+    celery_task_ids = [ctid for (_, ctid) in task_pairs if ctid]
+    _revoke_celery_tasks(celery_task_ids)
+    _drop_ready_celery_messages(celery_task_ids)
+    await _clear_worker_progress(celery_task_ids)
 
     scene_rows = await db.execute(
         select(SceneOutput.id, SceneOutput.ply_path, SceneOutput.sog_path, SceneOutput.metadata_path)
@@ -500,7 +947,7 @@ async def delete_upload(
     await db.execute(sa_delete(Upload).where(Upload.id == upload.id))
     await db.commit()
 
-    delete_storage_best_effort(get_minio_service(), prefixes, keys)
+    delete_storage_best_effort(minio, prefixes, keys)
 
     return None
 
@@ -646,6 +1093,15 @@ class RegisterLocalBasemapRequest(BaseModel):
     content_type: str = "application/octet-stream"
 
 
+class EnsureBasemapModuleRequest(BaseModel):
+    building_id: UUID
+    floor_id: UUID
+
+
+class EnsureBasemapModuleResponse(BaseModel):
+    module_id: UUID
+
+
 @router.post("/register-local", response_model=RegisterLocalResponse)
 async def register_local_upload(
     body: RegisterLocalRequest,
@@ -787,6 +1243,53 @@ async def register_local_basemap_upload(
     return RegisterLocalResponse(upload_id=upload.id, minio_path=placeholder_key)
 
 
+@router.post("/ensure-basemap-module", response_model=EnsureBasemapModuleResponse)
+async def ensure_basemap_module(
+    body: EnsureBasemapModuleRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """basemap 목적 COLMAP(영상/사진묶음) 업로드용 — 해당 층의 숨김 '__basemap__'
+    모듈을 찾거나 생성해 module_id 를 반환한다.
+
+    PLY basemap 등록은 register-local-basemap 이 placeholder 업로드까지 만들지만,
+    COLMAP 업로드는 /uploads/init 가 실제 업로드를 만들므로 여기서는 모듈만 확보한다.
+    is_visible=False 규약으로 일반 모듈 목록/통계에 노출되지 않게 한다.
+    """
+    floor_result = await db.execute(
+        select(Floor).where(Floor.id == body.floor_id, Floor.building_id == body.building_id)
+    )
+    floor = floor_result.scalar_one_or_none()
+    if floor is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="building_id / floor_id 조합이 유효하지 않습니다.",
+        )
+
+    module_result = await db.execute(
+        select(Module).where(
+            Module.floor_id == body.floor_id,
+            Module.user_id == user.id,
+            Module.name == "__basemap__",
+        )
+    )
+    module = module_result.scalar_one_or_none()
+    if module is None:
+        module = Module(
+            floor_id=body.floor_id,
+            user_id=user.id,
+            name="__basemap__",
+            is_visible=False,
+        )
+        db.add(module)
+        await db.flush()
+    elif module.is_visible:
+        module.is_visible = False
+    await db.commit()
+
+    return EnsureBasemapModuleResponse(module_id=module.id)
+
+
 # refined PLY: 클라이언트가 /refine/refined-upload-url 로 단일 PUT 업로드 한 후,
 # 이 엔드포인트를 호출해 canonical refined_ply_path 등록 + SAM3 task 발행.
 class BakeRotation(BaseModel):
@@ -853,44 +1356,43 @@ async def start_sam3(
     )
     mod, floor = mod_q.one()
 
-    celery_task_id: str | None = None
-    try:
-        # SAM3 검출은 다듬기 전 원본 PLY (upload.minio_path) 로 수행. 다듬기 산출물은
-        # 벽 가우시안이 mesh+texture 로 분리돼 SAM3 가 문을 못 봐 본질적으로 검출 실패.
-        # door-ml 결과(원본 좌표계 corners) 는 백엔드에서 베이크 회전 적용 → refined 좌표계로 변환.
-        bake = body.bake_rotation or BakeRotation()
-        celery_task_id = dispatch_sam3_door_detection_task(
-            upload_id=str(upload.id),
-            user_id=str(user.id),
-            original_ply_key=upload.minio_path,
-            prompt=upload.sam3_prompt or "",
-            building_id=str(floor.building_id),
-            floor_id=str(floor.id),
-            floor_number=floor.floor_number,
-            module_id=str(mod.id),
-            module_name=mod.name,
-            rot_x=bake.rotX,
-            rot_z=bake.rotZ,
-            wall_angle_rad=bake.wallAngleRad,
-            doors_target_key=refined_key,
-        )
-        upload.sam3_status = Sam3Status.running
-    except Exception as e:
-        # broker/worker 비가용 — failed 로 두면 사용자가 정합 단계에서 수동 지정 가능.
-        upload.sam3_status = Sam3Status.failed
-        logger.exception(f"[sam3] dispatch failed: {e}")
+    celery_task_id = str(uuid4())
+    task = Task(
+        upload_id=upload.id,
+        user_id=user.id,
+        task_type=TaskType.sam3_door_detection,
+        celery_task_id=celery_task_id,
+        status=TaskStatus.pending,
+    )
+    db.add(task)
+    await db.flush()
 
-    if celery_task_id:
-        task = Task(
-            upload_id=upload.id,
-            user_id=user.id,
-            task_type=TaskType.sam3_door_detection,
-            celery_task_id=celery_task_id,
-            status=TaskStatus.running,
-        )
-        db.add(task)
-
+    # SAM3 검출은 다듬기 전 원본 PLY (upload.minio_path) 로 수행. 다듬기 산출물은
+    # 벽 가우시안이 mesh+texture 로 분리돼 SAM3 가 문을 못 봐 본질적으로 검출 실패.
+    # door-ml 결과(원본 좌표계 corners) 는 백엔드에서 베이크 회전 적용 → refined 좌표계로 변환.
+    bake = body.bake_rotation or BakeRotation()
+    outbox = await enqueue_task_dispatch(
+        db,
+        task_id=task.id,
+        upload_id=upload.id,
+        celery_task_id=celery_task_id,
+        task_name=SAM3_DOOR_ML_TASK_NAME,
+        queue=None,
+        kwargs={
+            "upload_id": str(upload.id),
+            "original_ply_key": upload.minio_path,
+            "prompt": upload.sam3_prompt or "",
+            "rot_x": bake.rotX,
+            "rot_z": bake.rotZ,
+            "wall_angle_rad": bake.wallAngleRad,
+            "doors_target_key": refined_key,
+        },
+    )
+    outbox_id = outbox.id
     await db.commit()
+
+    await dispatch_outbox_by_id(outbox_id)
+    await db.refresh(upload)
 
     return Sam3StartResponse(
         upload_id=upload.id,
@@ -944,7 +1446,7 @@ class DoorMeshMeta(BaseModel):
     corners: list[list[float]]  # 4 × [x, y, z] — A'+Y 프레임 mesh 코너
     uvs: list[list[float]]      # 4 × [u, v]   — 텍스처 매핑
     normalInward: list[float]   # [x, y, z]    — 방 안쪽 normal
-    textureFilename: str        # MinIO 키: "tex_door_<doorId>.png"
+    textureFilename: str        # MinIO texture key
     textureWidth: int
     textureHeight: int
 

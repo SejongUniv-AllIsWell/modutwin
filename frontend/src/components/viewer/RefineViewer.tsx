@@ -27,6 +27,7 @@ export default function RefineViewer({ sogUrl, uploadId, originalFilename }: Ref
       key={reloadKey}
       ref={coreRef}
       sogUrl={currentUrl}
+      assetFilename={originalFilename}
       onSplatLoaded={refine.onSplatLoaded}
     >
       <div className="absolute top-3 left-3 z-50">

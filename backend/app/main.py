@@ -27,6 +27,7 @@ from app.services.sam3_temp_storage import (
     cleanup_loop as sam3_temp_cleanup_loop,
     ensure_temp_dir as sam3_ensure_temp_dir,
 )
+from app.services.task_dispatch_outbox import dispatch_outbox_loop
 
 settings = get_settings()
 
@@ -36,14 +37,16 @@ async def lifespan(app: FastAPI):
     get_minio_service()  # MinIO 버킷 자동 생성
     sam3_ensure_temp_dir()
     cleanup_task = asyncio.create_task(sam3_temp_cleanup_loop())
+    dispatch_task = asyncio.create_task(dispatch_outbox_loop())
     try:
         yield
     finally:
-        cleanup_task.cancel()
-        try:
-            await cleanup_task
-        except asyncio.CancelledError:
-            pass
+        for task in (cleanup_task, dispatch_task):
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
 
 app = FastAPI(

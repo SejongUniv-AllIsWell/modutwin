@@ -7,7 +7,7 @@ from app.core.config import get_settings
 
 settings = get_settings()
 
-PART_SIZE = 10 * 1024 * 1024  # 10MB per part
+PART_SIZE = 20 * 1024 * 1024  # 20MB per part
 
 
 def get_minio_client() -> Minio:
@@ -48,9 +48,17 @@ class MinioService:
             pass  # 설정된 정책이 없으면 무시 (기본 private)
 
     def init_multipart_upload(self, key: str, content_type: str) -> str:
-        return self.client._create_multipart_upload(
-            self.bucket, key, {"Content-Type": content_type}
-        )
+        headers = {"Content-Type": content_type}
+        try:
+            response = self.client._create_multipart_upload(
+                bucket_name=self.bucket,
+                object_name=key,
+                headers=headers,
+            )
+        except TypeError:
+            response = self.client._create_multipart_upload(self.bucket, key, headers)
+        upload_id = getattr(getattr(response, "result", None), "upload_id", response)
+        return str(upload_id)
 
     def get_presigned_upload_url(
         self, key: str, upload_id: str, part_number: int, expires: int = 3600
@@ -81,9 +89,32 @@ class MinioService:
             Part(p["part_number"], p["etag"])
             for p in sorted(parts, key=lambda x: x["part_number"])
         ]
-        self.client._complete_multipart_upload(
-            self.bucket, key, upload_id, minio_parts
-        )
+        try:
+            self.client._complete_multipart_upload(
+                bucket_name=self.bucket,
+                object_name=key,
+                upload_id=upload_id,
+                parts=minio_parts,
+            )
+        except TypeError:
+            self.client._complete_multipart_upload(self.bucket, key, upload_id, minio_parts)
+
+    def abort_multipart_upload(self, key: str, upload_id: str) -> bool:
+        """Abort an unfinished multipart upload and remove uploaded parts best-effort."""
+        if not key or not upload_id:
+            return False
+        try:
+            try:
+                self.client._abort_multipart_upload(
+                    bucket_name=self.bucket,
+                    object_name=key,
+                    upload_id=upload_id,
+                )
+            except TypeError:
+                self.client._abort_multipart_upload(self.bucket, key, upload_id)
+            return True
+        except Exception:
+            return False
 
     def get_presigned_download_url(self, key: str, expires: int = 3600) -> str:
         return self.public_client.presigned_get_object(
@@ -161,6 +192,15 @@ class MinioService:
         self.client.put_object(
             self.bucket, key, BytesIO(data), length=len(data), content_type=content_type,
         )
+
+    def copy_object(self, dest_key: str, src_key: str) -> None:
+        """버킷 내 서버사이드 복사 — 데이터가 클라이언트/프록시(Cloudflare)를 거치지 않는다.
+
+        대용량(>100MB) PLY 를 staging 키로 청크 업로드한 뒤 최종 키로 옮길 때 사용.
+        단일 copy_object 는 5GB 까지 지원하므로 refined PLY(수백 MB)엔 충분하다.
+        """
+        from minio.commonconfig import CopySource
+        self.client.copy_object(self.bucket, dest_key, CopySource(self.bucket, src_key))
 
 
 _minio_service: MinioService | None = None

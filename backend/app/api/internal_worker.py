@@ -4,12 +4,14 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel
-from sqlalchemy import select, update as sa_update
+from sqlalchemy import delete as sa_delete, select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.core.database import get_db
 from app.core.storage_keys import normalize_minio_key
+from app.services.minio_service import get_minio_service
+from app.services.storage_access import delete_storage_best_effort
 from app.models import (
     Floor,
     Module,
@@ -28,6 +30,7 @@ settings = get_settings()
 class WorkerTaskSuccessRequest(BaseModel):
     celery_task_id: str
     upload_id: UUID | None = None
+    task_type: str | None = None
     ply_key: str | None = None
     sog_key: str | None = None
     web_sog_key: str | None = None
@@ -37,7 +40,13 @@ class WorkerTaskSuccessRequest(BaseModel):
 class WorkerTaskFailureRequest(BaseModel):
     celery_task_id: str
     upload_id: UUID | None = None
+    task_type: str | None = None
     error_message: str | None = None
+
+
+class WorkerSogReadyRequest(BaseModel):
+    scene_id: UUID
+    sog_key: str
 
 
 class WorkerTaskCallbackResponse(BaseModel):
@@ -75,14 +84,45 @@ def _normalize_path(value: str | None, field_name: str) -> str | None:
         ) from exc
 
 
-def _summarize_error_message(error_message: str | None, max_len: int = 500) -> str:
+def _summarize_error_message(error_message: str | None, max_len: int = 4000) -> str:
     message = (error_message or "Worker task failed.").strip()
     if len(message) <= max_len:
         return message
     return f"{message[: max_len - 3].rstrip()}..."
 
 
-async def _get_task_by_celery_id(db: AsyncSession, celery_task_id: str) -> Task:
+def _callback_task_type(value: str | None, fallback: TaskType) -> TaskType:
+    if not value:
+        return fallback
+    try:
+        return TaskType(value)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid task_type: {value}",
+        ) from exc
+
+
+def _missing_callback_storage_fields(minio, field_keys: dict[str, str | None]) -> list[str]:
+    missing: list[str] = []
+    for field_name, key in field_keys.items():
+        if not key:
+            continue
+        try:
+            exists = bool(minio.object_exists(key))
+        except Exception:
+            exists = False
+        if not exists:
+            missing.append(field_name)
+    return missing
+
+
+async def _get_or_create_task_by_celery_id(
+    db: AsyncSession,
+    celery_task_id: str,
+    upload_id: UUID | None,
+    task_type: TaskType,
+) -> Task:
     result = await db.execute(
         select(Task)
         .where(Task.celery_task_id == celery_task_id)
@@ -90,8 +130,26 @@ async def _get_task_by_celery_id(db: AsyncSession, celery_task_id: str) -> Task:
         .limit(1)
     )
     task = result.scalar_one_or_none()
-    if task is None:
+    if task is not None:
+        return task
+
+    if upload_id is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found.")
+
+    upload = await db.get(Upload, upload_id)
+    if upload is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Upload not found.")
+
+    task = Task(
+        upload_id=upload.id,
+        user_id=upload.user_id,
+        task_type=task_type,
+        celery_task_id=celery_task_id,
+        status=TaskStatus.pending,
+        progress=0,
+    )
+    db.add(task)
+    await db.flush()
     return task
 
 
@@ -101,7 +159,13 @@ async def worker_task_success(
     _auth: None = Depends(_require_worker_token),
     db: AsyncSession = Depends(get_db),
 ):
-    task = await _get_task_by_celery_id(db, body.celery_task_id)
+    fallback_task_type = TaskType.door_alignment if (body.metadata_key or body.web_sog_key) else TaskType.training_3dgs
+    task = await _get_or_create_task_by_celery_id(
+        db,
+        body.celery_task_id,
+        body.upload_id,
+        _callback_task_type(body.task_type, fallback_task_type),
+    )
 
     if body.upload_id is not None and body.upload_id != task.upload_id:
         raise HTTPException(
@@ -110,7 +174,9 @@ async def worker_task_success(
         )
 
     ply_key = _normalize_path(body.ply_key, "ply_key")
-    sog_key = _normalize_path(body.web_sog_key, "web_sog_key") or _normalize_path(body.sog_key, "sog_key") or ply_key
+    raw_sog_key = _normalize_path(body.sog_key, "sog_key")
+    web_sog_key = _normalize_path(body.web_sog_key, "web_sog_key")
+    sog_key = web_sog_key or raw_sog_key or ply_key
     metadata_key = _normalize_path(body.metadata_key, "metadata_key")
     if not ply_key and not sog_key:
         raise HTTPException(
@@ -121,6 +187,22 @@ async def worker_task_success(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="ply_key is required to persist SceneOutput.",
+        )
+
+    minio = get_minio_service()
+    missing_fields = _missing_callback_storage_fields(
+        minio,
+        {
+            "ply_key": ply_key,
+            "sog_key": raw_sog_key,
+            "web_sog_key": web_sog_key,
+            "metadata_key": metadata_key,
+        },
+    )
+    if missing_fields:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Callback storage object not found: {', '.join(missing_fields)}",
         )
 
     upload_result = await db.execute(select(Upload).where(Upload.id == task.upload_id))
@@ -174,6 +256,8 @@ async def worker_task_success(
             .values(overview_dirty=True)
         )
 
+    await db.commit()
+
     return WorkerTaskCallbackResponse(
         task_id=task.id,
         scene_id=scene.id,
@@ -187,7 +271,12 @@ async def worker_task_failure(
     _auth: None = Depends(_require_worker_token),
     db: AsyncSession = Depends(get_db),
 ):
-    task = await _get_task_by_celery_id(db, body.celery_task_id)
+    task = await _get_or_create_task_by_celery_id(
+        db,
+        body.celery_task_id,
+        body.upload_id,
+        _callback_task_type(body.task_type, TaskType.training_3dgs),
+    )
 
     if body.upload_id is not None and body.upload_id != task.upload_id:
         raise HTTPException(
@@ -195,18 +284,78 @@ async def worker_task_failure(
             detail="upload_id does not match the task upload.",
         )
 
+    if task.status == TaskStatus.completed:
+        return WorkerTaskCallbackResponse(
+            task_id=task.id,
+            scene_id=None,
+            status=task.status.value,
+        )
+
     task.status = TaskStatus.failed
     task.error_message = _summarize_error_message(body.error_message)
     task.completed_at = datetime.now(timezone.utc)
 
-    if task.task_type == TaskType.training_3dgs:
+    scene_rows = await db.execute(
+        select(SceneOutput.id, SceneOutput.ply_path, SceneOutput.sog_path, SceneOutput.metadata_path)
+        .where(SceneOutput.task_id == task.id)
+    )
+    scene_ids: list[UUID] = []
+    keys: set[str] = set()
+    for scene_id, ply_path, sog_path, metadata_path in scene_rows.all():
+        scene_ids.append(scene_id)
+        for key in (ply_path, sog_path, metadata_path):
+            if key:
+                keys.add(key)
+    if scene_ids:
+        await db.execute(sa_delete(SceneOutput).where(SceneOutput.id.in_(scene_ids)))
+
+    if task.task_type in (TaskType.training_3dgs, TaskType.door_alignment):
         upload_result = await db.execute(select(Upload).where(Upload.id == task.upload_id))
         upload = upload_result.scalar_one_or_none()
         if upload is not None:
             upload.status = UploadStatus.failed
 
+    await db.commit()
+    if keys:
+        delete_storage_best_effort(get_minio_service(), set(), keys)
+
     return WorkerTaskCallbackResponse(
         task_id=task.id,
         scene_id=None,
         status=task.status.value,
+    )
+
+
+@router.post("/scenes/sog-ready", response_model=WorkerTaskCallbackResponse)
+async def worker_scene_sog_ready(
+    body: WorkerSogReadyRequest,
+    _auth: None = Depends(_require_worker_token),
+    db: AsyncSession = Depends(get_db),
+):
+    """refined PLY → SOG 변환 완료 통지. 기존 SceneOutput 의 sog_path 만 채운다."""
+    sog_key = _normalize_path(body.sog_key, "sog_key")
+    if not sog_key:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="sog_key is required.",
+        )
+
+    scene = await db.get(SceneOutput, body.scene_id)
+    if scene is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="SceneOutput not found.")
+
+    minio = get_minio_service()
+    if not minio.object_exists(sog_key):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="SOG object not found in storage.",
+        )
+
+    scene.sog_path = sog_key
+    await db.commit()
+
+    return WorkerTaskCallbackResponse(
+        task_id=scene.task_id,
+        scene_id=scene.id,
+        status="completed",
     )

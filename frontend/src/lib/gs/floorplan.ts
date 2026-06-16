@@ -49,6 +49,7 @@ interface SplatLike {
   posZ: Float32Array;
   numSplats: number;
   origColorData: Uint16Array | null;
+  origAlphaData?: Uint16Array | null;
   splatEntity: any;
 }
 
@@ -66,8 +67,9 @@ export async function bakeFloorplan(
   const maxDim = opts.maxDimension ?? 1500;
 
   const orig = splat.origColorData;
+  const origAlpha = splat.origAlphaData;
   const splatEntity = splat.splatEntity;
-  if (!orig || !splatEntity || !pc || !app) return null;
+  if ((!orig && !origAlpha) || !splatEntity || !pc || !app) return null;
   const device = app.graphicsDevice;
   if (!device) return null;
 
@@ -80,7 +82,8 @@ export async function bakeFloorplan(
     const m = splatEntity.getWorldTransform().data;
     const n = splat.numSplats;
     for (let i = 0; i < n; i++) {
-      const a = half2Float(orig[i * 4 + 3]);
+      const alphaH = origAlpha ? origAlpha[i] : orig![i * 4 + 3];
+      const a = half2Float(alphaH);
       if (a < alphaT) continue;
       const px = splat.posX[i], py = splat.posY[i], pz = splat.posZ[i];
       const wx = m[0]*px + m[4]*py + m[8]*pz + m[12];

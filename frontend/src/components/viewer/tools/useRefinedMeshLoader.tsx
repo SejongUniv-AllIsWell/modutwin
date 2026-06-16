@@ -4,6 +4,31 @@ import { RefObject, useEffect, useRef } from 'react';
 import type { SplatViewerCoreRef } from '../SplatViewerCore';
 import type { AdditionalGsplatsApi } from './useAdditionalGsplats';
 import type { DoorHandle } from '@/lib/gs/doorInteraction';
+import type { TextureImageSource } from '@/lib/gs/wallMesh';
+
+export async function loadTextureSource(label: string, url: string): Promise<TextureImageSource | null> {
+  let bitmapError: unknown = null;
+  if (typeof createImageBitmap === 'function') {
+    try {
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`fetch failed: ${response.status}`);
+      return await createImageBitmap(await response.blob());
+    } catch (e) {
+      bitmapError = e;
+    }
+  }
+
+  return await new Promise<HTMLImageElement | null>((resolve) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => resolve(img);
+    img.onerror = () => {
+      console.warn(`[useRefinedMeshLoader] texture load failed: ${label}`, bitmapError);
+      resolve(null);
+    };
+    img.src = url;
+  });
+}
 
 /**
  * 정합/베이스 뷰어용: upload_id 의 정제 결과를 자동 로드해 door 자산과 wall mesh 를 씬에 추가한다.
@@ -12,8 +37,8 @@ import type { DoorHandle } from '@/lib/gs/doorInteraction';
  *  1. /refine/refined-bundle 호출 → presigned URLs 받음.
  *  2. door mesh/splat 을 먼저 시작해 정합 단계에서 대상 문이 빠르게 보이게 함.
  *  3. mesh.json fetch → 메시 메타데이터 파싱.
- *  4. 텍스처 PNG 들을 HTMLImageElement 로 로드.
- *  5. 각 surface 마다 createWallMeshFromPersisted 호출 → 엔티티 생성.
+ *  4. 텍스처 이미지를 createImageBitmap 우선으로 디코드하고, 실패하면 HTMLImageElement 로 로드.
+ *  5. 이미지가 준비된 surface 부터 createWallMeshFromPersisted 호출 → 엔티티 생성.
  *
  * 정제된 결과가 없거나 mesh.json 이 없으면 조용히 무시 (PLY 만 표시되는 정상 동작).
  */
@@ -196,13 +221,7 @@ export function useRefinedMeshLoader(
           if (door.door_mesh) {
             try {
               const dm = door.door_mesh;
-              const img = await new Promise<HTMLImageElement | null>((res) => {
-                const i = new Image();
-                i.crossOrigin = 'anonymous';
-                i.onload = () => res(i);
-                i.onerror = () => { console.warn(`[useRefinedMeshLoader] door mesh tex load failed: ${door.id}`); res(null); };
-                i.src = dm.textureUrl;
-              });
+              const img = await loadTextureSource(`door mesh ${door.id}`, dm.textureUrl);
               if (cancelled) return;
               if (img) {
                 // N벽 일반화 — door 가 어느 벽에 속하는지는 정합 시 closest-plane 으로 결정. fallback: 'w0'.
@@ -249,30 +268,16 @@ export function useRefinedMeshLoader(
           const meta = await metaResp.json();
           if (cancelled) return;
 
-          // 텍스처 PNG 로드 (병렬)
           const surfaces = meta.surfaces ?? [];
-          const imgPromises = surfaces.map((surface: any) => {
+          const loadedSurfaces: Array<{ surfaceId: string; entity: any; corners: number[][] }> = [];
+          const createSurfaceEntity = async (surface: any) => {
             const surfaceId = surface.surfaceId;
             const url = bundle.textures[surfaceId];
-            if (!url) return Promise.resolve(null);
-            return new Promise<HTMLImageElement | null>((res) => {
-              const img = new Image();
-              img.crossOrigin = 'anonymous';
-              img.onload = () => res(img);
-              img.onerror = () => { console.warn(`[useRefinedMeshLoader] image load failed: ${surfaceId}`); res(null); };
-              img.src = url;
-            });
-          });
-          const images = await Promise.all(imgPromises);
-          if (cancelled) return;
-
-          const loadedSurfaces: Array<{ surfaceId: string; entity: any; corners: number[][] }> = [];
-          for (let i = 0; i < surfaces.length; i++) {
-            const surface = surfaces[i];
-            const img = images[i];
-            if (!img) continue;
+            if (!url) return;
+            const img = await loadTextureSource(surfaceId, url);
+            if (cancelled || !img) return;
             const ent = createWallMeshFromPersisted(pc, app, {
-              surfaceId: surface.surfaceId,
+              surfaceId,
               corners: surface.corners,
               uvs: surface.uvs,
               normalInward: surface.normalInward,
@@ -280,7 +285,7 @@ export function useRefinedMeshLoader(
             }, {
               mutableTexture: mutableTextures,
               onTextureData: (texture) => onWallTextureData?.({
-                surfaceId: surface.surfaceId,
+                surfaceId,
                 rgba: texture.rgba,
                 width: texture.width,
                 height: texture.height,
@@ -292,8 +297,22 @@ export function useRefinedMeshLoader(
             // basemap 자산 — enterAlignmentMode 가 module-side 와 구분해서 reparent 안 하도록 tag.
             try { ent.tags?.add?.('basemap'); } catch {}
             entitiesRef.current.push(ent);
-            loadedSurfaces.push({ surfaceId: surface.surfaceId, entity: ent, corners: surface.corners });
+            loadedSurfaces.push({ surfaceId, entity: ent, corners: surface.corners });
+          };
+
+          const concurrency = Math.min(3, surfaces.length);
+          let nextSurfaceIndex = 0;
+          const loadNextSurface = async () => {
+            while (!cancelled && nextSurfaceIndex < surfaces.length) {
+              const index = nextSurfaceIndex;
+              nextSurfaceIndex += 1;
+              await createSurfaceEntity(surfaces[index]);
+            }
+          };
+          if (concurrency > 0) {
+            await Promise.all(Array.from({ length: concurrency }, loadNextSurface));
           }
+          if (cancelled) return;
           // 모든 wallMesh 엔티티 생성 후 콜백 — 호출자가 visual ceiling entity / corners 를 잡아 마스킹 토글에 사용.
           if (!cancelled && loadedSurfaces.length > 0) {
             try { onLoadedRef.current?.({ surfaces: loadedSurfaces }); } catch (e) {
@@ -380,7 +399,7 @@ export function useRefinedMeshLoader(
         }
       } catch (e: any) {
         // 404 는 정상 (정제된 결과 없음). 그 외 에러만 로그.
-        if (!String(e?.message ?? '').includes('404')) {
+        if (e?.status !== 404 && !String(e?.message ?? '').includes('404')) {
           console.warn('[useRefinedMeshLoader] failed:', e);
         }
       }

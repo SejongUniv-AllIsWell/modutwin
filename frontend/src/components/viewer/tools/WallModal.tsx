@@ -184,6 +184,57 @@ export default function WallModal({
   // pts 가 바뀌면 (모달 첫 마운트) viewport 초기화.
   useEffect(() => { setViewport(null); }, [dataBounds]);
   const viewBounds = viewport ?? dataBounds;
+  // viewBounds 의 최신값을 ref 로도 보관 — 패닝 시작 시점의 스냅샷을 안전하게 읽기 위함.
+  const viewBoundsRef = useRef(viewBounds);
+  viewBoundsRef.current = viewBounds;
+
+  // 패닝 — 우클릭은 이미 (parallel 선분이동 / draw undo) 점유되어 있어 충돌 회피.
+  // 기본 패닝 수단: 중간버튼(휠클릭) 드래그, + 스페이스바 누른 상태 좌드래그.
+  const spaceHeldRef = useRef(false);
+  useEffect(() => {
+    const onKeyDown = (ev: KeyboardEvent) => {
+      if (ev.code === 'Space') {
+        spaceHeldRef.current = true;
+        // 캔버스에 포커스가 없어도 스페이스 스크롤 등 기본동작 방지.
+        const tag = (ev.target as HTMLElement | null)?.tagName;
+        if (tag !== 'INPUT' && tag !== 'TEXTAREA') ev.preventDefault();
+      }
+    };
+    const onKeyUp = (ev: KeyboardEvent) => {
+      if (ev.code === 'Space') spaceHeldRef.current = false;
+    };
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
+    };
+  }, []);
+
+  // 패닝 시작 — 시작 클라이언트 px + 시작 viewBounds 스냅샷을 잡고 document 리스너로 추적.
+  // px 이동량을 데이터 좌표 스케일로 환산해 setViewport 로 평행 이동 (드래그한 만큼 그림이 따라옴).
+  const startPan = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    const canvas = e.currentTarget;
+    const rect = canvas.getBoundingClientRect();
+    const rectW = rect.width, rectH = rect.height;
+    const startVp = { ...viewBoundsRef.current };
+    const startClientX = e.clientX, startClientY = e.clientY;
+    const plotW = CW - PAD * 2, plotH = CH - PAD * 2;
+    const onMove = (ev: MouseEvent) => {
+      const dxData = ((ev.clientX - startClientX) * (CW / rectW)) * (startVp.mxR - startVp.mnR) / plotW;
+      const dzData = ((ev.clientY - startClientY) * (CH / rectH)) * (startVp.mxT - startVp.mnT) / plotH;
+      setViewport({
+        mnR: startVp.mnR - dxData, mxR: startVp.mxR - dxData,
+        mnT: startVp.mnT - dzData, mxT: startVp.mxT - dzData,
+      });
+    };
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  }, []);
 
   const [pathPoints, setPathPoints] = useState<PathPoint[]>(initialPathPoints);
   const [pathEdges, setPathEdges] = useState<PathEdge[]>(initialPathEdges);
@@ -476,30 +527,57 @@ export default function WallModal({
   // 좌클릭 — 기존 점 hit 면 선택/드래그, 빈 공간이면 새 점 추가 + 직전 선택점과 edge.
   // 점 드래그는 document mousemove/mouseup 으로 추적 — 캔버스 밖으로 나가도 끊기지 않음.
   const handleMouseDown = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
-    // 우클릭 드래그 — point cloud 보기 평행이동. 점/선 좌표는 바꾸지 않고 viewport 만 이동한다.
-    if (e.button === 2) {
+    // 패닝 — 중간버튼(휠클릭) 드래그, 또는 스페이스바 누른 상태 좌드래그.
+    // draw 모드의 우클릭도 pan 으로 사용한다. parallel 모드 우클릭은 선분 수직 이동에 예약.
+    if (e.button === 1 || (e.button === 0 && spaceHeldRef.current) || (e.button === 2 && modeRef.current !== 'parallel')) {
       e.preventDefault();
-      const startBounds = viewport ?? dataBounds;
-      const startX = e.clientX;
-      const startY = e.clientY;
-      const plotW = CW - PAD * 2;
-      const plotH = CH - PAD * 2;
-      const scaleX = (startBounds.mxR - startBounds.mnR) / plotW;
-      const scaleZ = (startBounds.mxT - startBounds.mnT) / plotH;
+      startPan(e);
+      return;
+    }
+    // 우클릭 — 평행화 모드에서 선분 수직(normal) 평행이동 드래그.
+    if (e.button === 2) {
+      if (modeRef.current !== 'parallel') return;
+      const dp = derivedPolygonRef.current;
+      if (!dp) return;
+      e.preventDefault();
+      const { rx, rz } = mouseToWorld(e);
+      const segHit = findEdgeHitRef.current(rx, rz);
+      if (segHit < 0) return;
+      const { polygon, cycleOrder } = dp;
+      const N = polygon.length;
+      const a = polygon[segHit];
+      const b = polygon[(segHit + 1) % N];
+      const ex = b.x - a.x, ez = b.z - a.z;
+      const elen = Math.hypot(ex, ez) || 1;
+      const nx = ez / elen, nz = -ex / elen;
+      const aIdx = cycleOrder[segHit];
+      const bIdx = cycleOrder[(segHit + 1) % N];
+      const startSnapshot = pathPointsRef.current.map(p => ({ ...p }));
+      const startA = { ...startSnapshot[aIdx] };
+      const startB = { ...startSnapshot[bIdx] };
+      const startWx = rx, startWz = rz;
+      let moved = false;
 
       const onMove = (ev: MouseEvent) => {
-        const dx = (ev.clientX - startX) * scaleX;
-        const dz = (ev.clientY - startY) * scaleZ;
-        setViewport({
-          mnR: startBounds.mnR - dx,
-          mxR: startBounds.mxR - dx,
-          mnT: startBounds.mnT - dz,
-          mxT: startBounds.mxT - dz,
+        const r = nativeToWorld(ev);
+        if (!r) return;
+        const proj = (r.rx - startWx) * nx + (r.rz - startWz) * nz;
+        if (!moved && Math.abs(proj) < 1e-4) return;
+        moved = true;
+        const next = pathPointsRef.current.map((p, i) => {
+          if (i === aIdx) return { x: startA.x + proj * nx, z: startA.z + proj * nz };
+          if (i === bIdx) return { x: startB.x + proj * nx, z: startB.z + proj * nz };
+          return p;
         });
+        pathPointsRef.current = next;
+        setPathPoints(next);
       };
       const onUp = () => {
         document.removeEventListener('mousemove', onMove);
         document.removeEventListener('mouseup', onUp);
+        if (moved) {
+          pushPathAction({ type: 'parallel', prevPoints: startSnapshot });
+        }
       };
       document.addEventListener('mousemove', onMove);
       document.addEventListener('mouseup', onUp);
@@ -632,7 +710,7 @@ export default function WallModal({
     const edge = fromIdx >= 0 ? addPathEdge(fromIdx, nextIdx) : null;
     pushPathAction({ type: 'point', pointIdx: nextIdx, edge, prevSelected: selected });
     selectPathPoint(nextIdx);
-  }, [addPathEdge, dataBounds, findPathEdgeHit, findPathPointHit, mouseToWorld, nativeToWorld, pushPathAction, selectPathPoint, viewport]);
+  }, [addPathEdge, findPathEdgeHit, findPathPointHit, mouseToWorld, nativeToWorld, pushPathAction, selectPathPoint, startPan]);
 
   // hover 표시만 — 드래그는 document listener 가 담당.
   const handleMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -962,24 +1040,73 @@ export default function WallModal({
             <>
               ① 좌클릭으로 <span style={{color:'#22d3ee', fontWeight:'bold'}}>기준 선분</span> 선택 → ② <span style={{color:'#f59e0b', fontWeight:'bold'}}>대상 선분</span>들을 순서대로 클릭으로 평행화.
               <br />
-              우클릭 드래그로 point cloud 보기를 평행이동하고, 되돌리기는 아래 버튼을 사용합니다.
+              우클릭 드래그로 선분을 수직 평행이동하고, 휠클릭 또는 스페이스+좌클릭 드래그로 화면을 이동합니다. 되돌리기는 오른쪽 버튼을 사용합니다.
             </>
           ) : (
             <>
               좌클릭으로 점과 선을 추가, 기존 점은 드래그로 이동. 점을 클릭하면 직전에 선택한 점과 연결됩니다.
               <br />
-              우클릭 드래그로 point cloud 보기를 평행이동합니다. 되돌리기는 아래 버튼을 사용합니다. 마우스 휠로 줌, 더블클릭으로 초기화.
+              모든 점이 닫힌 cycle 로 연결되어야 확인이 활성화됩니다. 우클릭/휠클릭 또는 스페이스+좌클릭 드래그로 화면 이동, 마우스 휠로 줌, 더블클릭으로 초기화. 되돌리기는 오른쪽 버튼을 사용합니다.
             </>
           )}
         </div>
-        <div>
-          <div className="text-[var(--muted)] text-[10px] mb-1 text-center">Top-down (XZ)</div>
-          <canvas ref={xzRef} style={{ width: CW, height: CH, userSelect: 'none' }}
-            className={`border border-[var(--rule)] rounded ${mode === 'parallel' ? 'cursor-pointer' : 'cursor-crosshair'}`}
-            onMouseDown={handleMouseDown}
-            onMouseMove={handleMouseMove}
-            onContextMenu={handleContextMenu} />
+        <div className="flex gap-3 items-start">
+          {/* 좌: top-down 캔버스 */}
+          <div>
+            <div className="text-[var(--muted)] text-[10px] mb-1 text-center">Top-down (XZ)</div>
+            <canvas ref={xzRef} style={{ width: CW, height: CH, userSelect: 'none' }}
+              className={`border border-[var(--rule)] rounded ${mode === 'parallel' ? 'cursor-pointer' : 'cursor-crosshair'}`}
+              onMouseDown={handleMouseDown}
+              onMouseMove={handleMouseMove}
+              onContextMenu={handleContextMenu} />
+          </div>
+          {/* 우: 세로 도구 사이드바 (되돌리기 → 초기화 → 평행 관련, 수직 순서) */}
+          <div className="flex flex-col gap-2 w-28 shrink-0" style={{ paddingTop: 18 }}>
+            <button
+              onClick={() => undoLastAction()}
+              disabled={undoDepth === 0}
+              className="w-full px-3 py-2 bg-[var(--bg-soft)] hover:bg-[var(--rule)] disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] disabled:cursor-not-allowed text-[var(--ink-2)] rounded text-xs cursor-pointer">
+              되돌리기
+            </button>
+            <button
+              onClick={() => resetPath()}
+              disabled={pathPoints.length === 0 && pathEdges.length === 0}
+              className="w-full px-3 py-2 bg-[var(--bg-soft)] hover:bg-[var(--rule)] disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] disabled:cursor-not-allowed text-[var(--ink-2)] rounded text-xs cursor-pointer">
+              초기화
+            </button>
+            {mode === 'parallel' ? (
+              <>
+                <button
+                  onClick={() => { parallelSelectedRef.current = []; setParallelSelected([]); }}
+                  disabled={parallelSelected.length === 0}
+                  className="w-full px-3 py-2 bg-[var(--bg-soft)] hover:bg-[var(--rule)] disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] disabled:cursor-not-allowed text-[var(--ink-2)] rounded text-xs cursor-pointer">
+                  선택 초기화
+                </button>
+                <button
+                  onClick={() => applyParallel()}
+                  disabled={parallelSelected.length < 2}
+                  title={parallelSelected.length < 2 ? '기준 + 대상 선분 2개 이상 선택 필요' : ''}
+                  className="w-full px-3 py-2 bg-cyan-600 hover:bg-cyan-500 disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] disabled:cursor-not-allowed text-[var(--ink)] rounded text-xs cursor-pointer font-bold">
+                  적용
+                </button>
+                <button
+                  onClick={() => toggleParallelMode()}
+                  className="w-full px-3 py-2 bg-amber-600 hover:bg-amber-500 text-[var(--ink)] rounded text-xs cursor-pointer">
+                  모드 해제
+                </button>
+              </>
+            ) : (
+              <button
+                onClick={() => toggleParallelMode()}
+                disabled={!derivedPolygon}
+                title={derivedPolygon ? '' : 'cycle 형성 후 사용 가능'}
+                className="w-full px-3 py-2 bg-cyan-700 hover:bg-cyan-600 disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] disabled:cursor-not-allowed text-[var(--ink)] rounded text-xs cursor-pointer">
+                평행하게 만들기
+              </button>
+            )}
+          </div>
         </div>
+        {/* 하단: 상태 텍스트 + 취소/확인 (modal 액션). parallel 모드는 취소/확인 미표시 (기존 동작 보존). */}
         <div className="flex items-center justify-between mt-3 gap-3">
           <div className="text-xs font-mono flex-1 min-w-0">
             <div className="text-[var(--muted)]">{`점 ${pathPoints.length}개, 선 ${pathEdges.length}개`}</div>
@@ -996,61 +1123,19 @@ export default function WallModal({
               </div>
             )}
           </div>
-          <div className="flex gap-2 shrink-0">
-            <button
-              onClick={() => undoLastAction()}
-              disabled={undoDepth === 0}
-              className="px-3 py-2 bg-[var(--bg-soft)] hover:bg-[var(--rule)] disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] disabled:cursor-not-allowed text-[var(--ink-2)] rounded text-xs cursor-pointer">
-              되돌리기
-            </button>
-            <button
-              onClick={() => resetPath()}
-              disabled={pathPoints.length === 0 && pathEdges.length === 0}
-              className="px-3 py-2 bg-[var(--bg-soft)] hover:bg-[var(--rule)] disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] disabled:cursor-not-allowed text-[var(--ink-2)] rounded text-xs cursor-pointer">
-              초기화
-            </button>
-            {mode === 'parallel' ? (
-              <>
-                <button
-                  onClick={() => { parallelSelectedRef.current = []; setParallelSelected([]); }}
-                  disabled={parallelSelected.length === 0}
-                  className="px-3 py-2 bg-[var(--bg-soft)] hover:bg-[var(--rule)] disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] disabled:cursor-not-allowed text-[var(--ink-2)] rounded text-xs cursor-pointer">
-                  선택 초기화
-                </button>
-                <button
-                  onClick={() => applyParallel()}
-                  disabled={parallelSelected.length < 2}
-                  title={parallelSelected.length < 2 ? '기준 + 대상 선분 2개 이상 선택 필요' : ''}
-                  className="px-3 py-2 bg-cyan-600 hover:bg-cyan-500 disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] disabled:cursor-not-allowed text-[var(--ink)] rounded text-xs cursor-pointer font-bold">
-                  적용
-                </button>
-                <button
-                  onClick={() => toggleParallelMode()}
-                  className="px-3 py-2 bg-amber-600 hover:bg-amber-500 text-[var(--ink)] rounded text-xs cursor-pointer">
-                  모드 해제
-                </button>
-              </>
-            ) : (
-              <>
-                <button
-                  onClick={() => toggleParallelMode()}
-                  disabled={!derivedPolygon}
-                  title={derivedPolygon ? '' : 'cycle 형성 후 사용 가능'}
-                  className="px-3 py-2 bg-cyan-700 hover:bg-cyan-600 disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] disabled:cursor-not-allowed text-[var(--ink)] rounded text-xs cursor-pointer">
-                  평행하게 만들기
-                </button>
-                <button onClick={onClose}
-                  className="px-4 py-2 bg-[var(--bg-soft)] hover:bg-[var(--rule)] text-[var(--ink-2)] rounded text-sm cursor-pointer">취소</button>
-                <button onClick={() => {
-                  if (!derivedPolygon) return;
-                  onConfirm(derivedPolygon.angleDeg, derivedPolygon.polygon);
-                }}
-                  disabled={!derivedPolygon}
-                  title={derivedPolygon ? '' : cycleStatus}
-                  className="px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] disabled:cursor-not-allowed text-[var(--ink)] rounded text-sm cursor-pointer font-bold">확인</button>
-              </>
-            )}
-          </div>
+          {mode !== 'parallel' && (
+            <div className="flex gap-2 shrink-0">
+              <button onClick={onClose}
+                className="px-4 py-2 bg-[var(--bg-soft)] hover:bg-[var(--rule)] text-[var(--ink-2)] rounded text-sm cursor-pointer">취소</button>
+              <button onClick={() => {
+                if (!derivedPolygon) return;
+                onConfirm(derivedPolygon.angleDeg, derivedPolygon.polygon);
+              }}
+                disabled={!derivedPolygon}
+                title={derivedPolygon ? '' : cycleStatus}
+                className="px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-[var(--bg-soft)] disabled:text-[var(--muted)] disabled:cursor-not-allowed text-[var(--ink)] rounded text-sm cursor-pointer font-bold">확인</button>
+            </div>
+          )}
         </div>
       </div>
     </div>

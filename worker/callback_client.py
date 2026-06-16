@@ -14,20 +14,15 @@ _CALLBACK_TOKEN = (os.getenv("WORKER_CALLBACK_TOKEN") or "").strip()
 _TIMEOUT_SECONDS = 5
 
 
-def _post_callback(path: str, payload: dict) -> None:
+def _post_callback(path: str, payload: dict) -> dict:
     if not _CALLBACK_BASE_URL:
-        logger.info("BACKEND_CALLBACK_URL is not set; skipping worker callback to %s.", path)
-        return
+        raise RuntimeError(f"BACKEND_CALLBACK_URL is not set; cannot call {path}.")
     if not _CALLBACK_TOKEN:
-        logger.warning(
-            "WORKER_CALLBACK_TOKEN is not set; skipping worker callback to %s despite configured BACKEND_CALLBACK_URL.",
-            path,
-        )
-        return
+        raise RuntimeError(f"WORKER_CALLBACK_TOKEN is not set; cannot call {path}.")
 
     callback_url = f"{_CALLBACK_BASE_URL.rstrip('/')}{path}"
     try:
-        post_json(
+        response = post_json(
             callback_url,
             payload,
             headers={
@@ -36,6 +31,10 @@ def _post_callback(path: str, payload: dict) -> None:
             },
             timeout=_TIMEOUT_SECONDS,
         )
+        try:
+            return response.json()
+        except ValueError:
+            return {}
     except RuntimeError as exc:
         logger.error(
             "Worker callback HTTP error to %s: %s body=%s",
@@ -64,22 +63,37 @@ def _extract_error_body(exc: RuntimeError) -> str:
     return message.split(marker, 1)[1][:300]
 
 
-def notify_task_success(task_id: str, result_dict: dict) -> None:
+def notify_task_success(task_id: str, result_dict: dict) -> dict:
     payload = {
         "celery_task_id": task_id,
         "upload_id": result_dict.get("upload_id"),
+        "task_type": result_dict.get("task_type"),
         "ply_key": result_dict.get("ply_key"),
         "sog_key": result_dict.get("sog_key"),
         "web_sog_key": result_dict.get("web_sog_key"),
         "metadata_key": result_dict.get("metadata_key"),
     }
-    _post_callback("/internal/worker/tasks/success", payload)
+    return _post_callback("/internal/worker/tasks/success", payload)
 
 
-def notify_task_failure(task_id: str, upload_id: str | None, error_message: str | None) -> None:
+def notify_sog_ready(scene_id: str, sog_key: str) -> dict:
+    payload = {
+        "scene_id": scene_id,
+        "sog_key": sog_key,
+    }
+    return _post_callback("/internal/worker/scenes/sog-ready", payload)
+
+
+def notify_task_failure(
+    task_id: str,
+    upload_id: str | None,
+    error_message: str | None,
+    task_type: str | None = None,
+) -> dict:
     payload = {
         "celery_task_id": task_id,
         "upload_id": upload_id,
+        "task_type": task_type,
         "error_message": error_message,
     }
-    _post_callback("/internal/worker/tasks/failure", payload)
+    return _post_callback("/internal/worker/tasks/failure", payload)

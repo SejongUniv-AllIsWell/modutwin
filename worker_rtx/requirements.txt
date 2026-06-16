@@ -1,0 +1,10 @@
+celery
+redis
+requests
+minio
+numpy
+plyfile
+pycolmap
+# COLMAP CLI 는 RTX Dockerfile 의 apt 패키지로 설치한다.
+opencv-python-headless>=4.8.0
+ffmpeg-python>=0.2.0

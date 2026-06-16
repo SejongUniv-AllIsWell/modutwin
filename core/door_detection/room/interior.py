@@ -57,14 +57,67 @@ def estimate_eye_height_y(
     bbox_min_y: float,
     bbox_max_y: float,
     eye_height_m: float = 1.5,
+    eye_height_ratio: float | None = None,
 ) -> float:
-    """바닥 Y + eye_height_m 로 눈높이 Y 반환. 방 범위 안으로 clamp."""
+    """눈높이 Y 반환. 방 범위 안으로 clamp.
+
+    eye_height_ratio 지정 시: floor~ceiling(=bbox_max_y) 거리의 비율로 높이 결정.
+      예) ratio=0.7 → 바닥에서 70%, 천장에서 30% 지점.
+    미지정 시: 기존 동작 (floor_y + eye_height_m).
+    """
     floor_y = estimate_floor_y(means, bbox_min_y, bbox_max_y)
-    eye_y = float(floor_y + eye_height_m)
-    # 천장에 너무 가깝지 않게
+    if eye_height_ratio is not None:
+        ceiling_y = float(bbox_max_y)
+        eye_y = float(floor_y + eye_height_ratio * (ceiling_y - floor_y))
+    else:
+        eye_y = float(floor_y + eye_height_m)
+    # 천장/바닥에 너무 가깝지 않게 (안전 clamp)
     eye_y = min(eye_y, float(bbox_max_y) - 0.3)
     eye_y = max(eye_y, float(bbox_min_y) + 0.3)
     return eye_y
+
+
+def build_room_info_known(
+    means_ap: np.ndarray,
+    floor_y: float,
+    ceiling_y: float,
+    opacities_logit: np.ndarray | None = None,
+    opacity_threshold: float = 0.1,
+    percentile_low: float = 5.0,
+    percentile_high: float = 95.0,
+) -> "RoomInfo":
+    """방법 B — A' 프레임 means + 확정 floor/ceiling Y 로 RoomInfo 구성.
+
+    천장/바닥은 다듬기에서 사용자가 확정했으므로 Y 범위는 추정하지 않고
+    [floor_y, ceiling_y] 를 그대로 쓴다. X/Z 만 robust percentile bbox.
+    interior 검사는 생략(확정 방이므로 ok=True).
+    """
+    means_ap = np.asarray(means_ap, dtype=np.float64)
+    if opacities_logit is not None:
+        keep = _sigmoid(np.asarray(opacities_logit, dtype=np.float64)) >= opacity_threshold
+        means_ap = means_ap[keep]
+    if means_ap.shape[0] < 100:
+        raise RuntimeError(f"build_room_info_known: too few points ({means_ap.shape[0]}).")
+
+    xz_lo = np.percentile(means_ap, percentile_low, axis=0)
+    xz_hi = np.percentile(means_ap, percentile_high, axis=0)
+    y_lo, y_hi = (floor_y, ceiling_y) if floor_y <= ceiling_y else (ceiling_y, floor_y)
+
+    bbox_min = np.array([xz_lo[0], y_lo, xz_lo[2]], dtype=np.float64)
+    bbox_max = np.array([xz_hi[0], y_hi, xz_hi[2]], dtype=np.float64)
+    diag = float(np.linalg.norm(bbox_max - bbox_min))
+    center = (bbox_min + bbox_max) / 2.0
+    min_half = float(((bbox_max - bbox_min) / 2.0).min())
+
+    return RoomInfo(
+        robust_bbox_min=tuple(bbox_min.tolist()),  # type: ignore[arg-type]
+        robust_bbox_max=tuple(bbox_max.tolist()),  # type: ignore[arg-type]
+        robust_bbox_diagonal=diag,
+        room_center=tuple(center.tolist()),  # type: ignore[arg-type]
+        interior_ok=True,
+        interior_hits_26=26,
+        min_half_extent=min_half,
+    )
 
 
 @dataclass

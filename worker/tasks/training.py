@@ -4,7 +4,7 @@ import logging
 import tempfile
 
 from celery_app import app
-from minio_helper import download_file, upload_file
+from minio_helper import delete_file, delete_prefix, download_file, upload_file
 from redis_helper import update_progress, clear_progress
 from backend_callback import notify_upload_progress
 from callback_client import notify_task_failure, notify_task_success
@@ -23,8 +23,14 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+COLMAP_FRAME_FPS = float(os.environ.get("COLMAP_FRAME_FPS", "1"))
 PLY_EXT = {".ply"}
 VIDEO_EXT = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+WORKER_ERROR_CALLBACK_MAX = int(os.environ.get("WORKER_ERROR_CALLBACK_MAX", "4000"))
+
+
+def _callback_error_message(error: Exception) -> str:
+    return str(error)[:WORKER_ERROR_CALLBACK_MAX]
 
 
 def _check_magic_bytes(file_path: str, ext: str) -> bool:
@@ -94,6 +100,11 @@ def run_3dgs_training(self, upload_id: str, user_id: str, minio_input_key: str,
     logger.info(f"[Task {task_id}] 3DGS 학습 시작: upload_id={upload_id}")
     processing_completed = False
     success_callback_failed = False
+    uploaded_keys: list[str] = []
+
+    def upload_output(local_path: str, key: str, content_type: str = "application/octet-stream") -> None:
+        upload_file(local_path, key, content_type=content_type)
+        uploaded_keys.append(key)
 
     try:
         ext = os.path.splitext(minio_input_key)[1].lower()
@@ -122,13 +133,14 @@ def run_3dgs_training(self, upload_id: str, user_id: str, minio_input_key: str,
             update_progress(task_id, 90, "업로드")
             ply_key = f"{module_base}/gsplat/{module_name}.ply"
             sog_key = f"{module_base}/gsplat/{module_name}.sog"
-            upload_file(local_input, ply_key)
-            upload_file(sog_local, sog_key)
+            upload_output(local_input, ply_key)
+            upload_output(sog_local, sog_key)
 
             update_progress(task_id, 100, "완료")
             result = {
                 "status": "completed",
                 "upload_id": upload_id,
+                "task_type": "3dgs_training",
                 "ply_key": ply_key,
                 "sog_key": sog_key,
             }
@@ -153,7 +165,7 @@ def run_3dgs_training(self, upload_id: str, user_id: str, minio_input_key: str,
             update_progress(task_id, scaled, module_nm)
 
         modules = [
-            FFmpegModule(fps=2),
+            FFmpegModule(fps=COLMAP_FRAME_FPS),
             BlurDetectionModule(),
             ColmapModule(),
             GsplatModule(),
@@ -170,8 +182,8 @@ def run_3dgs_training(self, upload_id: str, user_id: str, minio_input_key: str,
         sog_key = f"{module_base}/gsplat/{module_name}.sog"
 
         if os.path.isfile(ply_path):
-            upload_file(ply_path, ply_key)
-        upload_file(sog_path, sog_key)
+            upload_output(ply_path, ply_key)
+        upload_output(sog_path, sog_key)
 
         logger.info(f"[Task {task_id}] 결과 업로드 완료")
 
@@ -180,6 +192,7 @@ def run_3dgs_training(self, upload_id: str, user_id: str, minio_input_key: str,
         result = {
             "status": "completed",
             "upload_id": upload_id,
+            "task_type": "3dgs_training",
             "ply_key": ply_key,
             "sog_key": sog_key,
         }
@@ -193,10 +206,30 @@ def run_3dgs_training(self, upload_id: str, user_id: str, minio_input_key: str,
         return result
 
     except Exception as e:
-        if not processing_completed and not success_callback_failed:
+        if uploaded_keys and not processing_completed:
+            for key in uploaded_keys:
+                delete_file(key)
+        if success_callback_failed:
+            logger.error(f"[Task {task_id}] 성공 콜백 실패로 태스크를 실패 처리: {e}")
+            failure_status = None
+            try:
+                failure_response = notify_task_failure(
+                    task_id,
+                    upload_id,
+                    f"성공 콜백 실패: {e}",
+                    "3dgs_training",
+                )
+                failure_status = failure_response.get("status")
+            except Exception as callback_err:
+                logger.error(f"[Task {task_id}] 실패 콜백 전송 실패: {callback_err}")
+            if uploaded_keys and failure_status and failure_status != "completed":
+                for key in uploaded_keys:
+                    delete_file(key)
+            update_progress(task_id, -1, f"성공 콜백 실패: {str(e)[:180]}")
+        elif not processing_completed:
             logger.error(f"[Task {task_id}] 실패: {e}")
             try:
-                notify_task_failure(task_id, upload_id, str(e))
+                notify_task_failure(task_id, upload_id, str(e), "3dgs_training")
             except Exception as callback_err:
                 logger.error(f"[Task {task_id}] 실패 콜백 전송 실패: {callback_err}")
             update_progress(task_id, -1, f"실패: {str(e)[:200]}")
@@ -242,12 +275,13 @@ def run_gs_training_from_colmap(self, upload_id: str, user_id: str, zip_minio_ke
 
     try:
         # 1. zip 다운로드 → 이미지 추출
+        completion_callback_failed = False
         update_progress(task_id, 5, "이미지 추출")
         ext = os.path.splitext(zip_minio_key)[1].lower()
         local_zip = os.path.join(work_dir, f"input{ext}")
         download_file(zip_minio_key, local_zip)
 
-        ffmpeg = FFmpegModule(fps=2)
+        ffmpeg = FFmpegModule(fps=COLMAP_FRAME_FPS)
         image_dir = ffmpeg.run(local_zip)
         logger.info(f"[Task {task_id}] 이미지 추출 완료: {image_dir}")
 
@@ -293,19 +327,24 @@ def run_gs_training_from_colmap(self, upload_id: str, user_id: str, zip_minio_ke
         update_progress(task_id, 100, "완료")
 
         # 백엔드에 GS 단계 완료 통지 — Upload.status=completed + gsplat_ply_path 저장
-        notify_upload_progress(
+        callback_ok = notify_upload_progress(
             upload_id, "gsplat", status="completed",
             ply_key=ply_key, celery_task_id=task_id,
         )
+        if not callback_ok:
+            completion_callback_failed = True
+            raise RuntimeError("백엔드 GS 완료 콜백 실패")
 
         return {"status": "completed", "upload_id": upload_id, "ply_key": ply_key}
 
     except Exception as e:
         logger.error(f"[Task {task_id}] 실패: {e}")
         update_progress(task_id, -1, f"실패: {str(e)[:200]}")
+        if not completion_callback_failed:
+            delete_prefix(result_base)
         notify_upload_progress(
             upload_id, "gsplat", status="failed",
-            celery_task_id=task_id, error_message=str(e)[:500],
+            celery_task_id=task_id, error_message=_callback_error_message(e),
         )
         raise
 

@@ -115,9 +115,9 @@ export default function SplatViewer({ sogUrl, mode, uploadId, onSelectionDone }:
   }, [splatReady]);
 
   const onSplatLoadedCombined = useCallback((data: any) => {
-    selectorRef.current.onSplatLoaded(data);
+    if (mode === 'edit') selectorRef.current.onSplatLoaded(data);
     setSplatReady(true);
-  }, []);
+  }, [mode]);
 
   // alignment(=edit) 모드 + uploadId 있을 때만 평면도 베이크. cutoff 변경 시 자동 재베이크.
   // 첫 베이크 500ms 디바운스, 이후 슬라이더 조작 시 300ms 디바운스.
@@ -154,7 +154,8 @@ export default function SplatViewer({ sogUrl, mode, uploadId, onSelectionDone }:
           {
             posX: sd.posX, posY: sd.posY, posZ: sd.posZ,
             numSplats: sd.numSplats,
-            origColorData: sd.origColorData ?? null,
+            origColorData: sd.origColorData,
+            origAlphaData: sd.origAlphaData ?? core.ensureMainAlphaSnapshot(),
             splatEntity: sd.splatEntity,
           },
           core.half2Float,
@@ -185,7 +186,7 @@ export default function SplatViewer({ sogUrl, mode, uploadId, onSelectionDone }:
     Boolean(uploadId),
     undefined,
     null,
-    true,
+    false,
     undefined,
     undefined,
     registerDoor,
@@ -193,7 +194,13 @@ export default function SplatViewer({ sogUrl, mode, uploadId, onSelectionDone }:
   );
 
   return (
-    <SplatViewerCore key={reloadKey} ref={coreRef} sogUrl={currentUrl} onSplatLoaded={onSplatLoadedCombined}>
+    <SplatViewerCore
+      key={reloadKey}
+      ref={coreRef}
+      sogUrl={currentUrl}
+      captureColorSnapshot={mode === 'edit'}
+      onSplatLoaded={onSplatLoadedCombined}
+    >
       {mode === 'edit' && (
         <>
           {selector.overlay}

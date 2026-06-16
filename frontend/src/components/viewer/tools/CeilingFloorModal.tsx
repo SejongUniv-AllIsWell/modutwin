@@ -123,6 +123,16 @@ export default function CeilingFloorModal({
   const lineARef = useRef(peaks[0]);
   const lineBRef = useRef(peaks[1]);
   const draggingRef = useRef<'A' | 'B' | null>(null);
+  // 우클릭 드래그 패닝 상태 — 어떤 캔버스를 어디서부터 끌고 있는지.
+  // clientX/Y(픽셀) + 시작 시점의 viewport 스냅샷을 보관.
+  const panRef = useRef<{
+    key: 'xy' | 'zy';
+    startClientX: number;
+    startClientY: number;
+    rectW: number;
+    rectH: number;
+    startVp: CanvasViewport;
+  } | null>(null);
   // 하단 정보 라벨용 DOM ref
   const floorLabelRef = useRef<HTMLSpanElement>(null);
   const ceilingLabelRef = useRef<HTMLSpanElement>(null);
@@ -377,6 +387,28 @@ export default function CeilingFloorModal({
   }, [activeYRange]);
 
   const handleMouseDown = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    // 우클릭 드래그 → 해당 캔버스 뷰포트 평행이동(pan). 현재 줌 상태(viewport)를 그대로 끌고 다님.
+    if (e.button === 2) {
+      const canvas = e.currentTarget;
+      const key: 'xy' | 'zy' = canvas === xyRef.current ? 'xy' : 'zy';
+      const rect = canvas.getBoundingClientRect();
+      const b = boundsRef.current;
+      // viewport 가 없으면 (fit-to-data) 현재 bounds 를 시작값으로 스냅샷 → 끌면 그때부터 패닝.
+      const cur = viewportRef.current[key] ?? {
+        minH: key === 'xy' ? b.mnX : b.mnZ,
+        maxH: key === 'xy' ? b.mxX : b.mxZ,
+        minY: b.mnY, maxY: b.mxY,
+      };
+      panRef.current = {
+        key,
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+        rectW: rect.width,
+        rectH: rect.height,
+        startVp: { ...cur },
+      };
+      return;
+    }
     const yVal = canvasToY(e);
     const dA = Math.abs(yVal - lineARef.current);
     const dB = Math.abs(yVal - lineBRef.current);
@@ -388,6 +420,21 @@ export default function CeilingFloorModal({
   }, [canvasToY, activeYRange]);
 
   const handleMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    // 패닝 중 — 마우스 이동(px)을 데이터 좌표 스케일로 환산해 viewport min/max 를 평행 이동.
+    const pan = panRef.current;
+    if (pan) {
+      const { key, startClientX, startClientY, rectW, rectH, startVp } = pan;
+      const plotW = CW - PAD * 2, plotH = CH - PAD * 2;
+      // 화면 px → backing px → 데이터 단위. 드래그한 만큼 그림이 따라오도록 viewport 를 반대로 민다.
+      const dxData = ((e.clientX - startClientX) * (CW / rectW)) * (startVp.maxH - startVp.minH) / plotW;
+      const dyData = ((e.clientY - startClientY) * (CH / rectH)) * (startVp.maxY - startVp.minY) / plotH;
+      viewportRef.current[key] = {
+        minH: startVp.minH - dxData, maxH: startVp.maxH - dxData,
+        minY: startVp.minY - dyData, maxY: startVp.maxY - dyData,
+      };
+      scheduleDraw();
+      return;
+    }
     const drag = draggingRef.current;
     if (!drag) return;
     const yVal = canvasToY(e);
@@ -400,7 +447,12 @@ export default function CeilingFloorModal({
     scheduleDraw();
   }, [canvasToY, updateInfoLabels, scheduleDraw]);
 
-  const handleMouseUp = useCallback(() => { draggingRef.current = null; }, []);
+  const handleMouseUp = useCallback(() => { draggingRef.current = null; panRef.current = null; }, []);
+
+  // 우클릭 드래그 후 브라우저 컨텍스트 메뉴 차단.
+  const handleContextMenu = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    e.preventDefault();
+  }, []);
 
   // 휠 줌 + 더블클릭 리셋. 캔버스 마운트/회전 변경 시 viewport 초기화.
   useEffect(() => {
@@ -480,7 +532,7 @@ export default function CeilingFloorModal({
       <div className="bg-[var(--paper)] border border-[var(--rule)] rounded-lg p-5 shadow-2xl" onClick={e => e.stopPropagation()}>
         <div className="text-[var(--ink)] font-bold text-sm mb-1">천장 / 바닥 설정</div>
         <div className="text-[var(--muted)] text-xs mb-3">
-          슬라이더로 포인트 클라우드를 회전해 천장/바닥이 수평이 되게 맞춘 뒤, <span style={{color:'#22d3ee'}}>천장선</span> / <span style={{color:'#92400e'}}>바닥선</span>을 드래그하세요. 마우스 휠로 줌, 더블클릭으로 초기화.
+          슬라이더로 포인트 클라우드를 회전해 천장/바닥이 수평이 되게 맞춘 뒤, <span style={{color:'#22d3ee'}}>천장선</span> / <span style={{color:'#92400e'}}>바닥선</span>을 드래그하세요. 마우스 휠로 줌, 우클릭 드래그로 이동, 더블클릭으로 초기화.
         </div>
         <div className="flex gap-3">
           <div>
@@ -488,7 +540,8 @@ export default function CeilingFloorModal({
             <canvas ref={xyRef} style={{ width: CW, height: CH }}
               className="border border-[var(--rule)] rounded cursor-ns-resize"
               onMouseDown={handleMouseDown} onMouseMove={handleMouseMove}
-              onMouseUp={handleMouseUp} onMouseLeave={handleMouseUp} />
+              onMouseUp={handleMouseUp} onMouseLeave={handleMouseUp}
+              onContextMenu={handleContextMenu} />
             <div className="mt-2 flex items-center gap-2 text-xs">
               <span className="text-[var(--muted)] w-16">Z축 회전</span>
               <input ref={rotZSliderRef} type="range" min={-180} max={180} step={0.5}
@@ -506,7 +559,8 @@ export default function CeilingFloorModal({
             <canvas ref={zyRef} style={{ width: CW, height: CH }}
               className="border border-[var(--rule)] rounded cursor-ns-resize"
               onMouseDown={handleMouseDown} onMouseMove={handleMouseMove}
-              onMouseUp={handleMouseUp} onMouseLeave={handleMouseUp} />
+              onMouseUp={handleMouseUp} onMouseLeave={handleMouseUp}
+              onContextMenu={handleContextMenu} />
             <div className="mt-2 flex items-center gap-2 text-xs">
               <span className="text-[var(--muted)] w-16">X축 회전</span>
               <input ref={rotXSliderRef} type="range" min={-180} max={180} step={0.5}

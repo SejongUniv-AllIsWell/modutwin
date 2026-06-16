@@ -30,15 +30,15 @@ class Ray:
 def pixel_rotate_cw_to_orig(
     u_rot: float, v_rot: float, img_size: int = 1024
 ) -> tuple[float, float]:
-    """90° CW 저장 이미지의 픽셀 → 원본(렌더 프레임) 픽셀 역변환.
+    """저장 이미지 픽셀 → ray 캐스팅용(원본 렌더 프레임) 픽셀.
 
-    splat_renderer.py가 np.rot90(k=-1) 즉 90° CW로 저장하므로:
-      저장 이미지: u_rot = H-1-v_orig, v_rot = u_orig
-      역변환:     u_orig = v_rot,      v_orig = H-1-u_rot
+    splat_renderer 가 gsplat 출력(상하 뒤집힘)을 np.flipud(수직 flip만)로 저장하므로,
+    역변환도 vflip: u 는 그대로, v 만 뒤집는다.
+        (u, v) → (u, H-1-v)
+    이래야 이미지 상단=문 상단(천장), 이미지 좌측=문 좌측(물리적 left)으로 일관.
+    (180° 역변환은 좌우까지 뒤집어 left↔right 반전을 일으켰음.)
     """
-    u_orig = float(v_rot)
-    v_orig = float(img_size - 1 - u_rot)
-    return u_orig, v_orig
+    return float(u_rot), float(img_size - 1 - v_rot)
 
 
 def pixel_to_world_ray(

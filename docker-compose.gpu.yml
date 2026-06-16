@@ -39,8 +39,8 @@ services:
     restart: unless-stopped
 
   worker:
-    build: ./worker
-    container_name: 3dgs-worker
+    build: ./worker_dgx
+    container_name: 3dgs-dgx-worker
     networks:
       - 3dgs-net
     volumes:

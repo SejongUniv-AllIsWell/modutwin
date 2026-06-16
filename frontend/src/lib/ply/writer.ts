@@ -46,6 +46,63 @@ export function serializePly(
   return out.buffer;
 }
 
+export function serializeFilteredPly(
+  scene: GaussianScene,
+  keep: Uint8Array | boolean[],
+  opts: {
+    comments?: string[];
+    overrides?: Map<number, Partial<Record<string, number>>>;
+    valueAt?: (prop: string, srcIndex: number, current: number) => number;
+  } = {},
+): ArrayBuffer {
+  let keepCount = 0;
+  for (let i = 0; i < scene.numSplats; i++) if (keep[i]) keepCount++;
+
+  const props = scene.propertyOrder;
+  const comments = opts.comments ?? [];
+  const headerLines = [
+    'ply',
+    'format binary_little_endian 1.0',
+    ...comments.map(c => `comment ${c}`),
+    `element vertex ${keepCount}`,
+    ...props.map(p => `property float ${p}`),
+    'end_header',
+    '',
+  ];
+  const headerBytes = new TextEncoder().encode(headerLines.join('\n'));
+  const rowBytes = props.length * 4;
+  const out = new Uint8Array(headerBytes.length + keepCount * rowBytes);
+  out.set(headerBytes, 0);
+
+  const view = new DataView(out.buffer, headerBytes.length);
+  const arrays = props.map(p => {
+    const a = scene.attrs.get(p);
+    if (!a) throw new Error(`serializeFilteredPly: missing attribute "${p}"`);
+    if (a.length !== scene.numSplats) {
+      throw new Error(`serializeFilteredPly: attribute "${p}" length mismatch`);
+    }
+    return a;
+  });
+
+  let row = 0;
+  for (let i = 0; i < scene.numSplats; i++) {
+    if (!keep[i]) continue;
+    const base = row * rowBytes;
+    const rowOverrides = opts.overrides?.get(i);
+    for (let j = 0; j < props.length; j++) {
+      const current = arrays[j][i];
+      const overridden = rowOverrides?.[props[j]];
+      const value = overridden !== undefined
+        ? overridden
+        : (opts.valueAt ? opts.valueAt(props[j], i, current) : current);
+      view.setFloat32(base + j * 4, value, true);
+    }
+    row++;
+  }
+
+  return out.buffer;
+}
+
 export function cloneScene(scene: GaussianScene): GaussianScene {
   const attrs = new Map<string, Float32Array>();
   scene.attrs.forEach((v, k) => { attrs.set(k, new Float32Array(v)); });

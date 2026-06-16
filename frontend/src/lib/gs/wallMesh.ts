@@ -1,5 +1,15 @@
 import type { TextureBakeResult, Vec3 } from './textureBake';
 
+export type TextureImageSource = HTMLImageElement | ImageBitmap;
+
+function textureSourceWidth(source: TextureImageSource): number {
+  return source instanceof HTMLImageElement ? source.naturalWidth : source.width;
+}
+
+function textureSourceHeight(source: TextureImageSource): number {
+  return source instanceof HTMLImageElement ? source.naturalHeight : source.height;
+}
+
 function averageOpaqueColor(rgba: Uint8ClampedArray | Uint8Array): [number, number, number] | null {
   let r = 0, g = 0, b = 0, n = 0;
   for (let i = 0; i < rgba.length; i += 4) {
@@ -11,6 +21,17 @@ function averageOpaqueColor(rgba: Uint8ClampedArray | Uint8Array): [number, numb
     n++;
   }
   return n > 0 ? [r / (255 * n), g / (255 * n), b / (255 * n)] : null;
+}
+
+function averageImageColor(image: TextureImageSource): [number, number, number] | null {
+  const sampleSize = 16;
+  const canvas = document.createElement('canvas');
+  canvas.width = sampleSize;
+  canvas.height = sampleSize;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return null;
+  ctx.drawImage(image, 0, 0, sampleSize, sampleSize);
+  return averageOpaqueColor(ctx.getImageData(0, 0, sampleSize, sampleSize).data);
 }
 
 function applyBakedTextureCutout(pc: any, mat: any, tex: any): void {
@@ -49,10 +70,12 @@ function createTextureFromRgba(
   return tex;
 }
 
-function createTextureFromImage(pc: any, device: any, name: string, image: HTMLImageElement): any {
+function createTextureFromImage(pc: any, device: any, name: string, image: TextureImageSource): any {
+  const width = textureSourceWidth(image);
+  const height = textureSourceHeight(image);
   const tex = new pc.Texture(device, {
-    width: image.naturalWidth,
-    height: image.naturalHeight,
+    width,
+    height,
     format: pc.PIXELFORMAT_SRGBA8 ?? pc.PIXELFORMAT_RGBA8,
     mipmaps: false,
     addressU: pc.ADDRESS_CLAMP_TO_EDGE,
@@ -65,8 +88,8 @@ function createTextureFromImage(pc: any, device: any, name: string, image: HTMLI
     tex.setSource(image);
   } else {
     const canvas = document.createElement('canvas');
-    canvas.width = image.naturalWidth;
-    canvas.height = image.naturalHeight;
+    canvas.width = width;
+    canvas.height = height;
     const ctx = canvas.getContext('2d')!;
     ctx.drawImage(image, 0, 0);
     const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
@@ -160,7 +183,7 @@ export interface PersistedMeshData {
   corners: number[][];      // 4 × 3 (TL, TR, BR, BL)
   uvs: number[][];          // 4 × 2 (TL, TR, BR, BL)
   normalInward: [number, number, number];
-  textureImage: HTMLImageElement;
+  textureImage: TextureImageSource;
 }
 
 export function createWallMeshFromPersisted(
@@ -181,7 +204,7 @@ export function createWallMeshFromPersisted(
   mat.diffuse.set(0, 0, 0);
   mat.cull = pc.CULLFACE_NONE;
 
-  // PNG 이미지를 PlayCanvas Texture 로 변환
+  // 저장된 텍스처 이미지를 PlayCanvas Texture 로 변환
   let tex: any;
   // 문 설정/정합 단계처럼 텍스처 alpha punch 를 수정해야 하는 화면은 mutableTexture=true
   // 기본 경로를 사용한다. 층 overview 처럼 read-only 로 보기만 하는 화면은 setSource 로
@@ -189,8 +212,8 @@ export function createWallMeshFromPersisted(
   let averageColor: [number, number, number] | null = null;
   if (opts.mutableTexture !== false) {
     const canvas = document.createElement('canvas');
-    canvas.width = data.textureImage.naturalWidth;
-    canvas.height = data.textureImage.naturalHeight;
+    canvas.width = textureSourceWidth(data.textureImage);
+    canvas.height = textureSourceHeight(data.textureImage);
     const ctx = canvas.getContext('2d')!;
     ctx.drawImage(data.textureImage, 0, 0);
     const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
@@ -202,6 +225,7 @@ export function createWallMeshFromPersisted(
     });
     tex = createTextureFromRgba(pc, device, name, canvas.width, canvas.height, imgData.data);
   } else {
+    averageColor = averageImageColor(data.textureImage);
     tex = createTextureFromImage(pc, device, name, data.textureImage);
   }
 

@@ -68,6 +68,8 @@ class DoorCornersResult:
             "right_bottom": (0.0, 0.0, 0.0),
         }
     )
+    # N-door: 추출된 모든 문 목록. door_corners_3d 는 첫 번째 문 (backward compat).
+    all_doors: list[dict] = field(default_factory=list)
     quality: QualityMetrics = field(default_factory=QualityMetrics)
     warnings: list[str] = field(default_factory=list)
     config: PipelineConfig = field(default_factory=PipelineConfig)

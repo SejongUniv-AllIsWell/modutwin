@@ -3,6 +3,7 @@ import subprocess
 import logging
 
 from pipeline.base import PipelineModule, PipelineError
+from pipeline.subprocess_utils import run_capture
 
 logger = logging.getLogger(__name__)
 
@@ -13,7 +14,7 @@ logger = logging.getLogger(__name__)
 # worker/splat-transform/ 에 PlayCanvas splat-transform 을 ply/compressed.ply/
 # sog/splat/spz -> sog 변환 파이프라인만 남기고 트리밍해 두었다. 이 모듈은 그
 # Node CLI(bin/cli.mjs)를 subprocess 로 호출해 입력과 동일한 폴더에 .sog 를
-#생성한다. 기본 디바이스는 CPU 이므로 GPU 없이도 동작한다.
+# 생성한다. 기본 디바이스는 CPU 이므로 GPU 없이도 동작한다.
 # ---------------------------------------------------------------------------
 
 # 지원 입력 확장자 (소문자, 긴 것부터 검사)
@@ -25,7 +26,7 @@ SOG_CLI = os.environ.get(
     "SPLAT_TO_SOG_CLI",
     os.path.join(os.path.dirname(__file__), "..", "splat-transform", "bin", "cli.mjs"),
 )
-SOG_DEVICE = os.environ.get("SOG_DEVICE", "cpu")          # cpu | auto | <gpu index>
+SOG_DEVICE = os.environ.get("SOG_DEVICE", "cpu")          # cpu | auto(NVIDIA/Vulkan preferred) | <gpu index>
 SOG_ITERATIONS = os.environ.get("SOG_ITERATIONS", "10")    # SH 압축 반복 횟수
 SOG_TIMEOUT = int(os.environ.get("SOG_TIMEOUT", "1800"))   # 초
 
@@ -108,9 +109,7 @@ def convert_to_sog(input_path: str, output_path: str | None = None,
     logger.debug(f"[SOGConverter] cmd: {' '.join(cmd)}")
 
     try:
-        result = subprocess.run(
-            cmd, check=True, capture_output=True, text=True, timeout=SOG_TIMEOUT,
-        )
+        result = run_capture(cmd, text=True, timeout=SOG_TIMEOUT)
         if result.stderr:
             logger.debug(f"[SOGConverter] {result.stderr.strip()[-500:]}")
     except FileNotFoundError:

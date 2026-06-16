@@ -112,11 +112,16 @@ class UploadInitRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_colmap_target(self) -> "UploadInitRequest":
-        """colmap ply_target은 zip 파일에만 허용된다."""
+        """colmap ply_target은 사진 묶음(.zip) 또는 영상 파일에만 허용된다.
+
+        워커(FFmpegModule)는 입력 확장자로 .zip(압축 해제)과 영상(프레임 추출)을
+        분기 처리하므로, 두 형식 모두 동일한 COLMAP 전처리 태스크로 보낼 수 있다.
+        """
         if self.ply_target == "colmap":
             ext = os.path.splitext(self.filename)[1].lower()
-            if ext != ".zip":
-                raise ValueError("colmap ply_target은 .zip 파일에만 허용됩니다.")
+            if ext != ".zip" and ext not in VIDEO_EXTENSIONS:
+                allowed = ", ".join(sorted({".zip", *VIDEO_EXTENSIONS}))
+                raise ValueError(f"colmap ply_target은 {allowed} 파일에만 허용됩니다.")
         return self
 
 
@@ -148,6 +153,11 @@ class UploadCompleteResponse(BaseModel):
 class UploadResponse(BaseModel):
     id: UUID
     module_id: UUID
+    module_name: Optional[str] = None
+    floor_id: Optional[UUID] = None
+    floor_number: Optional[int] = None
+    building_id: Optional[UUID] = None
+    building_name: Optional[str] = None
     original_filename: str
     file_size: int
     status: str
@@ -158,10 +168,14 @@ class UploadResponse(BaseModel):
     sam3_status: Optional[str] = None
     sam3_prompt: Optional[str] = None
     has_refined: bool = False
+    # /refine/refined-bundle 이 실제로 200을 반환할 수 있는 SceneOutput 존재 여부.
+    has_refined_bundle: bool = False
     has_doors_json: bool = False
     has_alignment: bool = False
     has_gsplat_ply: bool = False  # COLMAP→GS 결과 PLY 존재 여부
     is_basemap_source: bool = False  # basemap 으로 등록된 원본 업로드인지 — 삭제 비활성화 판단용
+    is_basemap_upload: bool = False  # basemap 목적 업로드인지 ('__basemap__' 모듈 소속) — 대시보드 상태/정합 버튼 분기용
+    is_basemap_active: bool = False  # 이 업로드 기반 basemap 이 활성(관리자 승인/등록 완료)인지 — '업로드 완료' vs 'Basemap' 구분용
 
     class Config:
         from_attributes = True

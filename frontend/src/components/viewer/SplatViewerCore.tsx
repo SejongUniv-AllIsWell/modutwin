@@ -10,6 +10,8 @@ import {
   getLookDir,
   getRightDir,
 } from './tools/cameraMath';
+import { stabilizeGsplatRendering } from './tools/gsplatRenderStability';
+import { getPlayCanvasGsplatAssetHint } from './tools/gsplatAssetHints';
 
 // ── 외부 노출 타입 ──
 
@@ -20,6 +22,7 @@ export interface SplatData {
   posZ: Float32Array;
   colorTexture: any;
   origColorData: Uint16Array | null;   // half-float RGBA
+  origAlphaData: Uint16Array | null;   // half-float alpha only, used by read-only masks/minimap
   splatEntity: any;
   /** transformA 텍스처 (위치+회전xy GPU 데이터) */
   transformATexture: any;
@@ -70,6 +73,10 @@ export interface SplatViewerCoreRef {
   setCameraPose: (pose: CameraPose) => void;
   /** 메인 splat 엔티티 visibility 토글 */
   setMainVisible: (visible: boolean) => void;
+  /** color texture 원본 snapshot 을 필요 시 생성해 반환. 보기 전용 초기 로드에서는 지연 생성에 사용. */
+  ensureMainColorSnapshot: () => Uint16Array | null;
+  /** alpha 채널만 필요할 때 RGBA 전체 복사 없이 원본 alpha snapshot 을 생성해 반환. */
+  ensureMainAlphaSnapshot: () => Uint16Array | null;
   /** 정합 모드: 모듈 entity 들 (splat + wall mesh + door mesh + module 추가 splat) 을
    *  공통 부모 alignmentGroup 아래로 이동. basemap 으로 표시된 추가 splat 은 제외.
    *  반환: alignmentGroup entity (transform 적용 대상). 이미 진입 상태면 기존 group 반환.
@@ -80,7 +87,7 @@ export interface SplatViewerCoreRef {
   /** 현재 alignmentGroup entity. 진입 안 했으면 null. */
   getAlignmentGroup: () => any | null;
   /** 메인 splat 을 새 URL (blob URL 가능) 로 재로드. 카메라 보존 옵션 지원. asset.ready 까지 await. */
-  reloadSplatFromUrl: (url: string, opts?: { preserveCamera?: boolean }) => Promise<void>;
+  reloadSplatFromUrl: (url: string, opts?: { preserveCamera?: boolean; filename?: string | null }) => Promise<void>;
   /**
    * 현재 씬을 일시적으로 ortho top-down 카메라로 렌더해 PNG Blob 으로 캡처.
    * 캡처 후 카메라 원상 복구. 천장제거 토글이 ON 인 상태에서 호출하면 위에서 본 실내 평면도 형태.
@@ -108,12 +115,20 @@ export interface SnapshotMeta {
 interface SplatViewerCoreProps {
   /** 없으면 빈 viewer만 표시 (카메라/기즈모만 활성). */
   sogUrl?: string | null;
+  /** blob URL 처럼 URL 만으로 확장자를 알 수 없을 때 PlayCanvas parser 선택에 쓰는 파일명 힌트. */
+  assetFilename?: string | null;
+  /** 편집/마스킹용 color texture 원본을 로드 직후 복사할지 여부. */
+  captureColorSnapshot?: boolean;
   onSplatLoaded?: (data: SplatData) => void;
   children?: React.ReactNode;
 }
 
+const hasEditableGsplatProps = (gsplatData: any): boolean => (
+  !!gsplatData && typeof gsplatData.getProp === 'function'
+);
+
 const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
-  ({ sogUrl, onSplatLoaded, children }, ref) => {
+  ({ sogUrl, assetFilename, captureColorSnapshot = true, onSplatLoaded, children }, ref) => {
     const containerRef = useRef<HTMLDivElement>(null);
     const rootRef = useRef<HTMLDivElement>(null);
     const [loading, setLoading] = useState(true);
@@ -147,11 +162,61 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
     const pcRef = useRef<any>(null);
     // splat 로드 인터페이스 — init 완료 후 첫 useEffect에서 채워짐.
     // 두 번째 useEffect (sogUrl 변경 트리거) 가 호출.
-    const loadSplatRef = useRef<((url: string, opts?: { preserveCamera?: boolean }) => Promise<void>) | null>(null);
+    const loadSplatRef = useRef<((url: string, opts?: { preserveCamera?: boolean; filename?: string | null }) => Promise<void>) | null>(null);
     const clearSplatRef = useRef<(() => void) | null>(null);
     // 콜백 identity가 매 렌더마다 바뀌어도 effect가 재실행되지 않도록 ref로 보관
     const onSplatLoadedRef = useRef(onSplatLoaded);
     useEffect(() => { onSplatLoadedRef.current = onSplatLoaded; }, [onSplatLoaded]);
+    const captureColorSnapshotRef = useRef(captureColorSnapshot);
+    useEffect(() => { captureColorSnapshotRef.current = captureColorSnapshot; }, [captureColorSnapshot]);
+
+    const ensureColorSnapshotForData = useCallback((target?: SplatData | null): Uint16Array | null => {
+      const data = target ?? splatDataRef.current;
+      if (!data?.colorTexture) return null;
+      if (data.origColorData) return data.origColorData;
+      let locked: Uint16Array | null = null;
+      try {
+        locked = data.colorTexture.lock?.() ?? null;
+        if (!locked) return null;
+        const snapshot = new Uint16Array(locked.length);
+        snapshot.set(locked);
+        data.origColorData = snapshot;
+        if (!data.origAlphaData) {
+          const alpha = new Uint16Array(data.numSplats);
+          for (let i = 0; i < data.numSplats; i++) alpha[i] = snapshot[i * 4 + 3];
+          data.origAlphaData = alpha;
+        }
+        return snapshot;
+      } finally {
+        if (locked) {
+          try { data.colorTexture.unlock(); } catch {}
+        }
+      }
+    }, []);
+
+    const ensureAlphaSnapshotForData = useCallback((target?: SplatData | null): Uint16Array | null => {
+      const data = target ?? splatDataRef.current;
+      if (!data?.colorTexture) return null;
+      if (data.origAlphaData) return data.origAlphaData;
+      const alpha = new Uint16Array(data.numSplats);
+      if (data.origColorData) {
+        for (let i = 0; i < data.numSplats; i++) alpha[i] = data.origColorData[i * 4 + 3];
+        data.origAlphaData = alpha;
+        return alpha;
+      }
+      let locked: Uint16Array | null = null;
+      try {
+        locked = data.colorTexture.lock?.() ?? null;
+        if (!locked) return null;
+        for (let i = 0; i < data.numSplats; i++) alpha[i] = locked[i * 4 + 3];
+        data.origAlphaData = alpha;
+        return alpha;
+      } finally {
+        if (locked) {
+          try { data.colorTexture.unlock(); } catch {}
+        }
+      }
+    }, []);
 
     // ── 외부 노출 API ──
     useImperativeHandle(ref, () => ({
@@ -185,6 +250,8 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
         const ent = splatEntityRef.current;
         if (ent) ent.enabled = visible;
       },
+      ensureMainColorSnapshot: () => ensureColorSnapshotForData(),
+      ensureMainAlphaSnapshot: () => ensureAlphaSnapshotForData(),
       enterAlignmentMode: () => {
         const app = appRef.current;
         const pc = pcRef.current;
@@ -219,7 +286,8 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
           const isDoor = name.startsWith('doorMesh_');
           const isAddSplat = name.startsWith('add_splat_');
           // moduleDoor wrapper — mesh + splat 자식 통째로 정합 transform 대상.
-          const isModuleDoorWrapper = name === 'moduleDoor';
+          // 'moduleDoorExtra_*' = N-door 비정합 문 wrapper (정합 문과 함께 정합되어야 mesh 가 보임).
+          const isModuleDoorWrapper = name === 'moduleDoor' || name.startsWith('moduleDoorExtra_');
           // basemap tag 가 붙은 entity 는 module 정합 transform 적용 대상이 아님 → 무조건 제외.
           // (useRefinedMeshLoader 가 추가하는 basemap 의 wallMesh/doorMesh/add_splat 모두 'basemap' tag.)
           const hasBasemapTag = c.tags?.has?.('basemap');
@@ -242,7 +310,7 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
         alignmentGroupRef.current = null;
       },
       getAlignmentGroup: () => alignmentGroupRef.current,
-      reloadSplatFromUrl: (url: string, opts?: { preserveCamera?: boolean }) => {
+      reloadSplatFromUrl: (url: string, opts?: { preserveCamera?: boolean; filename?: string | null }) => {
         const fn = loadSplatRef.current;
         if (!fn) return Promise.reject(new Error('splat loader not ready'));
         return fn(url, opts);
@@ -688,7 +756,7 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
 
           // ── splat 로드/교체 인터페이스 ──
           // 새 asset 준비가 끝난 뒤 splat entity 를 교체해 화면 공백을 줄인다.
-          const loadSplat = (url: string, opts?: { preserveCamera?: boolean }): Promise<void> => {
+          const loadSplat = (url: string, opts?: { preserveCamera?: boolean; filename?: string | null }): Promise<void> => {
             // 진행 중인 로드를 취소해 asset.ready 콜백이 entity를 만들지 않게 한다.
             activeCancel?.();
 
@@ -703,10 +771,12 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
             // reorder=false: PlayCanvas 의 기본 Morton order 재배치 비활성. 활성 시 splatData 의
             // 인덱스가 원본 PLY 순서와 달라져 save 시 alpha mask 가 엉뚱한 splat 에 매핑됨.
             // blob URL 은 확장자가 없어 PC parser 가 형식 판별을 못할 수 있어 filename 힌트 부여.
-            const ext = url.split('?')[0].split('.').pop()?.toLowerCase();
-            const isBlob = url.startsWith('blob:');
-            const filename = isBlob ? 'splat.ply' : (ext ?? 'ply');
-            const asset = new pc.Asset('splat', 'gsplat', { url, filename }, { reorder: false } as any);
+            const { filename, extension } = getPlayCanvasGsplatAssetHint(url, opts?.filename);
+            const assetData = {
+              reorder: false,
+              ...(extension === 'sog' ? { decompress: true } : {}),
+            };
+            const asset = new pc.Asset('splat', 'gsplat', { url, filename }, assetData as any);
             app.assets.add(asset);
 
             return new Promise<void>((resolve, reject) => {
@@ -730,11 +800,12 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
 
                 const splatEntity = new pc.Entity('splat', app);
                 // SuperSplat과 동일한 PLY 로드 기본 회전 (SPZ는 (0,0,0), PLY/기타는 Z축 180°)
-                const ext = url.split('?')[0].split('.').pop()?.toLowerCase();
-                if (ext !== 'spz') {
+                if (extension !== 'spz') {
                   splatEntity.setLocalEulerAngles(0, 0, 180);
                 }
-                splatEntity.addComponent('gsplat', { asset });
+                // LOD는 PlayCanvas unified/octree 경로에서 동작하므로 일반 GSplatInstance 로 고정한다.
+                splatEntity.addComponent('gsplat', { asset, unified: false });
+                stabilizeGsplatRendering(splatEntity);
                 app.root.addChild(splatEntity);
                 splatEntityRef.current = splatEntity;
 
@@ -757,25 +828,15 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
                   }
                 }
 
-                // PlayCanvas 2.x: gsplatData
+                // PlayCanvas 2.x: PLY/decompressed SOG resources expose gsplatData.getProp().
                 const resource = asset.resource as any;
                 const gsplatData = resource?.gsplatData;
-                if (gsplatData) {
+                if (hasEditableGsplatProps(gsplatData)) {
                   const n = gsplatData.numSplats;
                   const posX = gsplatData.getProp('x') as Float32Array;
                   const posY = gsplatData.getProp('y') as Float32Array;
                   const posZ = gsplatData.getProp('z') as Float32Array;
                   const colorTex = resource?.streams?.textures?.get('splatColor') ?? null;
-                  let origColorData: Uint16Array | null = null;
-                  if (colorTex) {
-                    const td = colorTex.lock();
-                    if (td) {
-                      origColorData = new Uint16Array(td.length);
-                      origColorData.set(td);
-                      colorTex.unlock();
-                    }
-                  }
-
                   const transformATex = resource?.streams?.textures?.get('transformA') ?? null;
                   const transformBTex = resource?.streams?.textures?.get('transformB') ?? null;
 
@@ -783,13 +844,15 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
                     numSplats: n,
                     posX, posY, posZ,
                     colorTexture: colorTex,
-                    origColorData,
+                    origColorData: null,
+                    origAlphaData: null,
                     splatEntity,
                     transformATexture: transformATex,
                     transformBTexture: transformBTex,
                     resource,
                     gsplatData,
                   };
+                  if (captureColorSnapshotRef.current) ensureColorSnapshotForData(data);
                   splatDataRef.current = data;
                   onSplatLoadedRef.current?.(data);
                 }
@@ -865,11 +928,11 @@ const SplatViewerCore = forwardRef<SplatViewerCoreRef, SplatViewerCoreProps>(
       if (!appReady) return;
       if (sogUrl) {
         // sogUrl prop 변경 → 카메라 fit 모드로 로드. 에러는 내부 setError 가 처리.
-        void loadSplatRef.current?.(sogUrl);
+        void loadSplatRef.current?.(sogUrl, { filename: assetFilename });
       } else {
         clearSplatRef.current?.();
       }
-    }, [sogUrl, appReady]);
+    }, [sogUrl, assetFilename, appReady]);
 
     const toggleMode = () => {
       const next = cameraMode === 'fly' ? 'orbit' : 'fly';

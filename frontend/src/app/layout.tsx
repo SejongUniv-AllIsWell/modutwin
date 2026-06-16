@@ -5,6 +5,7 @@ import { AuthProvider } from '@/lib/auth';
 import Navbar from '@/components/dashboard/Navbar';
 import AppShell from '@/components/dashboard/AppShell';
 import { ToastProvider } from '@/components/ui/Toast';
+import AssetCacheServiceWorker from '@/components/system/AssetCacheServiceWorker';
 
 // splat.wiki Landing.html 와 동일한 3-channel 폰트 — 자체 호스팅 + preload + display:swap.
 // globals.css 에서 각 CSS 변수로 참조.
@@ -51,6 +52,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       <body className="min-h-screen" style={{ background: 'var(--bg)', color: 'var(--ink)' }}>
         <AuthProvider>
           <ToastProvider>
+            <AssetCacheServiceWorker />
             <Navbar />
             <AppShell>{children}</AppShell>
           </ToastProvider>

@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 
 from pipeline.base import PipelineModule, PipelineError
+from pipeline.subprocess_utils import run_capture
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +22,7 @@ class FFmpegModule(PipelineModule):
     - 단일 이미지: images/ 에 복사 (테스트용)
     """
 
-    def __init__(self, fps: int = 2):
+    def __init__(self, fps: float = 1.0):
         self.fps = fps
 
     @property
@@ -40,7 +41,8 @@ class FFmpegModule(PipelineModule):
     def run(self, input_path: str) -> str:
         self.validate_input(input_path)
         ext = os.path.splitext(input_path)[1].lower()
-        work_dir = os.path.join(tempfile.gettempdir(), f"ffmpeg_{os.getpid()}")
+        parent_dir = os.path.dirname(os.path.abspath(input_path)) or tempfile.gettempdir()
+        work_dir = tempfile.mkdtemp(prefix="ffmpeg_", dir=parent_dir)
         output_dir = os.path.join(work_dir, "images")
         os.makedirs(output_dir, exist_ok=True)
 
@@ -86,7 +88,7 @@ class FFmpegModule(PipelineModule):
             "-y",
         ]
         try:
-            subprocess.run(cmd, check=True, capture_output=True)
+            run_capture(cmd, text=False)
         except FileNotFoundError:
             raise PipelineError(self.name, "ffmpeg이 설치되어 있지 않습니다.")
         except subprocess.CalledProcessError as e:

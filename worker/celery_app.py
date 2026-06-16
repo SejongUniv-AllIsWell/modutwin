@@ -1,10 +1,13 @@
 import os
 import sys
 from celery import Celery
+from celery.signals import worker_ready
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 if APP_DIR not in sys.path:
     sys.path.insert(0, APP_DIR)
+
+from worker_tmp_cleanup import cleanup_stale_tmp_dirs
 
 app = Celery('worker')
 app.config_from_object({
@@ -19,14 +22,24 @@ app.config_from_object({
     'task_routes': {
         'tasks.training.*': {'queue': 'training'},
         'tasks.alignment.*': {'queue': 'alignment'},
+        # SOG 는 전용 'sog' 큐 → 별도 sog-worker 가 소비. 긴 변환이 training/alignment 를 막지 않게.
+        'tasks.sog.*': {'queue': 'sog'},
     },
     'task_default_queue': 'training',
     'imports': (
         'tasks.training',
         'tasks.alignment',
+        'tasks.sog',
     ),
 })
+
+
+@worker_ready.connect
+def cleanup_worker_tmp_on_ready(**kwargs):
+    cleanup_stale_tmp_dirs()
+
 
 import tasks.colmap   # noqa: F401
 import tasks.training  # noqa: F401
 import tasks.alignment # noqa: F401
+import tasks.sog       # noqa: F401

@@ -169,11 +169,17 @@ For a fresh unauthenticated environment:
 
 ## GPU Worker Notes
 
-The default web stack does not require the GPU worker.
+The PC web stack runs no Celery worker. GPU Celery workers run on a separate
+GPU machine and consume `training`, `alignment`, and `sog` queues.
 
 Current status:
 
-- `worker/` contains `training` and `alignment` Celery tasks.
+- `worker_dgx/` is the DGX Spark-friendly worker image. It uses Miniforge and keeps
+  the existing host-mounted `/home/imlabdgx1/...` gsplat environment contract.
+- `worker_rtx/` is the RTX worker image. It installs
+  CUDA/PyTorch/COLMAP/pycolmap/gsplat inside the container and is launched with
+  `docker-compose.gpu-rtx.yml`.
+- The PC base `docker-compose.yml` no longer defines a worker.
 - Viewer automatic door designation uses the door-ml/SAM3 HTTP path when the
   service is available.
 - `core/door_detection` contains the SAM3-based door detection pipeline used by
@@ -181,9 +187,9 @@ Current status:
 - The older async worker/callback SAM3 path remains optional; keep
   `ENABLE_SAM3_DISPATCH=false` unless that path is intentionally deployed.
 
-If a separate GPU machine is prepared later, expose Redis/RabbitMQ/MinIO through
-`PC_HOST_IP` on a private interface such as Tailscale, keep secrets identical on
-both machines, and validate connectivity before starting workers:
+The GPU machine reaches the PC's Redis/RabbitMQ/MinIO over LAN/Tailscale via
+`PC_HOST_IP`. Keep secrets identical on both machines, and validate connectivity
+before starting a worker:
 
 ```bash
 nc -zv <PC_HOST_IP> 5673
@@ -191,7 +197,8 @@ nc -zv <PC_HOST_IP> 6379
 nc -zv <PC_HOST_IP> 9000
 ```
 
-The detailed SAM3 worker/callback contract is in
+Detailed GPU worker deployment and SOG/Vulkan troubleshooting are in
+`docs/GPU_WORKER.md`. The detailed SAM3 worker/callback contract is in
 `docs/sam3_worker_callback_plan.md`.
 
 ## Project Layout
@@ -200,7 +207,8 @@ The detailed SAM3 worker/callback contract is in
 /
 ├── frontend/                  # Next.js app and PlayCanvas viewer
 ├── backend/                   # FastAPI, Alembic, SQLAlchemy models
-├── worker/                    # Celery training/alignment scaffolding
+├── worker_dgx/                # DGX Spark Celery worker image
+├── worker_rtx/                # RTX Celery worker image
 ├── core/                      # Python 3DGS helpers used by worker/backend
 ├── utilities/                 # Shared PLY/file helpers
 ├── nginx/
@@ -208,5 +216,7 @@ The detailed SAM3 worker/callback contract is in
 │   └── nginx.local.conf       # local HTTP proxy
 ├── docker-compose.yml
 ├── docker-compose.local.yml
-└── docker-compose.gpu.yml     # future/optional; not default-ready
+├── docker-compose.gpu-dgx.yml  # DGX Spark remote worker stack
+├── docker-compose.gpu-rtx.yml   # RTX remote worker stack
+└── docker-compose.gpu.yml         # future/optional; not default-ready
 ```

@@ -87,6 +87,7 @@ export interface FloorDetailModuleEntry {
   is_visible: boolean;
   version: string | null;
   url: string | null;
+  filename?: string | null;
   source_upload_id: string | null;
 }
 
@@ -160,6 +161,11 @@ export type Sam3Status = 'pending' | 'running' | 'done' | 'failed';
 export interface Upload {
   id: string;
   module_id: string;
+  module_name?: string | null;
+  floor_id?: string | null;
+  floor_number?: number | null;
+  building_id?: string | null;
+  building_name?: string | null;
   original_filename: string;
   file_size: number;
   status: 'uploaded' | 'processing' | 'completed' | 'failed';
@@ -169,10 +175,13 @@ export interface Upload {
   sam3_status?: Sam3Status | null;
   sam3_prompt?: string | null;
   has_refined?: boolean;
+  has_refined_bundle?: boolean;
   has_doors_json?: boolean;
   has_alignment?: boolean;
   has_gsplat_ply?: boolean;
   is_basemap_source?: boolean;
+  is_basemap_upload?: boolean;
+  is_basemap_active?: boolean;
 }
 
 // ── Task ──

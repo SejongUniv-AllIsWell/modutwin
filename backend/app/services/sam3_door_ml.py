@@ -176,7 +176,7 @@ def _run_door_ml_pipeline(
     SAM3 가 벽 컨텍스트를 못 봐 검출 실패 → 원본 PLY 사용이 본질.
     """
     # 진입 시점에 status=running 으로 표시.
-    asyncio.run(_set_running(upload_id))
+    asyncio.run(_set_running(upload_id, celery_task_id))
 
     minio = get_minio_service()
     doors_key: str | None = None
@@ -191,7 +191,7 @@ def _run_door_ml_pipeline(
             resp = client.post(
                 f"{settings.DOOR_ML_URL}/detect",
                 files={"file": ("scene.ply", ply_bytes, "application/octet-stream")},
-                params={"prompt": prompt or "door", "sam3_prob": 0.55},
+                params={"prompt": prompt or "door", "sam3_prob": 0.86},
             )
         if resp.status_code != 200:
             raise RuntimeError(f"door-ml HTTP {resp.status_code}: {resp.text[:300]}")
@@ -210,13 +210,21 @@ def _run_door_ml_pipeline(
         error = f"{type(exc).__name__}: {exc}"
         logger.exception(f"[sam3_door_ml] FAILED upload_id={upload_id} task={celery_task_id}: {error}")
 
-    # 4) DB 반영.
-    asyncio.run(_persist_result(
-        upload_id=upload_id,
-        celery_task_id=celery_task_id,
-        doors_key=doors_key,
-        error=error,
-    ))
+    # 4) DB 반영. doors.json 업로드 후 DB 갱신이 실패하면 방금 만든 파일을 되돌린다.
+    try:
+        asyncio.run(_persist_result(
+            upload_id=upload_id,
+            celery_task_id=celery_task_id,
+            doors_key=doors_key,
+            error=error,
+        ))
+    except Exception:
+        logger.exception("[sam3_door_ml] DB persist failed upload_id=%s task=%s", upload_id, celery_task_id)
+        if doors_key:
+            try:
+                minio.delete_object(doors_key)
+            except Exception:
+                pass
 
 
 def _build_and_upload_doors_json(
@@ -253,7 +261,7 @@ def _build_and_upload_doors_json(
     return key
 
 
-async def _set_running(upload_id: str) -> None:
+async def _set_running(upload_id: str, celery_task_id: str) -> None:
     engine, session_maker = _make_thread_session()
     try:
         async with session_maker() as session:
@@ -261,6 +269,14 @@ async def _set_running(upload_id: str) -> None:
             upload = result.scalar_one_or_none()
             if upload is not None and upload.sam3_status != Sam3Status.done:
                 upload.sam3_status = Sam3Status.running
+            task_result = await session.execute(select(Task).where(Task.celery_task_id == celery_task_id))
+            task = task_result.scalar_one_or_none()
+            if task is not None and task.status not in (TaskStatus.completed, TaskStatus.failed):
+                task.status = TaskStatus.running
+                task.progress = 0
+                task.error_message = None
+                task.completed_at = None
+            if upload is not None or task is not None:
                 await session.commit()
     finally:
         await engine.dispose()
@@ -274,6 +290,7 @@ def dispatch_via_door_ml(
     rot_z: float = 0.0,
     wall_angle_rad: float = 0.0,
     doors_target_key: str | None = None,
+    task_id: str | None = None,
 ) -> str:
     """비동기 thread 로 door-ml 파이프라인을 시작하고 task_id 즉시 반환.
 
@@ -283,7 +300,7 @@ def dispatch_via_door_ml(
         doors_target_key: doors.json 위치 derivation 용 키 (refined PLY 키 또는
             동일 디렉터리 prefix 가지는 키). None 이면 original_ply_key 로부터 도출.
     """
-    task_id = str(uuid.uuid4())
+    task_id = task_id or str(uuid.uuid4())
     t = threading.Thread(
         target=_run_door_ml_pipeline,
         args=(

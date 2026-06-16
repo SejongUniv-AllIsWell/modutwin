@@ -3,6 +3,7 @@ import subprocess
 import logging
 
 from pipeline.base import PipelineModule, PipelineError
+from pipeline.subprocess_utils import run_capture
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +21,11 @@ GSPLAT_TRAINER = os.environ.get(
 # simple_trainer.py 가 examples/ 내부에서 `from datasets.colmap import ...` 처럼
 # 상대 import 를 쓰므로 examples 디렉토리에서 실행해야 한다.
 GSPLAT_CWD = os.path.dirname(GSPLAT_TRAINER)
-GSPLAT_MAX_STEPS = int(os.environ.get("GSPLAT_MAX_STEPS", "7000"))
+GSPLAT_MAX_STEPS = int(os.environ.get("GSPLAT_MAX_STEPS", "30000"))
+GSPLAT_STRATEGY = os.environ.get("GSPLAT_STRATEGY", "mcmc").strip() or "mcmc"
+# Upstream MCMCStrategy requires an integer cap_max. Use Python's practical
+# maxsize so we do not impose the default 1,000,000-Gaussian cap.
+GSPLAT_MCMC_CAP_MAX = str((1 << 63) - 1)
 
 
 class GsplatModule(PipelineModule):
@@ -61,11 +66,11 @@ class GsplatModule(PipelineModule):
 
         logger.info(
             f"[{self.name}] 3DGS 학습 시작: data_dir={input_path}, result_dir={result_dir}, "
-            f"max_steps={GSPLAT_MAX_STEPS}"
+            f"strategy={GSPLAT_STRATEGY}, max_steps={GSPLAT_MAX_STEPS}"
         )
 
         cmd = [
-            GSPLAT_PYTHON, GSPLAT_TRAINER, "default",
+            GSPLAT_PYTHON, GSPLAT_TRAINER, GSPLAT_STRATEGY,
             "--data_dir", input_path,
             "--result_dir", result_dir,
             "--data_factor", "1",
@@ -73,11 +78,11 @@ class GsplatModule(PipelineModule):
             "--save_ply",
             "--disable_viewer",
         ]
+        if GSPLAT_STRATEGY == "mcmc":
+            cmd.extend(["--strategy.cap-max", GSPLAT_MCMC_CAP_MAX])
 
         try:
-            result = subprocess.run(
-                cmd, check=True, capture_output=True, text=True, cwd=GSPLAT_CWD,
-            )
+            result = run_capture(cmd, text=True, cwd=GSPLAT_CWD)
             logger.info(f"[{self.name}] 학습 완료\n{result.stdout[-500:]}")
         except subprocess.CalledProcessError as e:
             tail = (e.stderr or e.stdout or "")[-1000:]

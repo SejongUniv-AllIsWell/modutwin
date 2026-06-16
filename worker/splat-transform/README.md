@@ -32,6 +32,8 @@ node bin/cli.mjs [OPTIONS] <input> [output]
 
 - `output` 을 생략하면 입력과 **동일한 폴더**에 `<basename>.sog` 로 저장합니다.
 - 기본 디바이스는 **CPU** 라 GPU 없이 동작합니다 (`webgpu` 는 optionalDependency).
+- `-g auto` 는 Linux 에서 기본적으로 Vulkan backend 를 사용하고 NVIDIA 하드웨어
+  어댑터를 우선 선택합니다. 실패하면 워커 태스크가 CPU 변환으로 폴백합니다.
 
 ```bash
 node bin/cli.mjs input.ply                       # → input.sog
@@ -44,7 +46,7 @@ node bin/cli.mjs -g auto input.ply               # GPU 사용 (webgpu 설치 필
 | ---- | ---- |
 | `-w, --overwrite` | 출력 파일이 있으면 덮어쓰기 |
 | `-i, --iterations <n>` | SH 압축 반복 횟수 (기본 10) |
-| `-g, --gpu <n\|cpu\|auto>` | SH 클러스터링 디바이스 (기본 cpu) |
+| `-g, --gpu <n\|cpu\|auto>` | SH 클러스터링 디바이스 (기본 cpu, auto 는 NVIDIA/Vulkan 우선) |
 | `-q, --quiet` / `--verbose` | 로그 레벨 |
 
 라이선스는 원본과 동일하게 MIT (LICENSE 참고).
