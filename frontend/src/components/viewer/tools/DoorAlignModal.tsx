@@ -7,6 +7,7 @@ import type { SplatData, SplatViewerCoreRef } from '../SplatViewerCore';
 import { loadRefineState } from '@/lib/refine/persistence';
 import { getEditorRotation, rawToA, aToRaw, rawToAY, type FrameRotation } from '@/lib/refine/coordFrames';
 import { surfacePlanesFromPolygon, type SurfacePlane } from '@/lib/gs/planes';
+import { normalizeDoorRect } from '@/lib/gs/doorRect';
 import { encodeRgbaTexture } from '@/lib/upload/textureEncoding';
 import { useAdditionalGsplats, type AdditionalGsplatsApi } from './useAdditionalGsplats';
 import { useDoorLabels } from './useDoorLabels';
@@ -230,79 +231,6 @@ const CORNERS = [
 // UI 표시용 순서 — 자연스러운 2x2 배치 (왼쪽아래, 오른쪽아래 가 시각 위치 그대로 가도록).
 // [TL, TR, BL, BR] = [0, 1, 3, 2]
 const DISPLAY_ORDER = [0, 1, 3, 2] as const;
-
-/**
- * 도어 4 코너를 "바닥에 평행한 위/아래 변 + 직사각형" 으로 정규화.
- * - 위 변 (0-1) 와 아래 변 (2-3) 은 Y 평행 (높이 일치).
- * - 좌측 변 (0-3) 과 우측 변 (1-2) 은 같은 horizontal axis 위치 → 수직 평행.
- * - 벽 평면 위에 있어야 하므로 (n·P = d) 조건 유지.
- *
- * anchorIdx:
- *   null      → 초기 4점 픽 직후. 각 변 평균값으로 직사각형 fit.
- *   0..3      → 드래그 중. 그 코너는 raycast 위치 그대로, 대각선 반대 코너는 고정.
- *               남은 두 코너는 직사각형 유지하며 자동 재배치.
- */
-function normalizeDoorRect(
-  corners: [Vec3, Vec3, Vec3, Vec3],
-  plane: SurfacePlane,
-  anchorIdx: number | null = null,
-  rotation: FrameRotation = { rotX: 0, rotZ: 0, wallAngleRad: 0 },
-): [Vec3, Vec3, Vec3, Vec3] {
-  const [nx, ny, nz] = plane.normal;
-  // 벽이 아니면 (천장/바닥 normal.y=±1) 정규화 skip — 도어는 벽 위.
-  if (Math.abs(ny) > 0.5) return corners;
-  const hxLen = Math.hypot(nz, -nx);
-  if (hxLen < 1e-6) return corners;
-  const hxN = nz / hxLen;
-  const hzN = -nx / hxLen;
-  const d = plane.d;
-
-  // corners 는 raw 프레임, plane 은 A' 프레임 — u/v 분해 + recon 은 A' 에서 일관 처리.
-  // 진입 시 raw → A' 변환, 반환 시 A' → raw 로 되돌려 caller 의 raw 컨벤션 유지.
-  const cornersA = corners.map(c => rawToA([c[0], c[1], c[2]] as Vec3, rotation)) as [Vec3, Vec3, Vec3, Vec3];
-
-  // (u, v) decomposition: u = pos · h (horizontal on wall), v = pos.y.
-  const us = cornersA.map(c => c[0] * hxN + c[2] * hzN);
-  const vs = cornersA.map(c => c[1]);
-
-  let u_left: number, u_right: number, v_top: number, v_bot: number;
-
-  if (anchorIdx === null) {
-    u_left  = (us[0] + us[3]) * 0.5;
-    u_right = (us[1] + us[2]) * 0.5;
-    v_top   = (vs[0] + vs[1]) * 0.5;
-    v_bot   = (vs[2] + vs[3]) * 0.5;
-  } else {
-    // anchorIdx = 드래그된 코너 (사용자가 끌어둔 위치). 대각선 반대는 그 전 상태 유지.
-    const opp = (anchorIdx + 2) % 4;
-    const isLeft = anchorIdx === 0 || anchorIdx === 3;
-    const isTop  = anchorIdx === 0 || anchorIdx === 1;
-    u_left  = isLeft ? us[anchorIdx] : us[opp];
-    u_right = isLeft ? us[opp]       : us[anchorIdx];
-    v_top   = isTop  ? vs[anchorIdx] : vs[opp];
-    v_bot   = isTop  ? vs[opp]       : vs[anchorIdx];
-  }
-
-  // 주의: u/v swap 자동 보정 금지.
-  // PLY 프레임에서 +Y 가 ceiling 인데 Z-180 회전으로 화면상 아래로 가고, h 방향도 wall normal sign 에 따라
-  // 좌우가 바뀜. v_top<v_bot 또는 u_left>u_right 가 PLY 컨벤션에서 정상 상태라 swap 하면 인덱스 → 위치
-  // 매핑이 깨져서 정합 시 상하/좌우 반전 발생. 사용자가 시계방향으로 픽한 ORIGINAL 인덱스 그대로 사용.
-
-  // 평면 위 점 P = d * n_xz + u * h + v * Y. (n.y = 0, h.y = 0 가정.) — A' 프레임 산출.
-  const recon = (u: number, v: number): Vec3 => [
-    nx * d + hxN * u,
-    v,
-    nz * d + hzN * u,
-  ];
-  const reconA: [Vec3, Vec3, Vec3, Vec3] = [
-    recon(u_left, v_top),
-    recon(u_right, v_top),
-    recon(u_right, v_bot),
-    recon(u_left, v_bot),
-  ];
-
-  return reconA.map(p => aToRaw(p, rotation)) as [Vec3, Vec3, Vec3, Vec3];
-}
 
 function asVec3(value: unknown): Vec3 | null {
   if (!Array.isArray(value) || value.length !== 3) return null;
@@ -691,8 +619,22 @@ export default function DoorAlignModal({
         const sd = Math.abs(p.normal[0]*refA[0] + p.normal[1]*refA[1] + p.normal[2]*refA[2] - p.d);
         if (sd < bestSd) { bestSd = sd; bestId = p.id; }
       }
-      return autoExtractedCorners.map(c => ({
-        pos: [c[0], c[1], c[2]] as Vec3,
+      // 자동 추출 코너도 수동 픽과 동일하게 직사각형 정규화 (위/아래 변 수평 + 직사각형 fit).
+      // SAM3 마스크 기반 코너는 삐뚤어질 수 있으므로 normalizeDoorRect(anchorIdx=null, 각 변 평균)
+      // 으로 벽 평면 위 직사각형으로 보간한다. autoExtractedCorners 순서 = [LT, RT, RB, LB]
+      // (시계방향) 으로 normalizeDoorRect 인덱스 규약과 일치.
+      const rawCorners: [Vec3, Vec3, Vec3, Vec3] = [
+        [autoExtractedCorners[0][0], autoExtractedCorners[0][1], autoExtractedCorners[0][2]],
+        [autoExtractedCorners[1][0], autoExtractedCorners[1][1], autoExtractedCorners[1][2]],
+        [autoExtractedCorners[2][0], autoExtractedCorners[2][1], autoExtractedCorners[2][2]],
+        [autoExtractedCorners[3][0], autoExtractedCorners[3][1], autoExtractedCorners[3][2]],
+      ];
+      const wallPlane = planes.find(p => p.id === bestId);
+      const finalCorners = wallPlane
+        ? normalizeDoorRect(rawCorners, wallPlane, null, r)
+        : rawCorners;
+      return finalCorners.map(p => ({
+        pos: p,
         surfaceId: bestId,
       }));
     });
@@ -2707,7 +2649,13 @@ export default function DoorAlignModal({
         // (bakeNonAlignDoorMode 에서 revertDoorRefine 은 PLY를 건드리지 않으므로 실질적 revert는 없음)
         mainDoorMutationSnapshotRef.current = null;
 
-        const overrideCorners: PickedCorner[] = dc.map(c => ({ pos: c as Vec3, surfaceId: bestId }));
+        // 비정합 문도 정합 문(picked)과 동일하게 직사각형 정규화 — SAM3 코너가 삐뚤어져 있어도
+        // 벽 평면 위 직사각형으로 보간. dc 순서 = [LT, RT, RB, LB] (normalizeDoorRect 규약과 동일).
+        const wallPlaneNA = planes.find(p => p.id === bestId);
+        const dcNorm = wallPlaneNA
+          ? normalizeDoorRect([dc[0], dc[1], dc[2], dc[3]] as [Vec3, Vec3, Vec3, Vec3], wallPlaneNA, null, rotR)
+          : dc;
+        const overrideCorners: PickedCorner[] = dcNorm.map(c => ({ pos: c as Vec3, surfaceId: bestId }));
         try {
           await applyDoorRefine({ cornersOverride: overrideCorners });
         } catch (e) {

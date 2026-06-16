@@ -19,6 +19,8 @@ import { rawToAY, ayToRaw, type FrameRotation } from '@/lib/refine/coordFrames';
 import { uploadMultipartParts } from '@/lib/upload/multipart';
 import { textureUploadFilename } from '@/lib/upload/textureEncoding';
 import type { ModuleDoorAssetPayload } from './tools/DoorAlignModal';
+import { surfacePlanesFromPolygon } from '@/lib/gs/planes';
+import { normalizeDoorCornersRaw } from '@/lib/gs/doorRect';
 import { buildDoorViewSet } from '@/lib/gs/doorViewSet';
 import { captureDoorViews, buildDetectImageFormData } from '@/lib/gs/doorRenderCapture';
 
@@ -1497,10 +1499,25 @@ export default function UnifiedSplatEditor({
                       return ay.map(p => ayToRaw(p, bake as FrameRotation)) as Array<[number,number,number]>;
                     };
 
-                    const primaryOrder = cornersAYtoRaw(resp.corners);
+                    // 검출 코너를 수동 픽과 동일하게 직사각형 정규화 — outline(부모) · picked · bake 가
+                    // 모두 같은 정규화 코너를 쓰도록 검출 응답 직후 한 곳에서 처리.
+                    // roomFrame(A') 폴리곤으로 평면 구성 → closest 벽 기준 normalizeDoorRect.
+                    const refinedPlanes = roomFrame?.wallPolygon
+                      ? surfacePlanesFromPolygon({
+                          polygon: roomFrame.wallPolygon,
+                          ceilingY: roomFrame.ceilingY,
+                          floorY: roomFrame.floorY,
+                        })
+                      : [];
+                    const normRect = (c: Array<[number, number, number]>) =>
+                      refinedPlanes.length
+                        ? normalizeDoorCornersRaw(c, refinedPlanes, bake as FrameRotation)
+                        : c;
 
-                    // N-door: all_doors 파싱
-                    const rawAllDoors = (resp.all_doors ?? [resp.corners]).map(cornersAYtoRaw);
+                    const primaryOrder = normRect(cornersAYtoRaw(resp.corners));
+
+                    // N-door: all_doors 파싱 (각 문도 동일하게 직사각형 정규화)
+                    const rawAllDoors = (resp.all_doors ?? [resp.corners]).map(cornersAYtoRaw).map(normRect);
                     setAllExtractedDoors(rawAllDoors);
                     // N-door: suggested_hinge_edge 파싱 (없으면 null)
                     const hinges = (resp.all_doors ?? []).map(d => d.suggested_hinge_edge ?? null);

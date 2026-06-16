@@ -100,11 +100,18 @@ def collect_door_candidates(
     sam3_summary: dict,
     coarse_cam_map: dict,          # view_idx → CameraView
     adjacency_window: int = 2,     # ±N 이웃에서 4코너 뷰 탐색 (요구③)
+    suppress_after: int = 2,       # ring-forward NMS: 4코너 검출 뒤 제외할 view 수
 ) -> list[DoorCandidate]:
     """SAM3 검출 coarse 뷰 → DoorCandidate 리스트.
 
     요구③: 상단 2코너만 보이는 뷰는 ±adjacency_window 이웃에 4코너 뷰가 있으면 skip.
     링 wrap-around 포함 (v0 ↔ v_last 인접 처리).
+
+    요구(ring-forward NMS): prob threshold 통과(=candidate) + 4코너 모두 보이는 뷰가
+    나오면, render(ring) 순서로 그 다음 suppress_after 개 view 는 prob 가 좋든 나쁘든
+    무조건 제외한다. 같은 문을 인접 뷰에서 중복 검출해 문이 여러 개로 갈라지는 것을 차단.
+    다중 문일 때도 동일 적용 — 트레이드오프: ring 상 suppress_after 개 이내의 '진짜로
+    다른' 문도 하나로 합쳐진다(문은 ring 상 suppress_after+1 칸 이상 떨어져 있어야 분리됨).
     """
     from ..view_selection.iterative_approach import analyze_mask_quad
 
@@ -159,7 +166,20 @@ def collect_door_candidates(
             continue
         filtered.append(cand)
 
-    return sorted(filtered, key=lambda c: c.view_idx)
+    # ring-forward NMS — render(ring) 순서로 훑으며, 4코너 모두 보이는 강한 뷰를 keep 하면
+    # 그 다음 suppress_after 개 view_idx(슬롯)를 prob 무관하게 제외한다.
+    # (candidate 는 이미 SAM3 prob ≥ threshold 통과분이므로 'prob 좋은' 조건은 충족.)
+    suppressed: set[int] = set()
+    nms_kept: list[DoorCandidate] = []
+    for cand in sorted(filtered, key=lambda c: c.view_idx):
+        if cand.view_idx in suppressed:
+            continue
+        nms_kept.append(cand)
+        if cand.all_corners_visible and n_total > 0:
+            for k in range(1, suppress_after + 1):
+                suppressed.add((cand.view_idx + k) % n_total)
+
+    return sorted(nms_kept, key=lambda c: c.view_idx)
 
 
 # ---------------------------------------------------------------------------
@@ -382,6 +402,7 @@ def extract_n_doors(
     adjacency_window: int = 2,
     gap: int = 2,
     merge_dist: float = 0.4,
+    suppress_after: int = 2,
 ) -> list[DoorStructure]:
     """Step A-D 통합 실행. 문 개수는 클러스터링으로 자동 결정 (개수 입력 불필요).
 
@@ -389,8 +410,10 @@ def extract_n_doors(
     """
     n_total = len(coarse_cam_map)  # 링 크기
 
-    # Step A
-    candidates = collect_door_candidates(sam3_summary, coarse_cam_map, adjacency_window)
+    # Step A (ring-forward NMS 포함 — 4코너 강한 뷰 뒤 suppress_after 개 view 제외)
+    candidates = collect_door_candidates(
+        sam3_summary, coarse_cam_map, adjacency_window, suppress_after=suppress_after,
+    )
     if not candidates:
         return []
 
@@ -409,5 +432,37 @@ def extract_n_doors(
 
     # Step D — 유사 구조체 병합 (같은 문 dedup)
     structures = merge_similar_structures(structures, merge_dist=merge_dist)
+
+    # Step E — hinge fallback: 대표 뷰에 손잡이가 안 보여 hinge=None 인 문은
+    # 근처 검출 뷰(ring ±suppress_after+1)의 마스크를 스캔해 hinge 보강.
+    # detect_hinge 가 대표 뷰 1장만 보는 구조적 한계 + NMS/렌더 변동으로 손잡이가
+    # 다른 각도 뷰에만 보이는 경우를 복구. sam3_summary 는 NMS 영향을 안 받는 전체 검출 뷰.
+    view_mask = {
+        v["view_idx"]: v.get("mask_path")
+        for v in sam3_summary.get("views", [])
+        if v.get("mask_path")
+    }
+    if view_mask and n_total > 0:
+        scan_radius = suppress_after + 1
+        for ds in structures:
+            if ds.suggested_hinge_edge is not None:
+                continue
+            found = None
+            for off in range(0, scan_radius + 1):
+                cands = ({ds.src_view_idx} if off == 0
+                         else {(ds.src_view_idx + off) % n_total,
+                               (ds.src_view_idx - off) % n_total})
+                for vi in cands:
+                    mp = view_mask.get(vi)
+                    if not mp:
+                        continue
+                    h = detect_hinge_edge_from_mask(mp)
+                    if h is not None:
+                        found = h
+                        break
+                if found is not None:
+                    break
+            if found is not None:
+                ds.suggested_hinge_edge = found
 
     return sorted(structures, key=lambda d: -d.score)
