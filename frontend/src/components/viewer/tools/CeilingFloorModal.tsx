@@ -17,9 +17,15 @@ interface Props {
 
 // ── Auto-detect ceiling/floor from Y histogram ──
 
-function detectBoundaryPeaks(
-  posX: Float32Array, posY: Float32Array, posZ: Float32Array, numSplats: number,
-): [number, number] {
+type NumArr = Float32Array | Float64Array | number[];
+
+const BP_BINS = 120;
+
+// 천장/바닥 점수 코어: Y 히스토그램(이웃 합 count) × XZ 점유율 → 넓고 조밀한 면 우대.
+// detectBoundaryPeaks(추출)와 회전 자동탐지(boundaryPeakScoreSum)가 공유하는 단일 점수.
+function boundaryScores(
+  posX: NumArr, posY: NumArr, posZ: NumArr, numSplats: number,
+): { scores: Float32Array; yLo: number; bw: number } {
   const maxSamp = 100000;
   const step = Math.max(1, Math.floor(numSplats / maxSamp));
   const sx: number[] = [], sy: number[] = [], sz: number[] = [];
@@ -37,7 +43,7 @@ function detectBoundaryPeaks(
   const xLo = pct(sortedX, 0.02), xHi = pct(sortedX, 0.98);
   const zLo = pct(sortedZ, 0.02), zHi = pct(sortedZ, 0.98);
 
-  const bins = 120;
+  const bins = BP_BINS;
   const subBins = 12;
   const neighborHalf = 2;
   const spreadWeight = 0.3;
@@ -76,14 +82,153 @@ function detectBoundaryPeaks(
     const ratio = nonEmpty / cells;
     scores[i] = mergedCount * (1 - spreadWeight + spreadWeight * ratio);
   }
+  return { scores, yLo, bw };
+}
 
+function detectBoundaryPeaks(
+  posX: NumArr, posY: NumArr, posZ: NumArr, numSplats: number,
+): [number, number] {
+  const { scores, yLo, bw } = boundaryScores(posX, posY, posZ, numSplats);
+  const bins = BP_BINS;
   const q1 = Math.floor(bins * 0.25);
   const q3 = Math.floor(bins * 0.75);
   let peakA = 0, peakB = q3;
   for (let i = 0; i < q1; i++) if (scores[i] > scores[peakA]) peakA = i;
   for (let i = q3; i < bins; i++) if (scores[i] > scores[peakB]) peakB = i;
-
   return [yLo + (peakA + 0.5) * bw, yLo + (peakB + 0.5) * bw];
+}
+
+// ── Auto-detect X·Z rotation (천장/바닥 완전 수평 정렬) ──
+//
+// 사용자 기준은 "정면(XY)·측면(ZY) 뷰에서 바닥/천장이 얇고 또렷한 수평 직선"이다.
+// 이는 지배 평면(바닥) 법선을 수직으로 세우는 것 — Y-히스토그램은 뷰의 2D line 구조
+// (x·z 상관)를 못 담아 클러터 장면에서 어긋난다. 그래서 RANSAC 으로 최대 지지 평면을
+// 찾아 법선 n=(nx,ny,nz) 을 Rz·Rx 2-DOF 로 수직(+Y)화한다:
+//   rotX = atan2(-nz, ny)  (측면 ZY 기울기 제거),  rotZ = atan2(nx, hypot(ny,nz)) (정면 XY 기울기 제거).
+// (gaussian-splatting/ceiling_floor_align 실험에서 검증된 알고리즘 포팅)
+
+// 결정적 RNG (버튼 재클릭 시 동일 결과).
+function mulberry32(seed: number): () => number {
+  let a = seed;
+  return () => {
+    a |= 0; a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// 대칭 3×3(=[c00,c01,c02,c11,c12,c22])의 최소 고유벡터 (Jacobi). 평면 법선 = 최소분산 방향.
+function smallestEigenvector3(m: number[]): [number, number, number] {
+  const a = [[m[0], m[1], m[2]], [m[1], m[3], m[4]], [m[2], m[4], m[5]]];
+  const v = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+  for (let sweep = 0; sweep < 12; sweep++) {
+    // 최대 off-diagonal 찾기
+    let p = 0, q = 1, max = Math.abs(a[0][1]);
+    if (Math.abs(a[0][2]) > max) { p = 0; q = 2; max = Math.abs(a[0][2]); }
+    if (Math.abs(a[1][2]) > max) { p = 1; q = 2; max = Math.abs(a[1][2]); }
+    if (max < 1e-12) break;
+    const app = a[p][p], aqq = a[q][q], apq = a[p][q];
+    const phi = 0.5 * Math.atan2(2 * apq, aqq - app);
+    const c = Math.cos(phi), s = Math.sin(phi);
+    for (let i = 0; i < 3; i++) {
+      const aip = a[i][p], aiq = a[i][q];
+      a[i][p] = c * aip - s * aiq; a[i][q] = s * aip + c * aiq;
+    }
+    for (let i = 0; i < 3; i++) {
+      const api = a[p][i], aqi = a[q][i];
+      a[p][i] = c * api - s * aqi; a[q][i] = s * api + c * aqi;
+    }
+    for (let i = 0; i < 3; i++) {
+      const vip = v[i][p], viq = v[i][q];
+      v[i][p] = c * vip - s * viq; v[i][q] = s * vip + c * viq;
+    }
+  }
+  const d = [a[0][0], a[1][1], a[2][2]];
+  let k = 0; if (d[1] < d[k]) k = 1; if (d[2] < d[k]) k = 2;
+  return [v[0][k], v[1][k], v[2][k]];
+}
+
+function findCeilingFloorRotation(
+  xa: Float64Array, ya: Float64Array, za: Float64Array, n: number,
+): { rotX: number; rotZ: number } {
+  // RANSAC 작업 집합 (성능을 위해 최대 6000점으로 stride 샘플).
+  const cap = 6000;
+  const stride = Math.max(1, Math.floor(n / cap));
+  const ix: number[] = [];
+  for (let i = 0; i < n; i += stride) ix.push(i);
+  const m = ix.length;
+  if (m < 3) return { rotX: 0, rotZ: 0 };
+
+  let mnx = Infinity, mxx = -Infinity, mny = Infinity, mxy = -Infinity, mnz = Infinity, mxz = -Infinity;
+  for (const i of ix) {
+    const x = xa[i], y = ya[i], z = za[i];
+    if (x < mnx) mnx = x; if (x > mxx) mxx = x;
+    if (y < mny) mny = y; if (y > mxy) mxy = y;
+    if (z < mnz) mnz = z; if (z > mxz) mxz = z;
+  }
+  const diag = Math.hypot(mxx - mnx, mxy - mny, mxz - mnz);
+  const thresh = diag * 0.01;
+
+  const rand = mulberry32(0x9e3779b9);
+  let bestIn = 0, bN = [0, 1, 0], bD = 0;
+  for (let it = 0; it < 1500; it++) {
+    const i0 = ix[(rand() * m) | 0], i1 = ix[(rand() * m) | 0], i2 = ix[(rand() * m) | 0];
+    if (i0 === i1 || i1 === i2 || i0 === i2) continue;
+    const ax = xa[i0], ay = ya[i0], az = za[i0];
+    const ux = xa[i1] - ax, uy = ya[i1] - ay, uz = za[i1] - az;
+    const vx = xa[i2] - ax, vy = ya[i2] - ay, vz = za[i2] - az;
+    let nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+    const nn = Math.hypot(nx, ny, nz);
+    if (nn < 1e-9) continue;
+    nx /= nn; ny /= nn; nz /= nn;
+    const d = -(nx * ax + ny * ay + nz * az);
+    let inl = 0;
+    for (const j of ix) if (Math.abs(nx * xa[j] + ny * ya[j] + nz * za[j] + d) < thresh) inl++;
+    if (inl > bestIn) { bestIn = inl; bN = [nx, ny, nz]; bD = d; }
+  }
+
+  // inlier 로 법선 재적합 (공분산 최소 고유벡터).
+  let sxx = 0, sxy = 0, sxz = 0, syy = 0, syz = 0, szz = 0, cx = 0, cy = 0, cz = 0, cnt = 0;
+  const inlIdx: number[] = [];
+  for (const j of ix) {
+    if (Math.abs(bN[0] * xa[j] + bN[1] * ya[j] + bN[2] * za[j] + bD) < thresh) {
+      inlIdx.push(j); cx += xa[j]; cy += ya[j]; cz += za[j]; cnt++;
+    }
+  }
+  let normal = bN;
+  if (cnt >= 3) {
+    cx /= cnt; cy /= cnt; cz /= cnt;
+    for (const j of inlIdx) {
+      const dx = xa[j] - cx, dy = ya[j] - cy, dz = za[j] - cz;
+      sxx += dx * dx; sxy += dx * dy; sxz += dx * dz; syy += dy * dy; syz += dy * dz; szz += dz * dz;
+    }
+    normal = smallestEigenvector3([sxx, sxy, sxz, syy, syz, szz]);
+  }
+
+  // 법선을 Rz·Rx 로 수직(+Y)화: rotX=atan2(-nz,ny), rotZ=atan2(nx, hypot(ny,nz)).
+  const anglesFromNormal = (nrm: number[]): [number, number] => [
+    Math.atan2(-nrm[2], nrm[1]),
+    Math.atan2(nrm[0], Math.hypot(nrm[1], nrm[2])),
+  ];
+  // Rz·Rx 적용 후 ny = sz*x + cz*cx*y - cz*sx*z (모달 recomputeRotated 와 동일).
+  const meanNy = (rx: number, rz: number, idxs: number[] | null): number => {
+    const cx = Math.cos(rx), sx = Math.sin(rx), cz = Math.cos(rz), sz = Math.sin(rz);
+    let sum = 0, k = 0;
+    const src = idxs ?? ix;
+    for (const j of src) { sum += sz * xa[j] + cz * cx * ya[j] - cz * sx * za[j]; k++; }
+    return k ? sum / k : 0;
+  };
+  // 부호 규약: n 과 -n 중 지배 평면(바닥)이 회전 후 전체 평균보다 아래(큰 ny)에 오는 쪽.
+  let best: { score: number; rx: number; rz: number } | null = null;
+  for (const sgn of [1, -1]) {
+    const ns = [sgn * normal[0], sgn * normal[1], sgn * normal[2]];
+    const [rx, rz] = anglesFromNormal(ns);
+    const score = meanNy(rx, rz, inlIdx) - meanNy(rx, rz, null);
+    if (!best || score > best.score) best = { score, rx, rz };
+  }
+  const wrap = (t: number) => ((t + Math.PI) % (2 * Math.PI) + 2 * Math.PI) % (2 * Math.PI) - Math.PI;
+  return { rotX: wrap(best!.rx), rotZ: wrap(best!.rz) };
 }
 
 // ── Canvas drawing ──
@@ -523,6 +668,22 @@ export default function CeilingFloorModal({
     onRotXSlider(0);
   }, [onRotXSlider]);
 
+  // 자동 정렬: 최적 X축 회전(천장/바닥 수평)을 찾아 슬라이더/뷰에 적용 후 peak 재감지.
+  // → 점묘 뷰가 수평 정렬된 모습으로 바뀐다.
+  const autoAlignAndDetect = useCallback(() => {
+    const N = sampleIdx.length;
+    const xa = new Float64Array(N), ya = new Float64Array(N), za = new Float64Array(N);
+    for (let k = 0; k < N; k++) { const i = sampleIdx[k]; xa[k] = posX[i]; ya[k] = posY[i]; za[k] = posZ[i]; }
+    const { rotX, rotZ } = findCeilingFloorRotation(xa, ya, za, N);
+    const degX = (rotX * 180) / Math.PI, degZ = (rotZ * 180) / Math.PI;
+    // X(측면 ZY)·Z(정면 XY) 두 슬라이더 모두 자동 적용 → 바닥/천장 완전 수평.
+    if (rotXSliderRef.current) rotXSliderRef.current.value = String(degX);
+    if (rotZSliderRef.current) rotZSliderRef.current.value = String(degZ);
+    onRotXSlider(degX);
+    onRotZSlider(degZ);  // rotZRef/label/viewport 갱신 + 재그리기 예약
+    redetectPeaks();     // 회전된 buffer 기준 천장/바닥 line 재감지 + 재그리기
+  }, [sampleIdx, posX, posY, posZ, onRotXSlider, onRotZSlider, redetectPeaks]);
+
   // 초기 lo/hi (하단 라벨 default 값용 — DOM ref로 그 후 갱신됨)
   const initLo = Math.min(lineARef.current, lineBRef.current);
   const initHi = Math.max(lineARef.current, lineBRef.current);
@@ -581,9 +742,9 @@ export default function CeilingFloorModal({
             {' '}간격: <span ref={gapLabelRef} className="text-[var(--ink)] font-mono">{(initHi - initLo).toFixed(2)}</span>
           </div>
           <div className="flex gap-2">
-            <button onClick={redetectPeaks}
+            <button onClick={autoAlignAndDetect}
               className="px-3 py-2 bg-[var(--bg-soft)] hover:bg-[var(--rule)] text-[var(--ink-2)] rounded text-xs cursor-pointer">
-              자동감지 재실행
+              자동 정렬·감지
             </button>
             <button onClick={onClose}
               className="px-4 py-2 bg-[var(--bg-soft)] hover:bg-[var(--rule)] text-[var(--ink-2)] rounded text-sm cursor-pointer">
