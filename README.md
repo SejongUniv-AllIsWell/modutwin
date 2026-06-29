@@ -1,7 +1,7 @@
 # Modutwin
 
 **Modutwin** | A web platform that creates digital twins of building interiors using 3D Gaussian Splatting.  
-* [Webite](https://splat.wiki)
+* [Website](https://splat.wiki)
 * [Demo Video](https://youtu.be/1Raxe9ffwnc)
 
 | Before(Only Corridor) | After(With Rooms) |
@@ -33,6 +33,16 @@ Modular Indoor Digital Twins via Door-Based Alignment of 3DGS Assets
   | Screenshot |
   |:---:|
   | <img width="380" height="250" alt="after_connect" src="https://github.com/user-attachments/assets/e4784e9a-f9c3-42de-9383-2fc43e55c989" /> |
+
+* Appearance Preservation Evaluation Before/After Refinement
+
+  | Asset | PSNR ↑ | SSIM ↑ | LPIPS ↓ |
+  |:---:|:---:|:---:|:---:|
+  | Asset 1 | 31.85 dB | 0.9759 | 0.0540 |
+  | Asset 2 | 30.48 dB | 0.9705 | 0.0699 |
+  | Asset 3 | 29.54 dB | 0.9693 | 0.0584 |
+  | Asset 4 | 31.24 dB | 0.9476 | 0.0384 |
+  | Average | 30.78 dB | 0.9658 | 0.0552 |
 
 ---
 

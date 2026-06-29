@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Modutwin | Modular Indoor Digital Twins</title>
+    <meta
+      name="description"
+      content="Modutwin creates modular indoor digital twins from 3D Gaussian Splatting assets using refinement, door extraction, and door-based alignment."
+    />
+    <meta property="og:title" content="Modutwin | Modular Indoor Digital Twins" />
+    <meta
+      property="og:description"
+      content="Door-based alignment for modular indoor 3D Gaussian Splatting assets."
+    />
+    <meta property="og:type" content="website" />
+    <meta
+      property="og:image"
+      content="https://github.com/user-attachments/assets/d17fd1bd-6442-4efa-bb0a-f1a8060a37d7"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="#top" aria-label="Modutwin home">
+        <span class="brand-mark"></span>
+        <span>Modutwin</span>
+      </a>
+      <nav aria-label="Primary navigation">
+        <a href="#refinement">Refinement</a>
+        <a href="#door-extraction">Door Extraction</a>
+        <a href="#alignment">Alignment</a>
+        <a href="#interaction">Interaction</a>
+      </nav>
+    </header>
+
+    <main id="top">
+      <section class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">3D Gaussian Splatting Digital Twin Platform</p>
+          <h1>Modular Indoor Digital Twins via Door-Based Alignment</h1>
+          <p class="lead">
+            Modutwin creates building-scale indoor digital twins by refining room-level 3DGS
+            assets, extracting doors, and aligning spaces through shared door geometry.
+          </p>
+          <div class="actions" aria-label="Project links">
+            <a class="button primary" href="https://splat.wiki">Website</a>
+            <a class="button secondary" href="https://youtu.be/1Raxe9ffwnc">Demo Video</a>
+          </div>
+        </div>
+
+        <div class="comparison" aria-label="Before and after comparison">
+          <figure>
+            <img
+              src="https://github.com/user-attachments/assets/e8fc9b88-215e-4698-a335-9e409adb0720"
+              alt="Corridor-only digital twin before room alignment"
+            />
+            <figcaption>Before: corridor only</figcaption>
+          </figure>
+          <figure>
+            <img
+              src="https://github.com/user-attachments/assets/d17fd1bd-6442-4efa-bb0a-f1a8060a37d7"
+              alt="Digital twin after rooms are aligned with the corridor"
+            />
+            <figcaption>After: rooms connected</figcaption>
+          </figure>
+        </div>
+      </section>
+
+      <section class="summary" aria-label="Core features">
+        <article>
+          <span>01</span>
+          <h2>Refine</h2>
+          <p>Remove outer Gaussians and generate boundary meshes for clean indoor modules.</p>
+        </article>
+        <article>
+          <span>02</span>
+          <h2>Detect</h2>
+          <p>Extract door corners automatically with SAM3 or through manual annotation.</p>
+        </article>
+        <article>
+          <span>03</span>
+          <h2>Align</h2>
+          <p>Register room modules to a basemap through door-centered geometric alignment.</p>
+        </article>
+        <article>
+          <span>04</span>
+          <h2>Interact</h2>
+          <p>Preserve door geometry for open and close interactions in the final scene.</p>
+        </article>
+      </section>
+
+      <section id="refinement" class="feature">
+        <div class="section-heading">
+          <p class="eyebrow">3DGS Asset Refinement</p>
+          <h2>From overlapping room scans to clean modular assets</h2>
+          <p>
+            Indoor 3DGS assets often contain geometry beyond the intended room boundary.
+            Modutwin removes boundary-crossing Gaussians, reconstructs room surfaces, and
+            prepares assets for reliable downstream alignment.
+          </p>
+        </div>
+
+        <div class="image-row single">
+          <figure>
+            <img
+              src="https://github.com/user-attachments/assets/0241528e-8862-481e-83a4-bb05850614b1"
+              alt="Unrefined indoor 3DGS assets overlapping"
+            />
+            <figcaption>Without refinement, adjacent assets overlap.</figcaption>
+          </figure>
+        </div>
+
+        <div class="image-row three">
+          <figure>
+            <img
+              src="https://github.com/user-attachments/assets/caecf60c-edca-4168-b708-e3848e995015"
+              alt="Original 3DGS room asset"
+            />
+            <figcaption>Original</figcaption>
+          </figure>
+          <figure>
+            <img
+              src="https://github.com/user-attachments/assets/04ecf586-ba53-481f-87f3-b21918a400e6"
+              alt="3DGS asset after outer Gaussian removal"
+            />
+            <figcaption>Outer Gaussian removal</figcaption>
+          </figure>
+          <figure>
+            <img
+              src="https://github.com/user-attachments/assets/27e81a56-eabc-402e-be83-281bba887ca0"
+              alt="3DGS asset after boundary mesh generation"
+            />
+            <figcaption>Boundary mesh generation</figcaption>
+          </figure>
+        </div>
+
+        <div class="image-row single">
+          <figure>
+            <img
+              src="https://github.com/user-attachments/assets/e4784e9a-f9c3-42de-9383-2fc43e55c989"
+              alt="Connected rooms after refinement and alignment"
+            />
+            <figcaption>Refined modules connect into a coherent indoor scene.</figcaption>
+          </figure>
+        </div>
+      </section>
+
+      <section id="door-extraction" class="feature split">
+        <div class="section-heading">
+          <p class="eyebrow">Automatic Door Corner Extraction</p>
+          <h2>Door geometry becomes the registration cue</h2>
+          <p>
+            Modutwin uses SAM3 to identify doors and extract corner geometry from indoor
+            3DGS assets. The extracted door rectangle provides a compact, user-verifiable
+            representation for module alignment.
+          </p>
+        </div>
+        <figure>
+          <img
+            src="https://github.com/user-attachments/assets/f8ea6be1-e007-4226-81c2-78fa3c6b1144"
+            alt="Automatic door corner extraction using SAM3"
+          />
+          <figcaption>SAM3-assisted door corner extraction.</figcaption>
+        </figure>
+      </section>
+
+      <section id="alignment" class="feature split reverse">
+        <div class="section-heading">
+          <p class="eyebrow">Automatic Door-Based Alignment</p>
+          <h2>Align rooms through shared door structure</h2>
+          <p>
+            Room modules are aligned to the fixed basemap using a door-to-door similarity
+            transform. This keeps independently reconstructed 3DGS assets modular while
+            enabling building-scale navigation.
+          </p>
+        </div>
+        <figure>
+          <img
+            src="https://github.com/user-attachments/assets/d9cef12e-0b4e-4fda-8e02-9e3c122aa7c4"
+            alt="Door-based alignment interface"
+          />
+          <figcaption>Door-based module registration.</figcaption>
+        </figure>
+      </section>
+
+      <section id="interaction" class="feature split">
+        <div class="section-heading">
+          <p class="eyebrow">Door Interaction</p>
+          <h2>Preserve interactive doors after alignment</h2>
+          <p>
+            Door mesh and splat assets remain grouped after registration, allowing the
+            final scene to support open and close interactions instead of flattening doors
+            into static walls.
+          </p>
+        </div>
+        <figure>
+          <img
+            src="https://github.com/user-attachments/assets/c13dd2ea-b897-4627-86af-62644e3925d2"
+            alt="Door open and close interaction"
+          />
+          <figcaption>Interactive door opening and closing.</figcaption>
+        </figure>
+      </section>
+
+      <section class="future-work">
+        <div>
+          <p class="eyebrow">Future Work</p>
+          <h2>Automatic room boundary surface extraction</h2>
+          <p>
+            A planned PointNet++-based module will infer ceiling, floor, and wall boundary
+            surfaces directly from the Gaussian point cloud to reduce manual refinement.
+          </p>
+        </div>
+        <div class="future-images">
+          <figure>
+            <img
+              src="https://github.com/user-attachments/assets/6f459332-8532-4fc7-8f9a-bd4e6cdaf91a"
+              alt="Ceiling and floor segmentation preview"
+            />
+            <figcaption>Ceiling and floor</figcaption>
+          </figure>
+          <figure>
+            <img
+              src="https://github.com/user-attachments/assets/c86a9be7-db51-4542-ada6-3ec6f11fb26d"
+              alt="Wall segmentation preview"
+            />
+            <figcaption>Walls</figcaption>
+          </figure>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <span>Modutwin</span>
+      <a href="https://splat.wiki">splat.wiki</a>
+      <a href="https://youtu.be/1Raxe9ffwnc">Demo video</a>
+    </footer>
+  </body>
+</html>
