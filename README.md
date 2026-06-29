@@ -37,7 +37,7 @@ Modular Indoor Digital Twins via Door-Based Alignment of 3DGS Assets
 ---
 
 ### Automatic Door Corner Extraction
-used SAM3
+using SAM3
   | Record |
   |:---:|
   | <img width="480" height="350" alt="sam3" src="https://github.com/user-attachments/assets/f8ea6be1-e007-4226-81c2-78fa3c6b1144" /> |
@@ -58,7 +58,8 @@ used SAM3
 
 ---
 
-### ❌ (TO-DO) ㅇAutomatic Room Boundary Surface Extraction using PointCloud of Gaussians
+### (TO-DO) Automatic Room Boundary Surface Extraction using PointCloud of Gaussians
+using PointNet++
 
 | Ceiling & Floor | Walls |
 |:---:|:---:|
