@@ -29,6 +29,8 @@ Modular Indoor Digital Twins via Door-Based Alignment of 3DGS Assets
   | Original | After Outer Gaussian Removal | After Boundary Mesh Generation |
   |:---:|:---:|:---:|
   | <img width="1800" height="1008" alt="out_1_cropped" src="https://github.com/user-attachments/assets/caecf60c-edca-4168-b708-e3848e995015" /> | <img width="1800" height="1008" alt="out_2_cropped" src="https://github.com/user-attachments/assets/04ecf586-ba53-481f-87f3-b21918a400e6" /> | <img width="1800" height="1008" alt="out_3_cropped" src="https://github.com/user-attachments/assets/27e81a56-eabc-402e-be83-281bba887ca0" /> |
+  | <img width="1800" height="1008" alt="in_1_cropped" src="https://github.com/user-attachments/assets/c06818b1-f902-4f05-9613-eb37953aa701" /> | <img width="1800" height="1008" alt="in_2_cropped" src="https://github.com/user-attachments/assets/fefeb85a-2f05-47f8-b68f-6fd251a4f2f8" /> | <img width="1800" height="1008" alt="in_3_cropped" src="https://github.com/user-attachments/assets/86dd32df-4302-4f4d-9eb5-98ab9e9aca9c" /> |
+
 * After Connecting
   | Screenshot |
   |:---:|
