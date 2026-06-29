@@ -19,7 +19,7 @@ Modular Indoor Digital Twins via Door-Based Alignment of 3DGS Assets
 
 ---
 
-### ✅ 3DGS asset Refinement
+### 3DGS asset Refinement
 * Without Refining Indoor 3DGS Assets...
 → Assets OVERLAP!
   | Example | 
@@ -36,7 +36,7 @@ Modular Indoor Digital Twins via Door-Based Alignment of 3DGS Assets
 
 ---
 
-### ✅ Automatic Door Corner Extraction
+### Automatic Door Corner Extraction
 used SAM3
   | Record |
   |:---:|
@@ -44,22 +44,22 @@ used SAM3
 
 ---
 
-### ✅ Automatic Door-Based Alignment
+### Automatic Door-Based Alignment
 | Record |
 |:---:|
 | <img width="581" height="350" alt="정합" src="https://github.com/user-attachments/assets/d9cef12e-0b4e-4fda-8e02-9e3c122aa7c4" /> |
 
 ---
 
-### ✅ Door Interaction (Open & Close)
+### Door Interaction (Open & Close)
 | Record |
 |:---:|
 | <img width="800" height="391" alt="door_openclose" src="https://github.com/user-attachments/assets/c13dd2ea-b897-4627-86af-62644e3925d2" /> |
 
 ---
 
-### ❌ Automatic Room Boundary Surface Extraction using PointCloud of Gaussians
-(TO-DO)
+### ❌ (TO-DO) ㅇAutomatic Room Boundary Surface Extraction using PointCloud of Gaussians
+
 | Ceiling & Floor | Walls |
 |:---:|:---:|
 | <img width="150" height="150" alt="image" src="https://github.com/user-attachments/assets/6f459332-8532-4fc7-8f9a-bd4e6cdaf91a" /> | <img width="150" height="150" alt="image" src="https://github.com/user-attachments/assets/c86a9be7-db51-4542-ada6-3ec6f11fb26d" /> |
