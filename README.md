@@ -1,8 +1,8 @@
 # Modutwin
 
 **Modutwin** | A web platform that creates digital twins of building interiors using 3D Gaussian Splatting.  
-* Website: https://splat.wiki
-* Demo Video: [https://youtu.be/1Raxe9ffwnc]
+* [Webite](https://splat.wiki)
+* [Demo Video](https://youtu.be/1Raxe9ffwnc)
 
 | Before(Only Corridor) | After(With Rooms) |
 |:---:|:---:|
