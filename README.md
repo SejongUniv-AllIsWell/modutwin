@@ -59,7 +59,7 @@ using SAM3
 ---
 
 ### (TO-DO) Automatic Room Boundary Surface Extraction using PointCloud of Gaussians
-using PointNet++
+- using a PointNet++-based network
 
 | Ceiling & Floor | Walls |
 |:---:|:---:|
