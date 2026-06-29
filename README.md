@@ -1,8 +1,8 @@
 # Modutwin
 
 **Modutwin** | A web platform that creates digital twins of building interiors using 3D Gaussian Splatting.  
-* Video upload → GPU server 3DGS training → door-based alignment → web viewer serving.
-* Link: https://splat.wiki
+* Website: https://splat.wiki
+* Demo Video: [https://youtu.be/1Raxe9ffwnc]
 
 | Before(Only Corridor) | After(With Rooms) |
 |:---:|:---:|
@@ -14,9 +14,6 @@ Modular Indoor Digital Twins via Door-Based Alignment of 3DGS Assets
 - [Automatic Door Corner Extraction](#Automatic-Door-Corner-Extraction)
 - [Automatic Door-Based Alignment](#Automatic-Door-Based-Alignment)
 - [Door Interaction (Open & Close)](#Door-Interaction (Open & Close))
-
-## Demo Video
-Link: [https://youtu.be/1Raxe9ffwnc]
 
 <br>  
 
