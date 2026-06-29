@@ -58,10 +58,9 @@ using SAM3
 
 ---
 
-### (TO-DO) Automatic Room Boundary Surface Extraction using PointCloud of Gaussians
+### Future Work: Automatic Room Boundary Surface Extraction using PointCloud of Gaussians
 - using a PointNet++-based network
 
 | Ceiling & Floor | Walls |
 |:---:|:---:|
 | <img width="150" height="150" alt="image" src="https://github.com/user-attachments/assets/6f459332-8532-4fc7-8f9a-bd4e6cdaf91a" /> | <img width="150" height="150" alt="image" src="https://github.com/user-attachments/assets/c86a9be7-db51-4542-ada6-3ec6f11fb26d" /> |
-

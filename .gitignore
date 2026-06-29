@@ -8,6 +8,13 @@
 # Local tool state
 .claude/
 
+# Internal docs and agent context
+docs/
+claude.md
+AGENTS.md
+core/**/claude.md
+how_to_use.txt
+
 # Dependencies
 node_modules/
 frontend/node_modules/
